@@ -79,7 +79,7 @@ class Orchestrator:
         gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
 
         baseline_preamble = await self._baseline(
-            project.id, worktree, checkpoint, target_branch, test_command, gate_timeout
+            project.id, task.id, worktree, checkpoint, target_branch, test_command, gate_timeout
         )
         plan_preamble = await self._maybe_plan(
             runner, task, worktree, knowledge, rules, baseline_preamble, config
@@ -196,6 +196,7 @@ class Orchestrator:
     async def _baseline(
         self,
         project_id: str,
+        task_id: str,
         worktree: Path,
         checkpoint: str,
         target_branch: str,
@@ -210,6 +211,7 @@ class Orchestrator:
         await self._bus.emit(
             type=EventType.baseline_snapshot,
             project_id=project_id,
+            task_id=task_id,
             payload={"sha": checkpoint[:12]},
         )
         gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)

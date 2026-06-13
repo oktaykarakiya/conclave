@@ -74,6 +74,33 @@ async def test_green_gate_passes_after_developer_change(db: Database, tmp_path: 
     assert done is not None and done.state is TaskState.done
 
 
+async def test_baseline_snapshot_event_carries_task_id(db: Database, tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "baseline_test_command": "test -f FEATURE.txt"}
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add feature", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(
+        db, EventBus(db), FakeProvider(developer_writes=True), tmp_path / "home"
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # The baseline snapshot must be attributed to the task so it shows in the
+    # per-task event view (list_events filters on task_id).
+    events = await repo.list_events(db, task_id=task.id)
+    snapshots = [e for e in events if e.type == "baseline.snapshot"]
+    assert snapshots, "expected a baseline.snapshot event scoped to the task"
+    assert all(e.task_id == task.id for e in snapshots)
+
+
 async def test_failure_when_gate_never_green(db: Database, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)
