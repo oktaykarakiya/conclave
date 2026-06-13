@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import re
+from pathlib import Path
 
 from .base import AgentResult, OnChunk
 from .profiles import ResolvedProfile, build_invocation
@@ -30,6 +31,7 @@ class ClaudeCliProvider:
         profile: ResolvedProfile,
         prompt: str,
         timeout_seconds: int,
+        cwd: Path | None = None,
         on_chunk: OnChunk | None = None,
     ) -> AgentResult:
         invocation = build_invocation(profile)
@@ -43,6 +45,7 @@ class ClaudeCliProvider:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                cwd=str(cwd) if cwd is not None else None,
             )
         except FileNotFoundError:
             return AgentResult(ok=False, error=f"CLI not found: {profile.cli!r}")

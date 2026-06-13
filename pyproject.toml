@@ -42,7 +42,10 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
-ignore = ["B008"]  # FastAPI uses function calls in argument defaults (Depends)
+# B008: FastAPI uses function calls in argument defaults (Depends).
+# ASYNC230/240: small local pathlib/open in async is fine here — the workload is
+# subprocess-bound (git/claude/tests), not high-concurrency file serving.
+ignore = ["B008", "ASYNC230", "ASYNC240"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel
@@ -37,6 +38,7 @@ class Provider(Protocol):
         profile: ResolvedProfile,
         prompt: str,
         timeout_seconds: int,
+        cwd: Path | None = None,
         on_chunk: OnChunk | None = None,
     ) -> AgentResult: ...
 
