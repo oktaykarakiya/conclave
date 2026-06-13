@@ -20,6 +20,7 @@ from ..db import Database, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType
 from ..providers import Provider
+from ..repo_intel.knowledge import render_preamble
 from .baseline import build_baseline_preamble
 from .gate import run_tests
 from .gitio import run_git
@@ -72,7 +73,7 @@ class Orchestrator:
         checkpoint = sha.strip()
 
         knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
-        knowledge = _render_knowledge(knowledge_row.knowledge) if knowledge_row else ""
+        knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
         rules = _read_project_rules(worktree)
         test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
         gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
@@ -486,24 +487,3 @@ def _test_command(config: ConclaveConfig, knowledge: dict[str, Any] | None) -> s
             if isinstance(test, str) and test.strip():
                 return test
     return None
-
-
-def _render_knowledge(knowledge: dict[str, Any]) -> str:
-    if not knowledge:
-        return ""
-    parts: list[str] = []
-    summary = knowledge.get("architecture_summary")
-    if isinstance(summary, str) and summary:
-        parts.append(summary)
-    langs = knowledge.get("languages")
-    if isinstance(langs, list) and langs:
-        parts.append("Languages: " + ", ".join(str(x) for x in langs))
-    commands = knowledge.get("commands")
-    if isinstance(commands, dict) and commands:
-        rendered = ", ".join(f"{k}: `{v}`" for k, v in commands.items() if v)
-        if rendered:
-            parts.append("Commands — " + rendered)
-    conventions = knowledge.get("conventions")
-    if isinstance(conventions, list) and conventions:
-        parts.append("Conventions:\n" + "\n".join(f"- {c}" for c in conventions))
-    return "\n".join(parts)
