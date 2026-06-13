@@ -499,6 +499,10 @@ async def list_engine_profiles(
     return [EngineProfileRow.from_row(r) for r in rows]
 
 
+async def delete_engine_profile(db: Database, profile_id: str) -> None:
+    await db.execute("DELETE FROM engine_profiles WHERE id = ?", (profile_id,))
+
+
 # --- agent personas ---------------------------------------------------------
 
 
