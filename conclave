@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Conclave launcher: bootstraps a local venv on first run, then starts the daemon.
+# Usage: ./conclave            (starts the web daemon on http://127.0.0.1:8700)
+#        CONCLAVE_PORT=9000 ./conclave
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+VENV="$HERE/.venv"
+PYTHON="${PYTHON:-python3}"
+
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "[conclave] creating virtualenv at $VENV ..."
+  "$PYTHON" -m venv "$VENV"
+  "$VENV/bin/python" -m pip install --quiet --upgrade pip
+fi
+
+# Install/refresh the package if it is missing or pyproject is newer than the marker.
+MARKER="$VENV/.conclave-installed"
+if [ ! -f "$MARKER" ] || [ "$HERE/pyproject.toml" -nt "$MARKER" ]; then
+  echo "[conclave] installing dependencies ..."
+  "$VENV/bin/python" -m pip install --quiet -e "$HERE"
+  touch "$MARKER"
+fi
+
+exec "$VENV/bin/python" -m conclave.main "$@"
