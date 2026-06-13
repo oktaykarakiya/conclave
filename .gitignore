@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+
+# Conclave runtime state (never commit a real data dir)
+.conclave-home/
+*.db
+*.db-wal
+*.db-shm
+
+# Node / frontend
+node_modules/
+frontend/dist/
+src/conclave/web/static/*
+!src/conclave/web/static/.gitkeep
+
+# Env / secrets
+.env
+*.local
