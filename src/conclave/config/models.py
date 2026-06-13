@@ -119,6 +119,9 @@ class ExperimentalSettings(BaseModel):
     cross_attempt_memory_entries: int = Field(default=5, ge=0, le=50)
     persistent_baseline_cache: bool = True
     planner_enabled: bool = True
+    # SUPERSEDED by classify_level / planning.level_thresholds (engine/level_router.py):
+    # the planner gate is now scale-adaptive (BMad L0-L4), not a single char threshold.
+    # Retained (not deleted) to avoid config churn; no longer read by the orchestrator.
     auto_planner_char_threshold: int = Field(default=400, ge=0)
     post_mortem_enabled: bool = True
 

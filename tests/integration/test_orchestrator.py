@@ -53,9 +53,9 @@ async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> No
 
 
 async def test_planner_path_runs_and_persists_plan(db: Database, tmp_path: Path) -> None:
-    # use_planner=True forces _maybe_plan's should_plan True regardless of the short
-    # request, exercising the L1 planner path (and the FakeProvider's plan branch,
-    # which is otherwise dead). This locks in today's behavior before the refactor.
+    # use_planner=True opts a short (trivial-length) request into planning: classify_level
+    # bumps it to L1, so _maybe_plan runs the one-shot planner (exercising the FakeProvider's
+    # plan branch, otherwise dead). Locks in the explicit-opt-in path after the level refactor.
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)
     project = await repo.create_project(
@@ -80,15 +80,97 @@ async def test_planner_path_runs_and_persists_plan(db: Database, tmp_path: Path)
     types = {e.type for e in await repo.list_events(db, task_id=task.id)}
     assert "plan.artifact" in types
 
-    # (c) the parsed plan was persisted on the task
+    # (c) the parsed plan was persisted on the task, classified L1 (explicit opt-in)
     done = await repo.get_task(db, task.id)
     assert done is not None
     assert done.plan == {"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}
+    assert done.level == 1
+
+    # (d) a single plan.level_selected event carried the L1 routing decision
+    level_events = [
+        e for e in await repo.list_events(db, task_id=task.id)
+        if e.type == "plan.level_selected"
+    ]
+    assert len(level_events) == 1 and level_events[0].payload["level"] == 1
 
     # the planner path does not regress the happy path: still done + merged to main
     assert done.state is TaskState.done
     code, out = await run_git(repo_path, "show", "main:FEATURE.txt")
     assert code == 0 and "done" in out
+
+
+async def test_trivial_request_classifies_l0_and_skips_planner(
+    db: Database, tmp_path: Path
+) -> None:
+    # Regression canary: a short (<= L0 ceiling) request with use_planner unset takes the
+    # trivial fast-path — level 0, the planner persona never runs, no plan persisted. The
+    # four existing process_task tests all use such requests, so this pins their behavior.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 0
+    assert done.plan is None  # planner did not run
+
+    events = await repo.list_events(db, task_id=task.id)
+    level_events = [e for e in events if e.type == "plan.level_selected"]
+    assert len(level_events) == 1 and level_events[0].payload["level"] == 0
+    # no plan.artifact event, and the planner prompt was never assembled
+    assert "plan.artifact" not in {e.type for e in events}
+    assert not any("Produce a structured plan" in p for p in provider.prompts)
+
+
+async def test_long_request_classifies_l3_and_runs_planner(
+    db: Database, tmp_path: Path
+) -> None:
+    # A ~500-char request (use_planner unset) classifies to L3; under the placeholder
+    # routing L2/3/4 reuse the L1 one-shot planner, so the plan is produced and persisted.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    # Benign filler keeps the request clear of the FakeProvider marker substrings
+    # ('Produce a structured plan' / 'Review the changes made for this task'), so the
+    # fake routes by persona rather than misreading the long request text.
+    task = await repo.create_task(
+        db, project_id=project.id, request="x" * 500, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 3
+    assert done.plan == {"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}
+
+    # the PLAN preamble reached a downstream (developer) prompt
+    assert any("=== PLAN (from the Planner" in p for p in provider.prompts)
+
+    level_events = [
+        e for e in await repo.list_events(db, task_id=task.id)
+        if e.type == "plan.level_selected"
+    ]
+    assert len(level_events) == 1 and level_events[0].payload["level"] == 3
 
 
 async def test_green_gate_passes_after_developer_change(db: Database, tmp_path: Path) -> None:

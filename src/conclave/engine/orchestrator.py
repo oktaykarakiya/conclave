@@ -24,6 +24,7 @@ from ..repo_intel.knowledge import render_preamble
 from .baseline import build_baseline_preamble
 from .gate import run_tests
 from .gitio import run_git
+from .level_router import classify_level
 from .memory import AttemptMemory
 from .pipeline import get_agent_pipeline
 from .runner import AgentRunner
@@ -64,6 +65,23 @@ class Orchestrator:
             payload={"request": task.request[:200], "target_branch": target_branch},
         )
 
+        # Scale-adaptive planning level (BMad L0-L4). Classified up-front — before any
+        # worktree creation/setup — so a future L4 path (task 9) can skip setup entirely;
+        # persisted and broadcast so the UI/event stream reflects the routing for EVERY task.
+        level = classify_level(
+            task.request,
+            config.planning,
+            use_planner=task.use_planner,
+            planner_enabled=config.experimental.planner_enabled,
+        )
+        await repo.update_task_fields(self._db, task.id, level=level)
+        await self._bus.emit(
+            type=EventType.plan_level,
+            project_id=project.id,
+            task_id=task.id,
+            payload={"task_id": task.id, "level": level},
+        )
+
         try:
             worktree = await wm.create(task.id, target_branch, task_branch)
         except WorktreeError as exc:
@@ -82,7 +100,7 @@ class Orchestrator:
             project.id, task.id, worktree, checkpoint, target_branch, test_command, gate_timeout
         )
         plan_preamble = await self._maybe_plan(
-            runner, task, worktree, knowledge, rules, baseline_preamble, config
+            runner, task, worktree, knowledge, rules, baseline_preamble, config, level
         )
 
         memory = AttemptMemory(config.experimental.cross_attempt_memory_entries)
@@ -229,16 +247,17 @@ class Orchestrator:
         rules: str,
         baseline_preamble: str,
         config: ConclaveConfig,
+        level: int,
     ) -> str:
+        # Defensive: classify_level already collapses planner_enabled=False to level 0,
+        # so this guard is redundant with the level == 0 check below. Kept to keep the
+        # config flag referenced and to fail closed regardless of the passed-in level.
         if not config.experimental.planner_enabled:
             return ""
-        threshold = config.experimental.auto_planner_char_threshold
-        should_plan = (
-            task.use_planner
-            if task.use_planner is not None
-            else len(task.request) >= threshold
-        )
-        if not should_plan:
+        # Level gate (SUPERSEDES auto_planner_char_threshold): L0 => no planner, no
+        # dispatch. Levels 1-4 run the one-shot planner; L2/3/4 currently reuse the L1
+        # path as a placeholder (tasks 5/7/9 specialize them).
+        if level == 0:
             return ""
         prompt = (
             f"{task.request}{baseline_preamble}\n\n"
@@ -247,6 +266,7 @@ class Orchestrator:
         plan = await self._dispatch_plan(
             runner, "planner", prompt, task, worktree, knowledge, rules
         )
+        # L1 degradation: a failed/empty plan yields no preamble (matches today's behavior).
         if plan is None:
             return ""
         await repo.update_task_fields(self._db, task.id, plan=plan)
