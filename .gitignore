@@ -19,8 +19,8 @@ build/
 # Node / frontend
 node_modules/
 frontend/dist/
-src/conclave/web/static/*
-!src/conclave/web/static/.gitkeep
+# NOTE: the built SPA under src/conclave/web/static/ IS committed so the daemon
+# serves the UI without needing Node at runtime (only frontend dev needs Node).
 
 # Env / secrets
 .env
