@@ -1,16 +1,15 @@
 """Scale-adaptive planning level router (BMad L0-L4).
 
 This module owns the pure decision logic that maps an incoming task request to a
-planning level. This task implements only the band-matching helper ``_matches``;
-``classify_level`` is wired in later tasks (2/4) and the canonical spec below is the
-single source of truth they must implement against.
+planning level. It exposes the band-matching helper ``_matches`` and the top-level
+``classify_level``, which implements the canonical spec below.
 
-``LevelConditions`` is defined locally (not in :mod:`conclave.config.models`) because
-this task forbids config/schema changes; tasks 2/4 will nest it into
-``PlanningSettings.level_thresholds``.
+``LevelConditions`` and ``PlanningSettings`` live in :mod:`conclave.config.models`
+(``PlanningSettings.level_thresholds`` nests the per-level bands). They are imported
+and re-exported here so callers and tests can reach ``LevelConditions`` from either.
 
-CANONICAL CLASSIFICATION SPEC (single source of truth for tasks 2 and 4 - state it
-verbatim in the module docstring). classify_level computes, in order:
+CANONICAL CLASSIFICATION SPEC (the single source of truth ``classify_level`` implements).
+classify_level computes, in order:
 1. If planner_enabled is False OR use_planner is False => return 0.
 2. TRIVIAL FAST-PATH keyed on L0's OWN ceiling (NOT on L1's band): if min_level == 0
    AND level_thresholds.get(0) exists AND its max_chars is not None AND
@@ -40,30 +39,71 @@ planning, preserving today's skip for short requests.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from conclave.config.models import LevelConditions, PlanningSettings
+
+# ``LevelConditions`` is imported for ``_matches``'s signature and re-exported so the
+# existing ``from conclave.engine.level_router import LevelConditions`` keeps resolving;
+# ``PlanningSettings`` carries the per-level ``level_thresholds`` bands classify_level reads.
 
 
-class LevelConditions(BaseModel):
-    """Match rule for a single planning level's band.
+def classify_level(
+    request: str,
+    planning: PlanningSettings,
+    *,
+    use_planner: bool | None = None,
+    planner_enabled: bool = True,
+) -> int:
+    """Map ``request`` to a BMad planning level in ``[min_level, max_level]``.
 
-    Defined here rather than in :mod:`conclave.config.models` because this task forbids
-    config/schema changes; tasks 2/4 nest it into ``PlanningSettings.level_thresholds``.
+    Implements the canonical spec (see the module docstring) exactly, in order:
+    1. ``planner_enabled`` False OR ``use_planner`` False => 0 (no planning).
+    2. Trivial fast-path keyed on L0's OWN ceiling: ``min_level == 0`` AND
+       ``level_thresholds[0]`` exists with a non-None ``max_chars`` AND
+       ``len(request) <= max_chars`` AND ``use_planner`` is not True => 0. Keying on L0
+       (never on L1) makes this immune to stored drift in ``level_thresholds[1]``.
+    3. Otherwise pick the HIGHEST level matching via ``_matches``, scanning ``max_level``
+       down to ``min_level``.
+    4. Gap-filler: if nothing matched, ``max(min_level, 1)`` — a non-trivial request is
+       never silently dropped to no-planning (NEVER 0).
+    5. If ``use_planner`` is True, ``max(result, 1)`` so explicit opt-in never yields 0.
+    6. Always clamp into ``[min_level, max_level]``.
     """
+    min_level = planning.min_level
+    max_level = planning.max_level
+    thresholds = planning.level_thresholds
 
-    model_config = ConfigDict(extra="forbid")
+    # Step 1: planner globally off, or an explicit per-task opt-out, means no planning.
+    if not planner_enabled or use_planner is False:
+        return 0
 
-    min_chars: int = Field(default=0, ge=0, description="Inclusive lower bound on len(request).")
-    max_chars: int | None = Field(
-        default=None, description="Inclusive upper bound on len(request); None => unbounded."
-    )
-    required_keywords: list[str] = Field(
-        default_factory=list,
-        description="All must appear case-insensitively in the request for a match.",
-    )
-    file_count_estimate: int | None = Field(
-        default=None,
-        description="Advisory: enforced only when a file estimate is supplied at call time.",
-    )
+    # Step 2: trivial fast-path keyed on L0's own ceiling (immune to stored L1 drift).
+    l0 = thresholds.get(0)
+    if (
+        min_level == 0
+        and l0 is not None
+        and l0.max_chars is not None
+        and len(request) <= l0.max_chars
+        and use_planner is not True
+    ):
+        return 0
+
+    # Step 3: highest fully-matching level, scanning max_level DOWN to min_level.
+    matched: int | None = None
+    for level in range(max_level, min_level - 1, -1):
+        conditions = thresholds.get(level)
+        if conditions is not None and _matches(conditions, request):
+            matched = level
+            break
+
+    # Step 4: gap-filler — a non-trivial request that fell in a band-hole still plans.
+    result = matched if matched is not None else max(min_level, 1)
+
+    # Step 5: explicit opt-in never yields 0.
+    if use_planner is True:
+        result = max(result, 1)
+
+    # Step 6: clamp into [min_level, max_level].
+    return max(min_level, min(result, max_level))
 
 
 # --- module helpers ---------------------------------------------------------

@@ -135,6 +135,31 @@ _DEFAULT_IGNORE_PATTERNS = [
 ]
 
 
+class LevelConditions(BaseModel):
+    """Match rule for a single planning level's request-length band.
+
+    Nested per level into :attr:`PlanningSettings.level_thresholds` and evaluated by
+    :func:`conclave.engine.level_router._matches`. Char bounds are inclusive on both
+    ends; an empty ``required_keywords`` is vacuously satisfied and ``file_count_estimate``
+    is advisory (enforced only when a file estimate is supplied at call time).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_chars: int = Field(default=0, ge=0, description="Inclusive lower bound on len(request).")
+    max_chars: int | None = Field(
+        default=None, description="Inclusive upper bound on len(request); None => unbounded."
+    )
+    required_keywords: list[str] = Field(
+        default_factory=list,
+        description="All must appear case-insensitively in the request for a match.",
+    )
+    file_count_estimate: int | None = Field(
+        default=None,
+        description="Advisory: enforced only when a file estimate is supplied at call time.",
+    )
+
+
 class PlanningSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -151,6 +176,23 @@ class PlanningSettings(BaseModel):
     ignore_patterns: list[str] = Field(default_factory=lambda: list(_DEFAULT_IGNORE_PATTERNS))
     min_level: int = Field(default=0, ge=0, le=4, description="Floor on scale-adaptive planning.")
     max_level: int = Field(default=4, ge=0, le=4, description="Cap on scale-adaptive planning.")
+    # Default is a clean, gap-free tiling of request length onto BMad L0-L4:
+    # [0,50]=L0 (trivial, no planning), [51,499]=L1 (light) and L2 when BOTH 'implement'
+    # and 'feature' appear, [500,999]=L3, [1000,inf]=L4. The router (level_router.py) keys
+    # its trivial fast-path on L0's own ceiling and fills band-holes with L1, so this tiling
+    # stays correct even if a stored override shadows an individual level (see R1 there).
+    level_thresholds: dict[int, LevelConditions] = Field(
+        default_factory=lambda: {
+            0: LevelConditions(min_chars=0, max_chars=50),
+            1: LevelConditions(min_chars=51, max_chars=499),
+            2: LevelConditions(
+                min_chars=51, max_chars=499, required_keywords=["implement", "feature"]
+            ),
+            3: LevelConditions(min_chars=500, max_chars=999),
+            4: LevelConditions(min_chars=1000, max_chars=None),
+        },
+        description="Per-level (BMad L0-L4) request-length match bands.",
+    )
 
 
 class ConditionalAgent(BaseModel):
