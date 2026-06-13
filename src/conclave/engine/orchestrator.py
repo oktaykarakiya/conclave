@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import ConclaveConfig, load_project_config, resolve_agent
+from ..config.models import L2Settings
 from ..db import Database, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType
@@ -263,10 +264,16 @@ class Orchestrator:
             f"{task.request}{baseline_preamble}\n\n"
             "Produce a structured plan per your system prompt."
         )
+        # L2 (enhanced one-shot): DEMAND the gated fields up-front. Appended AFTER the
+        # marker line above so persona routing is unaffected; empty (a no-op) when both
+        # l2_settings flags are off, collapsing L2 back to a plain L1 one-shot.
+        if level == 2:
+            prompt += _l2_plan_instruction(config.planning.l2_settings)
         plan = await self._dispatch_plan(
             runner, "planner", prompt, task, worktree, knowledge, rules
         )
-        # L1 degradation: a failed/empty plan yields no preamble (matches today's behavior).
+        # L1 degradation (shared verbatim by L2): a dispatch error / no fence / parse
+        # failure yields no preamble — never a task failure — matching today's behavior.
         if plan is None:
             return ""
         await repo.update_task_fields(self._db, task.id, plan=plan)
@@ -274,10 +281,15 @@ class Orchestrator:
             type=EventType.plan_artifact, project_id=task.project_id, task_id=task.id,
             payload={"plan": plan},
         )
-        return (
+        preamble = (
             "\n\n=== PLAN (from the Planner — follow its scope strictly) ===\n"
             f"```json\n{json.dumps(plan)}\n```\n=== END PLAN ===\n"
         )
+        # L2: fold a clearly-labeled corrective note into the preamble for any demanded
+        # field the planner still omitted, so the developer must supply it (vs. failing).
+        if level == 2:
+            preamble += _l2_corrective_notes(plan, config.planning.l2_settings)
+        return preamble
 
     async def _dispatch_plan(
         self,
@@ -533,3 +545,41 @@ def _test_command(config: ConclaveConfig, knowledge: dict[str, Any] | None) -> s
             if isinstance(test, str) and test.strip():
                 return test
     return None
+
+
+def _l2_plan_instruction(l2: L2Settings) -> str:
+    """Planner-prompt augmentation for the enhanced one-shot (L2) path.
+
+    Demands each gated field so the planner front-loads it. Returns '' when neither flag
+    is set, so an all-False :class:`L2Settings` leaves the prompt byte-identical to L1.
+    """
+    demands: list[str] = []
+    if l2.require_acceptance_criteria:
+        demands.append("non-empty `acceptance_criteria`")
+    if l2.require_risk_assessment:
+        demands.append("non-empty `risks`")
+    if not demands:
+        return ""
+    return "\n\nL2 REQUIREMENT: the plan JSON MUST include " + " and ".join(demands) + "."
+
+
+def _l2_corrective_notes(plan: dict[str, Any], l2: L2Settings) -> str:
+    """Corrective notes for any L2-demanded field the planner left missing/empty.
+
+    A field counts as missing when ``not plan.get(field)`` — absent OR an empty list. The
+    real planner persona emits both fields, so the happy path returns '' and the
+    developer's plan preamble is byte-identical to L1.
+    """
+    notes: list[str] = []
+    if l2.require_acceptance_criteria and not plan.get("acceptance_criteria"):
+        notes.append(
+            "L2 NOTE: planner omitted acceptance_criteria — "
+            "developer must define and verify them."
+        )
+    if l2.require_risk_assessment and not plan.get("risks"):
+        notes.append(
+            "L2 NOTE: planner omitted risks — developer must assess and mitigate them."
+        )
+    if not notes:
+        return ""
+    return "\n" + "\n".join(notes) + "\n"

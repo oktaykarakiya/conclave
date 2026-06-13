@@ -163,6 +163,30 @@ class LevelConditions(BaseModel):
     )
 
 
+class L2Settings(BaseModel):
+    """Field gates for the enhanced one-shot (BMad L2) planning path.
+
+    When a task classifies to level 2, these flags DEMAND the named fields in the plan
+    JSON: the planner prompt is augmented to require them up-front, and any the planner
+    still omits trigger a clearly-labeled corrective note folded into the developer's
+    plan preamble (never a task failure). Both default True so the "enhanced" intent
+    holds out of the box; the real planner persona already emits both, so the happy path
+    adds no note. Both False collapses L2 to a plain L1 one-shot. See
+    :meth:`conclave.engine.orchestrator.Orchestrator._maybe_plan`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    require_acceptance_criteria: bool = Field(
+        default=True,
+        description="Demand non-empty acceptance_criteria in the L2 plan; note it if omitted.",
+    )
+    require_risk_assessment: bool = Field(
+        default=True,
+        description="Demand non-empty risks in the L2 plan; note it if omitted.",
+    )
+
+
 class PlanningSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -195,6 +219,10 @@ class PlanningSettings(BaseModel):
             4: LevelConditions(min_chars=1000, max_chars=None),
         },
         description="Per-level (BMad L0-L4) request-length match bands.",
+    )
+    l2_settings: L2Settings = Field(
+        default_factory=L2Settings,
+        description="Field gates for the enhanced one-shot (BMad L2) planning path.",
     )
 
 

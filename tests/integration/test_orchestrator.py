@@ -250,6 +250,116 @@ async def test_failure_when_gate_never_green(db: Database, tmp_path: Path) -> No
     assert branches.strip() == ""
 
 
+# A request in the L2 band: [51,499] chars carrying BOTH 'implement' and 'feature' so
+# classify_level routes it to level 2 (the highest matching band), and clear of the
+# FakeProvider marker substrings ('Produce a structured plan' / 'Review the changes made
+# for this task') so the fake still routes by persona rather than misreading the request.
+_L2_REQUEST = "implement a new feature that adds a configurable widget to the analytics dashboard"
+
+
+async def test_l2_missing_acceptance_criteria_adds_corrective_note(
+    db: Database, tmp_path: Path
+) -> None:
+    # The default FakeProvider plan omits acceptance_criteria/risks; default l2_settings
+    # demand both, so the L2 path folds a corrective note into the developer's preamble
+    # (rather than failing the task) and the run still completes.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L2_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 2
+    assert done.state is TaskState.done
+
+    # the corrective note for the omitted acceptance_criteria reached a developer prompt,
+    # carried alongside the PLAN preamble (the enhanced L2 one-shot)
+    assert any(
+        "=== PLAN (from the Planner" in p and "L2 NOTE" in p and "acceptance_criteria" in p
+        for p in provider.prompts
+    )
+
+
+async def test_l2_flags_off_is_plain_l1_oneshot(db: Database, tmp_path: Path) -> None:
+    # With both l2_settings flags False the L2 path collapses to a plain L1 one-shot:
+    # no demand appended to the planner prompt, the FakeProvider plan persisted as-is,
+    # and no L2 corrective note anywhere.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main"},
+            "planning": {
+                "l2_settings": {
+                    "require_acceptance_criteria": False,
+                    "require_risk_assessment": False,
+                }
+            },
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L2_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 2
+    assert done.plan == {"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}
+
+    assert any("=== PLAN (from the Planner" in p for p in provider.prompts)
+    assert not any("L2 NOTE" in p for p in provider.prompts)
+
+
+async def test_l2_malformed_plan_degrades_to_empty_preamble(
+    db: Database, tmp_path: Path
+) -> None:
+    # A malformed (fence-less) planner reply makes _dispatch_plan return None; the L2 path
+    # degrades exactly like L1 — empty preamble, no plan persisted/emitted — without raising.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L2_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider(plan_malformed=True)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 2
+    assert done.plan is None
+
+    types = {e.type for e in await repo.list_events(db, task_id=task.id)}
+    assert "plan.artifact" not in types
+    assert not any("=== PLAN" in p or "L2 NOTE" in p for p in provider.prompts)
+
+
 async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)

@@ -16,11 +16,19 @@ _PLAN = '```json\n{"approach": "create the file", "files_to_touch": ["FEATURE.tx
 
 
 class FakeProvider:
-    """Configurable fake. ``developer_writes`` controls whether the developer makes a change."""
+    """Configurable fake. ``developer_writes`` toggles the developer's file write;
+    ``plan_malformed`` makes the planner emit fence-less text so the plan parses to None."""
 
-    def __init__(self, *, developer_writes: bool = True, filename: str = "FEATURE.txt") -> None:
+    def __init__(
+        self,
+        *,
+        developer_writes: bool = True,
+        filename: str = "FEATURE.txt",
+        plan_malformed: bool = False,
+    ) -> None:
         self.developer_writes = developer_writes
         self.filename = filename
+        self.plan_malformed = plan_malformed
         self.prompts: list[str] = []
 
     async def run_agent(
@@ -34,6 +42,12 @@ class FakeProvider:
     ) -> AgentResult:
         self.prompts.append(prompt)
         if "Produce a structured plan" in prompt:
+            if self.plan_malformed:
+                # No ```json fence => _dispatch_plan's regex misses and it parses to None,
+                # exercising the L2/L1 dispatch-degradation path (no plan, empty preamble).
+                return AgentResult(
+                    ok=True, text="No plan produced.", model_reported="fake", cost_usd=0.0
+                )
             return AgentResult(ok=True, text=_PLAN, model_reported="fake", cost_usd=0.0)
         if "Review the changes made for this task" in prompt:
             return AgentResult(ok=True, text=_PASS, model_reported="fake", cost_usd=0.0)
