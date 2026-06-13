@@ -52,6 +52,45 @@ async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> No
     assert {"task.started", "task.committed", "task.merged", "task.done"} <= types
 
 
+async def test_planner_path_runs_and_persists_plan(db: Database, tmp_path: Path) -> None:
+    # use_planner=True forces _maybe_plan's should_plan True regardless of the short
+    # request, exercising the L1 planner path (and the FakeProvider's plan branch,
+    # which is otherwise dead). This locks in today's behavior before the refactor.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file",
+        state=TaskState.approved, use_planner=True,
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # (a) the PLAN preamble reached a downstream (developer) prompt
+    assert any("=== PLAN (from the Planner" in p for p in provider.prompts)
+
+    # (b) a plan.artifact event was emitted for the task
+    types = {e.type for e in await repo.list_events(db, task_id=task.id)}
+    assert "plan.artifact" in types
+
+    # (c) the parsed plan was persisted on the task
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.plan == {"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}
+
+    # the planner path does not regress the happy path: still done + merged to main
+    assert done.state is TaskState.done
+    code, out = await run_git(repo_path, "show", "main:FEATURE.txt")
+    assert code == 0 and "done" in out
+
+
 async def test_green_gate_passes_after_developer_change(db: Database, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)

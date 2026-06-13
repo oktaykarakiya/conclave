@@ -244,22 +244,10 @@ class Orchestrator:
             f"{task.request}{baseline_preamble}\n\n"
             "Produce a structured plan per your system prompt."
         )
-        result = await runner.run(
-            agent="planner",
-            prompt=prompt,
-            task_id=task.id,
-            worktree=worktree,
-            repo_knowledge=knowledge,
-            project_rules=rules,
+        plan = await self._dispatch_plan(
+            runner, "planner", prompt, task, worktree, knowledge, rules
         )
-        if not result.ok:
-            return ""
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result.text, re.DOTALL)
-        if not match:
-            return ""
-        try:
-            plan = json.loads(match.group(1))
-        except (json.JSONDecodeError, ValueError):
+        if plan is None:
             return ""
         await repo.update_task_fields(self._db, task.id, plan=plan)
         await self._bus.emit(
@@ -268,8 +256,44 @@ class Orchestrator:
         )
         return (
             "\n\n=== PLAN (from the Planner — follow its scope strictly) ===\n"
-            f"```json\n{match.group(1)}\n```\n=== END PLAN ===\n"
+            f"```json\n{json.dumps(plan)}\n```\n=== END PLAN ===\n"
         )
+
+    async def _dispatch_plan(
+        self,
+        runner: AgentRunner,
+        agent: str,
+        prompt: str,
+        task: Task,
+        worktree: Path,
+        knowledge: str,
+        rules: str,
+    ) -> dict[str, Any] | None:
+        """Run a planning persona and parse its first ```json fenced block.
+
+        Returns the parsed plan object, or ``None`` when the agent dispatch
+        fails, emits no fenced JSON block, or the block fails to JSON-parse.
+        This ``None`` contract is the shared degradation primitive consumed by
+        the higher scale-adaptive planning levels (L2/L3/L4).
+        """
+        result = await runner.run(
+            agent=agent,
+            prompt=prompt,
+            task_id=task.id,
+            worktree=worktree,
+            repo_knowledge=knowledge,
+            project_rules=rules,
+        )
+        if not result.ok:
+            return None
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result.text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            parsed: dict[str, Any] = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return parsed
 
     async def _review(
         self,
