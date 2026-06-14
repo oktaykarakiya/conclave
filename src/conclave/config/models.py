@@ -214,6 +214,30 @@ class L3Settings(BaseModel):
     )
 
 
+class L4Settings(BaseModel):
+    """Settings for the epic-decomposition (BMad L4) planning path.
+
+    When ``auto_create_children`` is on and the task classifies to level 4, the
+    orchestrator dispatches a decomposer persona (via :meth:`_run_l4`) to split the
+    epic into child tasks.  ``max_child_tasks`` caps the row output.  Both defaults
+    keep the L4 path active out of the box; set ``auto_create_children`` to False
+    to degrade L4 epics to a direct L1 execution instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    auto_create_children: bool = Field(
+        default=True,
+        description="When True, a level-4 epic decomposes into child tasks.",
+    )
+    max_child_tasks: int = Field(
+        default=12,
+        ge=1,
+        le=100,
+        description="Maximum number of child tasks to create from an epic decomposition.",
+    )
+
+
 class PlanningSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -254,6 +278,10 @@ class PlanningSettings(BaseModel):
     l3_settings: L3Settings = Field(
         default_factory=L3Settings,
         description="Stage gates for the three-agent sequential (BMad L3) planning path.",
+    )
+    l4_settings: L4Settings = Field(
+        default_factory=L4Settings,
+        description="Settings for the epic-decomposition (BMad L4) planning path.",
     )
 
 

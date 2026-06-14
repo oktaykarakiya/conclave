@@ -680,3 +680,228 @@ async def test_l3_final_stage_none_degradation(
 
     # No '=== PLAN' block in any prompt (empty preamble).
     assert not any("=== PLAN" in p for p in provider.prompts)
+
+
+# ---------------------------------------------------------------------------
+# Scale-adaptive planning L4 integration tests
+# ---------------------------------------------------------------------------
+
+# L4 band filler: 1000 chars, clear of FakeProvider marker substrings so routing
+# stays persona-based (decomposer detects "Decompose this epic into child tasks").
+_L4_REQUEST = "x" * 1000
+
+
+async def test_l4_epic_decomposes_into_children_and_short_circuits(
+    db: Database, tmp_path: Path
+) -> None:
+    """Acceptance criterion: a level-4 task with auto_create_children=True
+    decomposes into child tasks, short-circuits the dev loop, and leaves the
+    epic terminal (done)."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L4_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # Epic is classified L4 and marked done.
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 4
+    assert done.state is TaskState.done
+
+    # Child tasks created in inbox with parent=epic.id.
+    all_tasks = await repo.list_tasks(db, project_id=project.id)
+    children = [t for t in all_tasks if t.parent_task_id == task.id]
+    assert len(children) == 3  # _DECOMPOSE returns 3 entries
+    for child in children:
+        assert child.state == TaskState.inbox
+        assert child.parent_task_id == task.id
+        assert child.title
+        assert child.request
+
+    # plan.artifact event was emitted with the decomposition JSON.
+    events = await repo.list_events(db, task_id=task.id)
+    plan_events = [e for e in events if e.type == "plan.artifact"]
+    assert len(plan_events) == 1, f"expected 1 plan.artifact, got {len(plan_events)}"
+    artifact = plan_events[0].payload["plan"]
+    assert "child_tasks" in artifact
+    assert len(artifact["child_tasks"]) == 3
+
+    # plan.decomposition_complete event emitted with child_count and child_ids.
+    complete_events = [e for e in events if e.type == "plan.decomposition_complete"]
+    assert len(complete_events) == 1
+    assert complete_events[0].payload["child_count"] == 3
+    assert len(complete_events[0].payload["child_ids"]) == 3
+
+    # NO developer dispatch event — the dev loop never ran.
+    dev_dispatches = [
+        e for e in events
+        if e.type == "agent.dispatched" and e.agent == "developer"
+    ]
+    assert len(dev_dispatches) == 0, "Developer was dispatched but should not be"
+
+    # plan.decomposition_fallback was NOT emitted.
+    assert not any(
+        e.type == "plan.decomposition_fallback" for e in events
+    )
+
+
+async def test_l4_empty_decomposition_falls_back_to_l1(
+    db: Database, tmp_path: Path
+) -> None:
+    """Acceptance criterion: a level-4 task with empty decomposition creates zero
+    children, emits the fallback event, and runs the developer loop as L1."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L4_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider(empty_decomposition=True)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 4
+    # Task completes through the normal L1 developer/review loop.
+    assert done.state is TaskState.done
+
+    # Zero children created — decomposition was empty.
+    all_tasks = await repo.list_tasks(db, project_id=project.id)
+    children = [t for t in all_tasks if t.parent_task_id == task.id]
+    assert len(children) == 0
+
+    # plan.decomposition_fallback event was emitted.
+    events = await repo.list_events(db, task_id=task.id)
+    fallback_events = [
+        e for e in events if e.type == "plan.decomposition_fallback"
+    ]
+    assert len(fallback_events) == 1
+
+    # plan.decomposition_complete was NOT emitted.
+    assert not any(
+        e.type == "plan.decomposition_complete" for e in events
+    )
+
+    # Developer WAS dispatched — dev loop ran as L1 fallback.
+    dev_dispatches = [
+        e for e in events
+        if e.type == "agent.dispatched" and e.agent == "developer"
+    ]
+    assert len(dev_dispatches) >= 1, "Developer should have been dispatched"
+
+
+async def test_l4_malformed_decomposition_falls_back_to_l1(
+    db: Database, tmp_path: Path
+) -> None:
+    """Acceptance criterion: a level-4 task whose decomposer dispatch returns
+    malformed output (no JSON fence) falls back to the L1 developer loop."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L4_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider(plan_malformed=True)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 4
+    assert done.state is TaskState.done
+
+    # Zero children — dispatch returned None.
+    all_tasks = await repo.list_tasks(db, project_id=project.id)
+    children = [t for t in all_tasks if t.parent_task_id == task.id]
+    assert len(children) == 0
+
+    # plan.decomposition_fallback event with dispatch reason.
+    events = await repo.list_events(db, task_id=task.id)
+    fallback_events = [
+        e for e in events if e.type == "plan.decomposition_fallback"
+    ]
+    assert len(fallback_events) == 1
+    assert "dispatch" in fallback_events[0].payload["reason"]
+
+    # Developer WAS dispatched — dev loop ran.
+    dev_dispatches = [
+        e for e in events
+        if e.type == "agent.dispatched" and e.agent == "developer"
+    ]
+    assert len(dev_dispatches) >= 1, "Developer should have been dispatched"
+
+
+async def test_l4_auto_create_children_false_treats_as_l1(
+    db: Database, tmp_path: Path
+) -> None:
+    """A level-4 task with auto_create_children=False degrades to L1: no
+    decomposer dispatch, no children, dev loop runs normally."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main"},
+            "planning": {"l4_settings": {"auto_create_children": False}},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L4_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 4
+    assert done.state is TaskState.done
+
+    # Zero children — decomposer never ran.
+    all_tasks = await repo.list_tasks(db, project_id=project.id)
+    children = [t for t in all_tasks if t.parent_task_id == task.id]
+    assert len(children) == 0
+
+    # No decomposition events at all.
+    events = await repo.list_events(db, task_id=task.id)
+    assert not any(
+        e.type in ("plan.decomposition_complete", "plan.decomposition_fallback")
+        for e in events
+    )
+
+    # Decomposer prompt was never assembled.
+    assert not any("Decompose this epic into child tasks" in p for p in provider.prompts)
+
+    # Developer was dispatched (L1 path ran).
+    dev_dispatches = [
+        e for e in events
+        if e.type == "agent.dispatched" and e.agent == "developer"
+    ]
+    assert len(dev_dispatches) >= 1, "Developer should have been dispatched"

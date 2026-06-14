@@ -23,6 +23,8 @@ class EventType(StrEnum):
     # planning
     plan_level = "plan.level_selected"
     plan_artifact = "plan.artifact"
+    plan_decomposition_complete = "plan.decomposition_complete"
+    plan_decomposition_fallback = "plan.decomposition_fallback"
     # agents
     agent_dispatched = "agent.dispatched"
     agent_output = "agent.output_chunk"

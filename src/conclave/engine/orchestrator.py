@@ -13,7 +13,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..config import ConclaveConfig, load_project_config, resolve_agent
 from ..config.models import L2Settings
@@ -33,6 +33,7 @@ from .verdict import ParsedVerdict, check_grounding, parse_verdict
 from .worktree import WorktreeError, WorktreeManager
 
 _PROJECT_RULE_FILES = ("CONCLAVE.md", "CLAUDE.md")
+_L4_DECOMPOSED = object()  # sentinel: _run_l4 decomposed the epic into children
 
 
 class Orchestrator:
@@ -103,6 +104,17 @@ class Orchestrator:
         plan_preamble = await self._maybe_plan(
             runner, task, worktree, knowledge, rules, baseline_preamble, config, level
         )
+
+        # L4 short-circuit: the epic was decomposed into child tasks — skip the entire
+        # developer/review retry loop, clean up the unused worktree, and return success.
+        if plan_preamble is _L4_DECOMPOSED:
+            await wm.cleanup(task.id, None)
+            return True
+
+        # plan_preamble is str at this point (the L4 sentinel returned above), but
+        # mypy can't narrow `str | object` through an `is` check on a plain
+        # `object()` sentinel.
+        plan_preamble = cast(str, plan_preamble)
 
         memory = AttemptMemory(config.experimental.cross_attempt_memory_entries)
         use_memory = config.experimental.cross_attempt_memory
@@ -249,7 +261,7 @@ class Orchestrator:
         baseline_preamble: str,
         config: ConclaveConfig,
         level: int,
-    ) -> str:
+    ) -> str | object:
         # Defensive: classify_level already collapses planner_enabled=False to level 0,
         # so this guard is redundant with the level == 0 check below. Kept to keep the
         # config flag referenced and to fail closed regardless of the passed-in level.
@@ -260,6 +272,11 @@ class Orchestrator:
         # path as a placeholder (tasks 5/7/9 specialize them).
         if level == 0:
             return ""
+        # L4: epic-decomposition — dispatch a decomposer persona, create child tasks,
+        # and short-circuit the retry loop on success; degrade to L1 on empty/malformed
+        # output so the work is still attempted under the green-gate.
+        if level == 4:
+            return await self._run_l4(runner, task, worktree, knowledge, rules, config)
         # L3: three-agent sequential planning (PM → Architect-as-Planner → Planner),
         # each stage flag-gated by l3_settings. Intermediate None → skip-and-continue;
         # final planner None → degrade to L1-style empty preamble.
@@ -418,6 +435,111 @@ class Orchestrator:
             )
         parts.append("=== END L3 PLAN ===\n")
         return "".join(parts)
+
+    async def _run_l4(
+        self,
+        runner: AgentRunner,
+        task: Task,
+        worktree: Path,
+        knowledge: str,
+        rules: str,
+        config: ConclaveConfig,
+    ) -> str | object:
+        """Epic-decomposition (BMad L4) planning path.
+
+        Gated by :attr:`L4Settings.auto_create_children`. Dispatches a decomposer
+        persona, parses ``child_tasks`` from the JSON output, and calls the shared
+        :func:`~conclave.db.repositories.create_child_tasks` helper.
+
+        **Happy path** — valid decomposition produced:
+        1. Emits :attr:`EventType.plan_artifact` with the decomposition JSON.
+        2. Creates child tasks (capped at ``max_child_tasks``).
+        3. Emits :attr:`EventType.plan_decomposition_complete` with child ids.
+        4. Marks the epic terminal (:meth:`repo.set_task_state` → ``done``).
+        5. Returns ``_L4_DECOMPOSED`` sentinel — the caller short-circuits the
+           entire retry loop (no developer/review dispatch).
+
+        **Fallback** — dispatch fails, ``child_tasks`` empty/absent, or no valid
+        children created:
+        1. Emits :attr:`EventType.plan_decomposition_fallback`.
+        2. Returns ``""`` (empty string) — the epic falls through to the normal
+           L1 developer/review loop so the work is still attempted.
+        """
+        l4 = config.planning.l4_settings
+        if not l4.auto_create_children:
+            return ""
+
+        prompt = (
+            f"{task.request}\n\n"
+            "Decompose this epic into child tasks. "
+            "Output a JSON block with a `child_tasks` array "
+            "where each entry has a non-empty `title` and `description`. "
+            f"Create at most {l4.max_child_tasks} children."
+        )
+        plan = await self._dispatch_plan(
+            runner, "decomposer", prompt, task, worktree, knowledge, rules
+        )
+
+        # --- dispatch failed ---
+        if plan is None:
+            await self._bus.emit(
+                type=EventType.plan_decomposition_fallback,
+                project_id=task.project_id,
+                task_id=task.id,
+                payload={"reason": "dispatch returned None"},
+            )
+            return ""
+
+        child_tasks = plan.get("child_tasks") if isinstance(plan, dict) else None
+        if not isinstance(child_tasks, list) or not child_tasks:
+            await self._bus.emit(
+                type=EventType.plan_decomposition_fallback,
+                project_id=task.project_id,
+                task_id=task.id,
+                payload={"reason": "empty or absent child_tasks in decomposition"},
+            )
+            return ""
+
+        # Persist and emit the decomposition plan so the UI/audit stream captures it.
+        await repo.update_task_fields(self._db, task.id, plan=plan)
+        await self._bus.emit(
+            type=EventType.plan_artifact,
+            project_id=task.project_id,
+            task_id=task.id,
+            payload={"plan": plan},
+        )
+
+        # Create the child tasks (sanitized + autonomy-gated via the shared helper).
+        created_ids = await repo.create_child_tasks(
+            self._db,
+            parent_task=task,
+            children=child_tasks,
+            max_children=l4.max_child_tasks,
+            project_id=task.project_id,
+        )
+
+        if not created_ids:
+            await self._bus.emit(
+                type=EventType.plan_decomposition_fallback,
+                project_id=task.project_id,
+                task_id=task.id,
+                payload={
+                    "reason": "create_child_tasks produced zero valid children "
+                    f"from {len(child_tasks)} raw entries"
+                },
+            )
+            return ""
+
+        # --- happy path: decomposition succeeded ---
+        await repo.set_task_state(self._db, task.id, TaskState.done)
+        await self._bus.emit(
+            type=EventType.plan_decomposition_complete,
+            project_id=task.project_id,
+            task_id=task.id,
+            payload={"child_count": len(created_ids), "child_ids": created_ids},
+        )
+
+        return _L4_DECOMPOSED
 
     async def _review(
         self,
