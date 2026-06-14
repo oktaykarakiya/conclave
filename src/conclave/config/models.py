@@ -116,6 +116,11 @@ class ExecutionSettings(BaseModel):
     require_full_green: bool = Field(
         default=True, description="Require zero failing suites (minus governed Quarantine)."
     )
+    setup_timeout_seconds: int = Field(
+        default=900,
+        ge=1,
+        description="Timeout in seconds for the setup_command provisioning step.",
+    )
 
 
 class ExperimentalSettings(BaseModel):

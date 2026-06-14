@@ -117,7 +117,10 @@ class Orchestrator:
                     task_id=task.id,
                     payload={"stage": "setup", "message": "provisioning worktree environment"},
                 )
-                rc, out = await run_shell(worktree, setup_cmd, timeout_seconds=900)
+                rc, out = await run_shell(
+                    worktree, setup_cmd,
+                    timeout_seconds=config.execution.setup_timeout_seconds,
+                )
                 if rc != 0:
                     return await self._fail_early(
                         task, wm, task_branch,
@@ -127,18 +130,10 @@ class Orchestrator:
             knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
             knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
             rules = _read_project_rules(worktree)
-            if setup_cmd:
-                rules += (
-                    "\n\n## Worktree environment (MANDATORY)\n"
-                    "A provisioned virtualenv exists at `.venv/` in the worktree root with all "
-                    "dependencies installed. Run EVERY verification through it so your checks "
-                    "match the green-gate exactly:\n"
-                    "- `.venv/bin/pytest -q`\n"
-                    "- `.venv/bin/mypy`\n"
-                    "- `.venv/bin/ruff check src tests`\n"
-                    "Do NOT use system-wide `pytest`/`mypy`/`ruff` — they are a different "
-                    "toolchain and will disagree with the gate."
-                )
+            rules += _build_venv_guidance(
+                worktree, config,
+                knowledge_row.knowledge if knowledge_row else None,
+            )
             test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
             gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
 
@@ -181,9 +176,12 @@ class Orchestrator:
                     if use_memory:
                         memory.add(attempts - 1, previous_diff, feedback)
                     await run_git(worktree, "reset", "--hard", checkpoint)
-                    # Preserve the provisioned .venv across attempts; rebuilding it each retry
-                    # is slow and pointless.
-                    await run_git(worktree, "clean", "-fd", "-e", ".venv")
+                    # Preserve the provisioned .venv across attempts; rebuilding it each
+                    # retry is slow and pointless.  .gitignore is the belt (the ideal
+                    # way to protect .venv from git-clean); `-e .venv/` is the suspenders
+                    # — the trailing-slash directory exclusion works even when .gitignore
+                    # is absent or doesn't cover the venv.
+                    await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
                 dev_prompt = task.request + plan_preamble + baseline_preamble
                 if use_memory:
@@ -258,7 +256,7 @@ class Orchestrator:
                 #                  keeping the provisioned .venv as the retry loop does
                 await run_git(worktree, "read-tree", review_tree)
                 await run_git(worktree, "checkout-index", "-a", "-f")
-                await run_git(worktree, "clean", "-fd", "-e", ".venv")
+                await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
                 if test_command and config.execution.require_full_green:
                     gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
@@ -776,3 +774,59 @@ def _test_command(config: ConclaveConfig, knowledge: dict[str, Any] | None) -> s
             if isinstance(test, str) and test.strip():
                 return test
     return None
+
+
+def _build_venv_guidance(
+    worktree: Path, config: ConclaveConfig, knowledge: dict[str, Any] | None,
+) -> str:
+    """Build tool/venv guidance lines derived from the project's actual configured commands.
+
+    Only injects guidance when ``.venv/`` actually exists in the worktree — i.e. the
+    ``setup_command`` ran and provisioned it.  Derives the test command via
+    :func:`_test_command` and also picks up ``lint`` / ``check`` commands from repo
+    knowledge.  Produces ``.venv/bin/``-prefixed lines for each command so the guidance
+    reflects the real toolchain instead of hard-coded pytest/mypy/ruff.  When no commands
+    are known, emits a generic ``.venv/bin/`` hint.
+    """
+    venv_path = worktree / ".venv"
+    if not venv_path.is_dir():
+        return ""
+
+    commands: list[str] = []
+
+    # Test command — derived from config or repo knowledge.
+    test_cmd = _test_command(config, knowledge)
+    if test_cmd:
+        commands.append(test_cmd.strip())
+
+    # Lint / check commands from repo knowledge (forward-compatible: keys may not exist).
+    if knowledge:
+        cmds = knowledge.get("commands")
+        if isinstance(cmds, dict):
+            for key in ("lint", "check"):
+                val = cmds.get(key)
+                if isinstance(val, str) and val.strip():
+                    commands.append(val.strip())
+
+    if not commands:
+        return (
+            "\n\n## Worktree environment (MANDATORY)\n"
+            "A provisioned virtualenv exists at `.venv/` in the worktree root with all "
+            "dependencies installed.  Run tooling through `.venv/bin/` so your checks "
+            "match the green-gate exactly.  Do NOT use system-wide tools — they are a "
+            "different toolchain and will disagree with the gate."
+        )
+
+    lines = [f"- `.venv/bin/{cmd}`" for cmd in commands]
+    unique_tools = sorted({cmd.split()[0] for cmd in commands})
+    tool_refs = "/".join(f"`{t}`" for t in unique_tools)
+
+    return (
+        "\n\n## Worktree environment (MANDATORY)\n"
+        "A provisioned virtualenv exists at `.venv/` in the worktree root with all "
+        "dependencies installed. Run EVERY verification through it so your checks "
+        "match the green-gate exactly:\n"
+        + "\n".join(lines) + "\n"
+        f"Do NOT use system-wide {tool_refs} — they are a different "
+        "toolchain and will disagree with the gate."
+    )

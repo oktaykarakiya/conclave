@@ -358,3 +358,137 @@ def test_merge_worktree_path_unique_per_task() -> None:
     p3 = wm_merge_path(Path("/repo"), "develop", "task-1")
     p4 = wm_merge_path(Path("/repo"), "main", "task-1")
     assert p3 != p4
+
+
+# --- ENG-6: venv guidance + setup timeout -----------------------------------
+
+
+async def test_setup_command_creates_venv_guidance_in_developer_prompt(
+    db: Database, tmp_path: Path,
+) -> None:
+    """When setup_command provisions .venv/, the developer agent sees venv guidance
+    that reflects the configured test command — not hard-coded pytest/mypy/ruff."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {
+                "target_branch": "main",
+                "setup_command": "mkdir -p .venv && echo ok",
+                # Use a test command that actually passes so the green-gate
+                # succeeds.  The command is crafted to look like a real test
+                # runner (pytest) but just echoes success.
+                "baseline_test_command": "echo '0 passed'",
+            },
+        },
+    )
+    await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # The developer agent's prompt should contain the derived venv guidance
+    # with the ACTUAL test command — not hard-coded pytest/mypy/ruff.
+    dev_prompts = [
+        p for p in provider.prompts
+        if "Review the changes made for this task" not in p
+        and "Produce a structured plan" not in p
+        and "Repository Analysis" not in p
+    ]
+    assert len(dev_prompts) >= 1
+    full_prompt = "\n".join(dev_prompts)
+    assert "Worktree environment (MANDATORY)" in full_prompt
+    assert ".venv/bin/echo" in full_prompt
+    # Must NOT contain the old hard-coded lines.
+    assert "`.venv/bin/pytest -q`" not in full_prompt
+    assert "`.venv/bin/mypy`" not in full_prompt
+    assert "Do NOT use system-wide `pytest`/`mypy`/`ruff`" not in full_prompt
+
+
+async def test_setup_timeout_seconds_from_config_is_passed_to_run_shell(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``setup_timeout_seconds`` config field is read and passed to ``run_shell``."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {
+                "target_branch": "main",
+                "setup_command": "mkdir -p .venv && echo ok",
+                "setup_timeout_seconds": 42,
+            },
+        },
+    )
+    await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+
+    captured_timeouts: list[int] = []
+
+    # run_shell is imported directly into orchestrator.py (from .gitio import
+    # run_shell), so the reference lives on the orchestrator module — monkeypatch
+    # there, not on gitio.
+    from conclave.engine import orchestrator as orch_mod
+
+    _original = orch_mod.run_shell
+
+    async def _spy(cwd: Path, command: str, *, env=None, timeout_seconds=None):
+        captured_timeouts.append(timeout_seconds)
+        return await _original(cwd, command, env=env, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(orch_mod, "run_shell", _spy)
+
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # At least one call to run_shell for the setup step.
+    assert len(captured_timeouts) >= 1
+    # The captured timeout should match the configured value (42), not the old 900.
+    assert any(t == 42 for t in captured_timeouts), (
+        f"Expected 42 in captured timeouts, got {captured_timeouts}"
+    )
+
+
+async def test_no_venv_guidance_when_setup_does_not_create_venv(
+    db: Database, tmp_path: Path,
+) -> None:
+    """When setup_command runs but does NOT create .venv/, no venv guidance is injected."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {
+                "target_branch": "main",
+                # This setup_command succeeds but does not create a .venv directory.
+                "setup_command": "echo 'provisioning done'",
+            },
+        },
+    )
+    await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # No prompt should contain venv guidance.
+    for p in provider.prompts:
+        assert "Worktree environment (MANDATORY)" not in p
