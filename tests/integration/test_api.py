@@ -125,6 +125,44 @@ async def test_secrets_are_write_only(client: httpx.AsyncClient) -> None:
     assert listing.json() == ["my_key"]  # names only, never values
 
 
+async def test_task_response_includes_level(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Task GET/list responses must include the 'level' field (scale-adaptive planning)."""
+    from conclave.db.repositories import create_task as repo_create_task
+
+    repo_path = tmp_path / "repo_lvl"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "lvl", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200, created.text
+    project_id = created.json()["id"]
+
+    # Persist a task with an explicit level via the repo, then read it back
+    # through the API to prove the field round-trips through serialization.
+    task = await repo_create_task(
+        db, project_id=project_id, request="test level exposure", level=3
+    )
+
+    # Single-task GET
+    resp = await client.get(f"/api/tasks/{task.id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "level" in body, f"level key missing from GET /api/tasks/{{id}}: {body}"
+    assert body["level"] == 3
+
+    # Task list GET
+    list_resp = await client.get(f"/api/projects/{project_id}/tasks")
+    assert list_resp.status_code == 200
+    tasks = list_resp.json()
+    assert len(tasks) == 1
+    assert "level" in tasks[0], f"level key missing from task in list: {tasks[0]}"
+    assert tasks[0]["level"] == 3
+
+
 async def test_agents_seeded_and_editable(client: httpx.AsyncClient) -> None:
     agents = await client.get("/api/agents")
     names = {a["name"] for a in agents.json()}
