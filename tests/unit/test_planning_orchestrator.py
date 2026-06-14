@@ -601,3 +601,133 @@ async def test_approve_session_rejects_cancelled(db: Database) -> None:
     # Approving a cancelled session must raise.
     with pytest.raises(ValueError, match="session is cancelled"):
         await orchestrator.approve_session(session.id)
+
+
+# --- per-session lock serialization (PLAN-3) ----------------------------------
+
+
+class _GatedProvider:
+    """Provider that blocks the first ``run_agent`` on an asyncio.Event.
+
+    Used to test per-session lock serialisation: the first call (Round 0
+    planner) holds the lock while blocked on the gate, so a concurrent
+    ``add_human_message`` turn must wait until the gate is opened.
+    """
+
+    def __init__(self) -> None:
+        self.gate: asyncio.Event = asyncio.Event()
+        self.enter_count: int = 0
+        self.planner_calls: int = 0
+        # Fired as soon as the first run_agent call enters (before it blocks).
+        self._round0_entered: asyncio.Event = asyncio.Event()
+
+    async def run_agent(
+        self,
+        *,
+        profile: object,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: object = None,
+        on_chunk: object = None,
+    ) -> AgentResult:
+        self.enter_count += 1
+
+        if self.enter_count == 1:
+            self._round0_entered.set()
+            await self.gate.wait()
+
+        if "Planning Facilitator" in prompt:
+            self.planner_calls += 1
+            pc = self.planner_calls
+            if pc <= 2:
+                return AgentResult(
+                    ok=True,
+                    text=f'```json\n{{"message":"ok","task_changes":[{{"action":"add","parent_id":null,"title":"Task{pc}","description":"desc"}}],"ready":false}}\n```',
+                    model_reported="fake",
+                    cost_usd=0.0,
+                )
+            return AgentResult(
+                ok=True,
+                text='```json\n{"message":"done","task_changes":[],"ready":true}\n```',
+                model_reported="fake",
+                cost_usd=0.0,
+            )
+        return AgentResult(ok=True, text="APPROVED.", model_reported="fake", cost_usd=0.0)
+
+
+async def test_concurrent_turns_on_same_session_are_serialized(db: Database) -> None:
+    """Two turns on the same session must never run concurrently.
+
+    Round 0 is blocked on a gate while holding the per-session lock.
+    A human interjection spawns a second turn that must wait for the
+    lock.  Once the gate opens both turns complete serially, producing
+    exactly two task nodes with no duplicates or sort_order collisions.
+    """
+    project = await repo.create_project(
+        db, name="lock-test", path="/tmp/lock-test", default_branch="main",
+    )
+    bus = EventBus(db)
+    provider = _GatedProvider()
+    orchestrator = PlanningOrchestrator(db, bus, provider)
+
+    # Start a session — Round 0 planner enters run_agent and blocks on gate.
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Lock Serialisation Test",
+        prompt="Test per-session lock serialises concurrent turns.",
+    )
+
+    # Wait until Round 0 has entered run_agent (holding the lock).
+    await provider._round0_entered.wait()
+
+    # At this point only Round 0 has entered run_agent.
+    assert provider.enter_count == 1
+
+    # Simulate a human interjection arriving while Round 0 is still blocked.
+    # This spawns a background _agent_turn that must wait for the lock.
+    await orchestrator.add_human_message(session.id, "Please add another task.")
+
+    # Give the background task a chance to reach the lock — it should be
+    # blocked waiting, so enter_count must still be 1.
+    await asyncio.sleep(0)
+
+    assert provider.enter_count == 1, (
+        f"Expected enter_count==1 (bg turn waiting on lock), got {provider.enter_count}"
+    )
+
+    # Open the gate — Round 0 finishes, releases the lock, then the bg
+    # turn acquires it and runs.
+    provider.gate.set()
+
+    # Wait for the background turn to complete (enter_count >= 2) and the
+    # discussion loop to reach stable.
+    for _ in range(200):
+        refreshed = await repo.get_planning_session(db, session.id)
+        if refreshed is not None and refreshed.status in (
+            PlanningSessionStatus.stable,
+            PlanningSessionStatus.completed,
+        ):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("session never reached stable/completed")
+
+    # Both turns must have entered run_agent (serially, not concurrently).
+    assert provider.enter_count >= 2, (
+        f"Expected enter_count>=2, got {provider.enter_count}"
+    )
+
+    # Exactly two task nodes were created (Task1 from Round 0, Task2 from bg turn).
+    # No duplicates — the title-dedupe guard held because turns were serialised.
+    nodes = await repo.list_planning_task_nodes(db, session.id)
+    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}"
+
+    titles = sorted(n.title for n in nodes)
+    assert titles == ["Task1", "Task2"], f"Unexpected titles: {titles}"
+
+    # No sort_order collisions: each root-level node has a distinct sort_order.
+    root_nodes = [n for n in nodes if n.parent_id is None]
+    sort_orders = [n.sort_order for n in root_nodes]
+    assert len(sort_orders) == len(set(sort_orders)), (
+        f"sort_order collision detected: {sort_orders}"
+    )
