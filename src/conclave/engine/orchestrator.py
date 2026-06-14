@@ -245,20 +245,42 @@ class Orchestrator:
                 if test_command and config.execution.require_full_green:
                     gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
                     if not gate.passed:
-                        feedback = (
-                            f"TEST GATE is not green (exit {gate.exit_code}). "
-                            f"Fix the failing tests:\n{gate.output[-2000:]}"
-                        )
-                        await self._bus.emit(
-                            type=EventType.attempt_failed,
-                            project_id=project.id,
-                            task_id=task.id,
-                            payload={
-                                "n": attempts, "stage": "gate", "exit_code": gate.exit_code,
-                            },
-                        )
-                        failed = True
-                        continue
+                        # ENG-7: distinguish infra failures (timeout / missing command)
+                        # from real test failures.  Infra problems get one retry; if they
+                        # persist the attempt is aborted — do NOT feed toolchain noise to
+                        # the developer as code feedback.
+                        if gate.outcome in ("timed_out", "missing_command"):
+                            gate = await run_tests(
+                                worktree, test_command, timeout_seconds=gate_timeout
+                            )
+                            if not gate.passed:
+                                reason = f"infra_{gate.outcome}"
+                                await self._bus.emit(
+                                    type=EventType.attempt_failed,
+                                    project_id=project.id,
+                                    task_id=task.id,
+                                    payload={
+                                        "n": attempts, "stage": "gate", "reason": reason,
+                                        "exit_code": gate.exit_code,
+                                    },
+                                )
+                                failed = True
+                                break  # infra failure — don't feed to developer
+                        else:
+                            feedback = (
+                                f"TEST GATE is not green (exit {gate.exit_code}). "
+                                f"Fix the failing tests:\n{gate.output[-2000:]}"
+                            )
+                            await self._bus.emit(
+                                type=EventType.attempt_failed,
+                                project_id=project.id,
+                                task_id=task.id,
+                                payload={
+                                    "n": attempts, "stage": "gate", "exit_code": gate.exit_code,
+                                },
+                            )
+                            failed = True
+                            continue
 
                 break  # success
 
@@ -298,7 +320,12 @@ class Orchestrator:
             payload={"sha": checkpoint[:12]},
         )
         gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
-        failures = "" if gate.passed else gate.output
+        # ENG-7: infra failures (timeout / missing command) must not be cached as
+        # pre-existing test failures — they are toolchain noise, not code defects.
+        if gate.passed or gate.outcome in ("timed_out", "missing_command"):
+            failures = ""
+        else:
+            failures = gate.output
         await repo.save_baseline(self._db, project_id, checkpoint, failures)
         await repo.gc_baselines(self._db, project_id)
         return build_baseline_preamble(target_branch, failures)
