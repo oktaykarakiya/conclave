@@ -462,9 +462,11 @@ class Orchestrator:
                     payload={"target": target_branch},
                 )
 
-        await repo.set_task_state(self._db, task.id, TaskState.done)
-        await repo.update_task_fields(
-            self._db, task.id, result_summary=f"completed in {attempts} attempt(s); merged={merged}"
+        # One transaction: flip state→done and write the result summary together so the
+        # lifecycle row is never observed half-updated.
+        await repo.finalize_task(
+            self._db, task.id, state=TaskState.done,
+            result_summary=f"completed in {attempts} attempt(s); merged={merged}",
         )
         await self._bus.emit(
             type=EventType.task_done, project_id=task.project_id, task_id=task.id,
@@ -478,15 +480,18 @@ class Orchestrator:
         self, task: Task, wm: WorktreeManager, task_branch: str, timed_out: bool, attempts: int
     ) -> bool:
         reason = "timeout" if timed_out else "max_retries"
-        await repo.set_task_state(self._db, task.id, TaskState.failed)
-        await repo.update_task_fields(
-            self._db, task.id, result_summary=f"failed ({reason}) after {attempts} attempt(s)"
+        # One transaction: fail the task, record why, and block its descendants together so
+        # a crash can't leave the task failed while children stay claimable. Announce only
+        # once the transition is durably committed.
+        blocked = await repo.finalize_task(
+            self._db, task.id, state=TaskState.failed,
+            result_summary=f"failed ({reason}) after {attempts} attempt(s)",
+            block_children=True,
         )
         await self._bus.emit(
             type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
             payload={"reason": reason, "attempts": attempts},
         )
-        blocked = await repo.block_descendants(self._db, task.id)
         if blocked:
             logger.info("blocked %d descendant tasks after %s failed", blocked, task.id)
         await wm.cleanup(task.id, task_branch)
@@ -495,13 +500,16 @@ class Orchestrator:
     async def _fail_early(
         self, task: Task, wm: WorktreeManager, task_branch: str, message: str
     ) -> bool:
-        await repo.set_task_state(self._db, task.id, TaskState.failed)
-        await repo.update_task_fields(self._db, task.id, result_summary=message)
+        # One transaction: fail + record the reason + block descendants atomically, then
+        # announce once it is durably committed.
+        blocked = await repo.finalize_task(
+            self._db, task.id, state=TaskState.failed, result_summary=message,
+            block_children=True,
+        )
         await self._bus.emit(
             type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
             payload={"reason": message},
         )
-        blocked = await repo.block_descendants(self._db, task.id)
         if blocked:
             logger.info("blocked %d descendant tasks after %s failed early", blocked, task.id)
         await wm.cleanup(task.id, task_branch)

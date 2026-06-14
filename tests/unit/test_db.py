@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from conclave.db import Database, ProjectMode, TaskState
 from conclave.db import repositories as repo
 
@@ -165,3 +167,55 @@ async def test_usage_summary(db: Database) -> None:
     summary = await repo.usage_summary(db, p.id)
     assert summary["calls"] == 2
     assert abs(summary["total_cost_usd"] - 0.15) < 1e-9
+
+
+async def test_transaction_commits_all_on_success(db: Database) -> None:
+    """Every statement inside a transaction() persists once the block exits cleanly."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    t1 = await repo.create_task(db, project_id=p.id, request="a", state=TaskState.inbox)
+    t2 = await repo.create_task(db, project_id=p.id, request="b", state=TaskState.inbox)
+
+    async with db.transaction() as conn:
+        await conn.execute(
+            "UPDATE tasks SET state = ? WHERE id = ?", (TaskState.approved.value, t1.id)
+        )
+        await conn.execute(
+            "UPDATE tasks SET state = ? WHERE id = ?", (TaskState.approved.value, t2.id)
+        )
+
+    r1 = await repo.get_task(db, t1.id)
+    r2 = await repo.get_task(db, t2.id)
+    assert r1 is not None and r1.state is TaskState.approved
+    assert r2 is not None and r2.state is TaskState.approved
+
+
+async def test_transaction_rolls_back_all_on_error(db: Database) -> None:
+    """Raising inside transaction() rolls back ALL of its statements, not just the last.
+
+    This fails against any non-transactional path (e.g. autocommit with no BEGIN): there
+    both UPDATEs would persist and the tasks would have advanced past ``inbox``.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    t1 = await repo.create_task(db, project_id=p.id, request="a", state=TaskState.inbox)
+    t2 = await repo.create_task(db, project_id=p.id, request="b", state=TaskState.inbox)
+
+    with pytest.raises(RuntimeError):
+        async with db.transaction() as conn:
+            await conn.execute(
+                "UPDATE tasks SET state = ? WHERE id = ?", (TaskState.approved.value, t1.id)
+            )
+            await conn.execute(
+                "UPDATE tasks SET state = ? WHERE id = ?", (TaskState.approved.value, t2.id)
+            )
+            raise RuntimeError("boom")
+
+    # Both rows retain their pre-transaction state — the first UPDATE rolled back too.
+    r1 = await repo.get_task(db, t1.id)
+    r2 = await repo.get_task(db, t2.id)
+    assert r1 is not None and r1.state is TaskState.inbox
+    assert r2 is not None and r2.state is TaskState.inbox
+
+    # The lock is released after a rolled-back transaction, so the connection is usable.
+    await repo.set_task_state(db, t1.id, TaskState.approved)
+    again = await repo.get_task(db, t1.id)
+    assert again is not None and again.state is TaskState.approved

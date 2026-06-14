@@ -97,15 +97,16 @@ class PlanningOrchestrator:
         if session is None:
             raise ValueError("session not found")
 
-        turn = await repo.increment_planning_turn(self._db, session_id)
-        msg = await repo.add_planning_message(
+        # Bump the turn and store the human message atomically (no provider call between
+        # them, unlike _agent_turn) so a turn is never consumed without its message.
+        msg = await repo.add_message_with_turn(
             self._db,
             session_id=session_id,
             agent="human",
             role="human",
             content=content,
-            turn_number=turn,
         )
+        turn = msg.turn_number
         await self._bus.emit(
             type=EventType.planning_human_interject,
             project_id=session.project_id,
