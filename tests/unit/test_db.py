@@ -83,8 +83,10 @@ async def test_task_lifecycle_claim_and_recover(db: Database) -> None:
     assert claimed.id == t1.id
     assert claimed.state is TaskState.in_progress
 
-    # crash recovery returns it to approved
-    assert await repo.recover_in_progress(db, p.id) == 1
+    # crash recovery returns it to approved; no failed/blocked parents → reblocked=0
+    recovered, reblocked = await repo.recover_in_progress(db, p.id)
+    assert recovered == 1
+    assert reblocked == 0
     again = await repo.get_task(db, t1.id)
     assert again is not None
     assert again.state is TaskState.approved
@@ -96,6 +98,103 @@ async def test_task_lifecycle_claim_and_recover(db: Database) -> None:
     assert updated.branch == "conclave/x"
     assert updated.level == 2
     assert updated.plan == {"approach": "a"}
+
+
+async def test_recover_reblocks_failed_parent_children(db: Database) -> None:
+    """After recovery, a child of a failed parent must be blocked — not claimable.
+
+    Simulates a crash where a parent is ``failed`` and its child is ``approved``
+    (e.g. stranded by a pre-CON-1 code path or direct manipulation). Recovery
+    must re-block the child so it can never be claimed out of dependency order.
+    A healthy approved task with a ``done`` parent (or no parent) is unaffected.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # A failed parent with an approved child — the vulnerable state.
+    parent = await repo.create_task(
+        db, project_id=p.id, request="parent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, parent.id, TaskState.failed)
+    child = await repo.create_task(
+        db, project_id=p.id, request="child", state=TaskState.approved,
+        parent_task_id=parent.id,
+    )
+
+    # A healthy approved task with a done parent — should NOT be blocked.
+    done_parent = await repo.create_task(
+        db, project_id=p.id, request="done-parent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, done_parent.id, TaskState.done)
+    healthy = await repo.create_task(
+        db, project_id=p.id, request="healthy", state=TaskState.approved,
+        parent_task_id=done_parent.id,
+    )
+
+    # A parentless approved task — should also be unaffected.
+    orphan = await repo.create_task(
+        db, project_id=p.id, request="orphan", state=TaskState.approved,
+    )
+
+    recovered, reblocked = await repo.recover_in_progress(db, p.id)
+    assert recovered == 0  # no in_progress tasks
+    assert reblocked == 1  # the failed parent's child was blocked
+
+    c = await repo.get_task(db, child.id)
+    assert c is not None and c.state is TaskState.blocked
+
+    # Unaffected tasks remain claimable.
+    h = await repo.get_task(db, healthy.id)
+    assert h is not None and h.state is TaskState.approved
+    o = await repo.get_task(db, orphan.id)
+    assert o is not None and o.state is TaskState.approved
+
+    # Verify claimability: only the healthy and orphan should be claimable.
+    claimed1 = await repo.claim_next_approved(db, p.id)
+    assert claimed1 is not None and claimed1.id in (healthy.id, orphan.id)
+    claimed2 = await repo.claim_next_approved(db, p.id)
+    assert claimed2 is not None and claimed2.id in (healthy.id, orphan.id)
+    assert claimed1.id != claimed2.id
+    # The blocked child is NOT claimable.
+    assert await repo.claim_next_approved(db, p.id) is None
+
+
+async def test_recover_reblocks_blocked_parent_children(db: Database) -> None:
+    """A ``blocked`` parent must also propagate blocking during recovery.
+
+    If task B is ``blocked`` (e.g. because its parent A failed) and B's own child C
+    is somehow ``approved``, recovery must block C — the blocked state propagates
+    across depth just like the failed state does.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Grandparent is failed → parent should be blocked, but we'll create it as approved
+    # to simulate the inconsistent state recovery fixes.
+    grandparent = await repo.create_task(
+        db, project_id=p.id, request="grandparent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, grandparent.id, TaskState.failed)
+    parent = await repo.create_task(
+        db, project_id=p.id, request="parent", state=TaskState.blocked,
+        parent_task_id=grandparent.id,
+    )
+    child = await repo.create_task(
+        db, project_id=p.id, request="child", state=TaskState.approved,
+        parent_task_id=parent.id,
+    )
+    grandchild = await repo.create_task(
+        db, project_id=p.id, request="grandchild", state=TaskState.approved,
+        parent_task_id=child.id,
+    )
+
+    recovered, reblocked = await repo.recover_in_progress(db, p.id)
+    assert recovered == 0  # no in_progress tasks
+    # Both the child (of blocked parent) and grandchild (of child) are blocked.
+    assert reblocked == 2
+
+    c = await repo.get_task(db, child.id)
+    assert c is not None and c.state is TaskState.blocked
+    gc = await repo.get_task(db, grandchild.id)
+    assert gc is not None and gc.state is TaskState.blocked
 
 
 async def test_claim_never_reclaims_terminal_tasks(db: Database) -> None:

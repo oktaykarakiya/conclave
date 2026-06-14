@@ -280,16 +280,39 @@ async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
     return blocked
 
 
-async def recover_in_progress(db: Database, project_id: str) -> int:
-    """Reset orphaned ``in_progress`` tasks to ``approved`` (crash recovery)."""
-    async with db._write() as conn:
+async def recover_in_progress(db: Database, project_id: str) -> tuple[int, int]:
+    """Reset orphaned ``in_progress`` tasks to ``approved`` and re-block descendants
+    of ``failed``/``blocked`` parents (crash recovery).
+
+    Returns ``(recovered, reblocked)`` where *recovered* is the count of ``in_progress``
+    tasks reset to ``approved`` and *reblocked* is the count of descendant tasks that
+    were set to ``blocked`` because their parent is still ``failed``/``blocked``.
+
+    Runs in a single transaction so an observer can never see recovered-but-not-yet-
+    reblocked state — the recovery atomically resets orphans AND re-applies blocking.
+    """
+    recovered = 0
+    reblocked = 0
+    async with db.transaction() as conn:
         cur = await conn.execute(
             "UPDATE tasks SET state = 'approved', updated_at = ? "
             "WHERE project_id = ? AND state = 'in_progress'",
             (now_iso(), project_id),
         )
-        count: int = cur.rowcount
-    return count
+        recovered = cur.rowcount
+
+        # Re-block descendants of every task currently in failed/blocked state so a
+        # crash that strands a parent in failed/blocked with children in approved can
+        # never leave those children claimable after recovery.
+        cur = await conn.execute(
+            "SELECT id FROM tasks WHERE project_id = ? AND state IN ('failed', 'blocked')",
+            (project_id,),
+        )
+        parents = [r["id"] for r in await cur.fetchall()]
+        for parent_id in parents:
+            reblocked += await _block_descendants(conn, parent_id)
+
+    return recovered, reblocked
 
 
 # --- attempts ---------------------------------------------------------------

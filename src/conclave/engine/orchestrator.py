@@ -70,8 +70,9 @@ class Orchestrator:
         # clobber each other's ref update.
         self._merge_locks: dict[str, asyncio.Lock] = {}
 
-    async def recover(self, project_id: str) -> int:
-        """Crash recovery: return orphaned in_progress tasks to approved."""
+    async def recover(self, project_id: str) -> tuple[int, int]:
+        """Crash recovery: return orphaned in_progress tasks to approved and re-block
+        descendants of failed/blocked parents. Returns ``(recovered, reblocked)``."""
         return await repo.recover_in_progress(self._db, project_id)
 
     async def process_task(self, task: Task) -> bool:

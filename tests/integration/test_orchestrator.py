@@ -249,9 +249,67 @@ async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_
     assert claimed is not None and claimed.state is TaskState.in_progress
 
     orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
-    assert await orchestrator.recover(project.id) == 1
+    recovered, reblocked = await orchestrator.recover(project.id)
+    assert recovered == 1
+    assert reblocked == 0
     again = await repo.get_task(db, claimed.id)
     assert again is not None and again.state is TaskState.approved
+
+
+async def test_crash_recovery_reblocks_descendants(db: Database, tmp_path: Path) -> None:
+    """Orchestrator-level recovery must re-block children of failed/blocked parents.
+
+    After a simulated crash where a parent is ``failed`` and its child is ``approved``,
+    calling ``orchestrator.recover()`` leaves the child ``blocked``, while a child of a
+    ``done`` parent remains ``approved`` and is claimable.
+    """
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+
+    # A failed parent with an approved child — the vulnerable state.
+    parent = await repo.create_task(
+        db, project_id=project.id, request="parent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, parent.id, TaskState.failed)
+    child = await repo.create_task(
+        db, project_id=project.id, request="child", state=TaskState.approved,
+        parent_task_id=parent.id,
+    )
+
+    # A done parent with an approved child — should stay claimable.
+    done_parent = await repo.create_task(
+        db, project_id=project.id, request="done-parent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, done_parent.id, TaskState.done)
+    healthy = await repo.create_task(
+        db, project_id=project.id, request="healthy", state=TaskState.approved,
+        parent_task_id=done_parent.id,
+    )
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    recovered, reblocked = await orchestrator.recover(project.id)
+
+    # No in_progress tasks to recover.
+    assert recovered == 0
+    # The failed parent's approved child was blocked.
+    assert reblocked == 1
+
+    c = await repo.get_task(db, child.id)
+    assert c is not None and c.state is TaskState.blocked
+
+    # The healthy task with a done parent is unaffected.
+    h = await repo.get_task(db, healthy.id)
+    assert h is not None and h.state is TaskState.approved
+
+    # Only the healthy task is claimable — the blocked child is skipped.
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert claimed.id == healthy.id
+    assert await repo.claim_next_approved(db, project.id) is None
 
 
 # --- ENG-5: merge hardening ---------------------------------------------------
