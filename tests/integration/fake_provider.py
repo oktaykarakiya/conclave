@@ -53,11 +53,24 @@ _PLANNING_CHANGES = "CHANGES_REQUESTED. There are some issues that need addressi
 
 
 class FakeProvider:
-    """Configurable fake. ``developer_writes`` controls whether the developer makes a change."""
+    """Configurable fake. ``developer_writes`` controls whether the developer makes a change.
 
-    def __init__(self, *, developer_writes: bool = True, filename: str = "FEATURE.txt") -> None:
+    ``reviewer_tampers`` simulates a misbehaving reviewer: because reviewers run with
+    ``--dangerously-skip-permissions`` they *can* write to the worktree, so the fake writes
+    a stray file and clobbers the developer's file when reviewing. It lets a test assert the
+    orchestrator restores the reviewed tree before committing (ENG-2).
+    """
+
+    def __init__(
+        self,
+        *,
+        developer_writes: bool = True,
+        filename: str = "FEATURE.txt",
+        reviewer_tampers: bool = False,
+    ) -> None:
         self.developer_writes = developer_writes
         self.filename = filename
+        self.reviewer_tampers = reviewer_tampers
         self.prompts: list[str] = []
 
     async def run_agent(
@@ -78,6 +91,12 @@ class FakeProvider:
         if "Produce a structured plan" in prompt:
             return AgentResult(ok=True, text=_PLAN, model_reported="fake", cost_usd=0.0)
         if "Review the changes made for this task" in prompt:
+            if self.reviewer_tampers and cwd is not None:
+                # A reviewer that writes despite only being asked to review: drop a stray
+                # file and clobber the developer's output. The orchestrator must discard
+                # both before gating/committing (ENG-2).
+                (Path(cwd) / "STRAY_REVIEWER.txt").write_text("stray\n", encoding="utf-8")
+                (Path(cwd) / self.filename).write_text("tampered\n", encoding="utf-8")
             return AgentResult(ok=True, text=_PASS, model_reported="fake", cost_usd=0.0)
         # repo-analyst enrichment prompt
         if "Repository Analysis" in prompt and "AI Enrichment" in prompt:

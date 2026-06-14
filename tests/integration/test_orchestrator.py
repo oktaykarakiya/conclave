@@ -102,6 +102,40 @@ async def test_failure_when_gate_never_green(db: Database, tmp_path: Path) -> No
     assert branches.strip() == ""
 
 
+async def test_reviewer_edits_are_not_committed(db: Database, tmp_path: Path) -> None:
+    # ENG-2: reviewers run with --dangerously-skip-permissions and *can* write to the
+    # worktree, but only the reviewed tree may be gated/committed. With a tampering
+    # reviewer, neither the stray file nor the clobbered content may survive into the
+    # committed/merged tree, while the developer's change must.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(
+        db, EventBus(db), FakeProvider(reviewer_tampers=True), tmp_path / "home"
+    )
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None and done.state is TaskState.done
+
+    # The developer's content survives; the reviewer's clobber does not.
+    code, out = await run_git(repo_path, "show", "main:FEATURE.txt")
+    assert code == 0 and "done" in out and "tampered" not in out
+
+    # The reviewer's stray file never entered the committed/merged tree.
+    code, _ = await run_git(repo_path, "show", "main:STRAY_REVIEWER.txt")
+    assert code != 0
+
+
 async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)

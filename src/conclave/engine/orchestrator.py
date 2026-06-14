@@ -194,6 +194,15 @@ class Orchestrator:
             # reviewers and grounding see — not just modifications to tracked files.
             await run_git(worktree, "add", "-A")
             _, current_diff = await run_git(worktree, "diff", "--cached", checkpoint)
+            # ENG-2: snapshot the exact staged tree the reviewers are about to review.
+            # Reviewers run with --dangerously-skip-permissions and CAN write to the
+            # worktree, but anything they touch falls outside ``current_diff`` (so grounding
+            # never sees it). write-tree records the index as an immutable tree object
+            # without moving HEAD or creating a commit; after review we restore the worktree
+            # to exactly this tree, so the gated+committed content is byte-for-byte what was
+            # reviewed and a reviewer cannot smuggle in unreviewed changes.
+            _, review_tree = await run_git(worktree, "write-tree")
+            review_tree = review_tree.strip()
             await repo.end_attempt(self._db, attempt_id, diff_stat=_diff_stat(current_diff))
 
             failed, feedback = await self._review(
@@ -207,6 +216,20 @@ class Orchestrator:
                     payload={"n": attempts, "stage": "review"},
                 )
                 continue
+
+            # ENG-2: the review passed, but reviewers may have written to the worktree.
+            # Restore it to the exact tree that was reviewed BEFORE gating/committing so
+            # unreviewed reviewer edits can neither be tested nor merged. This runs on the
+            # success path unconditionally (outside the gate block below): even with no test
+            # command, reviewer strays must not leak into the commit.
+            #   read-tree    — reset the index to the reviewed tree
+            #   checkout-index — force-rewrite the working tree from that index, overwriting
+            #                    reviewer edits and restoring files reviewers deleted
+            #   clean -fd    — drop reviewer-created strays (now untracked vs the index),
+            #                  keeping the provisioned .venv as the retry loop does
+            await run_git(worktree, "read-tree", review_tree)
+            await run_git(worktree, "checkout-index", "-a", "-f")
+            await run_git(worktree, "clean", "-fd", "-e", ".venv")
 
             if test_command and config.execution.require_full_green:
                 gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
