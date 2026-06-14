@@ -261,7 +261,15 @@ async def get_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> Task:
 @router.post("/tasks/{task_id}/approve")
 async def approve_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, str]:
     await _require_task(daemon, task_id)
-    await repo.set_task_state(daemon.db, task_id, TaskState.approved)
+    updated = await repo.approve_task(daemon.db, task_id)
+    if not updated:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "task is not in an approvable state "
+                "(only inbox or failed tasks can be approved)"
+            ),
+        )
     await daemon.bus.emit(type=EventType.task_approved, task_id=task_id)
     return {"approved": task_id}
 
@@ -293,7 +301,7 @@ async def cascade_approve_task(
     queue = [task]
     while queue:
         current = queue.pop(0)
-        if current.state == TaskState.inbox:
+        if current.state in (TaskState.inbox, TaskState.failed):
             await repo.set_task_state(daemon.db, current.id, TaskState.approved)
             await daemon.bus.emit(
                 type=EventType.task_approved, task_id=current.id,

@@ -12,6 +12,8 @@ from httpx import ASGITransport
 
 from conclave.bootstrap import seed_global_defaults
 from conclave.db import Database
+from conclave.db import repositories as repo
+from conclave.db.models import TaskState
 from conclave.engine import run_git
 from conclave.runtime import Daemon
 from conclave.web import create_app
@@ -135,3 +137,168 @@ async def test_agents_seeded_and_editable(client: httpx.AsyncClient) -> None:
     )
     assert edit.status_code == 200
     assert edit.json()["persona_md"] == "Edited persona"
+
+
+async def test_approve_in_progress_returns_409(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Approving a task that is already in_progress must return 409 and not change state."""
+    repo_path = tmp_path / "repo409"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects", json={"name": "p409", "path": str(repo_path), "default_branch": "main"}
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    task = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "do a thing"}
+    )
+    assert task.status_code == 200
+    task_id = task.json()["id"]
+
+    # Manually move the task to in_progress (simulating a running worker)
+    await repo.set_task_state(db, task_id, TaskState.in_progress)
+
+    # Approving an in_progress task must fail with 409
+    approve = await client.post(f"/api/tasks/{task_id}/approve")
+    assert approve.status_code == 409
+    assert "not in an approvable state" in approve.json()["detail"]
+
+    # Task must still be in_progress
+    get = await client.get(f"/api/tasks/{task_id}")
+    assert get.json()["state"] == "in_progress"
+
+
+async def test_approve_done_returns_409(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Approving a task that is already done must return 409."""
+    repo_path = tmp_path / "repo409done"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects", json={"name": "p409d", "path": str(repo_path), "default_branch": "main"}
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    task = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "do a thing"}
+    )
+    assert task.status_code == 200
+    task_id = task.json()["id"]
+
+    # Manually set to done
+    await repo.set_task_state(db, task_id, TaskState.done)
+
+    approve = await client.post(f"/api/tasks/{task_id}/approve")
+    assert approve.status_code == 409
+
+    get = await client.get(f"/api/tasks/{task_id}")
+    assert get.json()["state"] == "done"
+
+
+async def test_approve_inbox_succeeds(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """Approving an inbox task must succeed (200) and transition to approved."""
+    repo_path = tmp_path / "repo_inbox_ok"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "p_inbox_ok", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    task = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "do a thing"}
+    )
+    assert task.status_code == 200
+    task_id = task.json()["id"]
+    assert task.json()["state"] == "inbox"
+
+    approve = await client.post(f"/api/tasks/{task_id}/approve")
+    assert approve.status_code == 200
+
+    get = await client.get(f"/api/tasks/{task_id}")
+    assert get.json()["state"] == "approved"
+
+
+async def test_approve_failed_succeeds(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Approving a failed task must succeed (200) and transition to approved."""
+    repo_path = tmp_path / "repo_failed_ok"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "p_failed_ok", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    task = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "do a thing"}
+    )
+    assert task.status_code == 200
+    task_id = task.json()["id"]
+
+    # Manually set to failed
+    await repo.set_task_state(db, task_id, TaskState.failed)
+
+    # Approving a failed task must succeed
+    approve = await client.post(f"/api/tasks/{task_id}/approve")
+    assert approve.status_code == 200
+
+    get = await client.get(f"/api/tasks/{task_id}")
+    assert get.json()["state"] == "approved"
+
+
+async def test_cascade_approve_failed_descendant(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Cascade-approve must approve a failed descendant of an inbox task."""
+    repo_path = tmp_path / "repo_cascade_fail"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "p_cascade_fail", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    # Create parent task
+    parent = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "parent task"}
+    )
+    assert parent.status_code == 200
+    parent_id = parent.json()["id"]
+
+    # Create child task linked to parent; we must use the repo directly since the
+    # task creation API doesn't expose parent_task_id.
+    child_task = await repo.create_task(
+        db,
+        project_id=project_id,
+        request="child task",
+        title="child",
+        state=TaskState.failed,
+        parent_task_id=parent_id,
+    )
+
+    # Cascade-approve the parent — the failed child must also be approved
+    cascade = await client.post(f"/api/tasks/{parent_id}/cascade-approve")
+    assert cascade.status_code == 200, cascade.text
+    assert cascade.json()["count"] >= 2  # parent + child at minimum
+
+    # Both parent and child must be approved
+    get_parent = await client.get(f"/api/tasks/{parent_id}")
+    assert get_parent.json()["state"] == "approved"
+
+    get_child = await client.get(f"/api/tasks/{child_task.id}")
+    assert get_child.json()["state"] == "approved"

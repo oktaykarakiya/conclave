@@ -150,6 +150,25 @@ async def set_task_state(db: Database, task_id: str, state: TaskState) -> None:
     )
 
 
+async def approve_task(db: Database, task_id: str) -> bool:
+    """Atomically set state to ``approved`` only if currently in an approvable state.
+
+    The WHERE clause guarantees the state transition is conditional at the row
+    level — a worker claiming the task between a prior read and this UPDATE cannot
+    cause a duplicate run because the UPDATE simply won't match (zero rows affected).
+
+    Returns ``True`` if a row was updated, ``False`` if the task was not in an
+    approvable state (or doesn't exist).
+    """
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE tasks SET state = ?, updated_at = ? "
+            "WHERE id = ? AND state IN ('inbox', 'failed')",
+            (TaskState.approved.value, now_iso(), task_id),
+        )
+        return cur.rowcount > 0
+
+
 async def update_task_fields(
     db: Database,
     task_id: str,
