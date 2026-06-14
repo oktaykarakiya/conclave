@@ -127,9 +127,21 @@ class Daemon:
             logger.exception("backfill: AI enrichment failed for project %s", p.id)
 
     async def shutdown(self) -> None:
+        # 1. Stop per-project workers so no new tasks are claimed.
         for worker in list(self._workers.values()):
             await worker.stop()
         self._workers.clear()
+
+        # 2. Cancel and await any backfill / housekeeping background tasks
+        #    spawned by start() so they cannot touch the DB after close.
+        for task in list(self._bg_tasks):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._bg_tasks.clear()
+
+        # 3. Shut down planning-session discussions and agent-turn continuations.
+        await self.planning_orchestrator.shutdown()
 
     async def start_worker(self, project_id: str) -> None:
         if not self._workers_enabled or project_id in self._workers:

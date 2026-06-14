@@ -213,6 +213,26 @@ class PlanningOrchestrator:
             bg.cancel()
         return created_ids
 
+    async def shutdown(self) -> None:
+        """Cancel and await all active sessions and background tasks.
+
+        Called during daemon shutdown before the database is closed.  Every
+        tracked task (discussion loops, pending agent-turn continuations) is
+        cancelled and then awaited so no coroutine can touch the DB after
+        ``db.close()``.
+        """
+        for _session_id, task in list(self._active_sessions.items()):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._active_sessions.clear()
+
+        for task in list(self._bg_tasks):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._bg_tasks.clear()
+
     async def cancel_session(self, session_id: str) -> None:
         """Cancel an active or stable session."""
         session = await repo.get_planning_session(self._db, session_id)
