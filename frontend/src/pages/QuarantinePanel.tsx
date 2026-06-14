@@ -1,8 +1,9 @@
+import type React from "react";
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api";
 import type { Integrity, Quarantine } from "../types";
-import { Button, input } from "../ui";
+import { Button, Card, Spinner, input } from "../ui";
 
 /* --- local helpers -------------------------------------------------------- */
 
@@ -71,6 +72,7 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
   const [entries, setEntries] = useState<Quarantine[]>([]);
   const [integrity, setIntegrity] = useState<Integrity | null>(null);
   const [form, setForm] = useState({ pattern: "", reason: "", until: "" });
+  const [showAdd, setShowAdd] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -102,7 +104,14 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
   const formValid =
     form.pattern.trim() !== "" && form.reason.trim() !== "" && form.until.trim() !== "";
 
-  async function add() {
+  // Clear a stale add error as soon as the user starts editing any field.
+  function updateForm(patch: Partial<typeof form>) {
+    if (addError) setAddError("");
+    setForm((f) => ({ ...f, ...patch }));
+  }
+
+  async function add(e?: React.FormEvent) {
+    e?.preventDefault();
     if (!formValid || adding) return;
     setAddError("");
     setAdding(true);
@@ -113,6 +122,7 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
         until: form.until,
       });
       setForm({ pattern: "", reason: "", until: "" });
+      setShowAdd(false);
       await reload();
     } catch (e) {
       setAddError(String(e));
@@ -122,7 +132,8 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
   }
 
   async function remove(id: string) {
-    if (removingId) return;
+    // Only block re-removing the same row; allow acting on other rows.
+    if (removingId === id) return;
     setRemovingId(id);
     setLoadError("");
     try {
@@ -135,22 +146,26 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
     }
   }
 
-  // Sort: expired first (most overdue first), then active by soonest expiry.
+  // Sort: active entries by soonest expiry (most urgent first), then expired
+  // entries (cleanup) below, then no-expiry last.
   const sorted = [...entries].sort((a, b) => {
     const da = daysUntil(a.until);
     const db = daysUntil(b.until);
     if (da === null && db === null) return 0;
     if (da === null) return 1;
     if (db === null) return -1;
-    return da - db;
+    const aExp = da < 0;
+    const bExp = db < 0;
+    if (aExp !== bExp) return aExp ? 1 : -1; // active group before expired group
+    return da - db; // within a group, soonest first
   });
 
   const healthy = integrity?.healthy ?? true;
 
   return (
     <div className="space-y-4">
-      {/* Header: title + integrity stat */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      {/* Header: title + integrity stat (stacks on mobile) */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
         <div>
           <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-300">
             Quarantined tests
@@ -162,7 +177,7 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
 
         {integrity && (
           <div
-            className={`flex items-center gap-4 rounded-xl border px-4 py-2 ${
+            className={`flex w-full flex-wrap items-center gap-3 rounded-xl border px-4 py-2 sm:w-auto ${
               healthy
                 ? "border-emerald-500/30 bg-emerald-500/5"
                 : "border-rose-500/30 bg-rose-500/5"
@@ -192,54 +207,94 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
       {integrity && !healthy && integrity.expired_patterns.length > 0 && (
         <div className="rounded-xl border border-rose-500/30 bg-rose-500/5 p-3 text-xs text-rose-300">
           <span className="font-medium">Expired patterns still active:</span>{" "}
-          <span className="font-mono">{integrity.expired_patterns.join(", ")}</span>
+          <span className="break-all font-mono">{integrity.expired_patterns.join(", ")}</span>
           <span className="text-rose-400/70"> — re-validate or remove them.</span>
         </div>
       )}
 
-      {/* Add form */}
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-3">
-        <div className="flex flex-wrap items-start gap-2">
-          <div className="min-w-[200px] flex-1">
-            <input
-              className={`${input} font-mono`}
-              placeholder="pattern (suite/test path)"
-              title="Test pattern to quarantine (e.g. tests/flaky/test_login.py::test_oauth)"
-              value={form.pattern}
-              onChange={(e) => setForm({ ...form, pattern: e.target.value })}
-            />
-          </div>
-          <div className="min-w-[200px] flex-1">
-            <input
-              className={input}
-              placeholder="reason (required)"
-              title="Why is this test quarantined?"
-              value={form.reason}
-              onChange={(e) => setForm({ ...form, reason: e.target.value })}
-            />
-          </div>
-          <input
-            className={`${input} w-44`}
-            type="date"
-            min={todayISO()}
-            title="Quarantine expires on this date"
-            value={form.until}
-            onChange={(e) => setForm({ ...form, until: e.target.value })}
-          />
-          <Button variant="primary" onClick={add} disabled={!formValid || adding}>
-            {adding ? "Adding…" : "Quarantine"}
+      {/* Add rule — tucked behind a disclosure so the list stays primary */}
+      <div>
+        {!showAdd ? (
+          <Button
+            variant="ghost"
+            onClick={() => setShowAdd(true)}
+            title="Add a quarantine rule"
+          >
+            + Add quarantine rule
           </Button>
-        </div>
-        {addError && (
-          <div className="mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-300">
-            {addError}
-          </div>
+        ) : (
+          <Card className="p-3">
+            <form className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end" onSubmit={add}>
+              <Field label="Pattern" className="min-w-0 flex-1 sm:min-w-[200px]">
+                <input
+                  className={`${input} font-mono`}
+                  placeholder="suite/test path"
+                  aria-label="Test pattern to quarantine"
+                  title="Test pattern to quarantine (e.g. tests/flaky/test_login.py::test_oauth)"
+                  value={form.pattern}
+                  onChange={(e) => updateForm({ pattern: e.target.value })}
+                />
+              </Field>
+              <Field label="Reason" className="min-w-0 flex-1 sm:min-w-[200px]">
+                <input
+                  className={input}
+                  placeholder="why is it flaky?"
+                  aria-label="Reason for quarantine"
+                  title="Why is this test quarantined?"
+                  value={form.reason}
+                  onChange={(e) => updateForm({ reason: e.target.value })}
+                />
+              </Field>
+              <Field label="Expires" className="w-full sm:w-44">
+                <input
+                  className={input}
+                  style={{ colorScheme: "dark" }}
+                  type="date"
+                  min={todayISO()}
+                  aria-label="Quarantine expiry date"
+                  title="Quarantine expires on this date"
+                  value={form.until}
+                  onChange={(e) => updateForm({ until: e.target.value })}
+                />
+              </Field>
+              <div className="flex w-full gap-2 sm:w-auto">
+                <button
+                  type="submit"
+                  disabled={!formValid || adding}
+                  className="flex min-h-[44px] flex-1 items-center justify-center rounded px-4 text-sm font-medium text-white transition focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none disabled:opacity-40 bg-indigo-600 hover:bg-indigo-500 sm:flex-none"
+                >
+                  {adding ? "Adding…" : "Quarantine"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAdd(false);
+                    setAddError("");
+                  }}
+                  className="flex min-h-[44px] items-center justify-center rounded px-4 text-sm font-medium text-zinc-300 transition hover:bg-zinc-800 focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+            {addError && (
+              <div className="mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-300">
+                {addError}
+              </div>
+            )}
+          </Card>
         )}
       </div>
 
       {/* List */}
       {loading ? (
-        <ListSkeleton />
+        <div
+          className="flex items-center justify-center gap-2 py-10 text-sm text-zinc-500"
+          aria-busy="true"
+          aria-label="Loading quarantine entries"
+        >
+          <Spinner /> Loading quarantine…
+        </div>
       ) : loadError ? (
         <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300">
           {loadError}
@@ -247,62 +302,20 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
       ) : sorted.length === 0 ? (
         <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-900/40 py-12 text-center">
           <div className="text-sm font-medium text-zinc-400">Nothing quarantined</div>
-          <div className="mt-1 text-xs text-zinc-500">
-            The green gate is enforcing every test. Add a pattern above to skip a flaky one.
+          <div className="mt-1 px-4 text-xs text-zinc-500">
+            The green gate is enforcing every test. Add a pattern to skip a flaky one.
           </div>
         </div>
       ) : (
         <div className="space-y-2">
-          {sorted.map((q) => {
-            const expired = isExpired(q.until);
-            const busy = removingId === q.id;
-            return (
-              <div
-                key={q.id}
-                className={`flex items-center justify-between gap-3 rounded-xl border bg-zinc-900 p-3 transition-colors hover:bg-zinc-800/50 ${
-                  expired ? "border-amber-500/30" : "border-zinc-800"
-                }`}
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span
-                      className="truncate font-mono text-sm text-zinc-100"
-                      title={q.pattern}
-                    >
-                      {q.pattern}
-                    </span>
-                    <Pill
-                      tone={expired ? "amber" : "emerald"}
-                      title={expired ? "Past its expiry — no longer protecting the gate" : "Active"}
-                    >
-                      {expired ? "expired" : "active"}
-                    </Pill>
-                  </div>
-                  <div className="mt-1 flex items-center gap-2 text-xs text-zinc-400">
-                    <span className="truncate" title={q.reason}>
-                      {q.reason}
-                    </span>
-                    <span className="text-zinc-600">·</span>
-                    <span
-                      className={`shrink-0 tabular-nums ${
-                        expired ? "text-amber-400" : "text-zinc-500"
-                      }`}
-                      title={`Until ${fmtDate(q.until)}`}
-                    >
-                      {expiryLabel(q.until)} · {fmtDate(q.until)}
-                    </span>
-                  </div>
-                </div>
-                <Button
-                  variant="danger"
-                  onClick={() => remove(q.id)}
-                  disabled={busy}
-                >
-                  {busy ? "Removing…" : "Remove"}
-                </Button>
-              </div>
-            );
-          })}
+          {sorted.map((q) => (
+            <QuarantineRow
+              key={q.id}
+              q={q}
+              busy={removingId === q.id}
+              onRemove={() => remove(q.id)}
+            />
+          ))}
         </div>
       )}
     </div>
@@ -311,6 +324,102 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
 
 /* --- small presentational bits -------------------------------------------- */
 
+/** A single quarantine row with expandable long pattern/reason + inline delete confirm. */
+function QuarantineRow({
+  q,
+  busy,
+  onRemove,
+}: {
+  q: Quarantine;
+  busy: boolean;
+  onRemove: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const expired = isExpired(q.until);
+
+  return (
+    <div
+      className={`flex flex-col gap-2 rounded-xl border bg-zinc-900 p-3 transition-colors hover:bg-zinc-800/50 sm:flex-row sm:items-start sm:justify-between sm:gap-3 ${
+        expired ? "border-rose-500/30" : "border-zinc-800"
+      }`}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        title={expanded ? "Collapse details" : "Show full pattern & reason"}
+        className="min-w-0 flex-1 rounded text-left focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none"
+      >
+        <div className="flex items-center gap-2">
+          <span
+            className={`font-mono text-sm text-zinc-100 ${
+              expanded ? "break-all whitespace-pre-wrap" : "truncate"
+            }`}
+          >
+            {q.pattern}
+          </span>
+          <Pill
+            tone={expired ? "rose" : "emerald"}
+            title={expired ? "Past its expiry — no longer protecting the gate" : "Active"}
+          >
+            {expired ? "expired" : "active"}
+          </Pill>
+        </div>
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-zinc-400">
+          <span className={expanded ? "break-words whitespace-pre-wrap" : "min-w-0 truncate"}>
+            {q.reason}
+          </span>
+          <span className="text-zinc-600">·</span>
+          <span
+            className={`shrink-0 tabular-nums ${expired ? "text-rose-400" : "text-zinc-500"}`}
+          >
+            {expiryLabel(q.until)} · {fmtDate(q.until)}
+          </span>
+        </div>
+      </button>
+
+      {/* Delete with inline two-step confirmation (no modal) */}
+      {confirming ? (
+        <div className="flex shrink-0 gap-2">
+          <Button variant="danger" onClick={onRemove} disabled={busy} title="Confirm removal">
+            {busy ? "Removing…" : "Confirm"}
+          </Button>
+          <Button variant="ghost" onClick={() => setConfirming(false)} disabled={busy}>
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setConfirming(true)}
+          title="Remove this quarantine rule"
+          className="flex min-h-[44px] shrink-0 items-center justify-center rounded px-4 text-sm font-medium text-rose-300 transition hover:bg-rose-500/10 focus-visible:ring-2 focus-visible:ring-rose-400 focus-visible:outline-none"
+        >
+          Remove
+        </button>
+      )}
+    </div>
+  );
+}
+
+function Field({
+  label,
+  className = "",
+  children,
+}: {
+  label: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className={`block ${className}`}>
+      <span className="mb-1 block text-xs text-zinc-500">{label}</span>
+      {children}
+    </label>
+  );
+}
+
 function Stat({ label, value, tone }: { label: string; value: number; tone: Tone }) {
   const color =
     tone === "rose" ? "text-rose-300" : tone === "emerald" ? "text-emerald-300" : "text-zinc-200";
@@ -318,25 +427,6 @@ function Stat({ label, value, tone }: { label: string; value: number; tone: Tone
     <div className="flex items-baseline gap-1.5">
       <span className={`tabular-nums text-base font-semibold ${color}`}>{value}</span>
       <span className="text-zinc-500">{label}</span>
-    </div>
-  );
-}
-
-function ListSkeleton() {
-  return (
-    <div className="space-y-2" aria-busy="true">
-      {[0, 1, 2].map((i) => (
-        <div
-          key={i}
-          className="flex items-center justify-between rounded-xl border border-zinc-800 bg-zinc-900 p-3"
-        >
-          <div className="w-full space-y-2">
-            <div className="h-3.5 w-1/3 animate-pulse rounded bg-zinc-800" />
-            <div className="h-3 w-1/2 animate-pulse rounded bg-zinc-800/70" />
-          </div>
-          <div className="h-8 w-20 shrink-0 animate-pulse rounded bg-zinc-800" />
-        </div>
-      ))}
     </div>
   );
 }

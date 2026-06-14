@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { api } from "../api";
-import { Button } from "../ui";
+import { Button, Spinner } from "../ui";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
@@ -64,11 +64,19 @@ function formatServerError(
   return { title: raw.slice(0, 300), fields: [] };
 }
 
+// Auto-grows with content (no fixed vh height-trap) but stays inside the
+// section: a min height keeps short configs comfortable, a max height keeps
+// long ones from swallowing the page. `whitespace-pre overflow-x-auto` scrolls
+// long JSON lines inside the box instead of overflowing the viewport on mobile.
+// Vertical resize handle is desktop-only to avoid fighting touch scroll.
 const editorClass =
-  "w-full h-[58vh] resize-y rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2.5 " +
+  "block w-full min-h-[180px] max-h-[60vh] resize-none md:resize-y overflow-auto " +
+  "whitespace-pre rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2.5 " +
   "font-mono text-[13px] leading-relaxed text-zinc-100 outline-none " +
   "focus:border-indigo-500 focus-visible:ring-1 focus-visible:ring-indigo-500/40 " +
   "disabled:opacity-60 disabled:cursor-not-allowed transition-colors";
+
+const DESC_ID = "config-editor-desc";
 
 export function ConfigPanel({ projectId }: { projectId: string }) {
   const [text, setText] = useState("");
@@ -77,12 +85,16 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>("");
   const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [formatted, setFormatted] = useState(false);
   const [errorPanel, setErrorPanel] = useState<
     { title: string; fields: { key: string; msg: string }[] } | null
   >(null);
 
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+
   const loaded = !loading && !loadError;
   const dirty = loaded && text !== baseline;
+  const canSave = loaded && saveState !== "saving" && dirty;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -113,6 +125,22 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
     return () => clearTimeout(id);
   }, [saveState]);
 
+  // Auto-clear the transient "Formatted" confirmation.
+  useEffect(() => {
+    if (!formatted) return;
+    const id = setTimeout(() => setFormatted(false), 1200);
+    return () => clearTimeout(id);
+  }, [formatted]);
+
+  // Auto-grow the textarea to fit its content (capped by max-h via CSS).
+  // Runs whenever the text or the editor's mounted state changes.
+  useLayoutEffect(() => {
+    const el = taRef.current;
+    if (!el || !loaded) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [text, loaded]);
+
   function onEdit(next: string) {
     setText(next);
     if (saveState !== "idle") setSaveState("idle");
@@ -124,8 +152,10 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
     try {
       const pretty = JSON.stringify(JSON.parse(text), null, 2);
       setText(pretty);
+      setFormatted(true);
       if (saveState !== "idle") setSaveState("idle");
     } catch {
+      setFormatted(false);
       setErrorPanel({
         title: "Cannot format: the document is not valid JSON.",
         fields: [],
@@ -133,7 +163,7 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
     }
   }
 
-  async function save() {
+  const save = useCallback(async () => {
     if (!loaded) return; // hard guard against blank-overwrite
     setErrorPanel(null);
 
@@ -161,6 +191,16 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
       setSaveState("error");
       setErrorPanel(formatServerError(e));
     }
+  }, [loaded, projectId, text]);
+
+  // Ctrl/Cmd+S saves from within the editor (matches editor muscle memory).
+  // Scoped to the textarea so it never hijacks the browser's save elsewhere
+  // on the single-page layout; only fires when there are changes to persist.
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      if (canSave) void save();
+    }
   }
 
   const saveLabel =
@@ -172,35 +212,35 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
 
   return (
     <div className="space-y-3">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h3 className="text-sm font-semibold uppercase tracking-wide text-zinc-300">
-            Project configuration
-          </h3>
-          <p className="mt-1 max-w-2xl text-sm text-zinc-400">
-            Edit the raw project config JSON — target branch, per-agent
-            models/effort, the green-gate, planning, and more. Changes are
-            validated on the server before they are applied.
-          </p>
-        </div>
-        {loaded && (
+      {/* Header (the collapsible section title lives in App.tsx) */}
+      <div className="flex items-start justify-between gap-3">
+        <p id={DESC_ID} className="min-w-0 max-w-2xl text-sm text-zinc-400">
+          Edit the raw project config JSON — target branch, per-agent
+          models/effort, the green-gate, planning, and more. Changes are
+          validated on the server before they are applied. Press{" "}
+          <kbd className="rounded border border-zinc-700 bg-zinc-800 px-1 text-[11px] text-zinc-300">
+            ⌘/Ctrl+S
+          </kbd>{" "}
+          to save.
+        </p>
+        {loaded && dirty && (
           <span
-            className="shrink-0 self-center text-xs tabular-nums text-zinc-500"
-            title="Unsaved changes are present in the editor"
+            className="inline-flex shrink-0 items-center gap-1.5 self-center rounded-full bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-400"
+            title="You have unsaved changes in the editor"
           >
-            {dirty ? "Unsaved changes" : "Up to date"}
+            <span className="h-1.5 w-1.5 rounded-full bg-amber-400" aria-hidden="true" />
+            Unsaved
           </span>
         )}
       </div>
 
       {/* Body: loading / load-error / editor */}
       {loading ? (
-        <div className="flex h-[58vh] items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
-          <div className="flex items-center gap-2 text-sm text-zinc-500">
-            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-zinc-600 border-t-zinc-300" />
+        <div className="flex min-h-[180px] items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
+          <span className="flex items-center gap-2 text-sm text-zinc-500">
+            <Spinner />
             Loading configuration…
-          </div>
+          </span>
         </div>
       ) : loadError ? (
         <div className="space-y-3 rounded-lg border border-rose-900/60 bg-rose-950/40 p-4">
@@ -211,28 +251,37 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
             Saving is disabled to avoid overwriting your real config with an
             empty editor. Retry the load, then edit.
           </p>
-          <p className="font-mono text-xs text-rose-300/70 break-words">
+          <p className="font-mono text-xs break-words text-rose-300/70 select-text">
             {loadError}
           </p>
-          <Button variant="ghost" onClick={load}>
+          <Button variant="ghost" onClick={load} title="Reload the config from the server">
             Retry load
           </Button>
         </div>
       ) : (
         <textarea
+          ref={taRef}
           className={editorClass}
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
+          autoComplete="off"
+          wrap="off"
           value={text}
           onChange={(e) => onEdit(e.target.value)}
+          onKeyDown={onKeyDown}
           aria-label="Project configuration JSON editor"
+          aria-describedby={DESC_ID}
         />
       )}
 
       {/* Server / client error panel (never a raw JSON blob) */}
       {errorPanel && (
-        <div className="rounded-lg border border-rose-900/60 bg-rose-950/40 p-3">
+        <div
+          role="alert"
+          aria-live="polite"
+          className="rounded-lg border border-rose-900/60 bg-rose-950/40 p-3"
+        >
           <div className="text-sm font-semibold text-rose-300">
             {errorPanel.title}
           </div>
@@ -252,28 +301,28 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      {/* Actions */}
-      <div className="flex items-center gap-3">
+      {/* Actions — wrap on narrow screens so nothing is pushed off-canvas */}
+      <div className="flex flex-wrap items-center gap-2">
         <Button
           variant="primary"
-          onClick={save}
-          disabled={!loaded || saveState === "saving" || !dirty}
+          onClick={() => void save()}
+          disabled={!canSave}
+          title={dirty ? "Save changes (⌘/Ctrl+S)" : "No changes to save"}
         >
           {saveLabel}
         </Button>
-        <Button variant="ghost" onClick={format} disabled={!loaded}>
+        <Button
+          variant="ghost"
+          onClick={format}
+          disabled={!loaded}
+          title="Re-indent and normalize the JSON"
+        >
           Format
         </Button>
-        {saveState === "saved" && (
-          <span className="text-sm text-emerald-400">
-            Configuration saved.
+        {formatted && (
+          <span className="text-xs text-indigo-400" aria-live="polite">
+            Formatted
           </span>
-        )}
-        {saveState === "error" && (
-          <span className="text-sm text-rose-400">Save failed — see above.</span>
-        )}
-        {loaded && !dirty && saveState === "idle" && (
-          <span className="text-xs text-zinc-500">No changes to save.</span>
         )}
       </div>
     </div>

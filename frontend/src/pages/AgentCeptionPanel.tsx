@@ -1,3 +1,4 @@
+import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "../api";
@@ -7,7 +8,10 @@ import type {
   PlanningSession,
   PlanningTaskNode,
 } from "../types";
-import { Badge, Button, input } from "../ui";
+import { Badge, Button, Spinner, input } from "../ui";
+
+// Messages longer than this collapse to a few lines with a "Show more" toggle.
+const MESSAGE_COLLAPSE_THRESHOLD = 280;
 
 /* ------------------------------------------------------------------------ */
 /* Color maps                                                               */
@@ -121,15 +125,6 @@ function usePlanningStream(sessionId: string | null): EventRow[] {
 /* Small presentational atoms                                               */
 /* ------------------------------------------------------------------------ */
 
-function Spinner({ className = "" }: { className?: string }) {
-  return (
-    <span
-      className={`inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-zinc-600 border-t-zinc-200 ${className}`}
-      aria-hidden
-    />
-  );
-}
-
 function SectionHeader({
   children,
   right,
@@ -171,6 +166,83 @@ function TypingIndicator() {
   );
 }
 
+/**
+ * Long message body that collapses to a few lines by default with a keyboard-
+ * accessible "Show more / Show less" toggle. This is the core "wall of text" fix.
+ */
+function CollapsibleText({
+  text,
+  className = "",
+  toggleClassName = "text-indigo-400 hover:text-indigo-300",
+}: {
+  text: string;
+  className?: string;
+  toggleClassName?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const long = text.length > MESSAGE_COLLAPSE_THRESHOLD;
+
+  return (
+    <div>
+      <div
+        className={`whitespace-pre-wrap break-words ${className} ${
+          long && !expanded ? "line-clamp-[6]" : ""
+        }`}
+      >
+        {text}
+      </div>
+      {long && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          className={`mt-1 text-xs font-medium focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500 ${toggleClassName}`}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Subtle "Turn N" hairline between turn groups in the transcript. */
+function TurnDivider({ turn }: { turn: number }) {
+  return (
+    <div className="flex items-center gap-3 pt-1">
+      <span className="text-[11px] uppercase tracking-wide text-zinc-600">
+        turn {turn}
+      </span>
+      <span className="h-px flex-1 bg-zinc-800" />
+    </div>
+  );
+}
+
+function SendIcon() {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden="true"
+      className="h-4 w-4"
+    >
+      <path d="M3.105 2.289a.75.75 0 0 0-.826.95l1.414 4.926A1.5 1.5 0 0 0 5.135 9.25h6.115a.75.75 0 0 1 0 1.5H5.135a1.5 1.5 0 0 0-1.442 1.085l-1.414 4.926a.75.75 0 0 0 .826.95 28.897 28.897 0 0 0 15.293-7.155.75.75 0 0 0 0-1.113A28.897 28.897 0 0 0 3.105 2.289Z" />
+    </svg>
+  );
+}
+
+/** Grow a textarea to fit its content, capped by its CSS max-height. */
+function autoGrow(el: HTMLTextAreaElement) {
+  el.style.height = "auto";
+  el.style.height = `${el.scrollHeight}px`;
+}
+
+/** A stable, ellipsised label for a session (title, else a prompt slice). */
+function sessionLabel(s: PlanningSession): string {
+  if (s.title?.trim()) return s.title;
+  const slice = s.prompt.slice(0, 50);
+  return s.prompt.length > 50 ? `${slice}…` : slice;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Main panel                                                                */
 /* ------------------------------------------------------------------------ */
@@ -195,6 +267,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const pinnedRef = useRef(true);
 
   const events = usePlanningStream(activeSessionId);
@@ -329,6 +402,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
     try {
       await api.addPlanningMessage(activeSessionId, text);
       setHumanInput("");
+      if (inputRef.current) inputRef.current.style.height = "auto";
       pinnedRef.current = true;
       await loadSessionData(activeSessionId, true);
     } catch (e) {
@@ -394,11 +468,11 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
   const showTyping = isActive && (!lastMsg || lastMsg.role === "human");
 
   return (
-    <div className="grid h-full grid-cols-[260px_1fr_320px] gap-4">
+    <div className="flex flex-col gap-4 lg:grid lg:h-[72vh] lg:grid-cols-[260px_1fr_320px]">
       {/* ----------------------------------------------------------------- */}
       {/* Left: session list + new-session form                            */}
       {/* ----------------------------------------------------------------- */}
-      <div className="flex min-h-0 flex-col rounded-xl border border-zinc-800 bg-zinc-900">
+      <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0">
         <div className="border-b border-zinc-800 px-3 py-3">
           <SectionHeader
             right={
@@ -411,7 +485,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
           </SectionHeader>
         </div>
 
-        <div className="flex-1 space-y-1.5 overflow-y-auto p-2">
+        <div className="space-y-1.5 p-2 lg:flex-1 lg:overflow-y-auto">
           {sessionsLoading && (
             <div className="space-y-1.5">
               {[0, 1, 2].map((i) => (
@@ -443,7 +517,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
                   type="button"
                   onClick={() => setActiveSessionId(s.id)}
                   title={s.title || s.prompt}
-                  className={`w-full rounded-lg p-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500 ${
+                  className={`block w-full min-h-[44px] rounded-lg p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500 ${
                     selected
                       ? "bg-zinc-800 ring-1 ring-indigo-500/60"
                       : "hover:bg-zinc-800/50"
@@ -452,7 +526,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
                   <div className="flex items-center gap-2">
                     <StatusDot status={s.status} />
                     <span className="flex-1 truncate text-sm font-medium text-zinc-100">
-                      {s.title || s.prompt.slice(0, 48)}
+                      {sessionLabel(s)}
                     </span>
                   </div>
                   <div className="mt-1.5 flex items-center justify-between pl-4">
@@ -472,10 +546,15 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
 
         {/* New session form */}
         <div className="space-y-2 border-t border-zinc-800 p-3">
-          <label className="block text-xs font-medium text-zinc-400">
+          <label
+            htmlFor="acp-new-goal"
+            className="block text-xs font-medium text-zinc-400"
+          >
             New session goal
           </label>
           <textarea
+            id="acp-new-goal"
+            aria-label="New session goal"
             className={`${input} h-20 resize-none`}
             placeholder="Describe the big goal to decompose…"
             value={prompt}
@@ -489,40 +568,43 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
           />
           <input
             className={input}
+            aria-label="Session title (optional)"
             placeholder="Title (optional)"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
           />
-          <Button
-            variant="primary"
-            onClick={createSession}
-            disabled={creating || !prompt.trim()}
-          >
-            {creating ? (
-              <span className="flex items-center gap-2">
-                <Spinner /> Starting…
-              </span>
-            ) : (
-              "Start session"
-            )}
-          </Button>
+          <div className="[&>button]:w-full">
+            <Button
+              variant="primary"
+              onClick={createSession}
+              disabled={creating || !prompt.trim()}
+            >
+              {creating ? (
+                <span className="flex items-center justify-center gap-2">
+                  <Spinner /> Starting…
+                </span>
+              ) : (
+                "Start session"
+              )}
+            </Button>
+          </div>
         </div>
       </div>
 
       {/* ----------------------------------------------------------------- */}
       {/* Center: discussion transcript                                    */}
       {/* ----------------------------------------------------------------- */}
-      <div className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900">
+      <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0 lg:overflow-hidden">
         {/* Header */}
         {activeSession ? (
-          <div className="flex items-center justify-between gap-2 border-b border-zinc-800 px-4 py-3">
+          <div className="flex flex-col gap-2 border-b border-zinc-800 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex min-w-0 items-center gap-2">
               <StatusDot status={activeSession.status} />
               <span
                 className="truncate text-sm font-semibold text-zinc-100"
                 title={activeSession.title || activeSession.prompt}
               >
-                {activeSession.title || activeSession.prompt.slice(0, 60)}
+                {sessionLabel(activeSession)}
               </span>
               <Badge
                 text={activeSession.status}
@@ -532,7 +614,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
               />
             </div>
             <div className="flex shrink-0 items-center gap-2">
-              <span className="text-xs tabular-nums text-zinc-500">
+              <span className="mr-auto text-xs tabular-nums text-zinc-500 sm:mr-0">
                 turn {activeSession.turn_number}/{activeSession.max_rounds}
               </span>
               {isActive && (
@@ -588,21 +670,23 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
           </div>
         )}
 
-        {/* Messages */}
+        {/* Messages — capped height on every breakpoint so a long transcript
+            stays a scrollable feed rather than a wall of text; fills the column
+            at lg+ where the panel becomes a fixed-height 3-column layout. */}
         <div
           ref={scrollRef}
           onScroll={onScroll}
-          className="flex-1 space-y-4 overflow-y-auto p-4"
+          className="max-h-[60vh] space-y-4 overflow-y-auto p-4 lg:max-h-none lg:flex-1"
         >
           {!activeSessionId && (
-            <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-zinc-500">
+            <div className="flex min-h-[160px] flex-col items-center justify-center gap-2 text-center text-sm text-zinc-500">
               <span className="text-2xl">🪆</span>
               <span>Select a session, or start one to watch agents plan.</span>
             </div>
           )}
 
           {activeSessionId && dataLoading && messages.length === 0 && (
-            <div className="flex h-full items-center justify-center gap-2 text-sm text-zinc-500">
+            <div className="flex min-h-[160px] items-center justify-center gap-2 text-sm text-zinc-500">
               <Spinner /> Loading discussion…
             </div>
           )}
@@ -611,22 +695,31 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
             !dataLoading &&
             messages.length === 0 &&
             (isActive ? (
-              <div className="flex h-full items-center justify-center">
+              <div className="flex min-h-[160px] items-center justify-center">
                 <TypingIndicator />
               </div>
             ) : (
-              <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+              <div className="flex min-h-[160px] items-center justify-center text-sm text-zinc-500">
                 No messages in this session yet.
               </div>
             ))}
 
-          {messages.map((msg) =>
-            msg.role === "human" ? (
-              <HumanMessage key={msg.id} msg={msg} />
-            ) : (
-              <AgentMessage key={msg.id} msg={msg} />
-            ),
-          )}
+          {messages.map((msg, i) => {
+            const prev = messages[i - 1];
+            const showTurnDivider =
+              msg.role === "agent" &&
+              (!prev || prev.turn_number !== msg.turn_number);
+            return (
+              <div key={msg.id} className="space-y-4">
+                {showTurnDivider && <TurnDivider turn={msg.turn_number} />}
+                {msg.role === "human" ? (
+                  <HumanMessage msg={msg} />
+                ) : (
+                  <AgentMessage msg={msg} />
+                )}
+              </div>
+            );
+          })}
 
           {showTyping && messages.length > 0 && (
             <div className="pl-11">
@@ -640,7 +733,14 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
         {activeSessionId && (isActive || isStable) && (
           <div className="flex items-end gap-2 border-t border-zinc-800 p-3">
             <textarea
-              className={`${input} h-11 flex-1 resize-none`}
+              ref={inputRef}
+              aria-label={
+                isActive
+                  ? "Interject to steer the discussion"
+                  : "Add a note before approving"
+              }
+              className={`${input} max-h-[120px] min-h-[44px] flex-1 resize-none`}
+              rows={1}
               placeholder={
                 isActive
                   ? "Interject to steer the discussion…  (Enter to send, Shift+Enter for newline)"
@@ -648,7 +748,10 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
               }
               value={humanInput}
               disabled={sending}
-              onChange={(e) => setHumanInput(e.target.value)}
+              onChange={(e) => {
+                setHumanInput(e.target.value);
+                autoGrow(e.target);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
@@ -656,15 +759,23 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
                 }
               }}
             />
-            <Button onClick={sendMessage} disabled={sending || !humanInput.trim()}>
-              {sending ? (
-                <span className="flex items-center gap-2">
-                  <Spinner /> Sending…
-                </span>
-              ) : (
-                "Send"
-              )}
-            </Button>
+            <div className="[&>button]:flex [&>button]:min-h-[44px] [&>button]:items-center">
+              <Button
+                onClick={sendMessage}
+                disabled={sending || !humanInput.trim()}
+                title="Send message (Enter)"
+              >
+                {sending ? (
+                  <span className="flex items-center gap-2">
+                    <Spinner /> Sending…
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5">
+                    <SendIcon /> Send
+                  </span>
+                )}
+              </Button>
+            </div>
           </div>
         )}
         {activeSessionId && isClosed && (
@@ -723,9 +834,10 @@ function AgentMessage({ msg }: { msg: PlanningMessage }) {
             {relTime(msg.created_at)}
           </span>
         </div>
-        <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-zinc-100">
-          {msg.content}
-        </div>
+        <CollapsibleText
+          text={msg.content}
+          className="text-sm leading-relaxed text-zinc-100"
+        />
       </div>
     </div>
   );
@@ -746,9 +858,11 @@ function HumanMessage({ msg }: { msg: PlanningMessage }) {
             you
           </span>
         </div>
-        <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white">
-          {msg.content}
-        </div>
+        <CollapsibleText
+          text={msg.content}
+          className="text-sm leading-relaxed text-white"
+          toggleClassName="text-indigo-200 hover:text-white"
+        />
       </div>
       <div
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-xs font-semibold text-white"
@@ -812,7 +926,7 @@ function TaskTreePanel({
   }>({ open: true, n: 0 });
 
   return (
-    <div className="flex min-h-0 flex-col rounded-xl border border-zinc-800 bg-zinc-900">
+    <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0">
       <div className="space-y-2 border-b border-zinc-800 px-3 py-3">
         <SectionHeader
           right={
@@ -864,7 +978,7 @@ function TaskTreePanel({
         )}
       </div>
 
-      <div className="flex-1 overflow-y-auto p-2">
+      <div className="p-2 lg:max-h-none lg:flex-1 lg:overflow-y-auto">
         {loading && (
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-zinc-500">
             <Spinner /> Loading tasks…
@@ -895,7 +1009,7 @@ function TaskTreePanel({
       </div>
 
       {canApprove && total > 0 && (
-        <div className="border-t border-zinc-800 p-3">
+        <div className="border-t border-zinc-800 p-3 [&>button]:flex [&>button]:w-full [&>button]:items-center [&>button]:justify-center">
           <Button variant="primary" onClick={onApprove} disabled={approving}>
             {approving ? (
               <span className="flex items-center gap-2">
@@ -926,6 +1040,34 @@ function LegendItem({
       {label}
       <span className="tabular-nums text-zinc-500">{count}</span>
     </span>
+  );
+}
+
+/** Task-node description clamped to 2 lines with a compact expand toggle. */
+function NodeDescription({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  // Heuristic: only offer a toggle when the text is long enough to clip.
+  const clampable = text.length > 90;
+  return (
+    <div className="mt-0.5">
+      <p
+        className={`whitespace-pre-wrap break-words text-xs leading-relaxed text-zinc-400 ${
+          clampable && !open ? "line-clamp-2" : ""
+        }`}
+      >
+        {text}
+      </p>
+      {clampable && (
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="mt-0.5 text-[11px] font-medium text-indigo-400 hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
+        >
+          {open ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -987,9 +1129,7 @@ function TaskTreeNode({
             </span>
           </div>
           {expanded && node.description && (
-            <p className="mt-0.5 whitespace-pre-wrap break-words text-xs leading-relaxed text-zinc-400">
-              {node.description}
-            </p>
+            <NodeDescription text={node.description} />
           )}
         </div>
       </div>

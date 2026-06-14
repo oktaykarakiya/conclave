@@ -6,6 +6,7 @@ import { useStream } from "../useStream";
 import {
   Badge,
   Button,
+  Spinner,
   input,
   STATE_COLORS,
   VERDICT_COLORS,
@@ -14,6 +15,10 @@ import {
 } from "../ui";
 
 const PAGE_SIZE = 15;
+
+// Long free-text (result summaries, verdict reasons, requests) collapses to a
+// short preview with a "Show more" toggle, per the global collapsible-text rule.
+const TEXT_COLLAPSE_THRESHOLD = 160;
 
 // Honest filter taxonomy (no dedicated `blocked` state exists in the schema).
 type FilterKey = "all" | "active" | "done" | "failed" | "blocked";
@@ -205,12 +210,25 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setVisible(PAGE_SIZE);
   }, [filter, query]);
 
+  const selectedTask = useMemo(
+    () => tasks.find((t) => t.id === selected) ?? null,
+    [tasks, selected],
+  );
+
+  // Click an already-selected row to deselect (toggle the verdicts view).
+  const toggleSelect = useCallback(
+    (id: string) => setSelected((cur) => (cur === id ? null : id)),
+    [],
+  );
+
   return (
-    <div className="grid grid-cols-2 gap-4">
+    // Single-column on phones; two columns from lg up. No fixed height —
+    // content flows inside the parent accordion <Section>.
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
       {/* ------------------------------------------------------------------ */}
       {/* Left column: create + filters + list                                */}
       {/* ------------------------------------------------------------------ */}
-      <div className="space-y-3">
+      <div className="min-w-0 space-y-3">
         {/* Create task */}
         <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
           <textarea
@@ -218,36 +236,57 @@ export function TasksPanel({ projectId }: { projectId: string }) {
             placeholder="Describe the task for the team…"
             value={request}
             onChange={(e) => setRequest(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                create();
+              }
+            }}
           />
-          <div className="mt-3 flex items-center justify-between">
-            <label className="flex items-center gap-2 text-sm text-zinc-400">
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+            <label
+              className="flex min-h-[44px] cursor-pointer items-center gap-2 text-sm text-zinc-400"
+              title="When checked, the task bypasses the inbox and starts executing immediately."
+            >
               <input
                 type="checkbox"
-                className="accent-indigo-500"
+                className="h-4 w-4 accent-indigo-500"
                 checked={autoApprove}
                 onChange={(e) => setAutoApprove(e.target.checked)}
               />
-              auto-approve (run immediately)
+              Auto-approve (run immediately)
             </label>
             <Button
               variant="primary"
               onClick={create}
               disabled={creating || !request.trim()}
+              title="Create task (Cmd/Ctrl+Enter)"
             >
-              {creating ? "Creating…" : "Create task"}
+              {creating ? (
+                <span className="flex items-center gap-2">
+                  <Spinner size={14} /> Creating…
+                </span>
+              ) : (
+                "Create task"
+              )}
             </Button>
           </div>
         </div>
 
         {error && (
-          <div className="rounded-xl border border-rose-900/60 bg-rose-950/60 p-3 text-sm text-rose-300">
+          <div
+            role="alert"
+            className="rounded-xl border border-rose-900/60 bg-rose-950/60 p-3 text-sm text-rose-300"
+          >
             {error}
           </div>
         )}
 
         {/* Filter chips + search */}
         <div className="space-y-2">
-          <div className="flex flex-wrap items-center gap-1.5">
+          {/* Horizontally scrollable single row on phones (Linear/GitHub
+              pattern) so the chips never wrap into the search bar. */}
+          <div className="-mx-1 flex items-center gap-1.5 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             {FILTERS.map((f) => {
               const active = filter === f.key;
               const n = counts[f.key];
@@ -256,8 +295,9 @@ export function TasksPanel({ projectId }: { projectId: string }) {
                   key={f.key}
                   type="button"
                   title={chipTitle(f.key)}
+                  aria-pressed={active}
                   onClick={() => setFilter(f.key)}
-                  className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50 ${
+                  className={`flex min-h-[36px] shrink-0 items-center rounded-lg px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50 ${
                     active
                       ? "bg-indigo-500/15 text-indigo-300 ring-1 ring-indigo-500/40"
                       : "text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200"
@@ -277,23 +317,41 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           </div>
           <div className="relative">
             <input
-              className={`${input} pl-8`}
+              className={`${input} pl-9`}
               placeholder="Search title or request…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               aria-label="Search tasks"
             />
-            <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-600">
-              ⌕
-            </span>
+            <svg
+              viewBox="0 0 20 20"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              aria-hidden="true"
+              className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+            >
+              <circle cx="9" cy="9" r="5.5" />
+              <path d="m17 17-3.5-3.5" strokeLinecap="round" />
+            </svg>
             {query && (
               <button
                 type="button"
                 title="Clear search"
+                aria-label="Clear search"
                 onClick={() => setQuery("")}
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded px-1 text-zinc-500 hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
+                className="absolute right-1.5 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded text-zinc-500 hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
               >
-                ✕
+                <svg
+                  viewBox="0 0 20 20"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5"
+                >
+                  <path d="m5 5 10 10M15 5 5 15" strokeLinecap="round" />
+                </svg>
               </button>
             )}
           </div>
@@ -321,7 +379,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
                   node={node}
                   childrenOf={childrenOf}
                   selectedId={selected}
-                  onSelect={setSelected}
+                  onSelect={toggleSelect}
                   onReload={reload}
                   liveHint={liveHint}
                   depth={0}
@@ -348,51 +406,91 @@ export function TasksPanel({ projectId }: { projectId: string }) {
       </div>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Right column: verdicts                                              */}
+      {/* Right column: verdicts. Only rendered once a task is selected so it  */}
+      {/* never sits as a big empty block above the list on mobile.           */}
       {/* ------------------------------------------------------------------ */}
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-        <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-300">
-          Verdicts
-        </h3>
-        {!selected ? (
-          <EmptyState
-            title="No task selected"
-            hint="Select a task to see review verdicts."
-          />
-        ) : verdicts.length === 0 ? (
-          <EmptyState title="No verdicts yet" hint="Reviews will appear here." />
-        ) : (
-          <div className="space-y-2">
-            {verdicts.map((v) => (
-              <div
-                key={v.id}
-                className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-3 transition-colors"
+      {selectedTask && (
+        <div className="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <h3 className="min-w-0 text-sm font-semibold uppercase tracking-wide text-zinc-300">
+              Verdicts
+            </h3>
+            <button
+              type="button"
+              title="Close verdicts"
+              aria-label="Close verdicts"
+              onClick={() => setSelected(null)}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-zinc-500 hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
+            >
+              <svg
+                viewBox="0 0 20 20"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                aria-hidden="true"
+                className="h-3.5 w-3.5"
               >
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium text-zinc-200">
-                    {v.agent}
-                  </span>
-                  <span
-                    className={`text-sm font-semibold ${
-                      VERDICT_COLORS[v.verdict] ?? "text-zinc-400"
-                    }`}
-                  >
-                    {v.verdict}
-                  </span>
-                </div>
-                <div className="mt-0.5 text-xs text-zinc-500 tabular-nums">
-                  attempt #{v.attempt} · grounded {v.grounded_count}
-                </div>
-                {v.reason && (
-                  <div className="mt-1.5 text-xs leading-relaxed text-zinc-300">
-                    {v.reason}
-                  </div>
-                )}
-              </div>
-            ))}
+                <path d="m5 5 10 10M15 5 5 15" strokeLinecap="round" />
+              </svg>
+            </button>
           </div>
-        )}
-      </div>
+
+          <div
+            className="mb-3 truncate text-xs text-zinc-500"
+            title={selectedTask.title || selectedTask.request}
+          >
+            {selectedTask.title || selectedTask.request}
+          </div>
+
+          {verdicts.length === 0 ? (
+            selectedTask.state === "in_progress" ||
+            selectedTask.state === "approved" ? (
+              <div
+                role="status"
+                className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-zinc-800 bg-zinc-900/40 p-8 text-center text-sm text-zinc-400"
+              >
+                <Spinner size={14} /> Awaiting review…
+              </div>
+            ) : (
+              <EmptyState
+                title="No verdicts"
+                hint="No reviews were recorded for this task."
+              />
+            )
+          ) : (
+            <div className="space-y-2">
+              {verdicts.map((v) => (
+                <div
+                  key={v.id}
+                  className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-3 transition-colors"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate text-sm font-medium text-zinc-200">
+                      {v.agent}
+                    </span>
+                    <span
+                      className={`shrink-0 text-sm font-semibold ${
+                        VERDICT_COLORS[v.verdict] ?? "text-zinc-400"
+                      }`}
+                    >
+                      {v.verdict}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 text-xs text-zinc-500 tabular-nums">
+                    attempt #{v.attempt} · grounded {v.grounded_count}
+                  </div>
+                  {v.reason && (
+                    <CollapsibleText
+                      text={v.reason}
+                      className="mt-1.5 text-xs leading-relaxed text-zinc-300"
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -414,6 +512,43 @@ function chipTitle(key: FilterKey): string {
     default:
       return "All tasks";
   }
+}
+
+/**
+ * Long free-text with a collapsed preview + "Show more" / "Show less" toggle.
+ * Preserves newlines and wraps long words. Short text renders inline with no
+ * toggle. Matches the global collapsible-long-text mandate.
+ */
+function CollapsibleText({
+  text,
+  className = "",
+}: {
+  text: string;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > TEXT_COLLAPSE_THRESHOLD;
+  const shown =
+    long && !open ? `${text.slice(0, TEXT_COLLAPSE_THRESHOLD).trimEnd()}…` : text;
+
+  return (
+    <div className={className}>
+      <span className="whitespace-pre-wrap break-words">{shown}</span>
+      {long && (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpen((v) => !v);
+          }}
+          className="ml-1 inline-flex min-h-[28px] items-center font-medium text-indigo-400 hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
+        >
+          {open ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
 }
 
 /** Honest elapsed: created→updated (INCLUDES queue wait; no real exec start). */
@@ -543,17 +678,11 @@ function EmptyState({ title, hint }: { title: string; hint?: string }) {
   );
 }
 
-function Spinner() {
-  return (
-    <span
-      className="inline-block h-3 w-3 animate-spin rounded-full border border-zinc-600 border-t-zinc-300 align-middle"
-      aria-hidden
-    />
-  );
-}
-
 // --- a single task row (tree-aware) -----------------------------------------
 const TERMINAL = new Set(["done", "failed", "cancelled"]);
+// Cap nesting indent so deep trees never push content off a narrow viewport.
+const INDENT_STEP = 14;
+const INDENT_MAX = 42;
 
 function TaskTreeItem({
   node,
@@ -578,6 +707,7 @@ function TaskTreeItem({
 
   const [expanded, setExpanded] = useState(depth === 0);
   const [showDetails, setShowDetails] = useState(false);
+  const [actioning, setActioning] = useState(false);
   const [usage, setUsage] = useState<{
     total_turns: number;
     input_tokens: number;
@@ -620,29 +750,36 @@ function TaskTreeItem({
     }
   }, [showDetails, loadUsage]);
 
-  const stop = (e: React.MouseEvent) => e.stopPropagation();
-  const handleApprove = async (e: React.MouseEvent) => {
-    stop(e);
-    await api.approve(t.id);
-    onReload();
-  };
-  const handleCascade = async (e: React.MouseEvent) => {
-    stop(e);
-    try {
-      await api.cascadeApprove(t.id);
-    } finally {
-      onReload();
-    }
-  };
-  const handleCancel = async (e: React.MouseEvent) => {
-    stop(e);
-    await api.cancel(t.id);
-    onReload();
-  };
+  // Wrap an async action with a local in-flight flag so the buttons can show a
+  // spinner and refuse double-submits, then always refresh the list.
+  const runAction = useCallback(
+    async (e: React.MouseEvent, fn: () => Promise<unknown>) => {
+      e.stopPropagation();
+      if (actioning) return;
+      setActioning(true);
+      try {
+        await fn();
+      } finally {
+        setActioning(false);
+        onReload();
+      }
+    },
+    [actioning, onReload],
+  );
+
+  const handleApprove = (e: React.MouseEvent) =>
+    runAction(e, () => api.approve(t.id));
+  const handleCascade = (e: React.MouseEvent) =>
+    runAction(e, () => api.cascadeApprove(t.id));
+  const handleCancel = (e: React.MouseEvent) =>
+    runAction(e, () => api.cancel(t.id));
 
   const selected = selectedId === t.id;
   const running = t.state === "in_progress";
   const hint = running ? liveHint.get(t.id) : undefined;
+  const terminal = TERMINAL.has(t.state);
+
+  const indent = Math.min(depth * INDENT_STEP, INDENT_MAX);
 
   return (
     <div>
@@ -651,177 +788,232 @@ function TaskTreeItem({
           selected
             ? "border-indigo-500/60 bg-indigo-500/10"
             : "border-zinc-800 bg-zinc-900 hover:bg-zinc-800/50"
-        }`}
-        style={depth ? { marginLeft: depth * 18 } : undefined}
+        } ${depth ? "border-l-2 border-l-indigo-500/30" : ""}`}
+        style={depth ? { marginLeft: indent } : undefined}
         onClick={() => onSelect(t.id)}
       >
-        {/* Row 1: expand · state · title · time range */}
-        <div className="flex items-center gap-2">
+        {/* Row 1: expand · state · title · time range. The leading control is a
+            fixed-width flex child; the body is flex-1 so sub-rows align without
+            magic left-margins. */}
+        <div className="flex items-start gap-2">
           {hasChildren ? (
             <button
               type="button"
               title={expanded ? "Collapse subtasks" : "Expand subtasks"}
+              aria-label={expanded ? "Collapse subtasks" : "Expand subtasks"}
+              aria-expanded={expanded}
               onClick={(e) => {
                 e.stopPropagation();
                 setExpanded((v) => !v);
               }}
-              className="w-4 shrink-0 text-xs leading-none text-zinc-500 hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
+              className="-m-1 flex h-7 w-7 shrink-0 items-center justify-center rounded p-1 text-zinc-500 hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
             >
-              {expanded ? "▾" : "▸"}
+              <svg
+                viewBox="0 0 20 20"
+                fill="currentColor"
+                aria-hidden="true"
+                className={`h-3.5 w-3.5 transition-transform duration-150 ${
+                  expanded ? "rotate-90" : ""
+                }`}
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M7.21 14.77a.75.75 0 0 1 .02-1.06L11.168 10 7.23 6.29a.75.75 0 1 1 1.04-1.08l4.5 4.25a.75.75 0 0 1 0 1.08l-4.5 4.25a.75.75 0 0 1-1.06-.02Z"
+                  clipRule="evenodd"
+                />
+              </svg>
             </button>
           ) : (
-            <span className="w-4 shrink-0" />
+            <span className="w-5 shrink-0" aria-hidden="true" />
           )}
 
-          <Badge text={t.state} color={STATE_COLORS[t.state]} />
-          {hasChildren && (
-            <span
-              className="shrink-0 text-xs font-medium tabular-nums text-zinc-500"
-              title={`${children.length} subtask(s)`}
-            >
-              ×{children.length}
-            </span>
-          )}
-
-          <span
-            className="truncate text-sm font-medium text-zinc-100"
-            title={t.title || t.request}
-          >
-            {t.title || t.request}
-          </span>
-
-          <span className="ml-auto flex shrink-0 items-center gap-1.5 text-xs tabular-nums text-zinc-500">
-            <span title={`Created ${new Date(t.created_at).toLocaleString()}`}>
-              {fmtTime(t.created_at)}
-            </span>
-            {(t.state === "done" ||
-              t.state === "failed" ||
-              t.state === "cancelled") && (
+          <div className="min-w-0 flex-1">
+            {/* Title line: badge + (count) + title + timestamps. Wraps cleanly
+                on narrow screens instead of forcing horizontal overflow. */}
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <Badge text={t.state} color={STATE_COLORS[t.state]} />
+              {hasChildren && (
+                <span
+                  className="shrink-0 text-xs font-medium tabular-nums text-zinc-500"
+                  title={`${children.length} subtask(s)`}
+                >
+                  ×{children.length}
+                </span>
+              )}
               <span
-                title={`Updated ${new Date(t.updated_at).toLocaleString()}`}
+                className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100"
+                title={t.title || t.request}
               >
-                → {fmtTime(t.updated_at)}
+                {t.title || t.request}
               </span>
-            )}
-          </span>
-        </div>
+              <span className="flex shrink-0 items-center gap-1.5 text-xs tabular-nums text-zinc-500">
+                <span
+                  title={`Created ${new Date(t.created_at).toLocaleString()}`}
+                >
+                  {fmtTime(t.created_at)}
+                </span>
+                {terminal && (
+                  <span
+                    title={`Updated ${new Date(t.updated_at).toLocaleString()}`}
+                  >
+                    → {fmtTime(t.updated_at)}
+                  </span>
+                )}
+              </span>
+            </div>
 
-        {/* Row 2: live hint (running) OR token metrics + duration */}
-        <div className="ml-6 mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
-          {running ? (
-            <span
-              className="flex items-center gap-1.5 text-amber-400"
-              title="Latest streamed activity"
-            >
-              <Spinner />
-              {hint ? (
+            {/* Row 2: live hint (running) OR elapsed + token metrics */}
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
+              {running ? (
+                <span
+                  className="flex items-center gap-1.5 text-amber-400"
+                  title="Latest streamed activity"
+                >
+                  <Spinner size={12} />
+                  {hint ? (
+                    <>
+                      {hint.agent && (
+                        <span className="font-medium text-amber-300">
+                          [{hint.agent}]
+                        </span>
+                      )}
+                      <span className="text-amber-400/90">{hint.text}</span>
+                    </>
+                  ) : (
+                    <span className="text-amber-400/80">running…</span>
+                  )}
+                </span>
+              ) : (
                 <>
-                  {hint.agent && (
-                    <span className="font-medium text-amber-300">
-                      [{hint.agent}]
+                  {terminal && (
+                    <span title={ELAPSED_TITLE} className="text-zinc-500">
+                      {fmtElapsed(t.created_at, t.updated_at)}{" "}
+                      <span className="text-zinc-600">elapsed*</span>
                     </span>
                   )}
-                  <span className="text-amber-400/90">{hint.text}</span>
+                  {usage && <UsageMetrics usage={usage} />}
+                  {!usage && usageLoading && (
+                    <span
+                      role="status"
+                      aria-label="Loading usage"
+                      className="flex items-center gap-1.5 text-zinc-600"
+                    >
+                      <Spinner size={12} /> usage…
+                    </span>
+                  )}
                 </>
-              ) : (
-                <span className="text-amber-400/80">running…</span>
               )}
-            </span>
-          ) : (
-            <>
-              {(t.state === "done" ||
-                t.state === "failed" ||
-                t.state === "cancelled") && (
-                <span title={ELAPSED_TITLE} className="text-zinc-500">
-                  {fmtElapsed(t.created_at, t.updated_at)}{" "}
-                  <span className="text-zinc-600">elapsed*</span>
-                </span>
-              )}
-              {usage && <UsageMetrics usage={usage} />}
-              {!usage && usageLoading && (
-                <span className="text-zinc-600">
-                  <Spinner /> usage…
-                </span>
-              )}
-            </>
-          )}
 
-          {t.result_summary && (
-            <span
-              className="max-w-[280px] truncate text-zinc-400"
-              title={t.result_summary}
-            >
-              {t.result_summary}
-            </span>
-          )}
+              <button
+                type="button"
+                aria-expanded={showDetails}
+                aria-label={
+                  showDetails ? "Collapse task details" : "Expand task details"
+                }
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowDetails((v) => !v);
+                }}
+                className="ml-auto inline-flex min-h-[28px] items-center rounded px-1.5 text-zinc-500 hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
+              >
+                {showDetails ? "less" : "more"}
+              </button>
+            </div>
 
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setShowDetails((v) => !v);
-            }}
-            className="ml-auto text-zinc-600 hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/50"
-          >
-            {showDetails ? "less" : "more"}
-          </button>
-        </div>
-
-        {/* Details drawer */}
-        {showDetails && (
-          <div className="ml-6 mt-2 space-y-1 rounded-lg bg-zinc-950/60 p-3 text-xs text-zinc-400">
-            <Detail label="ID">
-              <span className="font-mono text-zinc-500">{t.id}</span>
-            </Detail>
-            <Detail label="Created">
-              {new Date(t.created_at).toLocaleString()}
-            </Detail>
-            <Detail label="Updated">
-              {new Date(t.updated_at).toLocaleString()}
-            </Detail>
-            <Detail label="Elapsed">
-              <span title={ELAPSED_TITLE}>
-                {fmtElapsed(t.created_at, t.updated_at)}{" "}
-                <span className="text-zinc-600">(incl. queue wait)</span>
-              </span>
-            </Detail>
-            {t.level != null && <Detail label="Level">{t.level}</Detail>}
-            {t.branch && (
-              <Detail label="Branch">
-                <span className="font-mono">{t.branch}</span>
-              </Detail>
+            {/* result_summary: full-width, collapsible (no fixed px width). */}
+            {t.result_summary && (
+              <CollapsibleText
+                text={t.result_summary}
+                className="mt-1.5 text-xs text-zinc-400"
+              />
             )}
-            {usage && (
-              <Detail label="Tokens">
-                <UsageMetrics usage={usage} />
-              </Detail>
+
+            {/* Details drawer */}
+            {showDetails && (
+              <div className="mt-2 space-y-1 rounded-lg bg-zinc-950/60 p-3 text-xs text-zinc-400">
+                <Detail label="ID">
+                  <span className="font-mono break-all text-zinc-500">
+                    {t.id}
+                  </span>
+                </Detail>
+                <Detail label="Created">
+                  {new Date(t.created_at).toLocaleString()}
+                </Detail>
+                <Detail label="Updated">
+                  {new Date(t.updated_at).toLocaleString()}
+                </Detail>
+                <Detail label="Elapsed">
+                  <span title={ELAPSED_TITLE}>
+                    {fmtElapsed(t.created_at, t.updated_at)}{" "}
+                    <span className="text-zinc-600">(incl. queue wait)</span>
+                  </span>
+                </Detail>
+                {t.level != null && <Detail label="Level">{t.level}</Detail>}
+                {t.branch && (
+                  <Detail label="Branch">
+                    <span className="font-mono break-all">{t.branch}</span>
+                  </Detail>
+                )}
+                {usage && (
+                  <Detail label="Tokens">
+                    <UsageMetrics usage={usage} />
+                  </Detail>
+                )}
+                {t.request && t.request !== t.title && (
+                  <div className="mt-1">
+                    <CollapsibleText
+                      text={t.request}
+                      className="text-zinc-500"
+                    />
+                  </div>
+                )}
+              </div>
             )}
-            {t.request && t.request !== t.title && (
-              <div className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap text-zinc-500">
-                {t.request}
+
+            {/* Actions */}
+            {(t.state === "inbox" || t.state === "approved") && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {t.state === "inbox" && hasChildren && (
+                  <Button
+                    variant="primary"
+                    onClick={handleCascade}
+                    disabled={actioning}
+                  >
+                    {actioning ? (
+                      <span className="flex items-center gap-2">
+                        <Spinner size={14} /> Approving…
+                      </span>
+                    ) : (
+                      "Approve tree"
+                    )}
+                  </Button>
+                )}
+                {t.state === "inbox" && !hasChildren && (
+                  <Button
+                    variant="primary"
+                    onClick={handleApprove}
+                    disabled={actioning}
+                  >
+                    {actioning ? (
+                      <span className="flex items-center gap-2">
+                        <Spinner size={14} /> Approving…
+                      </span>
+                    ) : (
+                      "Approve"
+                    )}
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  onClick={handleCancel}
+                  disabled={actioning}
+                >
+                  Cancel
+                </Button>
               </div>
             )}
           </div>
-        )}
-
-        {/* Actions */}
-        {(t.state === "inbox" || t.state === "approved") && (
-          <div className="ml-6 mt-2 flex gap-2">
-            {t.state === "inbox" && hasChildren && (
-              <Button variant="primary" onClick={handleCascade}>
-                Approve tree
-              </Button>
-            )}
-            {t.state === "inbox" && !hasChildren && (
-              <Button variant="primary" onClick={handleApprove}>
-                Approve
-              </Button>
-            )}
-            <Button variant="ghost" onClick={handleCancel}>
-              Cancel
-            </Button>
-          </div>
-        )}
+        </div>
       </div>
 
       {/* Children */}
@@ -858,7 +1050,7 @@ function Detail({
   );
 }
 
-/** Aligned token readout: ↓in ↑out ⚡cached +cache-write · turns · agents. */
+/** Aligned token readout: in / out / cached / cache-write · turns · agents. */
 function UsageMetrics({
   usage,
 }: {
@@ -873,13 +1065,29 @@ function UsageMetrics({
 }) {
   return (
     <span className="inline-flex flex-wrap items-center gap-x-2.5 gap-y-0.5 tabular-nums text-zinc-500">
-      <span title="Input tokens">↓{fmtTokens(usage.input_tokens)}</span>
-      <span title="Output tokens">↑{fmtTokens(usage.output_tokens)}</span>
-      <span title="Cache-read tokens">⚡{fmtTokens(usage.cache_read_tokens)}</span>
-      <span title="Cache-write tokens">
-        +{fmtTokens(usage.cache_creation_tokens)}
+      <span title="Input tokens">
+        <span aria-hidden="true">↓</span>
+        <span className="sr-only">input </span>
+        {fmtTokens(usage.input_tokens)}
       </span>
-      <span className="text-zinc-600">·</span>
+      <span title="Output tokens">
+        <span aria-hidden="true">↑</span>
+        <span className="sr-only">output </span>
+        {fmtTokens(usage.output_tokens)}
+      </span>
+      <span title="Cache-read tokens">
+        <span aria-hidden="true">⚡</span>
+        <span className="sr-only">cache read </span>
+        {fmtTokens(usage.cache_read_tokens)}
+      </span>
+      <span title="Cache-write tokens">
+        <span aria-hidden="true">+</span>
+        <span className="sr-only">cache write </span>
+        {fmtTokens(usage.cache_creation_tokens)}
+      </span>
+      <span className="text-zinc-600" aria-hidden="true">
+        ·
+      </span>
       <span title="Total turns">{usage.total_turns}t</span>
       <span title="Agent invocations">{usage.agent_count}a</span>
     </span>

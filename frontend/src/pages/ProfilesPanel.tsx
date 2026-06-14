@@ -2,13 +2,18 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api, type ProfileBody } from "../api";
 import type { EngineProfile, ProfileTestResult } from "../types";
-import { Badge, Button } from "../ui";
+import { Badge, Button, Card, Spinner } from "../ui";
 
 // Local field style — a darker variant of the shared `input` (zinc-950 surface)
 // kept page-local so the form fields sit cleanly inside the zinc-900 card.
 const field =
   "w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none transition-colors placeholder:text-zinc-600 focus:border-indigo-500 focus-visible:ring-1 focus-visible:ring-indigo-500/40";
 const label = "block text-xs font-medium text-zinc-400 mb-1";
+// Section header inside the panel — divider for clearer hierarchy when this
+// page sits inside a long scrollable accordion section.
+const sectionHeader =
+  "flex items-center justify-between gap-2 border-b border-zinc-800 pb-2";
+const sectionTitle = "text-sm font-semibold uppercase tracking-wide text-zinc-300";
 
 const ARG_MODES: { value: string; label: string; hint: string }[] = [
   {
@@ -49,13 +54,8 @@ const MODE_COLOR: Record<string, string> = {
   env: "bg-violet-700",
 };
 
-function Spinner({ className = "" }: { className?: string }) {
-  return (
-    <span
-      className={`inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-zinc-600 border-t-zinc-200 ${className}`}
-      aria-hidden="true"
-    />
-  );
+function modeHint(mode: string): string {
+  return ARG_MODES.find((m) => m.value === mode)?.hint ?? "";
 }
 
 function fmtLatency(ms: number | null): string {
@@ -63,6 +63,7 @@ function fmtLatency(ms: number | null): string {
   return `${Math.round(ms)} ms`;
 }
 
+// Currency formatter kept local for now (per shared-primitive guidance).
 function fmtCost(usd: number | null): string {
   if (usd == null) return "—";
   if (usd === 0) return "$0";
@@ -79,7 +80,9 @@ export function ProfilesPanel() {
   const [editingId, setEditingId] = useState<string | null>(null);
 
   const [test, setTest] = useState<ProfileTestResult | null>(null);
+  const [testedName, setTestedName] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
+  const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [formError, setFormError] = useState("");
@@ -100,10 +103,18 @@ export function ProfilesPanel() {
     reload();
   }, [reload]);
 
+  // Auto-hide the "Saved" confirmation so it registers then clears cleanly.
+  useEffect(() => {
+    if (!saved) return;
+    const t = setTimeout(() => setSaved(false), 3000);
+    return () => clearTimeout(t);
+  }, [saved]);
+
   function set<K extends keyof ProfileBody>(key: K, value: ProfileBody[K]) {
     setForm((f) => ({ ...f, [key]: value }));
     // Identity-relevant edits invalidate a prior test result.
     setTest(null);
+    setTestedName(null);
     setSaved(false);
   }
   const str = (v: string) => (v.trim() === "" ? null : v.trim());
@@ -115,6 +126,8 @@ export function ProfilesPanel() {
     setForm({ ...EMPTY_PROFILE });
     setEditingId(null);
     setTest(null);
+    setTestedName(null);
+    setShowKey(false);
     setFormError("");
     setSaved(false);
   }
@@ -133,6 +146,8 @@ export function ProfilesPanel() {
     });
     setEditingId(p.id);
     setTest(null);
+    setTestedName(null);
+    setShowKey(false);
     setFormError("");
     setSaved(false);
   }
@@ -148,6 +163,8 @@ export function ProfilesPanel() {
       setForm({ ...EMPTY_PROFILE });
       setEditingId(null);
       setTest(null);
+      setTestedName(null);
+      setShowKey(false);
       setSaved(true);
     } catch (e) {
       setFormError(String(e));
@@ -158,13 +175,16 @@ export function ProfilesPanel() {
 
   async function runTest() {
     if (!form.name.trim()) return;
+    const snapshotName = form.name.trim();
     setFormError("");
     setTest(null);
+    setTestedName(snapshotName);
     setTesting(true);
     try {
       setTest(await api.testProfile(form));
     } catch (e) {
       setFormError(String(e));
+      setTestedName(null);
     } finally {
       setTesting(false);
     }
@@ -192,21 +212,19 @@ export function ProfilesPanel() {
   );
 
   return (
-    <div className="grid grid-cols-2 gap-4">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
       {/* ---------------------------------------------------------------- */}
-      {/* Left: add / edit form                                            */}
+      {/* Add / edit form                                                  */}
       {/* ---------------------------------------------------------------- */}
       <form
-        className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900 p-4"
+        className="min-w-0 space-y-4 rounded-xl border border-zinc-800 bg-zinc-900 p-4"
         onSubmit={(e) => {
           e.preventDefault();
           save();
         }}
       >
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold uppercase tracking-wide text-zinc-300">
-            {editingId ? "Edit profile" : "New profile"}
-          </h3>
+        <div className={sectionHeader}>
+          <h3 className={sectionTitle}>{editingId ? "Edit profile" : "New profile"}</h3>
           {editingId && (
             <Button variant="ghost" onClick={startNew} title="Discard edits and start a new profile">
               New profile
@@ -215,9 +233,9 @@ export function ProfilesPanel() {
         </div>
 
         {editingId && (
-          <div className="flex items-center gap-2 rounded-lg border border-indigo-900/60 bg-indigo-950/40 px-3 py-2 text-xs text-indigo-300">
-            <span>Editing</span>
-            <span className="font-mono font-medium text-indigo-200">{editingName}</span>
+          <div className="flex min-w-0 items-center gap-2 rounded-lg border border-indigo-900/60 bg-indigo-950/40 px-3 py-2 text-xs text-indigo-300">
+            <span className="shrink-0">Editing</span>
+            <span className="truncate font-mono font-medium text-indigo-200">{editingName}</span>
           </div>
         )}
 
@@ -253,9 +271,7 @@ export function ProfilesPanel() {
               </option>
             ))}
           </select>
-          <p className="mt-1 text-xs text-zinc-500">
-            {ARG_MODES.find((m) => m.value === form.arg_mode)?.hint}
-          </p>
+          <p className="mt-1 text-xs text-zinc-500">{modeHint(form.arg_mode)}</p>
         </div>
 
         {/* Routing fields — only meaningful for flag / env */}
@@ -293,7 +309,7 @@ export function ProfilesPanel() {
               />
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label className={label} htmlFor="profile-subagent">
                   Subagent model
@@ -331,21 +347,32 @@ export function ProfilesPanel() {
                 <label className={label} htmlFor="profile-key">
                   API key
                 </label>
-                <input
-                  id="profile-key"
-                  className={field}
-                  type="password"
-                  placeholder={editingId ? "leave blank to keep existing" : "stored as a secret"}
-                  value={form.auth_token ?? ""}
-                  onChange={(e) => set("auth_token", str(e.target.value))}
-                />
+                <div className="relative">
+                  <input
+                    id="profile-key"
+                    className={`${field} pr-16`}
+                    type={showKey ? "text" : "password"}
+                    placeholder={editingId ? "leave blank to keep existing" : "stored as a secret"}
+                    value={form.auth_token ?? ""}
+                    onChange={(e) => set("auth_token", str(e.target.value))}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowKey((s) => !s)}
+                    aria-pressed={showKey}
+                    title={showKey ? "Hide API key" : "Show API key"}
+                    className="absolute inset-y-0 right-0 flex items-center px-3 text-xs font-medium text-zinc-400 transition-colors hover:text-zinc-200 focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none"
+                  >
+                    {showKey ? "Hide" : "Show"}
+                  </button>
+                </div>
               </div>
             )}
           </div>
         )}
 
         {/* Actions */}
-        <div className="flex items-center gap-2 pt-1">
+        <div className="flex flex-wrap items-center gap-2 pt-1">
           <Button
             type="submit"
             variant="primary"
@@ -361,19 +388,24 @@ export function ProfilesPanel() {
           >
             {testing ? (
               <span className="flex items-center gap-2">
-                <Spinner /> Testing…
+                <Spinner size={14} /> Testing…
               </span>
             ) : (
               "Test"
             )}
           </Button>
           {saved && !busy && (
-            <span className="text-sm font-medium text-emerald-400">Saved ✓</span>
+            <span className="text-sm font-medium text-emerald-400" role="status">
+              Saved ✓
+            </span>
           )}
         </div>
 
         {formError && (
-          <div className="rounded-lg border border-rose-900/60 bg-rose-950/50 px-3 py-2 text-sm text-rose-300">
+          <div
+            role="alert"
+            className="rounded-lg border border-rose-900/60 bg-rose-950/50 px-3 py-2 text-sm break-words text-rose-300"
+          >
             {formError}
           </div>
         )}
@@ -381,50 +413,52 @@ export function ProfilesPanel() {
         {/* Test result panel */}
         {testing && !test && (
           <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-3 text-sm text-zinc-400">
-            <Spinner /> Running test…
+            <Spinner size={14} /> Testing {testedName ?? "profile"}…
           </div>
         )}
-        {test && <TestResult result={test} />}
+        {test && <TestResult result={test} name={testedName} />}
       </form>
 
       {/* ---------------------------------------------------------------- */}
-      {/* Right: profile list                                              */}
+      {/* Profile list                                                     */}
       {/* ---------------------------------------------------------------- */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold uppercase tracking-wide text-zinc-300">
-            Profiles
-          </h3>
+      <div className="min-w-0 space-y-3">
+        <div className={sectionHeader}>
+          <h3 className={sectionTitle}>Profiles</h3>
           {!loading && profiles.length > 0 && (
-            <span className="text-xs text-zinc-500">{profiles.length}</span>
+            <span className="text-xs tabular-nums text-zinc-500">{profiles.length}</span>
           )}
         </div>
 
         {loading ? (
-          <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-8 text-sm text-zinc-500">
-            <Spinner /> Loading profiles…
-          </div>
+          <Card className="flex items-center justify-center gap-2 py-8 text-sm text-zinc-500">
+            <Spinner size={14} /> Loading profiles…
+          </Card>
         ) : listError ? (
-          <div className="rounded-xl border border-rose-900/60 bg-rose-950/50 px-4 py-3 text-sm text-rose-300">
+          <div
+            role="alert"
+            className="rounded-xl border border-rose-900/60 bg-rose-950/50 px-4 py-3 text-sm break-words text-rose-300"
+          >
             {listError}
           </div>
         ) : profiles.length === 0 ? (
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-10 text-center text-sm text-zinc-500">
-            No profiles yet. Create one on the left.
-          </div>
+          <Card className="py-10 text-center text-sm text-zinc-500">
+            No profiles yet — use the form to create one.
+          </Card>
         ) : (
-          <div className="space-y-2">
+          <ul role="list" aria-label="Engine profiles" className="space-y-2">
             {profiles.map((p) => (
-              <ProfileCard
-                key={p.id}
-                profile={p}
-                active={editingId === p.id}
-                deleting={deletingId === p.id}
-                onEdit={() => startEdit(p)}
-                onDelete={() => remove(p)}
-              />
+              <li key={p.id}>
+                <ProfileCard
+                  profile={p}
+                  active={editingId === p.id}
+                  deleting={deletingId === p.id}
+                  onEdit={() => startEdit(p)}
+                  onDelete={() => remove(p)}
+                />
+              </li>
             ))}
-          </div>
+          </ul>
         )}
       </div>
     </div>
@@ -447,11 +481,24 @@ function ProfileCard({
   onDelete: () => void;
 }) {
   const isDefault = p.name === "system-default";
+  const [confirming, setConfirming] = useState(false);
+
+  // Reset the confirm prompt if the user clicks away (focus leaves the card).
+  function handleDelete() {
+    if (confirming) {
+      setConfirming(false);
+      onDelete();
+    } else {
+      setConfirming(true);
+    }
+  }
 
   return (
-    <div
-      className={`rounded-xl border bg-zinc-900 p-4 transition-colors ${
-        active ? "border-indigo-500/70 ring-1 ring-indigo-500/30" : "border-zinc-800 hover:bg-zinc-800/40"
+    <Card
+      className={`overflow-hidden p-4 transition-colors ${
+        active
+          ? "border-indigo-500/70 ring-1 ring-indigo-500/30"
+          : "hover:bg-zinc-800/40"
       }`}
     >
       <div className="flex items-center justify-between gap-2">
@@ -461,20 +508,22 @@ function ProfileCard({
           </span>
           {isDefault && <Badge text="default" color="bg-indigo-600" />}
         </div>
-        <Badge text={p.arg_mode} color={MODE_COLOR[p.arg_mode] ?? "bg-zinc-700"} />
+        <span className="shrink-0" title={`${p.arg_mode}: ${modeHint(p.arg_mode)}`}>
+          <Badge text={p.arg_mode} color={MODE_COLOR[p.arg_mode] ?? "bg-zinc-700"} />
+        </span>
       </div>
 
       {/* Meta grid */}
       <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         <dt className="text-zinc-500">model</dt>
-        <dd className="truncate text-zinc-300" title={p.model ?? undefined}>
+        <dd className="min-w-0 truncate text-zinc-300" title={p.model ?? undefined}>
           {p.model ?? "—"}
         </dd>
 
         {p.subagent_model && (
           <>
             <dt className="text-zinc-500">subagent</dt>
-            <dd className="truncate text-zinc-300" title={p.subagent_model}>
+            <dd className="min-w-0 truncate text-zinc-300" title={p.subagent_model}>
               {p.subagent_model}
             </dd>
           </>
@@ -486,7 +535,7 @@ function ProfileCard({
         {p.base_url && (
           <>
             <dt className="text-zinc-500">base_url</dt>
-            <dd className="truncate font-mono text-zinc-400" title={p.base_url}>
+            <dd className="min-w-0 truncate font-mono text-zinc-400" title={p.base_url}>
               {p.base_url}
             </dd>
           </>
@@ -495,36 +544,53 @@ function ProfileCard({
         {p.auth_secret_id && (
           <>
             <dt className="text-zinc-500">auth</dt>
-            <dd className="text-emerald-400">key set</dd>
+            <dd className="text-emerald-400" title="API key stored as an encrypted secret">
+              key set
+            </dd>
           </>
         )}
       </dl>
 
-      <div className="mt-3 flex gap-2">
-        <Button variant="ghost" onClick={onEdit} title={`Edit ${p.name}`}>
-          Edit
-        </Button>
-        {!isDefault && (
-          <Button
-            variant="danger"
-            onClick={onDelete}
-            disabled={deleting}
-            title={`Delete ${p.name}`}
-          >
-            {deleting ? "Deleting…" : "Delete"}
+      {/* Actions — wrappers enforce a ≥44px touch target on mobile. */}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <div className="flex min-h-[44px] items-center sm:min-h-0">
+          <Button variant="ghost" onClick={onEdit} title={`Edit ${p.name}`}>
+            Edit
           </Button>
+        </div>
+        {!isDefault && (
+          <div
+            className="flex min-h-[44px] items-center sm:min-h-0"
+            onMouseLeave={() => setConfirming(false)}
+          >
+            <Button
+              variant="danger"
+              onClick={handleDelete}
+              disabled={deleting}
+              title={confirming ? `Confirm deletion of ${p.name}` : `Delete ${p.name}`}
+            >
+              {deleting ? "Deleting…" : confirming ? "Confirm delete?" : "Delete"}
+            </Button>
+            {confirming && !deleting && (
+              <Button variant="ghost" onClick={() => setConfirming(false)} title="Cancel">
+                Cancel
+              </Button>
+            )}
+          </div>
         )}
       </div>
-    </div>
+    </Card>
   );
 }
 
 // --- Test result panel ------------------------------------------------------
 
-function TestResult({ result }: { result: ProfileTestResult }) {
+function TestResult({ result, name }: { result: ProfileTestResult; name: string | null }) {
   const ok = result.ok;
+  const heading = `${ok ? "Test passed" : "Test failed"}${name ? ` — ${name}` : ""}`;
   return (
     <div
+      role="status"
       className={`rounded-lg border p-3 text-sm ${
         ok
           ? "border-emerald-900/60 bg-emerald-950/40 text-emerald-200"
@@ -532,15 +598,15 @@ function TestResult({ result }: { result: ProfileTestResult }) {
       }`}
     >
       <div className="flex items-center gap-2 font-semibold">
-        <span className={ok ? "text-emerald-400" : "text-rose-400"}>
+        <span aria-hidden="true" className={ok ? "text-emerald-400" : "text-rose-400"}>
           {ok ? "✓" : "✗"}
         </span>
-        <span>{ok ? "Test passed" : "Test failed"}</span>
+        <span>{heading}</span>
       </div>
 
       <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         <dt className="text-zinc-400">model</dt>
-        <dd className="truncate text-zinc-200" title={result.model_reported ?? undefined}>
+        <dd className="min-w-0 truncate text-zinc-200" title={result.model_reported ?? undefined}>
           {result.model_reported ?? "—"}
         </dd>
         <dt className="text-zinc-400">latency</dt>
