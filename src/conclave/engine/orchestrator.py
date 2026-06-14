@@ -260,6 +260,11 @@ class Orchestrator:
         # path as a placeholder (tasks 5/7/9 specialize them).
         if level == 0:
             return ""
+        # L3: three-agent sequential planning (PM → Architect-as-Planner → Planner),
+        # each stage flag-gated by l3_settings. Intermediate None → skip-and-continue;
+        # final planner None → degrade to L1-style empty preamble.
+        if level == 3:
+            return await self._run_l3(runner, task, worktree, knowledge, rules, config)
         prompt = (
             f"{task.request}{baseline_preamble}\n\n"
             "Produce a structured plan per your system prompt."
@@ -326,6 +331,93 @@ class Orchestrator:
         except (json.JSONDecodeError, ValueError):
             return None
         return parsed
+
+    async def _run_l3(
+        self,
+        runner: AgentRunner,
+        task: Task,
+        worktree: Path,
+        knowledge: str,
+        rules: str,
+        config: ConclaveConfig,
+    ) -> str:
+        """Three-agent sequential (BMad L3) planning: PM → Architect-as-Planner → Planner.
+
+        Each stage is flag-gated by :class:`~conclave.config.models.L3Settings`.
+        Intermediate ``None`` results are **skipped**; a ``None`` from the final
+        planner stage degrades to an **empty preamble** (L1 degradation, never a
+        task failure). Collected sections are assembled into a combined plan dict
+        and a labeled preamble, both persisted and emitted.
+        """
+        l3 = config.planning.l3_settings
+        sections: list[tuple[str, str, bool]] = [
+            ("pm", "PRD-lite", l3.produce_prd),
+            ("architect-as-planner", "Architecture Note", l3.produce_arch_note),
+            ("planner", "Story/Plan", l3.decompose_into_stories),
+        ]
+        collected: list[tuple[str, dict[str, Any]]] = []
+        prior_snippets: list[str] = []
+
+        for agent, label, enabled in sections:
+            if not enabled:
+                continue
+
+            prompt = task.request
+            if prior_snippets:
+                prompt += "\n\nPrior planning artifacts:\n" + "\n\n".join(prior_snippets)
+            # The planner stage is the final, story/plan-producing dispatch — keep the
+            # shared "Produce a structured plan" phrase so the FakeProvider (and any
+            # routing layer keyed on it) can identify the persona.
+            if agent == "planner":
+                prompt += "\n\nProduce a structured plan (story/plan JSON) per your system prompt."
+            else:
+                prompt += "\n\nProduce a " + label.lower() + " section per your system prompt."
+
+            plan = await self._dispatch_plan(
+                runner, agent, prompt, task, worktree, knowledge, rules
+            )
+            if plan is None:
+                # Intermediate stages (pm, architect-as-planner): skip-and-continue,
+                # omitting that section. Final story/plan stage (planner): fall back
+                # to an L1-style empty preamble without raising.
+                if agent == "planner":
+                    return ""
+                continue
+
+            collected.append((label, plan))
+            prior_snippets.append(
+                f"[{label}]\n```json\n{json.dumps(plan, indent=2)}\n```"
+            )
+
+        if not collected:
+            return ""
+
+        # Assemble combined plan dict with stable section keys.
+        key_map = {
+            "PRD-lite": "prd_lite",
+            "Architecture Note": "architecture_note",
+            "Story/Plan": "story_plan",
+        }
+        combined: dict[str, Any] = {}
+        for label_, data in collected:
+            combined[key_map[label_]] = data
+
+        await repo.update_task_fields(self._db, task.id, plan=combined)
+        await self._bus.emit(
+            type=EventType.plan_artifact,
+            project_id=task.project_id,
+            task_id=task.id,
+            payload={"plan": combined},
+        )
+
+        # Build labeled preamble so the developer sees every enabled section.
+        parts = ["\n\n=== L3 PLAN (Scale-Adaptive) ===\n"]
+        for label_, data in collected:
+            parts.append(
+                f"\n--- {label_} ---\n```json\n{json.dumps(data, indent=2)}\n```\n"
+            )
+        parts.append("=== END L3 PLAN ===\n")
+        return "".join(parts)
 
     async def _review(
         self,

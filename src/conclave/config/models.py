@@ -187,6 +187,33 @@ class L2Settings(BaseModel):
     )
 
 
+class L3Settings(BaseModel):
+    """Stage gates for the three-agent sequential (BMad L3) planning path.
+
+    When a task classifies to level 3, each flag controls whether that stage's
+    planning persona is dispatched. The stages run in strict order — PM →
+    Architect-as-Planner → Planner — and prior-section artifacts are passed into
+    the planner's prompt. An intermediate None is skipped; a final (planner) None
+    degrades to an L1-style empty preamble. See
+    :meth:`conclave.engine.orchestrator.Orchestrator._run_l3`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    produce_prd: bool = Field(
+        default=True,
+        description="Dispatch 'pm' persona for a PRD-lite section.",
+    )
+    produce_arch_note: bool = Field(
+        default=True,
+        description="Dispatch 'architect-as-planner' persona for an architecture note.",
+    )
+    decompose_into_stories: bool = Field(
+        default=True,
+        description="Dispatch 'planner' persona for concrete story/plan JSON (final stage).",
+    )
+
+
 class PlanningSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -223,6 +250,10 @@ class PlanningSettings(BaseModel):
     l2_settings: L2Settings = Field(
         default_factory=L2Settings,
         description="Field gates for the enhanced one-shot (BMad L2) planning path.",
+    )
+    l3_settings: L3Settings = Field(
+        default_factory=L3Settings,
+        description="Stage gates for the three-agent sequential (BMad L3) planning path.",
     )
 
 

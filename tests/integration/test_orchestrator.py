@@ -25,6 +25,18 @@ async def _init_repo(path: Path) -> None:
     await run_git(path, "commit", "-m", "initial commit")
 
 
+async def _seed_l3_personas(db: Database) -> None:
+    """Seed PM and Architect-as-Planner personas so AgentRunner injects their
+    ``# Product Manager Agent`` / ``# Architect-as-Planner Agent`` headers into
+    assembled prompts, which the FakeProvider keys on."""
+    from conclave.agents import DEFAULT_PERSONAS
+
+    for name in ("pm", "architect-as-planner"):
+        role, text = DEFAULT_PERSONAS[name]
+        if await repo.get_agent(db, name) is None:
+            await repo.upsert_agent(db, name=name, role=role.value, persona_md=text)
+
+
 async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)
@@ -140,10 +152,11 @@ async def test_trivial_request_classifies_l0_and_skips_planner(
 async def test_long_request_classifies_l3_and_runs_planner(
     db: Database, tmp_path: Path
 ) -> None:
-    # A ~500-char request (use_planner unset) classifies to L3; under the placeholder
-    # routing L2/3/4 reuse the L1 one-shot planner, so the plan is produced and persisted.
+    # A ~500-char request (use_planner unset) classifies to L3; the three-agent sequential
+    # L3 path (PM → Architect-as-Planner → Planner) runs with all l3_settings flags on.
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)
+    await _seed_l3_personas(db)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
         config={"execution": {"target_branch": "main"}},
@@ -164,10 +177,25 @@ async def test_long_request_classifies_l3_and_runs_planner(
     done = await repo.get_task(db, task.id)
     assert done is not None
     assert done.level == 3
-    assert done.plan == {"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}
+    # L3 combined plan: three sections keyed by stage.
+    assert done.plan == {
+        "prd_lite": {
+            "approach": "product-manager: define MVP scope", "files_to_touch": ["PRD.md"]
+        },
+        "architecture_note": {
+            "approach": "architect: design system components",
+            "files_to_touch": ["ARCHITECTURE.md"],
+        },
+        "story_plan": {
+            "approach": "create the file", "files_to_touch": ["FEATURE.txt"]
+        },
+    }
 
-    # the PLAN preamble reached a downstream (developer) prompt
-    assert any("=== PLAN (from the Planner" in p for p in provider.prompts)
+    # the L3 PLAN preamble reached a downstream (developer) prompt
+    assert any("=== L3 PLAN (Scale-Adaptive)" in p for p in provider.prompts)
+    assert any("PRD-lite" in p for p in provider.prompts)
+    assert any("Architecture Note" in p for p in provider.prompts)
+    assert any("Story/Plan" in p for p in provider.prompts)
 
     level_events = [
         e for e in await repo.list_events(db, task_id=task.id)
@@ -479,3 +507,176 @@ async def test_malformed_decompose_returns_no_json() -> None:
     assert "child_tasks" not in result.text
     # The text should be the raw degradation message.
     assert "No decomposition produced." in result.text
+
+
+# ---------------------------------------------------------------------------
+# Scale-adaptive planning L3 integration tests
+# ---------------------------------------------------------------------------
+
+# L3 band filler: 500 chars, clear of FakeProvider marker substrings.
+_L3_REQUEST = "x" * 500
+
+
+async def test_l3_sequential_dispatch_order(db: Database, tmp_path: Path) -> None:
+    """Acceptance criterion (a): for a level-3 task the three planning agents are
+    dispatched IN ORDER — PM → Architect-as-Planner → Planner — asserted via
+    prompts.index() using each persona's distinct header."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await _seed_l3_personas(db)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    await repo.create_task(
+        db, project_id=project.id, request=_L3_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    prompts = provider.prompts
+    pm_idx = next(
+        i for i, p in enumerate(prompts) if "# Product Manager Agent" in p
+    )
+    arch_idx = next(
+        i for i, p in enumerate(prompts) if "# Architect-as-Planner Agent" in p
+    )
+    plan_idx = next(
+        i for i, p in enumerate(prompts) if "Produce a structured plan" in p
+    )
+    assert (
+        pm_idx < arch_idx < plan_idx
+    ), f"Expected PM({pm_idx}) < Arch({arch_idx}) < Planner({plan_idx})"
+
+
+async def test_l3_preamble_contains_all_enabled_sections(
+    db: Database, tmp_path: Path
+) -> None:
+    """Acceptance criterion (b): the assembled developer preamble contains all
+    enabled section labels (PRD-lite, Architecture Note, Story/Plan) when all
+    l3_settings flags are on."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await _seed_l3_personas(db)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    await repo.create_task(
+        db, project_id=project.id, request=_L3_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # The developer prompt (and only it) carries the L3 preamble with all sections.
+    dev_prompts = [
+        p for p in provider.prompts if "=== L3 PLAN (Scale-Adaptive)" in p
+    ]
+    assert dev_prompts, "expected a developer prompt carrying the L3 preamble"
+    dev = dev_prompts[0]
+    assert "--- PRD-lite ---" in dev
+    assert "--- Architecture Note ---" in dev
+    assert "--- Story/Plan ---" in dev
+
+
+async def test_l3_flag_toggle_removes_stage(db: Database, tmp_path: Path) -> None:
+    """Acceptance criterion (c): toggling produce_arch_note off removes exactly
+    that stage — no Architect header in prompts, and the preamble lacks the
+    Architecture Note section."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await _seed_l3_personas(db)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main"},
+            "planning": {"l3_settings": {"produce_arch_note": False}},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L3_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # Architect persona header never appeared in any prompt.
+    assert not any(
+        "# Architect-as-Planner Agent" in p for p in provider.prompts
+    ), "Architect-as-Planner was dispatched despite produce_arch_note=False"
+
+    # PM and Planner WERE dispatched.
+    assert any(
+        "# Product Manager Agent" in p for p in provider.prompts
+    ), "PM was not dispatched"
+    assert any(
+        "Produce a structured plan" in p for p in provider.prompts
+    ), "Planner was not dispatched"
+
+    # The developer preamble contains PRD-lite and Story/Plan but NOT Architecture Note.
+    dev_prompts = [
+        p for p in provider.prompts if "=== L3 PLAN (Scale-Adaptive)" in p
+    ]
+    assert dev_prompts, "expected a developer prompt carrying the L3 preamble"
+    dev = dev_prompts[0]
+    assert "--- PRD-lite ---" in dev
+    assert "--- Story/Plan ---" in dev
+    assert "--- Architecture Note ---" not in dev
+
+    # Combined plan lacks the architecture_note key.
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.plan is not None
+    assert "prd_lite" in done.plan
+    assert "story_plan" in done.plan
+    assert "architecture_note" not in done.plan
+
+
+async def test_l3_final_stage_none_degradation(
+    db: Database, tmp_path: Path
+) -> None:
+    """Acceptance criterion (d): when the final planner stage returns None
+    (plan_malformed=True), the path degrades to an L1-style empty preamble
+    without raising — no plan persisted, no plan.artifact event, no '=== PLAN'
+    in any developer prompt."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await _seed_l3_personas(db)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request=_L3_REQUEST, state=TaskState.approved
+    )
+    provider = FakeProvider(plan_malformed=True)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    # The run still succeeds — L3 degradation is never a task failure.
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None
+    assert done.level == 3
+    # No plan persisted (L1 degradation path).
+    assert done.plan is None
+
+    # No plan.artifact event was emitted.
+    types = {e.type for e in await repo.list_events(db, task_id=task.id)}
+    assert "plan.artifact" not in types
+
+    # No '=== PLAN' block in any prompt (empty preamble).
+    assert not any("=== PLAN" in p for p in provider.prompts)
