@@ -123,6 +123,67 @@ async def test_claim_never_reclaims_terminal_tasks(db: Database) -> None:
     assert claimed.id == ok.id  # not the failed-parent child
     assert child.id != claimed.id
 
+    # A cancelled parent gates its child just like a failed one — cancelled is terminal but not
+    # success, so it never becomes 'done'. With 'ok' now in_progress, the failed-parent child and
+    # this cancelled-parent child are the only approved tasks left, and neither is claimable.
+    cancelled_parent = await repo.create_task(
+        db, project_id=p.id, request="cancelled-parent", state=TaskState.approved
+    )
+    await repo.set_task_state(db, cancelled_parent.id, TaskState.cancelled)
+    await repo.create_task(
+        db,
+        project_id=p.id,
+        request="cancelled-child",
+        state=TaskState.approved,
+        parent_task_id=cancelled_parent.id,
+    )
+    assert await repo.claim_next_approved(db, p.id) is None
+
+
+async def test_claim_enforces_parent_done_dependency(db: Database) -> None:
+    """Dependency ordering: a child is claimable only once its parent reaches 'done'.
+
+    This closes the gap the old failed/blocked-only predicate left open — a not-yet-'done'
+    parent (here in_progress) used to let its child run out of order. The child is created
+    BEFORE a parentless sibling so that, if FIFO alone decided, the older child would win;
+    instead the sibling is claimed while the parent is mid-flight, and the child is released
+    only once the parent is 'done'.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    parent = await repo.create_task(db, project_id=p.id, request="parent", state=TaskState.approved)
+
+    # Parent (oldest, parentless) is claimed first and is now in_progress — claimed, not done.
+    claimed_parent = await repo.claim_next_approved(db, p.id)
+    assert claimed_parent is not None
+    assert claimed_parent.id == parent.id
+    assert claimed_parent.state is TaskState.in_progress
+
+    # Child is the OLDEST remaining approved task; a younger parentless sibling follows it.
+    child = await repo.create_task(
+        db, project_id=p.id, request="child", state=TaskState.approved, parent_task_id=parent.id
+    )
+    sibling = await repo.create_task(
+        db, project_id=p.id, request="sibling", state=TaskState.approved
+    )
+
+    # Dependency ordering beats FIFO: the parent is still in_progress (not 'done'), so the older
+    # child is skipped and the younger parentless sibling is claimed instead.
+    nxt = await repo.claim_next_approved(db, p.id)
+    assert nxt is not None
+    assert nxt.id == sibling.id
+    assert nxt.id != child.id
+
+    # Sibling is now in_progress too; the child is the only approved task left but stays
+    # unclaimable while the parent is not done → claim returns None.
+    assert await repo.claim_next_approved(db, p.id) is None
+
+    # Parent reaches terminal success → the previously-skipped child is finally claimable.
+    await repo.set_task_state(db, parent.id, TaskState.done)
+    claimed_child = await repo.claim_next_approved(db, p.id)
+    assert claimed_child is not None
+    assert claimed_child.id == child.id
+    assert claimed_child.state is TaskState.in_progress
+
 
 async def test_events_stream_after_id(db: Database) -> None:
     p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")

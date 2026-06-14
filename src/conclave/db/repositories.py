@@ -186,9 +186,15 @@ async def update_task_fields(
 
 
 async def claim_next_approved(db: Database, project_id: str) -> Task | None:
-    """Atomically pick the oldest ``approved`` task and mark it ``in_progress``.
+    """Atomically pick the oldest claimable ``approved`` task and mark it ``in_progress``.
 
-    Skips tasks whose parent is failed or blocked, and tasks that are themselves blocked.
+    Claimability model: a task is claimable iff it has no parent OR its parent has completed
+    successfully (``state = 'done'``). Every other parent state keeps the child unclaimable —
+    both not-yet-terminal (inbox/approved/in_progress), so a subtask can never run before its
+    parent finishes, and terminal-non-success (failed/blocked/cancelled), so a doomed subtree
+    is never executed. The ``parent_task_id IS NULL`` branch is load-bearing: when no 'done'
+    rows exist the inner subquery is empty and ``IN (<empty>)`` is false, which would otherwise
+    stop parentless tasks from ever being claimed.
     """
     # Still a single atomic UPDATE...RETURNING — the write lock only serializes its commit
     # against other writers so it cannot flush an open transaction() on the shared connection.
@@ -199,8 +205,8 @@ async def claim_next_approved(db: Database, project_id: str) -> Task | None:
             "  SELECT t.id FROM tasks t "
             "  WHERE t.project_id = ? AND t.state = 'approved' "
             "  AND ("
-            "    t.parent_task_id IS NULL OR t.parent_task_id NOT IN ("
-            "      SELECT id FROM tasks WHERE state IN ('failed', 'blocked')"
+            "    t.parent_task_id IS NULL OR t.parent_task_id IN ("
+            "      SELECT id FROM tasks WHERE state = 'done'"
             "    )"
             "  )"
             "  ORDER BY t.created_at LIMIT 1"
