@@ -78,6 +78,10 @@ function summarize(ev: EventRow): string {
       return `done (merged=${String(p.merged)})`;
     case "agent.result":
       return `ok=${String(p.ok)} model=${String(p.model_reported ?? "?")}`;
+    case "plan.level_selected":
+      return `level=${String(p.level)}`;
+    case "plan.artifact":
+      return `plan artifact (${Object.keys(p).length} keys)`;
     default:
       return Object.keys(p).length ? JSON.stringify(p).slice(0, 140) : "";
   }
@@ -155,7 +159,10 @@ export function TasksPanel({ projectId }: { projectId: string }) {
               onClick={() => setSelected(t.id)}
             >
               <div className="flex items-center justify-between gap-2">
-                <Badge text={t.state} color={STATE_COLORS[t.state]} />
+                <div className="flex items-center gap-1.5">
+                  <Badge text={t.state} color={STATE_COLORS[t.state]} />
+                  {t.level != null && <Badge text={`L${t.level}`} color="bg-violet-600" />}
+                </div>
                 <span className="font-mono text-xs text-zinc-500">{t.id.slice(0, 8)}</span>
               </div>
               <div className="mt-1 line-clamp-2 text-sm text-zinc-200">{t.title || t.request}</div>
