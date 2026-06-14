@@ -72,18 +72,36 @@ class ClaudeCliProvider:
         async def drive() -> str:
             assert proc.stdin is not None
             assert proc.stdout is not None
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
+            # Capture narrowed types so mypy sees them inside the inner coroutines.
+            stdin = proc.stdin
+            stdout = proc.stdout
+
+            # Shared mutable list — safe in CPython asyncio since only one coroutine
+            # runs at a time (no true parallelism); await gather() joins before we
+            # read it below.
             parts: list[str] = []
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", errors="replace")
-                parts.append(text)
-                if on_chunk is not None:
-                    await on_chunk(text)
+
+            async def _write_stdin() -> None:
+                """Drain the prompt into stdin and close it to signal EOF."""
+                stdin.write(prompt.encode("utf-8"))
+                await stdin.drain()
+                stdin.close()
+
+            async def _read_stdout() -> None:
+                """Consume all stdout chunks, appending to parts and streaming on_chunk."""
+                while True:
+                    chunk = await stdout.read(4096)
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", errors="replace")
+                    parts.append(text)
+                    if on_chunk is not None:
+                        await on_chunk(text)
+
+            # Run stdin-writing and stdout-reading concurrently so a chatty child
+            # that emits a large volume of stdout while stdin is still being
+            # written cannot fill the OS pipe buffer and deadlock.
+            await asyncio.gather(_write_stdin(), _read_stdout())
             await proc.wait()
             return "".join(parts)
 
