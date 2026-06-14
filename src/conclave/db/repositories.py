@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import aiosqlite
+
 from ..util import new_id, now_iso
 from .database import Database
 from .models import (
@@ -188,57 +190,100 @@ async def claim_next_approved(db: Database, project_id: str) -> Task | None:
 
     Skips tasks whose parent is failed or blocked, and tasks that are themselves blocked.
     """
-    cur = await db.conn.execute(
-        "UPDATE tasks SET state = 'in_progress', updated_at = ? "
-        "WHERE id = ("
-        "  SELECT t.id FROM tasks t "
-        "  WHERE t.project_id = ? AND t.state = 'approved' "
-        "  AND ("
-        "    t.parent_task_id IS NULL OR t.parent_task_id NOT IN ("
-        "      SELECT id FROM tasks WHERE state IN ('failed', 'blocked')"
-        "    )"
-        "  )"
-        "  ORDER BY t.created_at LIMIT 1"
-        ") RETURNING *",
-        (now_iso(), project_id),
-    )
-    row = await cur.fetchone()
-    await db.conn.commit()
+    # Still a single atomic UPDATE...RETURNING — the write lock only serializes its commit
+    # against other writers so it cannot flush an open transaction() on the shared connection.
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE tasks SET state = 'in_progress', updated_at = ? "
+            "WHERE id = ("
+            "  SELECT t.id FROM tasks t "
+            "  WHERE t.project_id = ? AND t.state = 'approved' "
+            "  AND ("
+            "    t.parent_task_id IS NULL OR t.parent_task_id NOT IN ("
+            "      SELECT id FROM tasks WHERE state IN ('failed', 'blocked')"
+            "    )"
+            "  )"
+            "  ORDER BY t.created_at LIMIT 1"
+            ") RETURNING *",
+            (now_iso(), project_id),
+        )
+        row = await cur.fetchone()
     return Task.from_row(row) if row else None
 
 
 async def block_descendants(db: Database, task_id: str) -> int:
-    """Recursively mark all descendant tasks as blocked. Returns count of blocked tasks."""
+    """Recursively mark all descendant tasks as blocked. Returns count of blocked tasks.
+
+    The whole BFS runs in one transaction so a crash mid-walk can never leave the subtree
+    half-blocked (some children blocked, others still claimable).
+    """
+    async with db.transaction() as conn:
+        return await _block_descendants(conn, task_id)
+
+
+async def finalize_task(
+    db: Database,
+    task_id: str,
+    *,
+    state: TaskState,
+    result_summary: str,
+    block_children: bool = False,
+) -> int:
+    """Atomically set a task's terminal ``state`` + ``result_summary`` (one UPDATE) and,
+    when ``block_children`` is set, block every active descendant — all in ONE transaction.
+
+    Returns the number of descendants blocked (0 when ``block_children`` is False). Folding
+    the state flip, the summary, and the cascade into a single transaction keeps a task's
+    lifecycle row from ever being observed half-updated (e.g. state flipped to ``failed``
+    but children still claimable) if a crash lands mid-sequence.
+    """
+    blocked = 0
+    async with db.transaction() as conn:
+        await conn.execute(
+            "UPDATE tasks SET state = ?, result_summary = ?, updated_at = ? WHERE id = ?",
+            (state.value, result_summary, now_iso(), task_id),
+        )
+        if block_children:
+            blocked = await _block_descendants(conn, task_id)
+    return blocked
+
+
+async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
+    """BFS that blocks every active descendant of ``task_id`` on an already-open transaction.
+
+    Operates on a caller-supplied connection so it composes into a larger transaction
+    (e.g. :func:`finalize_task`); the caller owns the surrounding BEGIN/COMMIT.
+    """
     blocked = 0
     queue = [task_id]
     while queue:
         parent = queue.pop(0)
-        cur = await db.conn.execute(
+        cur = await conn.execute(
             "SELECT id FROM tasks WHERE parent_task_id = ? "
             "AND state NOT IN ('done', 'failed', 'cancelled', 'blocked')",
             (parent,),
         )
         children = [r["id"] for r in await cur.fetchall()]
         for child_id in children:
-            await db.execute(
+            await conn.execute(
                 "UPDATE tasks SET state = 'blocked', updated_at = ? WHERE id = ?",
                 (now_iso(), child_id),
             )
             blocked += 1
             queue.append(child_id)
-    await db.conn.commit()
     return blocked
 
 
 async def recover_in_progress(db: Database, project_id: str) -> int:
     """Reset orphaned ``in_progress`` tasks to ``approved`` (crash recovery)."""
-    cur = await db.conn.execute(
-        "UPDATE tasks SET state = 'approved', updated_at = ? "
-        "WHERE project_id = ? AND state = 'in_progress'",
-        (now_iso(), project_id),
-    )
-    await db.conn.commit()
-    return cur.rowcount
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE tasks SET state = 'approved', updated_at = ? "
+            "WHERE project_id = ? AND state = 'in_progress'",
+            (now_iso(), project_id),
+        )
+        count: int = cur.rowcount
+    return count
 
 
 # --- attempts ---------------------------------------------------------------
@@ -314,15 +359,16 @@ async def append_event(
     payload: dict[str, Any] | None = None,
 ) -> EventRow:
     ts = now_iso()
-    cur = await db.conn.execute(
-        "INSERT INTO events(project_id, task_id, planning_session_id, agent, type, "
-        "payload_json, ts) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (project_id, task_id, planning_session_id, agent, type, json.dumps(payload or {}), ts),
-    )
-    await db.conn.commit()
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "INSERT INTO events(project_id, task_id, planning_session_id, agent, type, "
+            "payload_json, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (project_id, task_id, planning_session_id, agent, type, json.dumps(payload or {}), ts),
+        )
+        last_id = int(cur.lastrowid or 0)
     return EventRow(
-        id=int(cur.lastrowid or 0),
+        id=last_id,
         project_id=project_id,
         task_id=task_id,
         planning_session_id=planning_session_id,
@@ -716,13 +762,13 @@ async def update_planning_session_status(
 
 
 async def increment_planning_turn(db: Database, session_id: str) -> int:
-    cur = await db.conn.execute(
-        "UPDATE planning_sessions SET turn_number = turn_number + 1 WHERE id = ? "
-        "RETURNING turn_number",
-        (session_id,),
-    )
-    row = await cur.fetchone()
-    await db.conn.commit()
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE planning_sessions SET turn_number = turn_number + 1 WHERE id = ? "
+            "RETURNING turn_number",
+            (session_id,),
+        )
+        row = await cur.fetchone()
     return int(row["turn_number"]) if row else 0
 
 
@@ -747,6 +793,40 @@ async def add_planning_message(
         (mid, session_id, agent, role, content, turn_number, parent_id,
          json.dumps(metadata or {}), now_iso()),
     )
+    msg = await _get_planning_message(db, mid)
+    assert msg is not None
+    return msg
+
+
+async def add_message_with_turn(
+    db: Database,
+    *,
+    session_id: str,
+    agent: str,
+    role: str,
+    content: str,
+    parent_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> PlanningMessage:
+    """Bump the session turn counter and insert a message stamped with that turn — in ONE
+    transaction, so a turn number can never be consumed without its message landing (nor a
+    message stored against a turn the counter never advanced to).
+    """
+    mid = new_id()
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "UPDATE planning_sessions SET turn_number = turn_number + 1 WHERE id = ? "
+            "RETURNING turn_number",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        turn = int(row["turn_number"]) if row else 0
+        await conn.execute(
+            "INSERT INTO planning_messages(id, session_id, agent, role, content, "
+            "turn_number, parent_id, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (mid, session_id, agent, role, content, turn, parent_id,
+             json.dumps(metadata or {}), now_iso()),
+        )
     msg = await _get_planning_message(db, mid)
     assert msg is not None
     return msg
