@@ -9,7 +9,11 @@ import pytest
 
 from conclave.db import Database
 from conclave.db import repositories as repo
-from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatus
+from conclave.db.planning_models import (
+    PlanningNodeStatus,
+    PlanningSessionStatus,
+    PlanningTaskNode,
+)
 from conclave.events import EventBus
 from conclave.planning.session import PlanningOrchestrator
 from conclave.providers import AgentResult
@@ -182,6 +186,52 @@ async def test_render_task_tree(db: Database) -> None:
     assert "Root 1" in rendered
     assert "Child 1a" in rendered
     assert "[proposed]" in rendered
+
+
+async def test_render_task_tree_cycle_safe() -> None:
+    """_render_task_tree terminates on a cyclic parent_id triangle and surfaces
+    every node exactly once with a [cycle] marker on unrooted nodes."""
+    from conclave.planning.session import PlanningOrchestrator
+
+    # Triangle cycle: A → B → C → A — none has parent_id=None, forming a
+    # pure 3-cycle.  The root-anchored pass finds nothing; the post-pass
+    # renders all three at root level with [cycle] markers.
+    nodes = [
+        PlanningTaskNode(
+            id="A", session_id="s1", parent_id="C",
+            title="Task A", description="Alpha task", level=0, sort_order=0,
+            status=PlanningNodeStatus.proposed,
+            created_at="2026-01-01", updated_at="2026-01-01",
+        ),
+        PlanningTaskNode(
+            id="B", session_id="s1", parent_id="A",
+            title="Task B", description="Beta task", level=0, sort_order=1,
+            status=PlanningNodeStatus.refined,
+            created_at="2026-01-01", updated_at="2026-01-01",
+        ),
+        PlanningTaskNode(
+            id="C", session_id="s1", parent_id="B",
+            title="Task C", description="Gamma task", level=0, sort_order=2,
+            status=PlanningNodeStatus.proposed,
+            created_at="2026-01-01", updated_at="2026-01-01",
+        ),
+    ]
+
+    rendered = PlanningOrchestrator._render_task_tree(nodes)
+
+    # Each task appears exactly once.
+    assert rendered.count("(id=A)") == 1
+    assert rendered.count("(id=B)") == 1
+    assert rendered.count("(id=C)") == 1
+
+    # Task titles are present.
+    assert "Task A" in rendered
+    assert "Task B" in rendered
+    assert "Task C" in rendered
+
+    # Every node carries the [cycle] marker (none was reachable from a root).
+    assert "[cycle]" in rendered
+    assert rendered.count("[cycle]") == 3
 
 
 # --- shutdown behaviour (CON-2) ------------------------------------------------

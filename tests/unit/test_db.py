@@ -563,3 +563,40 @@ async def test_corrupt_planning_rows_load_with_safe_defaults(db: Database) -> No
     nodes = await repo.list_planning_task_nodes(db, "sess")
     assert len(nodes) == 1
     assert nodes[0].status is PlanningNodeStatus.proposed
+
+
+async def test_block_descendants_cycle_safe(db: Database) -> None:
+    """block_descendants terminates on a cyclic parent_task_id (A → B → A)
+    and blocks each non-terminal node at most once."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Create task A (inbox).
+    task_a = await repo.create_task(
+        db, project_id=p.id, request="task A", state=TaskState.inbox,
+    )
+    # Create task B as a child of A.
+    task_b = await repo.create_task(
+        db, project_id=p.id, request="task B", state=TaskState.inbox,
+        parent_task_id=task_a.id,
+    )
+
+    # Create the cycle: point A's parent at B via raw SQL.
+    await db.execute(
+        "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+        (task_b.id, task_a.id),
+    )
+
+    # block_descendants must terminate and return a finite count.
+    blocked = await repo.block_descendants(db, task_a.id)
+    assert blocked in (1, 2), f"Expected 1 or 2 blocked tasks, got {blocked}"
+
+    # Verify that the blocked tasks are actually blocked.
+    a = await repo.get_task(db, task_a.id)
+    assert a is not None
+    # task_a is the root — it is NOT blocked by block_descendants (only
+    # descendants are blocked, not the root itself).
+    assert a.state is TaskState.inbox
+
+    b = await repo.get_task(db, task_b.id)
+    assert b is not None
+    assert b.state is TaskState.blocked

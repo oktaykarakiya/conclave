@@ -6,6 +6,7 @@ returned). Engine profiles can be tested before saving via /api/profiles/test.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,8 @@ async def _pagination(
     """Shared pagination dependency — bounds every list endpoint (DoS hardening — WEB-1)."""
     return PaginationParams(limit=limit, offset=offset)
 
+
+logger = logging.getLogger("conclave.web")
 
 router = APIRouter(prefix="/api")
 
@@ -319,11 +322,25 @@ async def list_task_events(
 async def cascade_approve_task(
     task_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
-    """Approve a task and all its descendants in dependency order (BFS)."""
+    """Approve a task and all its descendants in dependency order (BFS).
+
+    Cycle-safe: a visited-set guards the walk so a cyclic ``parent_task_id``
+    cannot cause an infinite loop.  Each node is approved at most once.
+    """
     task = await _require_task(daemon, task_id)
     approved_ids: list[str] = []
+    visited: set[str] = {task.id}
     queue = [task]
+    depth = 0
+    _MAX_DEPTH = 1000
     while queue:
+        depth += 1
+        if depth > _MAX_DEPTH:
+            logger.warning(
+                "cascade_approve_task hit depth cap %d at task %s — tree may be malformed",
+                _MAX_DEPTH, task_id,
+            )
+            break
         current = queue.pop(0)
         if current.state in (TaskState.inbox, TaskState.failed):
             await repo.set_task_state(daemon.db, current.id, TaskState.approved)
@@ -333,7 +350,15 @@ async def cascade_approve_task(
             )
             approved_ids.append(current.id)
         children = await repo.get_child_tasks(daemon.db, current.id)
-        queue.extend(children)
+        for child in children:
+            if child.id in visited:
+                logger.warning(
+                    "cascade_approve_task detected cycle at task %s (child of %s) — skipping",
+                    child.id, current.id,
+                )
+                continue
+            visited.add(child.id)
+            queue.append(child)
     return {"approved": True, "cascade": True, "task_ids": approved_ids, "count": len(approved_ids)}
 
 

@@ -304,6 +304,57 @@ async def test_cascade_approve_failed_descendant(
     assert get_child.json()["state"] == "approved"
 
 
+async def test_cascade_approve_cycle_safe(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Cascade-approve terminates on a cyclic parent_task_id (A → B → A) and
+    approves each node exactly once."""
+    repo_path = tmp_path / "repo_cascade_cycle"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "p_cascade_cycle", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    # Create task A (inbox) via API.
+    task_a = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "task A"}
+    )
+    assert task_a.status_code == 200
+    task_a_id = task_a.json()["id"]
+
+    # Create task B as a child of A via repo.
+    task_b = await repo.create_task(
+        db,
+        project_id=project_id,
+        request="task B",
+        title="task-b",
+        state=TaskState.inbox,
+        parent_task_id=task_a_id,
+    )
+
+    # Create the cycle: point A's parent at B via raw SQL.
+    await db.execute(
+        "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+        (task_b.id, task_a_id),
+    )
+
+    # Cascade-approve from A — must terminate and approve each node once.
+    cascade = await client.post(f"/api/tasks/{task_a_id}/cascade-approve")
+    assert cascade.status_code == 200, cascade.text
+    data = cascade.json()
+    assert data["count"] == 2, f"Expected 2 approved tasks, got {data}"
+
+    # Both tasks must be approved.
+    a = await client.get(f"/api/tasks/{task_a_id}")
+    assert a.json()["state"] == "approved"
+    b = await client.get(f"/api/tasks/{task_b.id}")
+    assert b.json()["state"] == "approved"
+
+
 # --- pagination tests (DoS hardening — WEB-1) --------------------------------
 
 

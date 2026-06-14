@@ -560,18 +560,38 @@ class PlanningOrchestrator:
 
     @staticmethod
     def _render_task_tree(nodes: list[PlanningTaskNode]) -> str:
-        """Render the task tree as an indented text representation."""
+        """Render the task tree as an indented text representation.
+
+        Cycle-safe: a visited-set guards the recursive walk so a cyclic
+        ``parent_id`` cannot cause an infinite loop.  Nodes that are never
+        reached from a root are rendered at the top level with a ``[cycle]``
+        marker so they don't vanish silently.
+        """
         by_parent: dict[str | None, list[PlanningTaskNode]] = {}
         for n in nodes:
             by_parent.setdefault(n.parent_id, []).append(n)
 
         lines: list[str] = []
+        visited: set[str] = set()
+        _MAX_DEPTH = 1000
 
         def render(pid: str | None, indent: int) -> None:
+            if indent > _MAX_DEPTH:
+                logger.warning(
+                    "_render_task_tree hit depth cap %d — tree may be malformed",
+                    _MAX_DEPTH,
+                )
+                return
             children = sorted(
                 by_parent.get(pid, []), key=lambda x: (x.sort_order, x.title)
             )
             for n in children:
+                if n.id in visited:
+                    logger.warning(
+                        "_render_task_tree detected cycle at node %s — skipping", n.id
+                    )
+                    continue
+                visited.add(n.id)
                 status = f"[{n.status}]"
                 desc = n.description[:80] + ("..." if len(n.description) > 80 else "")
                 lines.append(
@@ -580,6 +600,19 @@ class PlanningOrchestrator:
                 render(n.id, indent + 1)
 
         render(None, 0)
+
+        # Any node still unvisited is part of a cycle (or orphaned with a
+        # non-existent parent).  Surface them at root level so they are
+        # never silently dropped.
+        for n in nodes:
+            if n.id not in visited:
+                visited.add(n.id)
+                status = f"[{n.status}]"
+                desc = n.description[:80] + ("..." if len(n.description) > 80 else "")
+                lines.append(
+                    f"- (id={n.id}) {status} [cycle] {n.title}: {desc}"
+                )
+
         return "\n".join(lines) if lines else "(no tasks yet)"
 
     async def _apply_task_changes(

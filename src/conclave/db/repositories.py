@@ -7,6 +7,7 @@ Each returns domain row models from :mod:`conclave.db.models`.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import aiosqlite
@@ -34,6 +35,8 @@ from .planning_models import (
     PlanningSessionStatus,
     PlanningTaskNode,
 )
+
+logger = logging.getLogger("conclave.db")
 
 # --- projects ---------------------------------------------------------------
 
@@ -300,12 +303,25 @@ async def finalize_task(
 async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
     """BFS that blocks every active descendant of ``task_id`` on an already-open transaction.
 
+    Cycle-safe: a visited-set guards the walk so a cyclic ``parent_task_id`` cannot
+    cause an infinite loop.  Each node is blocked at most once.
+
     Operates on a caller-supplied connection so it composes into a larger transaction
     (e.g. :func:`finalize_task`); the caller owns the surrounding BEGIN/COMMIT.
     """
     blocked = 0
+    visited: set[str] = {task_id}
     queue = [task_id]
+    depth = 0
+    _MAX_DEPTH = 1000
     while queue:
+        depth += 1
+        if depth > _MAX_DEPTH:
+            logger.warning(
+                "_block_descendants hit depth cap %d at task %s — tree may be malformed",
+                _MAX_DEPTH, task_id,
+            )
+            break
         parent = queue.pop(0)
         cur = await conn.execute(
             "SELECT id FROM tasks WHERE parent_task_id = ? "
@@ -314,6 +330,13 @@ async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
         )
         children = [r["id"] for r in await cur.fetchall()]
         for child_id in children:
+            if child_id in visited:
+                logger.warning(
+                    "_block_descendants detected cycle at task %s (child of %s) — skipping",
+                    child_id, parent,
+                )
+                continue
+            visited.add(child_id)
             await conn.execute(
                 "UPDATE tasks SET state = 'blocked', updated_at = ? WHERE id = ?",
                 (now_iso(), child_id),
