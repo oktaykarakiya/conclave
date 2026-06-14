@@ -5,6 +5,7 @@ export interface Project {
   default_branch: string;
   mode: string;
   created_at: string;
+  config?: { execution?: { target_branch?: string } };
 }
 
 export interface Task {

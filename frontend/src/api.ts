@@ -63,6 +63,22 @@ export interface NewPlanningSession {
   max_rounds?: number;
 }
 
+export interface ListTasksOptions {
+  state?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** Build a `?a=1&b=2` query string, skipping undefined/empty values. */
+function qs(params: Record<string, string | number | undefined>): string {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== "") sp.append(k, String(v));
+  }
+  const s = sp.toString();
+  return s ? `?${s}` : "";
+}
+
 export const api = {
   listProjects: () => req<Project[]>("GET", "/api/projects"),
   createProject: (b: NewProject) => req<Project>("POST", "/api/projects", b),
@@ -78,8 +94,13 @@ export const api = {
   usage: (id: string) =>
     req<{ calls: number; total_cost_usd: number }>("GET", `/api/projects/${id}/usage`),
 
-  listTasks: (id: string, state?: string) =>
-    req<Task[]>("GET", `/api/projects/${id}/tasks${state ? `?state=${state}` : ""}`),
+  listTasks: (id: string, opts?: string | ListTasksOptions) => {
+    const o: ListTasksOptions = typeof opts === "string" ? { state: opts } : opts ?? {};
+    return req<Task[]>(
+      "GET",
+      `/api/projects/${id}/tasks${qs({ state: o.state, limit: o.limit, offset: o.offset })}`,
+    );
+  },
   createTask: (id: string, b: NewTask) => req<Task>("POST", `/api/projects/${id}/tasks`, b),
   approve: (tid: string) => req<unknown>("POST", `/api/tasks/${tid}/approve`),
   cancel: (tid: string) => req<unknown>("POST", `/api/tasks/${tid}/cancel`),

@@ -40,6 +40,49 @@ severity, location, problem, and fix. Feed CRITICAL/HIGH into Conclave first.
 
 ---
 
+## GLOBAL UI/UX requirements (user, 2026-06-14) — apply everywhere
+1. **Single page only**: collapse the 7-tab nav into ONE scrollable page — each former tab becomes a
+   collapsible section (accordion). No tab-switching. (Lazy-load/stream heavy sections like Live &
+   Agent-ception only when expanded, for performance.)
+2. **Mobile friendly**: mobile-first responsive — layouts reflow/stack on narrow screens, touch-sized
+   targets, no horizontal overflow (user reaches it from their phone via 0.0.0.0).
+3. **Agent-ception huge text**: long transcript messages / task descriptions must be COLLAPSIBLE
+   (truncated with expand toggles), collapsed by default — currently it's a wall of text.
+4. **Page order**: Agent-ception must be FIRST/leftmost (and the default landing view); it's last today.
+   Applies to both the current tab nav and the single-page section order.
+
+## PENDING — Second UI/UX swarm (user-requested 2026-06-14, gated)
+Run ONLY after BOTH complete: (a) the current 7-agent FE polish swarm is integrated+built+committed,
+and (b) Conclave's last backend task (PLAN-4) is done + backend wrap-up (ff/gate/restart). Then:
+- **Step 1 — identify**: one dedicated agent PER PAGE audits its page for ALL possible UI/UX improvements
+  (produces a findings list). 
+- **Step 2 — apply**: one dedicated agent PER PAGE applies the improvements that genuinely help UX.
+- I (Opus) am the boss: vet Step-1 lists, decide what's worth doing, drive Step 2, integrate, build, verify.
+
+## PENDING — Final verification swarm (user-requested 2026-06-14, LAST step)
+After ALL the above is done, a final QA pass: verify every page is nice, simple, intuitive, slick.
+Use as many agents/sessions as needed; check EVERY page. Approach: if a headless browser
+(chromium + playwright/puppeteer) is available, screenshot each page at desktop + mobile widths and
+actually look (Opus can Read images); otherwise code-level design review + build/type checks +
+rendered-HTML structure. Fix anything that isn't tidy/cohesive before declaring done.
+
+## Frontend pass (Opus, end-of-run — gate is Python-only, so FE can't be dogfooded)
+Do these myself after the autonomous waves: edit tsx, `cd frontend && npm run build`, verify the page loads.
+- **Tasks list UX (messy → clean)**: state filter (All / Active / Done / Failed / Blocked), text search,
+  server-side pagination via WEB-1's `limit`/`offset`, newest-first sort, collapse/By-default-hide done,
+  keep the tree view for parented tasks. (User: "pagination, filtering, etc. currently it is messy".)
+- **#1 wrong target in header**: shows `default_branch` (conclave-selftest); show `execution.target_branch`
+  (conclave-work = real merge target; merges verified correct, label only).
+- **#2 started_at**: Task has only created_at/updated_at → "start" = queue time, durations include queue
+  wait (DATA-1 "118m" was mostly waiting). Add `started_at` (set on claim; small backend+migration) and
+  show real run-time (or both).
+- **#3 usage stale in list**: just-completed task shows 0 turns/agents though data exists (PLAN-2 had 144
+  turns). Refetch usage on state change, or batch usage endpoint.
+- **#5 verdicts**: panel "No verdicts recorded yet" though verdicts exist — surface per-row / auto-select.
+- **#6 in-progress visibility**: running task shows only "(running)"; add live stage/agent badge from events.
+- **FE-2** RepoKnowledge `{}` guard + remove dead cost-shaped `api.usage()`; **FE-1** WebSocket reconnect
+  with backoff (live log dies silently on daemon restart).
+
 ## CRITICAL
 
 > **SEC-1..4 DE-SCOPED (2026-06-14)** — no-auth is a deliberate choice for this personal,
