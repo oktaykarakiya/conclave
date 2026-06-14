@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from conclave.config import ArgMode
 from conclave.providers import ClaudeCliProvider, ResolvedProfile, probe_profile
+
+if TYPE_CHECKING:
+    import pytest
 
 # A fake "claude" that echoes the routed model back via the JSON envelope, so we can
 # prove the composed environment actually reaches the child process.
@@ -49,7 +53,11 @@ async def test_env_routing_reaches_subprocess(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
 
-async def test_inherit_sets_no_model_env(tmp_path: Path) -> None:
+async def test_inherit_sets_no_model_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The test environment may have ANTHROPIC_MODEL set (e.g. by the harness),
+    # which would leak into the subprocess and break the "inherit" assertion.
+    # Clear it so the fake CLI's default ("inherit") is used.
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     cli = _make_cli(tmp_path, _FAKE_CLI)
     profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
     chunks: list[str] = []

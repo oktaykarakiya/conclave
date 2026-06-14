@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fake_provider import FakeProvider
 
+from conclave.config import ArgMode
 from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
 from conclave.events import EventBus
+from conclave.providers import ResolvedProfile
 
 
 async def _init_repo(path: Path) -> None:
@@ -375,3 +378,104 @@ async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_
     assert await orchestrator.recover(project.id) == 1
     again = await repo.get_task(db, claimed.id)
     assert again is not None and again.state is TaskState.approved
+
+
+# ---------------------------------------------------------------------------
+# Scale-adaptive planning persona + decomposition tests (FakeProvider direct)
+# ---------------------------------------------------------------------------
+
+
+async def test_planning_personas_yield_distinct_artifacts() -> None:
+    """Each planning-persona marker yields its OWN distinct artifact.
+
+    The '# ' prefix disambiguates 'Test-Architect Agent' from 'Architect Agent'
+    (the former is a superstring of the latter).  This test proves the routing
+    keys don't collide and that each persona returns a unique plan.
+    """
+    provider = FakeProvider()
+    profile = ResolvedProfile(name="fake", arg_mode=ArgMode.inherit)
+
+    pm = await provider.run_agent(
+        profile=profile,
+        prompt="# Product Manager Agent\nWrite a short PRD-lite note.",
+        timeout_seconds=30,
+    )
+    arch = await provider.run_agent(
+        profile=profile,
+        prompt="# Architect-as-Planner Agent\nProduce an architecture note.",
+        timeout_seconds=30,
+    )
+    ta = await provider.run_agent(
+        profile=profile,
+        prompt="# Test-Architect Agent (Scale-Adaptive Planning)\nOutline a test strategy.",
+        timeout_seconds=30,
+    )
+
+    # Each persona returns distinct text from every other.
+    texts = {pm.text, arch.text, ta.text}
+    assert len(texts) == 3, f"Expected 3 distinct artifacts, got {len(texts)}"
+
+    # None collided with the default _PLAN (the generic one-shot planner).
+    plan = await provider.run_agent(
+        profile=profile,
+        prompt="Produce a structured plan for the feature.",
+        timeout_seconds=30,
+    )
+    assert plan.text not in texts, "Persona artifact collided with default _PLAN"
+
+
+async def test_epic_decomposition_yields_child_tasks() -> None:
+    """The decompose marker yields parseable child_tasks JSON with 3 entries."""
+    provider = FakeProvider()
+    profile = ResolvedProfile(name="fake", arg_mode=ArgMode.inherit)
+
+    result = await provider.run_agent(
+        profile=profile,
+        prompt="Decompose this epic into child tasks for the dashboard feature.",
+        timeout_seconds=30,
+    )
+
+    # Strip ```json fences and parse.
+    json_text = result.text.replace("```json\n", "").replace("\n```", "")
+    data = json.loads(json_text)
+    child_tasks = data["child_tasks"]
+    assert isinstance(child_tasks, list)
+    assert len(child_tasks) == 3
+    for task in child_tasks:
+        assert isinstance(task["title"], str)
+        assert isinstance(task["description"], str)
+
+
+async def test_empty_decomposition_returns_empty_child_tasks() -> None:
+    """empty_decomposition=True yields child_tasks: [] (still valid JSON)."""
+    provider = FakeProvider(empty_decomposition=True)
+    profile = ResolvedProfile(name="fake", arg_mode=ArgMode.inherit)
+
+    result = await provider.run_agent(
+        profile=profile,
+        prompt="Decompose this epic into child tasks.",
+        timeout_seconds=30,
+    )
+
+    json_text = result.text.replace("```json\n", "").replace("\n```", "")
+    data = json.loads(json_text)
+    assert data == {"child_tasks": []}
+
+
+async def test_malformed_decompose_returns_no_json() -> None:
+    """plan_malformed=True with the decompose marker yields fence-less text —
+    no parseable ```json block anywhere in the output."""
+    provider = FakeProvider(plan_malformed=True)
+    profile = ResolvedProfile(name="fake", arg_mode=ArgMode.inherit)
+
+    result = await provider.run_agent(
+        profile=profile,
+        prompt="Decompose this epic into child tasks.",
+        timeout_seconds=30,
+    )
+
+    # There must be no ```json fence to parse.
+    assert "```json" not in result.text
+    assert "child_tasks" not in result.text
+    # The text should be the raw degradation message.
+    assert "No decomposition produced." in result.text
