@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 from typing import Any
 
 from ..config import ArgMode
@@ -307,15 +306,9 @@ class PlanningOrchestrator:
                 # Check if planner signalled readiness
                 planner_ready = False
                 if planner_result:
-                    try:
-                        json_match = re.search(
-                            r"```json\s*(\{.*?\})\s*```", planner_result, re.DOTALL
-                        )
-                        if json_match:
-                            data = json.loads(json_match.group(1))
-                            planner_ready = data.get("ready", False)
-                    except (json.JSONDecodeError, ValueError):
-                        pass
+                    data = _extract_json_block(planner_result)
+                    if data is not None:
+                        planner_ready = data.get("ready", False)
 
                 # Session is stable when all mandatory agents approve + planner ready
                 if planner_ready and approvals.issuperset(APPROVAL_AGENTS):
@@ -404,17 +397,10 @@ class PlanningOrchestrator:
         # Parse task tree changes from planner output
         tasks_changed = False
         if agent_name == _PLANNER:
-            try:
-                json_match = re.search(
-                    r"```json\s*(\{.*?\})\s*```", result_text, re.DOTALL
-                )
-                if json_match:
-                    data = json.loads(json_match.group(1))
-                    if "task_changes" in data:
-                        await self._apply_task_changes(session_id, data["task_changes"])
-                        tasks_changed = True
-            except (json.JSONDecodeError, ValueError):
-                logger.debug("could not parse task changes from planner output")
+            data = _extract_json_block(result_text)
+            if data is not None and "task_changes" in data:
+                await self._apply_task_changes(session_id, data["task_changes"])
+                tasks_changed = True
 
         # Persist the message
         await repo.add_planning_message(
@@ -578,3 +564,27 @@ class PlanningOrchestrator:
                 logger.exception(
                     "failed to apply task change: %s", json.dumps(change)[:200]
                 )
+
+
+# ------------------------------------------------------------------
+# module helpers
+# ------------------------------------------------------------------
+
+
+def _extract_json_block(text: str) -> dict[str, Any] | None:
+    """Extract the first complete JSON object from *text*.
+
+    Uses :func:`json.JSONDecoder.raw_decode` so nested braces are handled
+    correctly, unlike a non-greedy regex which truncates at the first ``}``.
+    """
+    idx = text.find("{")
+    if idx == -1:
+        return None
+    try:
+        decoder = json.JSONDecoder()
+        obj, _end = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    return None

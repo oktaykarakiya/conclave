@@ -51,6 +51,29 @@ async def client_with_session(
         yield c, project_id
 
 
+@pytest_asyncio.fixture
+async def client_with_nested_session(
+    db: Database, tmp_path: Path,
+) -> AsyncIterator[tuple[httpx.AsyncClient, str]]:
+    """Client with a FakeProvider that emits nested JSON in planner task_changes."""
+    await seed_global_defaults(db)
+    repo_path = tmp_path / "repo_nested"
+    await _init_repo(repo_path)
+    daemon = Daemon(
+        db, tmp_path / "home_nested", FakeProvider(use_nested_plan=True),
+        workers_enabled=False,
+    )
+    app = create_app(daemon, manage_lifecycle=False)
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/api/projects",
+            json={"name": "nested-demo", "path": str(repo_path), "default_branch": "main"},
+        )
+        project_id = resp.json()["id"]
+        yield c, project_id
+
+
 async def test_create_and_list_sessions(
     client_with_session: tuple[httpx.AsyncClient, str],
 ) -> None:
@@ -165,6 +188,42 @@ async def test_task_nodes_appear(
     task_list = nodes.json()
     assert len(task_list) > 0, "Expected task nodes from planner breakdown"
     assert all("title" in n for n in task_list)
+
+
+async def test_nested_task_changes_parsed(
+    client_with_nested_session: tuple[httpx.AsyncClient, str],
+) -> None:
+    """Nested JSON (e.g. metadata dicts) in task_changes must be parsed in full.
+
+    A non-greedy regex would truncate at the first nested ``}`` and silently
+    drop all task_changes.  The :func:`_extract_json_block` helper uses
+    ``raw_decode`` which consumes the complete balanced object.
+    """
+    client, pid = client_with_nested_session
+
+    create = await client.post(
+        f"/api/projects/{pid}/planning/sessions",
+        json={"title": "Test Nested", "prompt": "Feature with nested metadata"},
+    )
+    session_id = create.json()["id"]
+
+    # All 3 nested task_changes must be parsed — not truncated at the first nested brace
+    import asyncio
+    for _ in range(10):
+        nodes = await client.get(f"/api/planning/sessions/{session_id}/tasks")
+        if nodes.status_code == 200 and len(nodes.json()) == 3:
+            break
+        await asyncio.sleep(0.5)
+
+    nodes = await client.get(f"/api/planning/sessions/{session_id}/tasks")
+    assert nodes.status_code == 200
+    task_list = nodes.json()
+    assert len(task_list) == 3, (
+        f"Expected 3 task nodes from nested-JSON planner response, got {len(task_list)}. "
+        "Non-greedy regex would truncate at first nested '}' and drop all changes."
+    )
+    titles = {n["title"] for n in task_list}
+    assert titles == {"Add auth middleware", "Set up database schema", "Write integration tests"}
 
 
 async def test_approve_creates_real_tasks(
