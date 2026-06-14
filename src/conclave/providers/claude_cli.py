@@ -21,6 +21,19 @@ from .profiles import ResolvedProfile, build_invocation
 # agent verdict / completion as a usable result rather than a hard failure.
 _SUCCESS_HINT = re.compile(r"(?i)(verdict|task completed|i have)")
 
+# Provider-controlled env vars that must NOT leak from the parent process into
+# inherit/flag-mode dispatches. In env-mode, build_invocation reintroduces them.
+_PROVIDER_ENV_KEYS: frozenset[str] = frozenset({
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+})
+
 
 class ClaudeCliProvider:
     """Runs agents by invoking the ``claude`` CLI as a subprocess."""
@@ -35,7 +48,13 @@ class ClaudeCliProvider:
         on_chunk: OnChunk | None = None,
     ) -> AgentResult:
         invocation = build_invocation(profile)
-        env = {**os.environ, **invocation.env}
+        # Strip provider-controlled env vars from the parent environment so they
+        # never leak into inherit/flag-mode dispatches. invocation.env reintroduces
+        # them for env-mode profiles.
+        env = {
+            k: v for k, v in os.environ.items() if k not in _PROVIDER_ENV_KEYS
+        }
+        env.update(invocation.env)
 
         try:
             proc = await asyncio.create_subprocess_exec(

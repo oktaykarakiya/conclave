@@ -79,183 +79,202 @@ class Orchestrator:
         except WorktreeError as exc:
             return await self._fail_early(task, wm, task_branch, f"worktree setup failed: {exc}")
 
-        _, sha = await run_git(worktree, "rev-parse", "HEAD")
-        checkpoint = sha.strip()
+        # Wrap the entire body after worktree creation so ANY unexpected exception
+        # transitions the task to failed, cleans the worktree, and lets the worker
+        # continue with the next task — never stranding a task in_progress or leaking
+        # a worktree.
+        try:
+            _, sha = await run_git(worktree, "rev-parse", "HEAD")
+            checkpoint = sha.strip()
 
-        # Provision the worktree environment ONCE (e.g. venv + deps) before any agent
-        # runs, so developer self-checks, reviewer verification, and the green-gate all
-        # share one toolchain. Without this, agents fall back to host-global tools and
-        # report "clean" against a different environment than the gate enforces.
-        setup_cmd = config.execution.setup_command
-        if setup_cmd:
-            await self._bus.emit(
-                type=EventType.log,
-                project_id=project.id,
-                task_id=task.id,
-                payload={"stage": "setup", "message": "provisioning worktree environment"},
-            )
-            rc, out = await run_shell(worktree, setup_cmd, timeout_seconds=900)
-            if rc != 0:
-                return await self._fail_early(
-                    task, wm, task_branch,
-                    f"worktree setup failed (exit {rc}):\n{out[-1000:]}",
-                )
-
-        knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
-        knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
-        rules = _read_project_rules(worktree)
-        if setup_cmd:
-            rules += (
-                "\n\n## Worktree environment (MANDATORY)\n"
-                "A provisioned virtualenv exists at `.venv/` in the worktree root with all "
-                "dependencies installed. Run EVERY verification through it so your checks match "
-                "the green-gate exactly:\n"
-                "- `.venv/bin/pytest -q`\n"
-                "- `.venv/bin/mypy`\n"
-                "- `.venv/bin/ruff check src tests`\n"
-                "Do NOT use system-wide `pytest`/`mypy`/`ruff` — they are a different toolchain "
-                "and will disagree with the gate."
-            )
-        test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
-        gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
-
-        baseline_preamble = await self._baseline(
-            project.id, worktree, checkpoint, target_branch, test_command, gate_timeout
-        )
-        plan_preamble = await self._maybe_plan(
-            runner, task, worktree, knowledge, rules, baseline_preamble, config
-        )
-
-        memory = AttemptMemory(config.experimental.cross_attempt_memory_entries)
-        use_memory = config.experimental.cross_attempt_memory
-        max_retries = resolve_agent(config, "developer").max_retries
-        budget = config.execution.wall_clock_budget_minutes
-        started = time.monotonic()
-
-        feedback = ""
-        previous_diff = ""
-        attempts = 0
-        failed = False
-        timed_out = False
-
-        while attempts < max_retries:
-            if budget > 0 and (time.monotonic() - started) / 60.0 >= budget:
-                timed_out = True
-                failed = True
-                break
-            attempts += 1
-            failed = False
-            await self._bus.emit(
-                type=EventType.attempt_started,
-                project_id=project.id,
-                task_id=task.id,
-                payload={"n": attempts},
-            )
-            attempt_id = await repo.start_attempt(self._db, task.id, attempts)
-
-            if attempts > 1:
-                _, previous_diff = await run_git(worktree, "diff", "--cached", checkpoint)
-                if use_memory:
-                    memory.add(attempts - 1, previous_diff, feedback)
-                await run_git(worktree, "reset", "--hard", checkpoint)
-                # Preserve the provisioned .venv across attempts; rebuilding it each retry
-                # is slow and pointless.
-                await run_git(worktree, "clean", "-fd", "-e", ".venv")
-
-            dev_prompt = task.request + plan_preamble + baseline_preamble
-            if use_memory:
-                dev_prompt += memory.build_preamble()
-            if feedback:
-                dev_prompt += f"\n\nLATEST REVIEWER FEEDBACK (must fix these issues):\n{feedback}"
-                if previous_diff:
-                    dev_prompt += f"\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n{previous_diff}\n```"
-
-            dev = await runner.run(
-                agent="developer",
-                prompt=dev_prompt,
-                task_id=task.id,
-                worktree=worktree,
-                repo_knowledge=knowledge,
-                project_rules=rules,
-            )
-            if not dev.ok:
-                feedback = f"Developer agent error: {dev.error}"
-                await repo.end_attempt(self._db, attempt_id)
+            # Provision the worktree environment ONCE (e.g. venv + deps) before any agent
+            # runs, so developer self-checks, reviewer verification, and the green-gate all
+            # share one toolchain. Without this, agents fall back to host-global tools and
+            # report "clean" against a different environment than the gate enforces.
+            setup_cmd = config.execution.setup_command
+            if setup_cmd:
                 await self._bus.emit(
-                    type=EventType.attempt_failed,
+                    type=EventType.log,
                     project_id=project.id,
                     task_id=task.id,
-                    payload={"n": attempts, "stage": "developer", "error": dev.error},
+                    payload={"stage": "setup", "message": "provisioning worktree environment"},
                 )
-                failed = True
-                continue
-
-            # Stage everything so new (untracked) files appear in the diff the
-            # reviewers and grounding see — not just modifications to tracked files.
-            await run_git(worktree, "add", "-A")
-            _, current_diff = await run_git(worktree, "diff", "--cached", checkpoint)
-            # ENG-2: snapshot the exact staged tree the reviewers are about to review.
-            # Reviewers run with --dangerously-skip-permissions and CAN write to the
-            # worktree, but anything they touch falls outside ``current_diff`` (so grounding
-            # never sees it). write-tree records the index as an immutable tree object
-            # without moving HEAD or creating a commit; after review we restore the worktree
-            # to exactly this tree, so the gated+committed content is byte-for-byte what was
-            # reviewed and a reviewer cannot smuggle in unreviewed changes.
-            _, review_tree = await run_git(worktree, "write-tree")
-            review_tree = review_tree.strip()
-            await repo.end_attempt(self._db, attempt_id, diff_stat=_diff_stat(current_diff))
-
-            failed, feedback = await self._review(
-                runner, task, project.id, worktree, current_diff, attempts, config, knowledge, rules
-            )
-            if failed:
-                await self._bus.emit(
-                    type=EventType.attempt_failed,
-                    project_id=project.id,
-                    task_id=task.id,
-                    payload={"n": attempts, "stage": "review"},
-                )
-                continue
-
-            # ENG-2: the review passed, but reviewers may have written to the worktree.
-            # Restore it to the exact tree that was reviewed BEFORE gating/committing so
-            # unreviewed reviewer edits can neither be tested nor merged. This runs on the
-            # success path unconditionally (outside the gate block below): even with no test
-            # command, reviewer strays must not leak into the commit.
-            #   read-tree    — reset the index to the reviewed tree
-            #   checkout-index — force-rewrite the working tree from that index, overwriting
-            #                    reviewer edits and restoring files reviewers deleted
-            #   clean -fd    — drop reviewer-created strays (now untracked vs the index),
-            #                  keeping the provisioned .venv as the retry loop does
-            await run_git(worktree, "read-tree", review_tree)
-            await run_git(worktree, "checkout-index", "-a", "-f")
-            await run_git(worktree, "clean", "-fd", "-e", ".venv")
-
-            if test_command and config.execution.require_full_green:
-                gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
-                if not gate.passed:
-                    feedback = (
-                        f"TEST GATE is not green (exit {gate.exit_code}). "
-                        f"Fix the failing tests:\n{gate.output[-2000:]}"
+                rc, out = await run_shell(worktree, setup_cmd, timeout_seconds=900)
+                if rc != 0:
+                    return await self._fail_early(
+                        task, wm, task_branch,
+                        f"worktree setup failed (exit {rc}):\n{out[-1000:]}",
                     )
+
+            knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
+            knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
+            rules = _read_project_rules(worktree)
+            if setup_cmd:
+                rules += (
+                    "\n\n## Worktree environment (MANDATORY)\n"
+                    "A provisioned virtualenv exists at `.venv/` in the worktree root with all "
+                    "dependencies installed. Run EVERY verification through it so your checks "
+                    "match the green-gate exactly:\n"
+                    "- `.venv/bin/pytest -q`\n"
+                    "- `.venv/bin/mypy`\n"
+                    "- `.venv/bin/ruff check src tests`\n"
+                    "Do NOT use system-wide `pytest`/`mypy`/`ruff` — they are a different "
+                    "toolchain and will disagree with the gate."
+                )
+            test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
+            gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
+
+            baseline_preamble = await self._baseline(
+                project.id, worktree, checkpoint, target_branch, test_command, gate_timeout
+            )
+            plan_preamble = await self._maybe_plan(
+                runner, task, worktree, knowledge, rules, baseline_preamble, config
+            )
+
+            memory = AttemptMemory(config.experimental.cross_attempt_memory_entries)
+            use_memory = config.experimental.cross_attempt_memory
+            max_retries = resolve_agent(config, "developer").max_retries
+            budget = config.execution.wall_clock_budget_minutes
+            started = time.monotonic()
+
+            feedback = ""
+            previous_diff = ""
+            attempts = 0
+            failed = False
+            timed_out = False
+
+            while attempts < max_retries:
+                if budget > 0 and (time.monotonic() - started) / 60.0 >= budget:
+                    timed_out = True
+                    failed = True
+                    break
+                attempts += 1
+                failed = False
+                await self._bus.emit(
+                    type=EventType.attempt_started,
+                    project_id=project.id,
+                    task_id=task.id,
+                    payload={"n": attempts},
+                )
+                attempt_id = await repo.start_attempt(self._db, task.id, attempts)
+
+                if attempts > 1:
+                    _, previous_diff = await run_git(worktree, "diff", "--cached", checkpoint)
+                    if use_memory:
+                        memory.add(attempts - 1, previous_diff, feedback)
+                    await run_git(worktree, "reset", "--hard", checkpoint)
+                    # Preserve the provisioned .venv across attempts; rebuilding it each retry
+                    # is slow and pointless.
+                    await run_git(worktree, "clean", "-fd", "-e", ".venv")
+
+                dev_prompt = task.request + plan_preamble + baseline_preamble
+                if use_memory:
+                    dev_prompt += memory.build_preamble()
+                if feedback:
+                    dev_prompt += (
+                        "\n\nLATEST REVIEWER FEEDBACK (must fix these issues):\n" + feedback
+                    )
+                    if previous_diff:
+                        dev_prompt += (
+                            "\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n"
+                            + previous_diff + "\n```"
+                        )
+
+                dev = await runner.run(
+                    agent="developer",
+                    prompt=dev_prompt,
+                    task_id=task.id,
+                    worktree=worktree,
+                    repo_knowledge=knowledge,
+                    project_rules=rules,
+                )
+                if not dev.ok:
+                    feedback = f"Developer agent error: {dev.error}"
+                    await repo.end_attempt(self._db, attempt_id)
                     await self._bus.emit(
                         type=EventType.attempt_failed,
                         project_id=project.id,
                         task_id=task.id,
-                        payload={"n": attempts, "stage": "gate", "exit_code": gate.exit_code},
+                        payload={"n": attempts, "stage": "developer", "error": dev.error},
                     )
                     failed = True
                     continue
 
-            break  # success
+                # Stage everything so new (untracked) files appear in the diff the
+                # reviewers and grounding see — not just modifications to tracked files.
+                await run_git(worktree, "add", "-A")
+                _, current_diff = await run_git(worktree, "diff", "--cached", checkpoint)
+                # ENG-2: snapshot the exact staged tree the reviewers are about to review.
+                # Reviewers run with --dangerously-skip-permissions and CAN write to the
+                # worktree, but anything they touch falls outside ``current_diff`` (so grounding
+                # never sees it). write-tree records the index as an immutable tree object
+                # without moving HEAD or creating a commit; after review we restore the worktree
+                # to exactly this tree, so the gated+committed content is byte-for-byte what was
+                # reviewed and a reviewer cannot smuggle in unreviewed changes.
+                _, review_tree = await run_git(worktree, "write-tree")
+                review_tree = review_tree.strip()
+                await repo.end_attempt(self._db, attempt_id, diff_stat=_diff_stat(current_diff))
 
-        if failed or attempts == 0:
-            return await self._finish_failure(
-                task, wm, task_branch, timed_out, attempts
+                failed, feedback = await self._review(
+                    runner, task, project.id, worktree, current_diff, attempts, config, knowledge,
+                    rules,
+                )
+                if failed:
+                    await self._bus.emit(
+                        type=EventType.attempt_failed,
+                        project_id=project.id,
+                        task_id=task.id,
+                        payload={"n": attempts, "stage": "review"},
+                    )
+                    continue
+
+                # ENG-2: the review passed, but reviewers may have written to the worktree.
+                # Restore it to the exact tree that was reviewed BEFORE gating/committing so
+                # unreviewed reviewer edits can neither be tested nor merged. This runs on the
+                # success path unconditionally (outside the gate block below): even with no test
+                # command, reviewer strays must not leak into the commit.
+                #   read-tree    — reset the index to the reviewed tree
+                #   checkout-index — force-rewrite the working tree from that index, overwriting
+                #                    reviewer edits and restoring files reviewers deleted
+                #   clean -fd    — drop reviewer-created strays (now untracked vs the index),
+                #                  keeping the provisioned .venv as the retry loop does
+                await run_git(worktree, "read-tree", review_tree)
+                await run_git(worktree, "checkout-index", "-a", "-f")
+                await run_git(worktree, "clean", "-fd", "-e", ".venv")
+
+                if test_command and config.execution.require_full_green:
+                    gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
+                    if not gate.passed:
+                        feedback = (
+                            f"TEST GATE is not green (exit {gate.exit_code}). "
+                            f"Fix the failing tests:\n{gate.output[-2000:]}"
+                        )
+                        await self._bus.emit(
+                            type=EventType.attempt_failed,
+                            project_id=project.id,
+                            task_id=task.id,
+                            payload={
+                                "n": attempts, "stage": "gate", "exit_code": gate.exit_code,
+                            },
+                        )
+                        failed = True
+                        continue
+
+                break  # success
+
+            if failed or attempts == 0:
+                return await self._finish_failure(
+                    task, wm, task_branch, timed_out, attempts
+                )
+            return await self._finish_success(
+                task, wm, task_branch, repo_path, target_branch, worktree, config, attempts
             )
-        return await self._finish_success(
-            task, wm, task_branch, repo_path, target_branch, worktree, config, attempts
-        )
+        except Exception:
+            logger.exception("Unhandled exception processing task %s", task.id)
+            return await self._fail_early(
+                task, wm, task_branch,
+                f"unhandled exception processing task {task.id}",
+            )
 
     # --- phases ---------------------------------------------------------------
 

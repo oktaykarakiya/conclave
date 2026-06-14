@@ -192,6 +192,51 @@ async def test_review_all_empty_reviewers_record_unknown_and_block(
     assert all(v.verdict == "unknown" and v.source == "none" for v in verdicts)
 
 
+async def test_exception_mid_process_task_fails_task_and_cleans_worktree(
+    db: Database, tmp_path: Path,
+) -> None:
+    """An unexpected exception after worktree creation must fail the task and
+    remove the worktree — never strand a task in_progress or leak a worktree."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(
+        db, EventBus(db), FakeProvider(), tmp_path / "home"
+    )
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+
+    # Inject an exception mid-processing — simulates an unexpected runtime error
+    # after the worktree has been created and the task is in_progress.
+    async def _explode(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("injected failure")
+
+    orchestrator._baseline = _explode  # type: ignore[method-assign]
+
+    result = await orchestrator.process_task(claimed)
+    assert result is False
+
+    # Task must be failed, NOT stranded in_progress.
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.failed
+
+    # Worktree must be cleaned up — the task's worktree path must not appear in
+    # ``git worktree list`` output. The path is rooted at the orchestrator home.
+    worktree_path = str(
+        tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    )
+    _, wt_list = await run_git(repo_path, "worktree", "list")
+    assert worktree_path not in wt_list
+
+
 async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)
