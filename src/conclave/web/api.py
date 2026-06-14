@@ -6,10 +6,11 @@ returned). Engine profiles can be tested before saving via /api/profiles/test.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
 
 from .. import __version__
@@ -36,6 +37,7 @@ from .deps import get_daemon
 from .schemas import (
     AgentUpsert,
     ConfigPatch,
+    PaginationParams,
     PlanningMessageInput,
     PlanningSessionCreate,
     ProfileInput,
@@ -44,6 +46,17 @@ from .schemas import (
     SecretInput,
     TaskCreate,
 )
+
+
+async def _pagination(
+    limit: int = Query(50, ge=1, le=500, description="Max items per page"),
+    offset: int = Query(0, ge=0, description="Items to skip"),
+) -> PaginationParams:
+    """Shared pagination dependency — bounds every list endpoint (DoS hardening — WEB-1)."""
+    return PaginationParams(limit=limit, offset=offset)
+
+
+logger = logging.getLogger("conclave.web")
 
 router = APIRouter(prefix="/api")
 
@@ -79,8 +92,13 @@ async def get_config_schema() -> dict[str, Any]:
 
 
 @router.get("/projects")
-async def list_projects(daemon: Daemon = Depends(get_daemon)) -> list[Project]:
-    return await repo.list_projects(daemon.db)
+async def list_projects(
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
+) -> list[Project]:
+    return await repo.list_projects(
+        daemon.db, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/projects")
@@ -193,9 +211,13 @@ async def get_usage(project_id: str, daemon: Daemon = Depends(get_daemon)) -> di
 
 @router.get("/projects/{project_id}/quarantine")
 async def list_quarantine(
-    project_id: str, daemon: Daemon = Depends(get_daemon)
+    project_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[QuarantineEntry]:
-    return await repo.list_quarantine(daemon.db, project_id)
+    return await repo.list_quarantine(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.get("/projects/{project_id}/quarantine/integrity")
@@ -226,10 +248,15 @@ async def delete_quarantine(entry_id: str, daemon: Daemon = Depends(get_daemon))
 
 @router.get("/projects/{project_id}/tasks")
 async def list_tasks(
-    project_id: str, state: str | None = None, daemon: Daemon = Depends(get_daemon)
+    project_id: str,
+    state: str | None = None,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[Task]:
     task_state = TaskState(state) if state else None
-    return await repo.list_tasks(daemon.db, project_id, task_state)
+    return await repo.list_tasks(
+        daemon.db, project_id, task_state, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/projects/{project_id}/tasks")
@@ -261,7 +288,15 @@ async def get_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> Task:
 @router.post("/tasks/{task_id}/approve")
 async def approve_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, str]:
     await _require_task(daemon, task_id)
-    await repo.set_task_state(daemon.db, task_id, TaskState.approved)
+    updated = await repo.approve_task(daemon.db, task_id)
+    if not updated:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "task is not in an approvable state "
+                "(only inbox or failed tasks can be approved)"
+            ),
+        )
     await daemon.bus.emit(type=EventType.task_approved, task_id=task_id)
     return {"approved": task_id}
 
@@ -287,13 +322,27 @@ async def list_task_events(
 async def cascade_approve_task(
     task_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
-    """Approve a task and all its descendants in dependency order (BFS)."""
+    """Approve a task and all its descendants in dependency order (BFS).
+
+    Cycle-safe: a visited-set guards the walk so a cyclic ``parent_task_id``
+    cannot cause an infinite loop.  Each node is approved at most once.
+    """
     task = await _require_task(daemon, task_id)
     approved_ids: list[str] = []
+    visited: set[str] = {task.id}
     queue = [task]
+    depth = 0
+    _MAX_DEPTH = 1000
     while queue:
+        depth += 1
+        if depth > _MAX_DEPTH:
+            logger.warning(
+                "cascade_approve_task hit depth cap %d at task %s — tree may be malformed",
+                _MAX_DEPTH, task_id,
+            )
+            break
         current = queue.pop(0)
-        if current.state == TaskState.inbox:
+        if current.state in (TaskState.inbox, TaskState.failed):
             await repo.set_task_state(daemon.db, current.id, TaskState.approved)
             await daemon.bus.emit(
                 type=EventType.task_approved, task_id=current.id,
@@ -301,7 +350,15 @@ async def cascade_approve_task(
             )
             approved_ids.append(current.id)
         children = await repo.get_child_tasks(daemon.db, current.id)
-        queue.extend(children)
+        for child in children:
+            if child.id in visited:
+                logger.warning(
+                    "cascade_approve_task detected cycle at task %s (child of %s) — skipping",
+                    child.id, current.id,
+                )
+                continue
+            visited.add(child.id)
+            queue.append(child)
     return {"approved": True, "cascade": True, "task_ids": approved_ids, "count": len(approved_ids)}
 
 
@@ -309,48 +366,24 @@ async def cascade_approve_task(
 async def get_task_usage(
     task_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
-    """Return per-agent token usage + totals for a single task (cost intentionally omitted)."""
+    """Return SQL-aggregated token-usage totals for a single task (cost intentionally omitted).
+
+    All aggregation happens in SQL via ``COALESCE(SUM(...), 0)`` — a single aggregate row
+    is returned regardless of how many usage rows exist (DoS hardening — WEB-1).
+    """
     await _require_task(daemon, task_id)
-    rows = await daemon.db.fetchall(
-        "SELECT agent, model_reported, num_turns, input_tokens, output_tokens, "
-        "cache_read_tokens, cache_creation_tokens, ts FROM usage "
-        "WHERE task_id = ? ORDER BY ts",
-        (task_id,),
-    )
-    entries = [
-        {
-            "agent": r["agent"],
-            "model_reported": r["model_reported"],
-            "num_turns": r["num_turns"],
-            "input_tokens": r["input_tokens"],
-            "output_tokens": r["output_tokens"],
-            "cache_read_tokens": r["cache_read_tokens"],
-            "cache_creation_tokens": r["cache_creation_tokens"],
-            "ts": r["ts"],
-        }
-        for r in rows
-    ]
-
-    def _sum(field: str) -> int:
-        return sum(int(e[field]) for e in entries if e[field] is not None)
-
-    return {
-        "task_id": task_id,
-        "entries": entries,
-        "total_turns": _sum("num_turns"),
-        "input_tokens": _sum("input_tokens"),
-        "output_tokens": _sum("output_tokens"),
-        "cache_read_tokens": _sum("cache_read_tokens"),
-        "cache_creation_tokens": _sum("cache_creation_tokens"),
-        "agent_count": len(entries),
-    }
+    return await repo.get_task_usage(daemon.db, task_id)
 
 
 @router.get("/tasks/{task_id}/verdicts")
 async def list_task_verdicts(
-    task_id: str, daemon: Daemon = Depends(get_daemon)
+    task_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[VerdictRow]:
-    return await repo.list_verdicts(daemon.db, task_id)
+    return await repo.list_verdicts(
+        daemon.db, task_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 # --- engine profiles --------------------------------------------------------
@@ -358,9 +391,13 @@ async def list_task_verdicts(
 
 @router.get("/profiles")
 async def list_profiles(
-    project_id: str | None = None, daemon: Daemon = Depends(get_daemon)
+    project_id: str | None = None,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[EngineProfileRow]:
-    return await repo.list_engine_profiles(daemon.db, project_id)
+    return await repo.list_engine_profiles(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/profiles")
@@ -437,9 +474,13 @@ async def set_secret(body: SecretInput, daemon: Daemon = Depends(get_daemon)) ->
 
 @router.get("/agents")
 async def list_agents(
-    project_id: str | None = None, daemon: Daemon = Depends(get_daemon)
+    project_id: str | None = None,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[AgentPersona]:
-    return await repo.list_agents(daemon.db, project_id)
+    return await repo.list_agents(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.put("/agents/{name}")
@@ -456,10 +497,14 @@ async def upsert_agent(
 
 @router.get("/projects/{project_id}/planning/sessions")
 async def list_planning_sessions(
-    project_id: str, daemon: Daemon = Depends(get_daemon)
+    project_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningSession]:
     await _require_project(daemon, project_id)
-    return await repo.list_planning_sessions(daemon.db, project_id)
+    return await repo.list_planning_sessions(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/projects/{project_id}/planning/sessions")
@@ -487,9 +532,13 @@ async def get_planning_session(
 
 @router.get("/planning/sessions/{session_id}/messages")
 async def list_planning_messages(
-    session_id: str, daemon: Daemon = Depends(get_daemon)
+    session_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningMessage]:
-    return await repo.list_planning_messages(daemon.db, session_id)
+    return await repo.list_planning_messages(
+        daemon.db, session_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/planning/sessions/{session_id}/messages")
@@ -503,16 +552,28 @@ async def add_planning_message(
 
 @router.get("/planning/sessions/{session_id}/tasks")
 async def list_planning_task_nodes(
-    session_id: str, daemon: Daemon = Depends(get_daemon)
+    session_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningTaskNode]:
-    return await repo.list_planning_task_nodes(daemon.db, session_id)
+    return await repo.list_planning_task_nodes(
+        daemon.db, session_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/planning/sessions/{session_id}/approve")
 async def approve_planning_session(
     session_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
-    task_ids = await daemon.planning_orchestrator.approve_session(session_id)
+    try:
+        task_ids = await daemon.planning_orchestrator.approve_session(session_id)
+    except ValueError as exc:
+        msg = str(exc)
+        if "session not found" in msg:
+            raise HTTPException(status_code=404, detail=msg) from exc
+        if "session is cancelled" in msg:
+            raise HTTPException(status_code=409, detail=msg) from exc
+        raise HTTPException(status_code=400, detail=msg) from exc
     return {"approved": True, "task_ids": task_ids, "count": len(task_ids)}
 
 
@@ -520,7 +581,12 @@ async def approve_planning_session(
 async def cancel_planning_session(
     session_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, bool]:
-    await daemon.planning_orchestrator.cancel_session(session_id)
+    try:
+        await daemon.planning_orchestrator.cancel_session(session_id)
+    except ValueError as exc:
+        if "session not found" in str(exc):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise
     return {"cancelled": True}
 
 

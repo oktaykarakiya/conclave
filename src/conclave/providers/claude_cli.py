@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import re
+import signal
 from pathlib import Path
 
 from .base import AgentResult, OnChunk
@@ -20,6 +21,19 @@ from .profiles import ResolvedProfile, build_invocation
 # Mirrors team-ai: even on a non-zero exit, treat output that clearly contains an
 # agent verdict / completion as a usable result rather than a hard failure.
 _SUCCESS_HINT = re.compile(r"(?i)(verdict|task completed|i have)")
+
+# Provider-controlled env vars that must NOT leak from the parent process into
+# inherit/flag-mode dispatches. In env-mode, build_invocation reintroduces them.
+_PROVIDER_ENV_KEYS: frozenset[str] = frozenset({
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+})
 
 
 class ClaudeCliProvider:
@@ -35,7 +49,13 @@ class ClaudeCliProvider:
         on_chunk: OnChunk | None = None,
     ) -> AgentResult:
         invocation = build_invocation(profile)
-        env = {**os.environ, **invocation.env}
+        # Strip provider-controlled env vars from the parent environment so they
+        # never leak into inherit/flag-mode dispatches. invocation.env reintroduces
+        # them for env-mode profiles.
+        env = {
+            k: v for k, v in os.environ.items() if k not in _PROVIDER_ENV_KEYS
+        }
+        env.update(invocation.env)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -46,6 +66,7 @@ class ClaudeCliProvider:
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
                 cwd=str(cwd) if cwd is not None else None,
+                start_new_session=True,
             )
         except FileNotFoundError:
             return AgentResult(ok=False, error=f"CLI not found: {profile.cli!r}")
@@ -53,25 +74,53 @@ class ClaudeCliProvider:
         async def drive() -> str:
             assert proc.stdin is not None
             assert proc.stdout is not None
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
+            # Capture narrowed types so mypy sees them inside the inner coroutines.
+            stdin = proc.stdin
+            stdout = proc.stdout
+
+            # Shared mutable list — safe in CPython asyncio since only one coroutine
+            # runs at a time (no true parallelism); await gather() joins before we
+            # read it below.
             parts: list[str] = []
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", errors="replace")
-                parts.append(text)
-                if on_chunk is not None:
-                    await on_chunk(text)
+
+            async def _write_stdin() -> None:
+                """Drain the prompt into stdin and close it to signal EOF."""
+                stdin.write(prompt.encode("utf-8"))
+                await stdin.drain()
+                stdin.close()
+
+            async def _read_stdout() -> None:
+                """Consume all stdout chunks, appending to parts and streaming on_chunk."""
+                while True:
+                    chunk = await stdout.read(4096)
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", errors="replace")
+                    parts.append(text)
+                    if on_chunk is not None:
+                        await on_chunk(text)
+
+            # Run stdin-writing and stdout-reading concurrently so a chatty child
+            # that emits a large volume of stdout while stdin is still being
+            # written cannot fill the OS pipe buffer and deadlock.
+            await asyncio.gather(_write_stdin(), _read_stdout())
             await proc.wait()
             return "".join(parts)
 
         try:
             raw = await asyncio.wait_for(drive(), timeout=timeout_seconds)
         except TimeoutError:
-            proc.kill()
+            # Terminate the entire process group so descendant subagents
+            # (e.g. tools spawned by the CLI) aren't orphaned.  Two-phase
+            # escalation — SIGTERM first for a graceful shutdown window,
+            # then SIGKILL for any stragglers.
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                await asyncio.sleep(0.3)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
             with contextlib.suppress(ProcessLookupError):
                 await proc.wait()
             return AgentResult(ok=False, error=f"timed out after {timeout_seconds}s")

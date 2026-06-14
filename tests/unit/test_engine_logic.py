@@ -139,3 +139,105 @@ def test_baseline_preamble_and_trim() -> None:
 
     trimmed = trim_output("\n".join(str(i) for i in range(500)), max_lines=10)
     assert trimmed.splitlines() == [str(i) for i in range(490, 500)]
+
+
+# --- _test_command ----------------------------------------------------------
+
+
+def test_test_command_returns_baseline_when_set() -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _test_command
+
+    config = ConclaveConfig()
+    config.execution.baseline_test_command = "cargo test"
+    assert _test_command(config, None) == "cargo test"
+
+
+def test_test_command_falls_back_to_knowledge_commands_test() -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _test_command
+
+    config = ConclaveConfig()
+    knowledge = {"commands": {"test": "pytest -q"}}
+    assert _test_command(config, knowledge) == "pytest -q"
+
+
+def test_test_command_returns_none_when_neither() -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _test_command
+
+    config = ConclaveConfig()
+    assert _test_command(config, None) is None
+    assert _test_command(config, {}) is None
+    assert _test_command(config, {"commands": {}}) is None
+
+
+# --- _build_venv_guidance ---------------------------------------------------
+
+
+def test_build_venv_guidance_returns_empty_when_no_venv(tmp_path: Path) -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _build_venv_guidance
+
+    config = ConclaveConfig()
+    config.execution.baseline_test_command = "pytest"
+    # tmp_path has no .venv/ directory.
+    assert _build_venv_guidance(tmp_path, config, None) == ""
+
+
+def test_build_venv_guidance_derives_pythonic_commands(tmp_path: Path) -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _build_venv_guidance
+
+    (tmp_path / ".venv").mkdir()
+    config = ConclaveConfig()
+    config.execution.baseline_test_command = "pytest -q"
+    knowledge = {"commands": {"lint": "ruff check src tests", "check": "mypy"}}
+
+    result = _build_venv_guidance(tmp_path, config, knowledge)
+
+    assert ".venv/bin/pytest -q" in result
+    assert ".venv/bin/ruff check src tests" in result
+    assert ".venv/bin/mypy" in result
+    assert "Do NOT use system-wide" in result
+    # Must NOT mention hard-coded tools — it derives from configured commands.
+    assert "pytest" in result.lower()
+    # The tool_refs line mentions the unique tool names.
+    assert "`pytest`" in result and "`ruff`" in result and "`mypy`" in result
+
+
+def test_build_venv_guidance_derives_non_python_commands(tmp_path: Path) -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _build_venv_guidance
+
+    (tmp_path / ".venv").mkdir()
+    config = ConclaveConfig()
+    config.execution.baseline_test_command = "cargo test"
+
+    result = _build_venv_guidance(tmp_path, config, None)
+
+    # Must mention the actual test command, never hard-coded pytest.
+    assert "cargo test" in result
+    assert "pytest" not in result
+    assert "mypy" not in result
+    assert ".venv/bin/cargo test" in result
+
+
+def test_build_venv_guidance_handles_empty_config(tmp_path: Path) -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _build_venv_guidance
+
+    (tmp_path / ".venv").mkdir()
+    config = ConclaveConfig()
+    # No baseline_test_command, no knowledge.
+
+    result = _build_venv_guidance(tmp_path, config, None)
+
+    # When no commands are known, emit a generic .venv/bin/ hint.
+    assert result != ""
+    assert ".venv/bin/" in result
+    assert "MANDATORY" in result
+    # Must NOT contain hard-coded pytest/mypy/ruff.
+    assert "pytest" not in result
+    assert "mypy" not in result
+    assert "ruff" not in result

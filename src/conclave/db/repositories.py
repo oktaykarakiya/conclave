@@ -7,6 +7,7 @@ Each returns domain row models from :mod:`conclave.db.models`.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import aiosqlite
@@ -34,6 +35,8 @@ from .planning_models import (
     PlanningSessionStatus,
     PlanningTaskNode,
 )
+
+logger = logging.getLogger("conclave.db")
 
 # --- projects ---------------------------------------------------------------
 
@@ -66,8 +69,15 @@ async def get_project(db: Database, project_id: str) -> Project | None:
     return Project.from_row(row) if row else None
 
 
-async def list_projects(db: Database) -> list[Project]:
-    rows = await db.fetchall("SELECT * FROM projects ORDER BY created_at")
+async def list_projects(
+    db: Database, limit: int | None = None, offset: int = 0
+) -> list[Project]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM projects ORDER BY created_at LIMIT ? OFFSET ?", (limit, offset)
+        )
+    else:
+        rows = await db.fetchall("SELECT * FROM projects ORDER BY created_at")
     return [Project.from_row(r) for r in rows]
 
 
@@ -122,9 +132,26 @@ async def get_task(db: Database, task_id: str) -> Task | None:
 
 
 async def list_tasks(
-    db: Database, project_id: str, state: TaskState | None = None
+    db: Database,
+    project_id: str,
+    state: TaskState | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[Task]:
-    if state is None:
+    if limit is not None:
+        if state is None:
+            rows = await db.fetchall(
+                "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC "
+                "LIMIT ? OFFSET ?",
+                (project_id, limit, offset),
+            )
+        else:
+            rows = await db.fetchall(
+                "SELECT * FROM tasks WHERE project_id = ? AND state = ? "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (project_id, state.value, limit, offset),
+            )
+    elif state is None:
         rows = await db.fetchall(
             "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC", (project_id,)
         )
@@ -148,6 +175,25 @@ async def set_task_state(db: Database, task_id: str, state: TaskState) -> None:
         "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?",
         (state.value, now_iso(), task_id),
     )
+
+
+async def approve_task(db: Database, task_id: str) -> bool:
+    """Atomically set state to ``approved`` only if currently in an approvable state.
+
+    The WHERE clause guarantees the state transition is conditional at the row
+    level — a worker claiming the task between a prior read and this UPDATE cannot
+    cause a duplicate run because the UPDATE simply won't match (zero rows affected).
+
+    Returns ``True`` if a row was updated, ``False`` if the task was not in an
+    approvable state (or doesn't exist).
+    """
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE tasks SET state = ?, updated_at = ? "
+            "WHERE id = ? AND state IN ('inbox', 'failed')",
+            (TaskState.approved.value, now_iso(), task_id),
+        )
+        return cur.rowcount > 0
 
 
 async def update_task_fields(
@@ -257,12 +303,25 @@ async def finalize_task(
 async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
     """BFS that blocks every active descendant of ``task_id`` on an already-open transaction.
 
+    Cycle-safe: a visited-set guards the walk so a cyclic ``parent_task_id`` cannot
+    cause an infinite loop.  Each node is blocked at most once.
+
     Operates on a caller-supplied connection so it composes into a larger transaction
     (e.g. :func:`finalize_task`); the caller owns the surrounding BEGIN/COMMIT.
     """
     blocked = 0
+    visited: set[str] = {task_id}
     queue = [task_id]
+    depth = 0
+    _MAX_DEPTH = 1000
     while queue:
+        depth += 1
+        if depth > _MAX_DEPTH:
+            logger.warning(
+                "_block_descendants hit depth cap %d at task %s — tree may be malformed",
+                _MAX_DEPTH, task_id,
+            )
+            break
         parent = queue.pop(0)
         cur = await conn.execute(
             "SELECT id FROM tasks WHERE parent_task_id = ? "
@@ -271,6 +330,13 @@ async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
         )
         children = [r["id"] for r in await cur.fetchall()]
         for child_id in children:
+            if child_id in visited:
+                logger.warning(
+                    "_block_descendants detected cycle at task %s (child of %s) — skipping",
+                    child_id, parent,
+                )
+                continue
+            visited.add(child_id)
             await conn.execute(
                 "UPDATE tasks SET state = 'blocked', updated_at = ? WHERE id = ?",
                 (now_iso(), child_id),
@@ -280,16 +346,39 @@ async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
     return blocked
 
 
-async def recover_in_progress(db: Database, project_id: str) -> int:
-    """Reset orphaned ``in_progress`` tasks to ``approved`` (crash recovery)."""
-    async with db._write() as conn:
+async def recover_in_progress(db: Database, project_id: str) -> tuple[int, int]:
+    """Reset orphaned ``in_progress`` tasks to ``approved`` and re-block descendants
+    of ``failed``/``blocked`` parents (crash recovery).
+
+    Returns ``(recovered, reblocked)`` where *recovered* is the count of ``in_progress``
+    tasks reset to ``approved`` and *reblocked* is the count of descendant tasks that
+    were set to ``blocked`` because their parent is still ``failed``/``blocked``.
+
+    Runs in a single transaction so an observer can never see recovered-but-not-yet-
+    reblocked state — the recovery atomically resets orphans AND re-applies blocking.
+    """
+    recovered = 0
+    reblocked = 0
+    async with db.transaction() as conn:
         cur = await conn.execute(
             "UPDATE tasks SET state = 'approved', updated_at = ? "
             "WHERE project_id = ? AND state = 'in_progress'",
             (now_iso(), project_id),
         )
-        count: int = cur.rowcount
-    return count
+        recovered = cur.rowcount
+
+        # Re-block descendants of every task currently in failed/blocked state so a
+        # crash that strands a parent in failed/blocked with children in approved can
+        # never leave those children claimable after recovery.
+        cur = await conn.execute(
+            "SELECT id FROM tasks WHERE project_id = ? AND state IN ('failed', 'blocked')",
+            (project_id,),
+        )
+        parents = [r["id"] for r in await cur.fetchall()]
+        for parent_id in parents:
+            reblocked += await _block_descendants(conn, parent_id)
+
+    return recovered, reblocked
 
 
 # --- attempts ---------------------------------------------------------------
@@ -344,10 +433,19 @@ async def add_verdict(
     )
 
 
-async def list_verdicts(db: Database, task_id: str) -> list[VerdictRow]:
-    rows = await db.fetchall(
-        "SELECT * FROM verdicts WHERE task_id = ? ORDER BY attempt, created_at", (task_id,)
-    )
+async def list_verdicts(
+    db: Database, task_id: str, limit: int | None = None, offset: int = 0
+) -> list[VerdictRow]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM verdicts WHERE task_id = ? ORDER BY attempt, created_at "
+            "LIMIT ? OFFSET ?",
+            (task_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM verdicts WHERE task_id = ? ORDER BY attempt, created_at", (task_id,)
+        )
     return [VerdictRow.from_row(r) for r in rows]
 
 
@@ -448,6 +546,34 @@ async def usage_summary(db: Database, project_id: str) -> dict[str, Any]:
     return {"calls": int(row["calls"]), "total_cost_usd": float(row["total_cost"])}
 
 
+async def get_task_usage(db: Database, task_id: str) -> dict[str, Any]:
+    """Return token-usage totals for a single task computed entirely in SQL (DoS hardening — WEB-1).
+
+    Uses ``COALESCE(SUM(...), 0)`` so a single aggregate row is returned regardless of how many
+    usage rows exist — no Python-side iteration over unbounded rows.
+    """
+    row = await db.fetchone(
+        "SELECT COALESCE(SUM(num_turns), 0) AS total_turns, "
+        "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+        "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+        "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+        "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, "
+        "COUNT(*) AS agent_count "
+        "FROM usage WHERE task_id = ?",
+        (task_id,),
+    )
+    assert row is not None  # COUNT(*) always yields a row
+    return {
+        "task_id": task_id,
+        "total_turns": int(row["total_turns"]),
+        "input_tokens": int(row["input_tokens"]),
+        "output_tokens": int(row["output_tokens"]),
+        "cache_read_tokens": int(row["cache_read_tokens"]),
+        "cache_creation_tokens": int(row["cache_creation_tokens"]),
+        "agent_count": int(row["agent_count"]),
+    }
+
+
 # --- baselines --------------------------------------------------------------
 
 
@@ -496,10 +622,18 @@ async def add_quarantine(
     return QuarantineEntry.from_row(row)
 
 
-async def list_quarantine(db: Database, project_id: str) -> list[QuarantineEntry]:
-    rows = await db.fetchall(
-        "SELECT * FROM quarantine WHERE project_id = ? ORDER BY until", (project_id,)
-    )
+async def list_quarantine(
+    db: Database, project_id: str, limit: int | None = None, offset: int = 0
+) -> list[QuarantineEntry]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM quarantine WHERE project_id = ? ORDER BY until LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM quarantine WHERE project_id = ? ORDER BY until", (project_id,)
+        )
     return [QuarantineEntry.from_row(r) for r in rows]
 
 
@@ -605,12 +739,21 @@ async def get_engine_profile(
 
 
 async def list_engine_profiles(
-    db: Database, project_id: str | None = None
+    db: Database, project_id: str | None = None,
+    limit: int | None = None, offset: int = 0,
 ) -> list[EngineProfileRow]:
-    rows = await db.fetchall(
-        "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? ORDER BY name",
-        (project_id,),
-    )
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? "
+            "ORDER BY name LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? "
+            "ORDER BY name",
+            (project_id,),
+        )
     return [EngineProfileRow.from_row(r) for r in rows]
 
 
@@ -661,11 +804,21 @@ async def get_agent(
     return AgentPersona.from_row(row) if row else None
 
 
-async def list_agents(db: Database, project_id: str | None = None) -> list[AgentPersona]:
-    rows = await db.fetchall(
-        "SELECT * FROM agents WHERE project_id IS NULL OR project_id = ? ORDER BY name",
-        (project_id,),
-    )
+async def list_agents(
+    db: Database, project_id: str | None = None,
+    limit: int | None = None, offset: int = 0,
+) -> list[AgentPersona]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM agents WHERE project_id IS NULL OR project_id = ? "
+            "ORDER BY name LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM agents WHERE project_id IS NULL OR project_id = ? ORDER BY name",
+            (project_id,),
+        )
     return [AgentPersona.from_row(r) for r in rows]
 
 
@@ -747,11 +900,20 @@ async def get_planning_session(db: Database, session_id: str) -> PlanningSession
     return PlanningSession.from_row(row) if row else None
 
 
-async def list_planning_sessions(db: Database, project_id: str) -> list[PlanningSession]:
-    rows = await db.fetchall(
-        "SELECT * FROM planning_sessions WHERE project_id = ? ORDER BY created_at DESC",
-        (project_id,),
-    )
+async def list_planning_sessions(
+    db: Database, project_id: str, limit: int | None = None, offset: int = 0
+) -> list[PlanningSession]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_sessions WHERE project_id = ? ORDER BY created_at DESC "
+            "LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_sessions WHERE project_id = ? ORDER BY created_at DESC",
+            (project_id,),
+        )
     return [PlanningSession.from_row(r) for r in rows]
 
 
@@ -845,11 +1007,20 @@ async def _get_planning_message(db: Database, message_id: str) -> PlanningMessag
     return PlanningMessage.from_row(row) if row else None
 
 
-async def list_planning_messages(db: Database, session_id: str) -> list[PlanningMessage]:
-    rows = await db.fetchall(
-        "SELECT * FROM planning_messages WHERE session_id = ? ORDER BY turn_number, id",
-        (session_id,),
-    )
+async def list_planning_messages(
+    db: Database, session_id: str, limit: int | None = None, offset: int = 0
+) -> list[PlanningMessage]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_messages WHERE session_id = ? "
+            "ORDER BY turn_number, id LIMIT ? OFFSET ?",
+            (session_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_messages WHERE session_id = ? ORDER BY turn_number, id",
+            (session_id,),
+        )
     return [PlanningMessage.from_row(r) for r in rows]
 
 
@@ -927,11 +1098,21 @@ async def delete_planning_task_node(db: Database, node_id: str) -> None:
     await db.execute("DELETE FROM planning_task_nodes WHERE id = ?", (node_id,))
 
 
-async def list_planning_task_nodes(db: Database, session_id: str) -> list[PlanningTaskNode]:
-    rows = await db.fetchall(
-        "SELECT * FROM planning_task_nodes WHERE session_id = ? ORDER BY level, sort_order",
-        (session_id,),
-    )
+async def list_planning_task_nodes(
+    db: Database, session_id: str, limit: int | None = None, offset: int = 0
+) -> list[PlanningTaskNode]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_task_nodes WHERE session_id = ? "
+            "ORDER BY level, sort_order LIMIT ? OFFSET ?",
+            (session_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_task_nodes WHERE session_id = ? "
+            "ORDER BY level, sort_order",
+            (session_id,),
+        )
     return [PlanningTaskNode.from_row(r) for r in rows]
 
 

@@ -63,3 +63,15 @@ class PlanningSessionCreate(BaseModel):
 
 class PlanningMessageInput(BaseModel):
     content: str
+
+
+class PaginationParams(BaseModel):
+    """Shared pagination model for list endpoints (DoS hardening — WEB-1).
+
+    Every unbounded list endpoint accepts these query params; the repo layer
+    translates them into ``LIMIT ? OFFSET ?`` clauses. When omitted, the
+    defaults cap the response so a single request can never balloon memory.
+    """
+
+    limit: int = Field(50, ge=1, le=500, description="Max items per page")
+    offset: int = Field(0, ge=0, description="Items to skip")

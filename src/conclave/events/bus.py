@@ -50,7 +50,7 @@ class Subscriber:
     so the subscription is removed on exit.
     """
 
-    def __init__(self, bus: EventBus, event_filter: EventFilter, maxsize: int = 1000) -> None:
+    def __init__(self, bus: EventBus, event_filter: EventFilter, maxsize: int = 256) -> None:
         self._bus = bus
         self._filter = event_filter
         self.queue: asyncio.Queue[EventRow] = asyncio.Queue(maxsize=maxsize)
@@ -94,9 +94,17 @@ class Subscriber:
 
 
 class EventBus:
-    def __init__(self, db: Database) -> None:
+    """In-process pub/sub bus with a hard subscriber cap (DoS hardening — WEB-1).
+
+    The cap prevents unbounded fan-out: every subscriber holds an asyncio.Queue
+    whose memory footprint adds up, and every emit iterates the subscriber set so
+    wall-clock cost grows with subscriber count.
+    """
+
+    def __init__(self, db: Database, max_subscribers: int = 64) -> None:
         self._db = db
         self._subscribers: set[Subscriber] = set()
+        self._max_subscribers = max_subscribers
 
     async def emit(
         self,
@@ -129,8 +137,13 @@ class EventBus:
         planning_session_id: str | None = None,
         agent: str | None = None,
         types: list[str] | None = None,
-        maxsize: int = 1000,
+        maxsize: int = 256,
     ) -> Subscriber:
+        if len(self._subscribers) >= self._max_subscribers:
+            raise RuntimeError(
+                f"EventBus subscriber cap reached ({self._max_subscribers}). "
+                "Unsubscribe unused subscribers before creating new ones."
+            )
         event_filter = EventFilter(
             project_id=project_id,
             task_id=task_id,

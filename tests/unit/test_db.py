@@ -83,8 +83,10 @@ async def test_task_lifecycle_claim_and_recover(db: Database) -> None:
     assert claimed.id == t1.id
     assert claimed.state is TaskState.in_progress
 
-    # crash recovery returns it to approved
-    assert await repo.recover_in_progress(db, p.id) == 1
+    # crash recovery returns it to approved; no failed/blocked parents → reblocked=0
+    recovered, reblocked = await repo.recover_in_progress(db, p.id)
+    assert recovered == 1
+    assert reblocked == 0
     again = await repo.get_task(db, t1.id)
     assert again is not None
     assert again.state is TaskState.approved
@@ -96,6 +98,103 @@ async def test_task_lifecycle_claim_and_recover(db: Database) -> None:
     assert updated.branch == "conclave/x"
     assert updated.level == 2
     assert updated.plan == {"approach": "a"}
+
+
+async def test_recover_reblocks_failed_parent_children(db: Database) -> None:
+    """After recovery, a child of a failed parent must be blocked — not claimable.
+
+    Simulates a crash where a parent is ``failed`` and its child is ``approved``
+    (e.g. stranded by a pre-CON-1 code path or direct manipulation). Recovery
+    must re-block the child so it can never be claimed out of dependency order.
+    A healthy approved task with a ``done`` parent (or no parent) is unaffected.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # A failed parent with an approved child — the vulnerable state.
+    parent = await repo.create_task(
+        db, project_id=p.id, request="parent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, parent.id, TaskState.failed)
+    child = await repo.create_task(
+        db, project_id=p.id, request="child", state=TaskState.approved,
+        parent_task_id=parent.id,
+    )
+
+    # A healthy approved task with a done parent — should NOT be blocked.
+    done_parent = await repo.create_task(
+        db, project_id=p.id, request="done-parent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, done_parent.id, TaskState.done)
+    healthy = await repo.create_task(
+        db, project_id=p.id, request="healthy", state=TaskState.approved,
+        parent_task_id=done_parent.id,
+    )
+
+    # A parentless approved task — should also be unaffected.
+    orphan = await repo.create_task(
+        db, project_id=p.id, request="orphan", state=TaskState.approved,
+    )
+
+    recovered, reblocked = await repo.recover_in_progress(db, p.id)
+    assert recovered == 0  # no in_progress tasks
+    assert reblocked == 1  # the failed parent's child was blocked
+
+    c = await repo.get_task(db, child.id)
+    assert c is not None and c.state is TaskState.blocked
+
+    # Unaffected tasks remain claimable.
+    h = await repo.get_task(db, healthy.id)
+    assert h is not None and h.state is TaskState.approved
+    o = await repo.get_task(db, orphan.id)
+    assert o is not None and o.state is TaskState.approved
+
+    # Verify claimability: only the healthy and orphan should be claimable.
+    claimed1 = await repo.claim_next_approved(db, p.id)
+    assert claimed1 is not None and claimed1.id in (healthy.id, orphan.id)
+    claimed2 = await repo.claim_next_approved(db, p.id)
+    assert claimed2 is not None and claimed2.id in (healthy.id, orphan.id)
+    assert claimed1.id != claimed2.id
+    # The blocked child is NOT claimable.
+    assert await repo.claim_next_approved(db, p.id) is None
+
+
+async def test_recover_reblocks_blocked_parent_children(db: Database) -> None:
+    """A ``blocked`` parent must also propagate blocking during recovery.
+
+    If task B is ``blocked`` (e.g. because its parent A failed) and B's own child C
+    is somehow ``approved``, recovery must block C — the blocked state propagates
+    across depth just like the failed state does.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Grandparent is failed → parent should be blocked, but we'll create it as approved
+    # to simulate the inconsistent state recovery fixes.
+    grandparent = await repo.create_task(
+        db, project_id=p.id, request="grandparent", state=TaskState.approved,
+    )
+    await repo.set_task_state(db, grandparent.id, TaskState.failed)
+    parent = await repo.create_task(
+        db, project_id=p.id, request="parent", state=TaskState.blocked,
+        parent_task_id=grandparent.id,
+    )
+    child = await repo.create_task(
+        db, project_id=p.id, request="child", state=TaskState.approved,
+        parent_task_id=parent.id,
+    )
+    grandchild = await repo.create_task(
+        db, project_id=p.id, request="grandchild", state=TaskState.approved,
+        parent_task_id=child.id,
+    )
+
+    recovered, reblocked = await repo.recover_in_progress(db, p.id)
+    assert recovered == 0  # no in_progress tasks
+    # Both the child (of blocked parent) and grandchild (of child) are blocked.
+    assert reblocked == 2
+
+    c = await repo.get_task(db, child.id)
+    assert c is not None and c.state is TaskState.blocked
+    gc = await repo.get_task(db, grandchild.id)
+    assert gc is not None and gc.state is TaskState.blocked
 
 
 async def test_claim_never_reclaims_terminal_tasks(db: Database) -> None:
@@ -270,6 +369,83 @@ async def test_usage_summary(db: Database) -> None:
     assert abs(summary["total_cost_usd"] - 0.15) < 1e-9
 
 
+async def test_get_task_usage_sql_aggregation(db: Database) -> None:
+    """get_task_usage uses COALESCE(SUM(...)) — a single aggregate row regardless of row count."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    t = await repo.create_task(db, project_id=p.id, request="x")
+
+    # Add multiple usage rows with varying token counts.
+    await repo.add_usage(
+        db, agent="dev", task_id=t.id, project_id=p.id,
+        num_turns=3, input_tokens=100, output_tokens=50,
+        cache_read_tokens=20, cache_creation_tokens=10,
+    )
+    await repo.add_usage(
+        db, agent="tester", task_id=t.id, project_id=p.id,
+        num_turns=1, input_tokens=80, output_tokens=30,
+        cache_read_tokens=15, cache_creation_tokens=5,
+    )
+
+    usage = await repo.get_task_usage(db, t.id)
+    assert usage["task_id"] == t.id
+    assert usage["total_turns"] == 4  # 3 + 1
+    assert usage["input_tokens"] == 180  # 100 + 80
+    assert usage["output_tokens"] == 80  # 50 + 30
+    assert usage["cache_read_tokens"] == 35  # 20 + 15
+    assert usage["cache_creation_tokens"] == 15  # 10 + 5
+    assert usage["agent_count"] == 2  # two distinct usage rows
+
+    # A task with no usage rows returns zeros — not an error.
+    t2 = await repo.create_task(db, project_id=p.id, request="no-usage")
+    empty = await repo.get_task_usage(db, t2.id)
+    assert empty["total_turns"] == 0
+    assert empty["input_tokens"] == 0
+    assert empty["agent_count"] == 0
+
+
+async def test_list_functions_honor_limit_offset(db: Database) -> None:
+    """Repo list functions append LIMIT ? OFFSET ? when limit is provided."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Create several tasks to paginate over.
+    for i in range(10):
+        await repo.create_task(db, project_id=p.id, request=f"task-{i}")
+
+    # Without limit, all tasks are returned.
+    all_tasks = await repo.list_tasks(db, p.id)
+    assert len(all_tasks) == 10
+
+    # With limit, only the requested count is returned.
+    page1 = await repo.list_tasks(db, p.id, limit=3, offset=0)
+    assert len(page1) == 3
+
+    # Offset skips the first items.
+    page2 = await repo.list_tasks(db, p.id, limit=3, offset=3)
+    assert len(page2) == 3
+    # Verify no overlap — offsets produce distinct pages.
+    ids1 = {t.id for t in page1}
+    ids2 = {t.id for t in page2}
+    assert ids1.isdisjoint(ids2)
+
+    # Offset past the end returns empty.
+    tail = await repo.list_tasks(db, p.id, limit=5, offset=100)
+    assert tail == []
+
+    # Quarantine and verdicts also support pagination.
+    entries = await repo.list_quarantine(db, p.id, limit=5, offset=0)
+    assert entries == []
+
+    # Verdicts pagination.
+    t = all_tasks[0]
+    await repo.add_verdict(db, task_id=t.id, attempt=1, agent="reviewer", verdict="pass")
+    await repo.add_verdict(db, task_id=t.id, attempt=1, agent="security", verdict="pass")
+    v_page = await repo.list_verdicts(db, t.id, limit=1, offset=0)
+    assert len(v_page) == 1
+    v_page2 = await repo.list_verdicts(db, t.id, limit=1, offset=1)
+    assert len(v_page2) == 1
+    assert v_page[0].id != v_page2[0].id
+
+
 async def test_transaction_commits_all_on_success(db: Database) -> None:
     """Every statement inside a transaction() persists once the block exits cleanly."""
     p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
@@ -387,3 +563,40 @@ async def test_corrupt_planning_rows_load_with_safe_defaults(db: Database) -> No
     nodes = await repo.list_planning_task_nodes(db, "sess")
     assert len(nodes) == 1
     assert nodes[0].status is PlanningNodeStatus.proposed
+
+
+async def test_block_descendants_cycle_safe(db: Database) -> None:
+    """block_descendants terminates on a cyclic parent_task_id (A → B → A)
+    and blocks each non-terminal node at most once."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Create task A (inbox).
+    task_a = await repo.create_task(
+        db, project_id=p.id, request="task A", state=TaskState.inbox,
+    )
+    # Create task B as a child of A.
+    task_b = await repo.create_task(
+        db, project_id=p.id, request="task B", state=TaskState.inbox,
+        parent_task_id=task_a.id,
+    )
+
+    # Create the cycle: point A's parent at B via raw SQL.
+    await db.execute(
+        "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+        (task_b.id, task_a.id),
+    )
+
+    # block_descendants must terminate and return a finite count.
+    blocked = await repo.block_descendants(db, task_a.id)
+    assert blocked in (1, 2), f"Expected 1 or 2 blocked tasks, got {blocked}"
+
+    # Verify that the blocked tasks are actually blocked.
+    a = await repo.get_task(db, task_a.id)
+    assert a is not None
+    # task_a is the root — it is NOT blocked by block_descendants (only
+    # descendants are blocked, not the root itself).
+    assert a.state is TaskState.inbox
+
+    b = await repo.get_task(db, task_b.id)
+    assert b is not None
+    assert b.state is TaskState.blocked

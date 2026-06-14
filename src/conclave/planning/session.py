@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 from typing import Any
 
 from ..config import ArgMode
@@ -55,6 +54,10 @@ class PlanningOrchestrator:
         self._provider = provider
         self._active_sessions: dict[str, asyncio.Task[None]] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
+        # Per-session lock ensures only one _agent_turn mutates a given session
+        # at a time, preventing concurrent read-modify-write races on task_changes
+        # (title dedupe, sort_order) and transcript ordering.
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -130,11 +133,69 @@ class PlanningOrchestrator:
         return msg
 
     async def approve_session(self, session_id: str) -> list[str]:
-        """Create real Task rows from all planning task nodes and mark completed."""
+        """Create real Task rows from all planning task nodes and mark completed.
+
+        Guarded by session status so that:
+        * ``completed`` — idempotent: returns the existing task IDs without creating new ones.
+        * ``cancelled`` — rejects with ValueError.
+        * ``active`` — cancels & awaits the background discussion loop before creating tasks,
+          avoiding a race between the loop's own status writes and task creation.
+        * ``stable`` — proceeds with task creation as normal.
+        """
         session = await repo.get_planning_session(self._db, session_id)
         if session is None:
             raise ValueError("session not found")
 
+        # --- status guard ---------------------------------------------------
+        if session.status == PlanningSessionStatus.completed:
+            # Idempotent: tasks already created — return their ids without creating more.
+            nodes = await repo.list_planning_task_nodes(self._db, session_id)
+            return [n.task_id for n in nodes if n.task_id]
+
+        if session.status == PlanningSessionStatus.cancelled:
+            raise ValueError("session is cancelled")
+
+        if session.status == PlanningSessionStatus.active:
+            # Cancel the background discussion loop first so it cannot race
+            # task creation with its own status writes (e.g. marking itself
+            # stable in _run_discussion after we've started materialising).
+            bg = self._active_sessions.pop(session_id, None)
+            if bg is not None:
+                bg.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await bg
+            # Re-read status — the loop may have already set it to stable
+            # before we cancelled it.  If it somehow ended up completed or
+            # cancelled during the await we bail out.
+            session = await repo.get_planning_session(self._db, session_id)
+            if session is None:
+                raise ValueError("session not found")
+            if session.status == PlanningSessionStatus.completed:
+                # Already materialised by a concurrent call — idempotent return.
+                nodes = await repo.list_planning_task_nodes(self._db, session_id)
+                return [n.task_id for n in nodes if n.task_id]
+            if session.status == PlanningSessionStatus.cancelled:
+                raise ValueError("session is cancelled")
+            # If the loop already set us to stable, proceed; otherwise we
+            # transition manually (the loop was cancelled before it could).
+            if session.status != PlanningSessionStatus.stable:
+                await repo.update_planning_session_status(
+                    self._db, session_id, PlanningSessionStatus.stable
+                )
+                # Re-read so the local variable reflects the new status.
+                session = await repo.get_planning_session(self._db, session_id)
+                if session is None:
+                    raise ValueError("session not found")
+
+        # At this point session.status must be stable (either originally, or
+        # we just settled an active session).  Any other unexpected status
+        # (e.g. a future status added later) is rejected.
+        if session.status != PlanningSessionStatus.stable:
+            raise ValueError(
+                f"session cannot be approved in status {session.status}"
+            )
+
+        # --- task materialisation -------------------------------------------
         nodes = await repo.list_planning_task_nodes(self._db, session_id)
 
         # Create a parent task representing the session itself
@@ -207,11 +268,29 @@ class PlanningOrchestrator:
             planning_session_id=session_id,
             payload={"planning_session_id": session_id},
         )
-        # Clean up background task
-        bg = self._active_sessions.pop(session_id, None)
-        if bg is not None:
-            bg.cancel()
+        self._session_locks.pop(session_id, None)
         return created_ids
+
+    async def shutdown(self) -> None:
+        """Cancel and await all active sessions and background tasks.
+
+        Called during daemon shutdown before the database is closed.  Every
+        tracked task (discussion loops, pending agent-turn continuations) is
+        cancelled and then awaited so no coroutine can touch the DB after
+        ``db.close()``.
+        """
+        for _session_id, task in list(self._active_sessions.items()):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._active_sessions.clear()
+
+        for task in list(self._bg_tasks):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._bg_tasks.clear()
+        self._session_locks.clear()
 
     async def cancel_session(self, session_id: str) -> None:
         """Cancel an active or stable session."""
@@ -229,6 +308,7 @@ class PlanningOrchestrator:
             # we return (otherwise it races teardown / shutdown).
             with contextlib.suppress(asyncio.CancelledError):
                 await bg
+        self._session_locks.pop(session_id, None)
         await self._bus.emit(
             type=EventType.planning_session_cancelled,
             project_id=session.project_id,
@@ -243,101 +323,101 @@ class PlanningOrchestrator:
     async def _run_discussion(self, session: PlanningSession) -> None:
         """Background task: orchestrate agent discussion rounds."""
         try:
-            await self._bus.emit(
-                type=EventType.planning_session_started,
-                project_id=session.project_id,
-                planning_session_id=session.id,
-                payload={"planning_session_id": session.id},
-            )
-
-            # Round 0: initial planner breakdown
-            await self._agent_turn(
-                session.id, _PLANNER, PLANNER_DISCUSSION, session.prompt
-            )
-
-            for round_num in range(1, session.max_rounds + 1):
-                # Check if session was cancelled during execution
-                current = await repo.get_planning_session(self._db, session.id)
-                if current is None or current.status == PlanningSessionStatus.cancelled:
-                    return
-
-                # Reviewer round: each reviewer critiques the current plan
-                approvals: set[str] = set()
-                for agent_name, system_prompt in DISCUSSION_AGENTS:
-                    if agent_name == _PLANNER:
-                        continue  # planner responds after reviewers
-                    context = await self._build_context(session.id)
-                    result = await self._agent_turn(
-                        session.id, agent_name, system_prompt, context
-                    )
-                    if result and "APPROVED" in result:
-                        approvals.add(agent_name)
-
-                # Planner refinement round: incorporate feedback
-                context = await self._build_context(session.id)
-                planner_result = await self._agent_turn(
-                    session.id, _PLANNER, PLANNER_DISCUSSION, context
-                )
-
-                # Check if planner signalled readiness
-                planner_ready = False
-                if planner_result:
-                    try:
-                        json_match = re.search(
-                            r"```json\s*(\{.*?\})\s*```", planner_result, re.DOTALL
-                        )
-                        if json_match:
-                            data = json.loads(json_match.group(1))
-                            planner_ready = data.get("ready", False)
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-
-                # Session is stable when all mandatory agents approve + planner ready
-                if planner_ready and approvals.issuperset(APPROVAL_AGENTS):
-                    await repo.update_planning_session_status(
-                        self._db, session.id, PlanningSessionStatus.stable
-                    )
-                    await self._bus.emit(
-                        type=EventType.planning_session_stable,
-                        project_id=session.project_id,
-                        planning_session_id=session.id,
-                        payload={
-                            "planning_session_id": session.id,
-                            "round": round_num,
-                        },
-                    )
-                    return
-
-            # Max rounds reached — mark stable for human review anyway
-            await repo.update_planning_session_status(
-                self._db, session.id, PlanningSessionStatus.stable
-            )
-            await self._bus.emit(
-                type=EventType.planning_session_stable,
-                project_id=session.project_id,
-                planning_session_id=session.id,
-                payload={
-                    "planning_session_id": session.id,
-                    "max_rounds_reached": True,
-                },
-            )
-
-        except asyncio.CancelledError:
-            logger.info("discussion cancelled for session %s", session.id)
-        except Exception:
-            logger.exception("discussion failed for session %s", session.id)
             try:
                 await self._bus.emit(
-                    type=EventType.planning_error,
+                    type=EventType.planning_session_started,
+                    project_id=session.project_id,
+                    planning_session_id=session.id,
+                    payload={"planning_session_id": session.id},
+                )
+
+                # Round 0: initial planner breakdown
+                await self._agent_turn(
+                    session.id, _PLANNER, PLANNER_DISCUSSION, session.prompt
+                )
+
+                for round_num in range(1, session.max_rounds + 1):
+                    # Check if session was cancelled during execution
+                    current = await repo.get_planning_session(self._db, session.id)
+                    if current is None or current.status == PlanningSessionStatus.cancelled:
+                        return
+
+                    # Reviewer round: each reviewer critiques the current plan
+                    approvals: set[str] = set()
+                    for agent_name, system_prompt in DISCUSSION_AGENTS:
+                        if agent_name == _PLANNER:
+                            continue  # planner responds after reviewers
+                        context = await self._build_context(session.id)
+                        result = await self._agent_turn(
+                            session.id, agent_name, system_prompt, context
+                        )
+                        if result and "APPROVED" in result:
+                            approvals.add(agent_name)
+
+                    # Planner refinement round: incorporate feedback
+                    context = await self._build_context(session.id)
+                    planner_result = await self._agent_turn(
+                        session.id, _PLANNER, PLANNER_DISCUSSION, context
+                    )
+
+                    # Check if planner signalled readiness
+                    planner_ready = False
+                    if planner_result:
+                        data = _extract_json_block(planner_result)
+                        if data is not None:
+                            planner_ready = data.get("ready", False)
+
+                    # Session is stable when all mandatory agents approve + planner ready
+                    if planner_ready and approvals.issuperset(APPROVAL_AGENTS):
+                        await repo.update_planning_session_status(
+                            self._db, session.id, PlanningSessionStatus.stable
+                        )
+                        await self._bus.emit(
+                            type=EventType.planning_session_stable,
+                            project_id=session.project_id,
+                            planning_session_id=session.id,
+                            payload={
+                                "planning_session_id": session.id,
+                                "round": round_num,
+                            },
+                        )
+                        return
+
+                # Max rounds reached — mark stable for human review anyway
+                await repo.update_planning_session_status(
+                    self._db, session.id, PlanningSessionStatus.stable
+                )
+                await self._bus.emit(
+                    type=EventType.planning_session_stable,
                     project_id=session.project_id,
                     planning_session_id=session.id,
                     payload={
                         "planning_session_id": session.id,
-                        "error": "Discussion loop crashed — check server logs.",
+                        "max_rounds_reached": True,
                     },
                 )
+
+            except asyncio.CancelledError:
+                logger.info("discussion cancelled for session %s", session.id)
             except Exception:
-                logger.debug("could not emit planning error event (db closed?)")
+                logger.exception("discussion failed for session %s", session.id)
+                try:
+                    await self._bus.emit(
+                        type=EventType.planning_error,
+                        project_id=session.project_id,
+                        planning_session_id=session.id,
+                        payload={
+                            "planning_session_id": session.id,
+                            "error": "Discussion loop crashed — check server logs.",
+                        },
+                    )
+                except Exception:
+                    logger.debug("could not emit planning error event (db closed?)")
+        finally:
+            # Remove the lock entry so the dict doesn't leak entries for
+            # long-gone sessions.  Any in-flight _agent_turn still holds a
+            # reference to the Lock itself, so it can finish safely.
+            self._session_locks.pop(session.id, None)
 
     # ------------------------------------------------------------------
     # agent turn
@@ -353,81 +433,92 @@ class PlanningOrchestrator:
         """Dispatch one agent, store its message, and parse task changes.
 
         Returns the agent's response text, or None on failure.
+
+        The entire body runs under a per-session lock so only one turn
+        mutates a given session at a time — human interjections are
+        serialized behind the discussion loop, preventing concurrent
+        read-modify-write on task_changes (title dedupe, sort_order)
+        and transcript ordering.
         """
-        session = await repo.get_planning_session(self._db, session_id)
-        if session is None:
-            return None
+        async with self._get_session_lock(session_id):
+            session = await repo.get_planning_session(self._db, session_id)
+            if session is None:
+                return None
 
-        turn = await repo.increment_planning_turn(self._db, session_id)
+            turn = await repo.increment_planning_turn(self._db, session_id)
 
-        full_prompt = f"{system_prompt}\n\n{user_message}"
+            full_prompt = f"{system_prompt}\n\n{user_message}"
 
-        # Use a simple inherited profile (uses the host's logged-in Claude default).
-        profile = ResolvedProfile(name="system-default", arg_mode=ArgMode.inherit)
-        try:
-            result = await self._provider.run_agent(
-                profile=profile,
-                prompt=full_prompt,
-                timeout_seconds=900,  # 15 min/turn — opus-max does deep repo analysis here
-            )
-        except Exception as exc:
-            logger.exception("agent %s failed for session %s", agent_name, session_id)
-            result_text = f"[Error dispatching {agent_name}: {exc}]"
-        else:
-            result_text = result.text if result.ok else f"[Error: {result.error}]"
-
-        # Parse task tree changes from planner output
-        tasks_changed = False
-        if agent_name == _PLANNER:
+            # Use a simple inherited profile (uses the host's logged-in Claude default).
+            profile = ResolvedProfile(name="system-default", arg_mode=ArgMode.inherit)
             try:
-                json_match = re.search(
-                    r"```json\s*(\{.*?\})\s*```", result_text, re.DOTALL
+                result = await self._provider.run_agent(
+                    profile=profile,
+                    prompt=full_prompt,
+                    timeout_seconds=900,  # 15 min/turn — opus-max does deep repo analysis here
                 )
-                if json_match:
-                    data = json.loads(json_match.group(1))
-                    if "task_changes" in data:
-                        await self._apply_task_changes(session_id, data["task_changes"])
-                        tasks_changed = True
-            except (json.JSONDecodeError, ValueError):
-                logger.debug("could not parse task changes from planner output")
+            except Exception as exc:
+                logger.exception("agent %s failed for session %s", agent_name, session_id)
+                result_text = f"[Error dispatching {agent_name}: {exc}]"
+            else:
+                result_text = result.text if result.ok else f"[Error: {result.error}]"
 
-        # Persist the message
-        await repo.add_planning_message(
-            self._db,
-            session_id=session_id,
-            agent=agent_name,
-            role="agent",
-            content=result_text,
-            turn_number=turn,
-        )
+            # Parse task tree changes from planner output
+            tasks_changed = False
+            if agent_name == _PLANNER:
+                data = _extract_json_block(result_text)
+                if data is not None and "task_changes" in data:
+                    await self._apply_task_changes(session_id, data["task_changes"])
+                    tasks_changed = True
 
-        # Emit event
-        await self._bus.emit(
-            type=EventType.planning_agent_turn,
-            project_id=session.project_id,
-            planning_session_id=session_id,
-            agent=agent_name,
-            payload={
-                "planning_session_id": session_id,
-                "agent": agent_name,
-                "turn": turn,
-                "preview": result_text[:200],
-            },
-        )
-        if tasks_changed:
+            # Persist the message
+            await repo.add_planning_message(
+                self._db,
+                session_id=session_id,
+                agent=agent_name,
+                role="agent",
+                content=result_text,
+                turn_number=turn,
+            )
+
+            # Emit event
             await self._bus.emit(
-                type=EventType.planning_task_refined,
+                type=EventType.planning_agent_turn,
                 project_id=session.project_id,
                 planning_session_id=session_id,
                 agent=agent_name,
-                payload={"planning_session_id": session_id, "turn": turn},
+                payload={
+                    "planning_session_id": session_id,
+                    "agent": agent_name,
+                    "turn": turn,
+                    "preview": result_text[:200],
+                },
             )
+            if tasks_changed:
+                await self._bus.emit(
+                    type=EventType.planning_task_refined,
+                    project_id=session.project_id,
+                    planning_session_id=session_id,
+                    agent=agent_name,
+                    payload={"planning_session_id": session_id, "turn": turn},
+                )
 
-        return result_text
+            return result_text
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Return (or create) the per-session lock for *session_id*.
+
+        Different sessions get independent locks so they can proceed in
+        parallel.  The same session always gets the same lock, serialising
+        every ``_agent_turn`` for that session.
+        """
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
 
     async def _build_context(self, session_id: str) -> str:
         """Build the full discussion context for an agent turn."""
@@ -469,18 +560,38 @@ class PlanningOrchestrator:
 
     @staticmethod
     def _render_task_tree(nodes: list[PlanningTaskNode]) -> str:
-        """Render the task tree as an indented text representation."""
+        """Render the task tree as an indented text representation.
+
+        Cycle-safe: a visited-set guards the recursive walk so a cyclic
+        ``parent_id`` cannot cause an infinite loop.  Nodes that are never
+        reached from a root are rendered at the top level with a ``[cycle]``
+        marker so they don't vanish silently.
+        """
         by_parent: dict[str | None, list[PlanningTaskNode]] = {}
         for n in nodes:
             by_parent.setdefault(n.parent_id, []).append(n)
 
         lines: list[str] = []
+        visited: set[str] = set()
+        _MAX_DEPTH = 1000
 
         def render(pid: str | None, indent: int) -> None:
+            if indent > _MAX_DEPTH:
+                logger.warning(
+                    "_render_task_tree hit depth cap %d — tree may be malformed",
+                    _MAX_DEPTH,
+                )
+                return
             children = sorted(
                 by_parent.get(pid, []), key=lambda x: (x.sort_order, x.title)
             )
             for n in children:
+                if n.id in visited:
+                    logger.warning(
+                        "_render_task_tree detected cycle at node %s — skipping", n.id
+                    )
+                    continue
+                visited.add(n.id)
                 status = f"[{n.status}]"
                 desc = n.description[:80] + ("..." if len(n.description) > 80 else "")
                 lines.append(
@@ -489,6 +600,19 @@ class PlanningOrchestrator:
                 render(n.id, indent + 1)
 
         render(None, 0)
+
+        # Any node still unvisited is part of a cycle (or orphaned with a
+        # non-existent parent).  Surface them at root level so they are
+        # never silently dropped.
+        for n in nodes:
+            if n.id not in visited:
+                visited.add(n.id)
+                status = f"[{n.status}]"
+                desc = n.description[:80] + ("..." if len(n.description) > 80 else "")
+                lines.append(
+                    f"- (id={n.id}) {status} [cycle] {n.title}: {desc}"
+                )
+
         return "\n".join(lines) if lines else "(no tasks yet)"
 
     async def _apply_task_changes(
@@ -553,3 +677,27 @@ class PlanningOrchestrator:
                 logger.exception(
                     "failed to apply task change: %s", json.dumps(change)[:200]
                 )
+
+
+# ------------------------------------------------------------------
+# module helpers
+# ------------------------------------------------------------------
+
+
+def _extract_json_block(text: str) -> dict[str, Any] | None:
+    """Extract the first complete JSON object from *text*.
+
+    Uses :func:`json.JSONDecoder.raw_decode` so nested braces are handled
+    correctly, unlike a non-greedy regex which truncates at the first ``}``.
+    """
+    idx = text.find("{")
+    if idx == -1:
+        return None
+    try:
+        decoder = json.JSONDecoder()
+        obj, _end = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    return None

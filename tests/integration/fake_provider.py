@@ -38,6 +38,38 @@ _PLANNING_PLANNER_INITIAL = """Here is the initial task breakdown for this featu
 }
 ```"""
 
+_PLANNING_PLANNER_INITIAL_NESTED = """Here is the initial task breakdown with nested metadata.
+
+```json
+{
+  "message": "I've broken this down into implementation tasks with metadata.",
+  "task_changes": [
+    {
+      "action": "add",
+      "parent_id": null,
+      "title": "Add auth middleware",
+      "description": "Auth mw",
+      "metadata": {"priority": "high", "tags": ["security", "core"]}
+    },
+    {
+      "action": "add",
+      "parent_id": null,
+      "title": "Set up database schema",
+      "description": "DB",
+      "metadata": {"priority": "medium", "tags": ["data"]}
+    },
+    {
+      "action": "add",
+      "parent_id": null,
+      "title": "Write integration tests",
+      "description": "Tests",
+      "metadata": {"priority": "low", "tags": ["quality"]}
+    }
+  ],
+  "ready": false
+}
+```"""
+
 _PLANNING_PLANNER_REFINE = """Thank you for the feedback. I've refined the task list accordingly.
 
 ```json
@@ -67,10 +99,12 @@ class FakeProvider:
         developer_writes: bool = True,
         filename: str = "FEATURE.txt",
         reviewer_tampers: bool = False,
+        use_nested_plan: bool = False,
     ) -> None:
         self.developer_writes = developer_writes
         self.filename = filename
         self.reviewer_tampers = reviewer_tampers
+        self.use_nested_plan = use_nested_plan
         self.prompts: list[str] = []
 
     async def run_agent(
@@ -108,8 +142,13 @@ class FakeProvider:
                 return AgentResult(
                     ok=True, text=_PLANNING_PLANNER_REFINE, model_reported="fake", cost_usd=0.0,
                 )
+            initial = (
+                _PLANNING_PLANNER_INITIAL_NESTED
+                if self.use_nested_plan
+                else _PLANNING_PLANNER_INITIAL
+            )
             return AgentResult(
-                ok=True, text=_PLANNING_PLANNER_INITIAL, model_reported="fake", cost_usd=0.0,
+                ok=True, text=initial, model_reported="fake", cost_usd=0.0,
             )
         if "Architect Agent" in prompt or "Tester Agent" in prompt:
             return AgentResult(
