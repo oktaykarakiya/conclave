@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from conclave.db import Database, ProjectMode, TaskOrigin, TaskState
 from conclave.db import repositories as repo
+from conclave.db.migrations import Migration
 from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatus
 
 
@@ -15,6 +18,42 @@ async def test_migrations_apply(db: Database) -> None:
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
     assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 5
+
+
+async def test_migration_failure_is_atomic(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A migration that fails partway must roll back its partial DDL and NOT advance the
+    schema_version.
+
+    Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
+    replays the same migration and wedges on a duplicate-column error. The fixture DB is
+    already at version 5; we inject a v6 migration whose first statement succeeds (creates
+    a probe table) and whose second fails — ``input_tokens`` was already added by migration
+    5, so re-adding it raises a duplicate-column error — which is exactly that wedge.
+    """
+    failing = Migration(
+        version=6,
+        name="injected_failure",
+        sql=(
+            "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
+            "ALTER TABLE usage ADD COLUMN input_tokens INTEGER;"
+        ),
+    )
+    monkeypatch.setattr("conclave.db.database.MIGRATIONS", [failing])
+
+    with pytest.raises(sqlite3.OperationalError):
+        await db._apply_migrations()
+
+    # Version did not advance past the last good migration...
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 5
+    # ...and the partial DDL (the probe table from the first statement) was rolled back.
+    assert (
+        await db.fetchval(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'atomic_probe'"
+        )
+        == 0
+    )
 
 
 async def test_project_crud_and_config(db: Database) -> None:

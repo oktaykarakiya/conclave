@@ -21,6 +21,7 @@ interleave with, or be flushed by, ours.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -79,12 +80,21 @@ class Database:
         for mig in sorted(MIGRATIONS, key=lambda m: m.version):
             if mig.version <= current:
                 continue
-            await conn.executescript(mig.sql)
-            await conn.execute(
-                "INSERT INTO schema_version(version, name, applied_at) VALUES (?, ?, ?)",
-                (mig.version, mig.name, now_iso()),
-            )
-            await conn.commit()
+            # Apply the migration body AND its schema_version bump in one explicit
+            # transaction so they land all-or-nothing: a failure partway rolls the partial
+            # DDL back and leaves the version unadvanced. Otherwise the partial DDL would
+            # be committed but the version not bumped, so the next boot replays the same
+            # migration and wedges the database (e.g. a duplicate-column error).
+            # executescript cannot be used here — it issues an implicit COMMIT first, which
+            # would defeat the surrounding BEGIN — so we run each statement individually
+            # inside transaction() (BEGIN / COMMIT on success / ROLLBACK on any error).
+            async with self.transaction() as tx:
+                for stmt in _iter_sql_statements(mig.sql):
+                    await tx.execute(stmt)
+                await tx.execute(
+                    "INSERT INTO schema_version(version, name, applied_at) VALUES (?, ?, ?)",
+                    (mig.version, mig.name, now_iso()),
+                )
 
     # --- query helpers (reads do not commit; writes serialize through the lock) ---
 
@@ -143,3 +153,33 @@ class Database:
         if row is None:
             return None
         return row[0]
+
+
+# --- Internal helpers ---
+
+
+def _iter_sql_statements(script: str) -> list[str]:
+    """Split a migration script into its individual SQL statements.
+
+    Migrations are run statement-by-statement (via ``conn.execute``) inside an explicit
+    transaction so the whole migration is atomic — ``executescript`` can't be used because
+    it issues an implicit COMMIT before running, which would defeat the surrounding BEGIN.
+    Splitting is driven by :func:`sqlite3.complete_statement` rather than a naive
+    ``split(";")`` so a semicolon inside a string literal does not produce a spurious
+    boundary: the buffer is only cut at a ``;`` once it forms a complete statement (an
+    unterminated string literal keeps ``complete_statement`` False). A trailing statement
+    without a final ``;`` is flushed too.
+    """
+    statements: list[str] = []
+    buffer = ""
+    for char in script:
+        buffer += char
+        if char == ";" and sqlite3.complete_statement(buffer):
+            stmt = buffer.strip()
+            if stmt:
+                statements.append(stmt)
+            buffer = ""
+    tail = buffer.strip()
+    if tail:
+        statements.append(tail)
+    return statements
