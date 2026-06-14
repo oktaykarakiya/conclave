@@ -86,6 +86,7 @@ async def create_task(
     request: str,
     title: str = "",
     level: int | None = None,
+    parent_task_id: str | None = None,
     use_planner: bool | None = None,
     state: TaskState = TaskState.inbox,
     origin: TaskOrigin = TaskOrigin.operator,
@@ -94,9 +95,11 @@ async def create_task(
     ts = now_iso()
     up = None if use_planner is None else int(use_planner)
     await db.execute(
-        "INSERT INTO tasks(id, project_id, title, request, level, state, use_planner, origin, "
-        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (tid, project_id, title, request, level, state.value, up, origin.value, ts, ts),
+        "INSERT INTO tasks(id, project_id, title, request, level, parent_task_id, state, "
+        "use_planner, origin, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (tid, project_id, title, request, level, parent_task_id, state.value, up, origin.value,
+         ts, ts),
     )
     task = await get_task(db, tid)
     assert task is not None
@@ -187,6 +190,76 @@ async def recover_in_progress(db: Database, project_id: str) -> int:
     )
     await db.conn.commit()
     return cur.rowcount
+
+
+async def get_child_tasks(db: Database, parent_task_id: str) -> list[Task]:
+    """Return all tasks whose ``parent_task_id`` matches, ordered by creation."""
+    rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at", (parent_task_id,)
+    )
+    return [Task.from_row(r) for r in rows]
+
+
+async def create_child_tasks(
+    db: Database,
+    *,
+    parent_task: Task,
+    children: list[dict[str, object]],
+    max_children: int,
+    project_id: str,
+) -> list[str]:
+    """Create child tasks with input sanitization, an autonomy gate, and a row cap.
+
+    **Sanitization** (Security S1): entries that are not dicts, or whose ``title`` /
+    ``description`` is missing, non-string, or empty/whitespace, are silently skipped.
+    Titles are capped at 200 chars and descriptions at 4000 chars.  This function
+    never raises on malformed input.
+
+    **Autonomy gate** (Security S2): children are created with ``state=inbox`` so a
+    human must approve them before the worker picks them up.  (Workers only claim
+    ``approved`` tasks via :func:`claim_next_approved`.)
+
+    **Level**: ``max((parent_task.level or 1) - 1, 1)`` — bounds fan-out depth to
+    one level below the parent, never deeper than level 1.
+    """
+    child_level = max((parent_task.level or 1) - 1, 1)
+    created: list[str] = []
+
+    for entry in children:
+        if len(created) >= max_children:
+            break
+        if not isinstance(entry, dict):
+            continue
+
+        raw_title = entry.get("title")
+        raw_description = entry.get("description")
+
+        # -- missing or non-string keys are silently skipped --
+        if not isinstance(raw_title, str) or not isinstance(raw_description, str):
+            continue
+
+        title = raw_title.strip()
+        description = raw_description.strip()
+        if not title or not description:
+            continue
+
+        # -- truncate oversize strings --
+        title = title[:200]
+        description = description[:4000]
+
+        task = await create_task(
+            db,
+            project_id=project_id,
+            request=description,
+            title=title,
+            level=child_level,
+            parent_task_id=parent_task.id,
+            state=TaskState.inbox,
+            origin=TaskOrigin.operator,
+        )
+        created.append(task.id)
+
+    return created
 
 
 # --- attempts ---------------------------------------------------------------

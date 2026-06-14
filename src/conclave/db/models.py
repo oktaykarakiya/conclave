@@ -71,6 +71,7 @@ class Task(BaseModel):
     title: str = ""
     request: str
     level: int | None = None
+    parent_task_id: str | None = None
     state: TaskState = TaskState.inbox
     use_planner: bool | None = None
     plan: dict[str, Any] | None = None
@@ -89,6 +90,7 @@ class Task(BaseModel):
             title=row["title"],
             request=row["request"],
             level=row["level"],
+            parent_task_id=row["parent_task_id"],
             state=TaskState(row["state"]),
             use_planner=None if up is None else bool(up),
             plan=_loads(row["plan_json"], None),

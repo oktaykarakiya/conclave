@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 from conclave.db import Database, ProjectMode, TaskState
 from conclave.db import repositories as repo
 
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 1
+    assert version == 2
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 1
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 2
 
 
 async def test_project_crud_and_config(db: Database) -> None:
@@ -139,3 +141,141 @@ async def test_usage_summary(db: Database) -> None:
     summary = await repo.usage_summary(db, p.id)
     assert summary["calls"] == 2
     assert abs(summary["total_cost_usd"] - 0.15) < 1e-9
+
+
+# --- create_child_tasks ------------------------------------------------------
+
+
+async def test_create_child_tasks_enforces_max_children_cap(db: Database) -> None:
+    """5 children, max_children=3 -> only 3 rows created."""
+    p = await repo.create_project(db, name="cap", path="/tmp/cap", default_branch="main")
+    parent = await repo.create_task(db, project_id=p.id, request="parent task", level=4,
+                                     state=TaskState.approved)
+
+    children: list[dict[str, object]] = [
+        {"title": f"child {i}", "description": f"desc {i}"} for i in range(5)
+    ]
+    ids = await repo.create_child_tasks(
+        db, parent_task=parent, children=children, max_children=3, project_id=p.id,
+    )
+    assert len(ids) == 3
+
+
+async def test_create_child_tasks_sets_parent_task_id_and_get_child_tasks_returns_them(
+    db: Database,
+) -> None:
+    """Parent linkage is stored and retrievable via get_child_tasks."""
+    p = await repo.create_project(db, name="link", path="/tmp/link", default_branch="main")
+    parent = await repo.create_task(db, project_id=p.id, request="parent", level=3,
+                                     state=TaskState.approved)
+
+    children: list[dict[str, object]] = [
+        {"title": "a", "description": "first"},
+        {"title": "b", "description": "second"},
+    ]
+    ids = await repo.create_child_tasks(
+        db, parent_task=parent, children=children, max_children=10, project_id=p.id,
+    )
+    assert len(ids) == 2
+
+    retrieved = await repo.get_child_tasks(db, parent.id)
+    assert len(retrieved) == 2
+    assert {t.id for t in retrieved} == set(ids)
+    for child in retrieved:
+        assert child.parent_task_id == parent.id
+
+
+async def test_create_child_tasks_children_are_inbox_not_approved(db: Database) -> None:
+    """Children must be inbox (not approved) so a human gate is enforced."""
+    p = await repo.create_project(db, name="gate", path="/tmp/gate", default_branch="main")
+    parent = await repo.create_task(db, project_id=p.id, request="parent", level=2)
+
+    children: list[dict[str, object]] = [
+        {"title": "safe", "description": "should be inbox"},
+    ]
+    ids = await repo.create_child_tasks(
+        db, parent_task=parent, children=children, max_children=5, project_id=p.id,
+    )
+    assert len(ids) == 1
+    child = await repo.get_task(db, ids[0])
+    assert child is not None
+    assert child.state is TaskState.inbox
+
+    # claim_next_approved only picks up approved tasks — inbox tasks are invisible
+    claimed = await repo.claim_next_approved(db, p.id)
+    assert claimed is None
+
+
+async def test_create_child_tasks_level_bounded_below_parent_and_never_4(db: Database) -> None:
+    """Level logic: L4 -> L3; L1 -> L1; None-level -> L1; never 4."""
+    p = await repo.create_project(db, name="levels", path="/tmp/levels", default_branch="main")
+
+    # L4 parent -> children must be L3 (max((4 or 1) - 1, 1) = max(3, 1) = 3)
+    l4 = await repo.create_task(db, project_id=p.id, request="l4", level=4,
+                                 state=TaskState.approved)
+    ids = await repo.create_child_tasks(
+        db, parent_task=l4,
+        children=[{"title": "l4c", "description": "child of l4"}],
+        max_children=5, project_id=p.id,
+    )
+    l4c = await repo.get_task(db, ids[0])
+    assert l4c is not None
+    assert l4c.level == 3
+
+    # L1 parent -> children must be L1 (max((1 or 1) - 1, 1) = max(0, 1) = 1)
+    l1 = await repo.create_task(db, project_id=p.id, request="l1", level=1,
+                                 state=TaskState.approved)
+    ids2 = await repo.create_child_tasks(
+        db, parent_task=l1,
+        children=[{"title": "l1c", "description": "child of l1"}],
+        max_children=5, project_id=p.id,
+    )
+    l1c = await repo.get_task(db, ids2[0])
+    assert l1c is not None
+    assert l1c.level == 1
+
+    # None-level parent -> children must be L1 (max((1) - 1, 1) = max(0, 1) = 1)
+    none_parent = await repo.create_task(db, project_id=p.id, request="none level", level=None,
+                                          state=TaskState.approved)
+    ids3 = await repo.create_child_tasks(
+        db, parent_task=none_parent,
+        children=[{"title": "nc", "description": "child of none"}],
+        max_children=5, project_id=p.id,
+    )
+    nc = await repo.get_task(db, ids3[0])
+    assert nc is not None
+    assert nc.level == 1
+
+    # No child should ever be level 4
+    for tid in ids + ids2 + ids3:
+        t = await repo.get_task(db, tid)
+        assert t is not None
+        assert t.level != 4
+
+
+async def test_create_child_tasks_malformed_payload_sanitized_no_raise(db: Database) -> None:
+    """Malformed entries are silently skipped; valid ones are created."""
+    p = await repo.create_project(db, name="malform", path="/tmp/malform", default_branch="main")
+    parent = await repo.create_task(db, project_id=p.id, request="parent", level=3,
+                                     state=TaskState.approved)
+
+    malformed: list[Any] = [
+        42,  # non-dict: skipped
+        "not-a-dict",  # non-dict: skipped
+        {"title": None, "description": 5},  # wrong types: skipped
+        {"title": "", "description": "valid but empty title"},  # empty title: skipped
+        {"title": "valid but empty desc", "description": "  "},  # whitespace desc: skipped
+        {"title": "x" * 500, "description": "y" * 8000},  # oversized: truncated to 200/4000
+    ]
+    ids = await repo.create_child_tasks(
+        db, parent_task=parent, children=cast(list[dict[str, object]], malformed),
+        max_children=10, project_id=p.id,
+    )
+    # Only the last (oversized) entry should produce a row
+    assert len(ids) == 1
+
+    child = await repo.get_task(db, ids[0])
+    assert child is not None
+    assert child.title == "x" * 200
+    assert child.request == "y" * 4000
+    assert child.state is TaskState.inbox

@@ -16,6 +16,11 @@ class Migration:
     sql: str
 
 
+_SQL_002 = """
+ALTER TABLE tasks ADD COLUMN parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+CREATE INDEX idx_tasks_parent ON tasks(parent_task_id);
+"""
+
 _SQL_001 = """
 CREATE TABLE projects (
   id              TEXT PRIMARY KEY,
@@ -192,4 +197,5 @@ CREATE UNIQUE INDEX idx_coverage_region ON coverage(project_id, region);
 
 MIGRATIONS: list[Migration] = [
     Migration(version=1, name="initial_schema", sql=_SQL_001),
+    Migration(version=2, name="add_parent_task_id", sql=_SQL_002),
 ]
