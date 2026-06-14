@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import time
 from pathlib import Path
 
 from conclave.config import ArgMode
@@ -71,6 +74,59 @@ async def test_timeout_kills_and_reports(tmp_path: Path) -> None:
     result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=1)
     assert not result.ok
     assert "timed out" in (result.error or "")
+
+
+async def test_timeout_kills_process_group(tmp_path: Path) -> None:
+    """On timeout the provider must kill the entire process group, not just the
+    direct child — descendant subprocesses must not be orphaned.
+
+    A fake CLI spawns a sleeping grandchild, writes its PID to a file, then
+    hangs.  After the provider times out we verify the grandchild PID is dead
+    via os.kill(pid, 0) — ProcessLookupError means the process is gone.
+    """
+    pid_file = tmp_path / "child.pid"
+    # fmt: off — keep the embedded script readable
+    grandchild_cli = f"""#!/usr/bin/env python3
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+with open({str(pid_file)!r}, 'w') as f:
+    f.write(str(child.pid))
+time.sleep(300)
+"""
+    # fmt: on
+    cli = _make_cli(tmp_path, grandchild_cli, name="grandchild_cli.py")
+    profile = ResolvedProfile(
+        name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=(),
+    )
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=1,
+    )
+    assert not result.ok
+    assert "timed out" in (result.error or "")
+
+    # Read grandchild PID from the file the fake CLI wrote before hanging.
+    child_pid = int(pid_file.read_text().strip())
+
+    # Poll until the process is gone (SIGTERM → 0.3s → SIGKILL takes a
+    # moment to fully reap).  os.kill(pid, 0) raises ProcessLookupError
+    # when the process no longer exists.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break  # process is dead — success
+        except PermissionError:
+            # Process exists but we cannot signal it — unexpected in a test
+            # where the provider runs as the same user.  Treat as alive
+            # and keep polling.
+            pass
+        await asyncio.sleep(0.1)
+    else:
+        raise AssertionError(
+            f"Grandchild process {child_pid} still alive after timeout kill"
+        )
 
 
 async def test_cli_not_found() -> None:

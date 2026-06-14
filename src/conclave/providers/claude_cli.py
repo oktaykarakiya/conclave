@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import re
+import signal
 from pathlib import Path
 
 from .base import AgentResult, OnChunk
@@ -65,6 +66,7 @@ class ClaudeCliProvider:
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
                 cwd=str(cwd) if cwd is not None else None,
+                start_new_session=True,
             )
         except FileNotFoundError:
             return AgentResult(ok=False, error=f"CLI not found: {profile.cli!r}")
@@ -108,7 +110,17 @@ class ClaudeCliProvider:
         try:
             raw = await asyncio.wait_for(drive(), timeout=timeout_seconds)
         except TimeoutError:
-            proc.kill()
+            # Terminate the entire process group so descendant subagents
+            # (e.g. tools spawned by the CLI) aren't orphaned.  Two-phase
+            # escalation — SIGTERM first for a graceful shutdown window,
+            # then SIGKILL for any stragglers.
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                await asyncio.sleep(0.3)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
             with contextlib.suppress(ProcessLookupError):
                 await proc.wait()
             return AgentResult(ok=False, error=f"timed out after {timeout_seconds}s")

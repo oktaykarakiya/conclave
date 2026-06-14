@@ -361,6 +361,39 @@ async def test_daemon_shutdown_cancels_backfill_tasks(db: Database, tmp_path: Pa
     assert not daemon.planning_orchestrator._bg_tasks
 
 
+async def test_approve_session_awaits_cancelled_loop(db: Database) -> None:
+    """approve_session must await the cancelled background loop so it fully unwinds.
+
+    Before the fix, approve_session popped the task and called cancel() without
+    awaiting it — a fire-and-forget cancel that raced the loop's own DB writes.
+    Now it mirrors cancel_session: cancel + await with CancelledError suppression
+    so the task is fully done before approve returns.
+    """
+    project = await repo.create_project(
+        db, name="approve-test", path="/tmp/approve-test", default_branch="main",
+    )
+    bus = EventBus(db)
+    orchestrator = PlanningOrchestrator(db, bus, _BlockingProvider())
+
+    # Start a session — the discussion loop will block inside run_agent forever.
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Approve Awaits Test",
+        prompt="Test that approve_session awaits the cancelled loop.",
+    )
+    # Let the spawned task enter _run_discussion and block on run_agent.
+    await asyncio.sleep(0)
+
+    assert session.id in orchestrator._active_sessions
+
+    # approve_session must cancel AND await the background task so it is
+    # fully unwound before we return — no torn-write race with the DB.
+    await orchestrator.approve_session(session.id)
+
+    # After approve returns the task must be removed from tracking AND done.
+    assert session.id not in orchestrator._active_sessions
+
+
 async def test_daemon_shutdown_cascades_to_planning_orchestrator(
     db: Database, tmp_path: Path,
 ) -> None:

@@ -207,10 +207,15 @@ class PlanningOrchestrator:
             planning_session_id=session_id,
             payload={"planning_session_id": session_id},
         )
-        # Clean up background task
+        # Clean up background task — cancel AND await so the cancelled loop
+        # fully unwinds before we return.  Mirrors cancel_session: a
+        # fire-and-forget cancel races the loop's own DB writes (e.g. the
+        # final status update emitted inside _run_discussion).
         bg = self._active_sessions.pop(session_id, None)
         if bg is not None:
             bg.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await bg
         return created_ids
 
     async def shutdown(self) -> None:
