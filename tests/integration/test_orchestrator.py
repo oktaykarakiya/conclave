@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fake_provider import FakeProvider
 
+from conclave.config import load_project_config
 from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
+from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
+from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 
 
 async def _init_repo(path: Path) -> None:
@@ -20,6 +24,25 @@ async def _init_repo(path: Path) -> None:
     (path / "README.md").write_text("# test repo\n")
     await run_git(path, "add", "-A")
     await run_git(path, "commit", "-m", "initial commit")
+
+
+class _EmptyReviewerProvider:
+    """Provider whose every dispatch comes back empty (simulated backend outage).
+
+    Used to drive ``_review`` directly so each reviewer falls back to a non-blocking
+    'unknown' (ENG-4) while the all-'unknown' round still fails the attempt (ENG-3).
+    """
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+    ) -> AgentResult:
+        return AgentResult(ok=False, text="", error="backend unavailable")
 
 
 async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> None:
@@ -134,6 +157,39 @@ async def test_reviewer_edits_are_not_committed(db: Database, tmp_path: Path) ->
     # The reviewer's stray file never entered the committed/merged tree.
     code, _ = await run_git(repo_path, "show", "main:STRAY_REVIEWER.txt")
     assert code != 0
+
+
+async def test_review_all_empty_reviewers_record_unknown_and_block(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ENG-4 + ENG-3: when every reviewer dispatch comes back empty (a backend outage),
+    # _dispatch_reviewer exhausts its retries and each reviewer is recorded as a
+    # NON-BLOCKING 'unknown' (source 'none'). The round as a whole still fails the attempt
+    # (no usable PASS) so unvetted code is never merged — the all-'unknown' guard holds.
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    config = load_project_config(project.config)
+    runner = AgentRunner(db, EventBus(db), _EmptyReviewerProvider(), project.id, config)
+    orchestrator = Orchestrator(db, EventBus(db), _EmptyReviewerProvider(), tmp_path / "home")
+
+    failed, feedback = await orchestrator._review(
+        runner, task, project.id, repo_path, "diff --git a/x.py b/x.py\n", 1, config, "", ""
+    )
+
+    assert failed is True
+    assert "REVIEW INCONCLUSIVE" in feedback
+
+    verdicts = await repo.list_verdicts(db, task.id)
+    assert {v.agent for v in verdicts} == {"tester", "security", "reviewer"}
+    assert all(v.verdict == "unknown" and v.source == "none" for v in verdicts)
 
 
 async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_path: Path) -> None:

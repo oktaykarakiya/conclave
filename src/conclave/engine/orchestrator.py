@@ -344,9 +344,22 @@ class Orchestrator:
         worktree: Path,
         knowledge: str,
         rules: str,
-    ) -> AgentResult:
-        """Run one reviewer, retrying transient empty/non-ok dispatches with backoff."""
+    ) -> tuple[AgentResult, ParsedVerdict]:
+        """Run one reviewer; retry ONLY a genuinely empty/timeout/CLI-missing dispatch.
+
+        ENG-4: the retry signal is "could we extract a verdict?", not the provider's
+        ``result.ok`` success-hint heuristic. We parse the output each try and stop early
+        when it carries an answer:
+          * a real verdict (``source != "none"``) is returned immediately even if the
+            process exited non-zero — re-dispatching a parseable pass/fail/block/decline
+            just burns opus calls; and
+          * any non-empty text is returned too — usable-but-unparseable output is not a
+            transient infra failure (the caller records it as a non-blocking 'unknown').
+        Only a response with no verdict AND no text (genuine empty/timeout/CLI-missing) is
+        retried with the existing backoff. ``parsed`` is seeded so it is never unbound.
+        """
         result = AgentResult(ok=False, error="not dispatched")
+        parsed = ParsedVerdict()
         for attempt in range(_REVIEWER_DISPATCH_RETRIES + 1):
             result = await runner.run(
                 agent=agent,
@@ -356,15 +369,16 @@ class Orchestrator:
                 repo_knowledge=knowledge,
                 project_rules=rules,
             )
-            if result.ok and result.text.strip():
-                return result
+            parsed = parse_verdict(result.text)
+            if parsed.source != "none" or result.text.strip():
+                return result, parsed
             if attempt < _REVIEWER_DISPATCH_RETRIES:
                 logger.info(
                     "reviewer %s returned no usable response (try %d/%d); retrying",
                     agent, attempt + 1, _REVIEWER_DISPATCH_RETRIES + 1,
                 )
                 await asyncio.sleep(_REVIEWER_RETRY_BACKOFF_S)
-        return result
+        return result, parsed
 
     async def _review(
         self,
@@ -386,15 +400,16 @@ class Orchestrator:
         reviewer_prompt = f"Review the changes made for this task:\n{task.request}"
         passes = 0
         for agent in pipeline:
-            result = await self._dispatch_reviewer(
+            # ENG-4: _dispatch_reviewer already parsed the output; the verdict is used as-is.
+            # A parseable verdict (even one whose process exited non-zero) and any usable
+            # text both come back here untouched. Only a genuinely empty response (no verdict
+            # AND no text, i.e. exhausted retries on a real outage) is downgraded to a
+            # non-blocking 'unknown' — a single reviewer that can't run is NOT a code defect,
+            # so it must not fail the whole attempt (mirrors the grounding downgrade).
+            result, verdict = await self._dispatch_reviewer(
                 runner, agent, reviewer_prompt, task, worktree, knowledge, rules
             )
-            if result.ok and result.text.strip():
-                verdict = parse_verdict(result.text)
-            else:
-                # Transient infra failure even after retries: a single reviewer that
-                # can't run is NOT a code defect, so record a non-blocking 'unknown'
-                # (like the grounding downgrade) instead of failing the whole attempt.
+            if verdict.source == "none" and not result.text.strip():
                 verdict = ParsedVerdict(
                     verdict="unknown",
                     reason=f"{agent} agent unavailable after retries: {result.error}",
