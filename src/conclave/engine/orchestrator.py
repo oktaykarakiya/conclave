@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,19 @@ _REVIEWER_RETRY_BACKOFF_S = 3.0
 logger = logging.getLogger("conclave.engine.orchestrator")
 
 
+class MergeResult(StrEnum):
+    """Three-way outcome for :meth:`Orchestrator._merge`.
+
+    ``success`` — the target now contains the task work.
+    ``conflict`` — a real merge conflict; task branch is preserved, task is failed.
+    ``error`` — a transient infra error (e.g. concurrent ref advance); retryable.
+    """
+
+    success = "success"
+    conflict = "conflict"
+    error = "error"
+
+
 class Orchestrator:
     def __init__(
         self, db: Database, bus: EventBus, provider: Provider, conclave_home: Path
@@ -51,6 +65,10 @@ class Orchestrator:
         self._bus = bus
         self._provider = provider
         self._home = conclave_home
+        # Serialize merges into the same target branch so two tasks merging
+        # "main" concurrently can never race on a shared worktree path or
+        # clobber each other's ref update.
+        self._merge_locks: dict[str, asyncio.Lock] = {}
 
     async def recover(self, project_id: str) -> int:
         """Crash recovery: return orphaned in_progress tasks to approved."""
@@ -537,14 +555,44 @@ class Orchestrator:
             payload={"branch": task_branch},
         )
 
-        merged = False
         if config.execution.auto_merge:
-            merged = await self._merge(repo_path, target_branch, task_branch)
-            if merged:
+            merge_result = await self._merge(repo_path, target_branch, task_branch, task.id)
+            if merge_result is MergeResult.success:
                 await self._bus.emit(
                     type=EventType.task_merged, project_id=task.project_id, task_id=task.id,
                     payload={"target": target_branch},
                 )
+                merged = True
+            elif merge_result is MergeResult.conflict:
+                # Real merge conflict: task work committed but cannot be merged.
+                # Mark failed, KEEP the branch so the work is preserved, and emit
+                # a loud failure event so the operator can resolve it manually.
+                summary = f"merge conflict into {target_branch}; branch {task_branch} preserved"
+                await repo.finalize_task(
+                    self._db, task.id, state=TaskState.failed, result_summary=summary,
+                )
+                await self._bus.emit(
+                    type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
+                    payload={"reason": "merge_conflict", "target": target_branch},
+                )
+                await wm.cleanup(task.id, None)  # keep the branch
+                return False
+            else:
+                # MergeResult.error — transient infra error (e.g. concurrent ref
+                # advance the retry couldn't resolve). Mark failed but preserve the
+                # branch so nothing is lost.
+                summary = f"merge error into {target_branch}; branch {task_branch} preserved"
+                await repo.finalize_task(
+                    self._db, task.id, state=TaskState.failed, result_summary=summary,
+                )
+                await self._bus.emit(
+                    type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
+                    payload={"reason": "merge_error", "target": target_branch},
+                )
+                await wm.cleanup(task.id, None)
+                return False
+        else:
+            merged = False
 
         # One transaction: flip state→done and write the result summary together so the
         # lifecycle row is never observed half-updated.
@@ -599,10 +647,28 @@ class Orchestrator:
         await wm.cleanup(task.id, task_branch)
         return False
 
-    async def _merge(self, repo_path: Path, target_branch: str, task_branch: str) -> bool:
-        """Merge ``task_branch`` into ``target_branch`` without disturbing the user's checkout
-        when possible (fast-forward via ``update-ref``); otherwise merge in the checked-out
-        target. Returns whether the target now contains the task work."""
+    async def _merge(
+        self, repo_path: Path, target_branch: str, task_branch: str, task_id: str
+    ) -> MergeResult:
+        """Merge ``task_branch`` into ``target_branch`` without disturbing the user's
+        checkout. Serialises merges into the same target via an asyncio lock so two
+        concurrent tasks can never race on the shared merge-worktree path or clobber
+        each other's ref update.
+
+        Returns a three-way :class:`MergeResult`:
+        * ``success`` — the target now contains the task work.
+        * ``conflict`` — a real merge conflict (caller must fail the task, preserve
+          the branch).
+        * ``error`` — transient infra failure (e.g. concurrent ref advance); retryable.
+        """
+        lock = self._merge_locks.setdefault(target_branch, asyncio.Lock())
+        async with lock:
+            return await self._merge_locked(repo_path, target_branch, task_branch, task_id)
+
+    async def _merge_locked(
+        self, repo_path: Path, target_branch: str, task_branch: str, task_id: str
+    ) -> MergeResult:
+        """Body of :meth:`_merge` — runs while holding the per-target-branch lock."""
         ancestor_code, _ = await run_git(
             repo_path, "merge-base", "--is-ancestor", target_branch, task_branch
         )
@@ -613,10 +679,26 @@ class Orchestrator:
         task_sha = task_sha.strip()
 
         if is_ff and current_branch != target_branch:
+            # Fast-forward via GUARDED update-ref so a concurrent advance is
+            # detected rather than silently clobbered. Retry once with the new
+            # HEAD when the old-value doesn't match (target advanced while we
+            # were computing task_sha).
+            _, old_sha = await run_git(repo_path, "rev-parse", target_branch)
+            old_sha = old_sha.strip()
             code, _ = await run_git(
-                repo_path, "update-ref", f"refs/heads/{target_branch}", task_sha
+                repo_path, "update-ref", f"refs/heads/{target_branch}", task_sha, old_sha,
             )
-            return code == 0
+            if code != 0:
+                _, new_old = await run_git(repo_path, "rev-parse", target_branch)
+                new_old = new_old.strip()
+                if new_old != old_sha:
+                    code, _ = await run_git(
+                        repo_path, "update-ref", f"refs/heads/{target_branch}",
+                        task_sha, new_old,
+                    )
+            if code == 0:
+                return MergeResult.success
+            return MergeResult.error
 
         if current_branch == target_branch:
             code, _ = await run_git(repo_path, "merge", "--ff-only", task_branch)
@@ -625,27 +707,41 @@ class Orchestrator:
                     repo_path, "merge", "--no-ff", "-m",
                     f"merge(conclave): {task_branch}", task_branch,
                 )
-            return code == 0
+                if code != 0:
+                    # Abort the failed merge to leave the repo clean.
+                    await run_git(repo_path, "merge", "--abort")
+                    return MergeResult.conflict
+            return MergeResult.success
 
         # target is not checked out and history diverged: merge via a temp worktree.
-        merge_path = wm_merge_path(repo_path, target_branch)
+        # Include task_id so concurrent merges into the same target never collide.
+        merge_path = wm_merge_path(repo_path, target_branch, task_id)
         await run_git(repo_path, "worktree", "add", str(merge_path), target_branch)
         try:
             code, _ = await run_git(
-                merge_path, "merge", "--no-ff", "-m", f"merge(conclave): {task_branch}", task_branch
+                merge_path, "merge", "--no-ff", "-m",
+                f"merge(conclave): {task_branch}", task_branch,
             )
+            if code != 0:
+                return MergeResult.conflict
         finally:
             await run_git(repo_path, "worktree", "remove", "--force", str(merge_path))
             await run_git(repo_path, "worktree", "prune")
-        return code == 0
+        return MergeResult.success
 
 
 # --- module helpers ---------------------------------------------------------
 
 
-def wm_merge_path(repo_path: Path, target_branch: str) -> Path:
+def wm_merge_path(repo_path: Path, target_branch: str, task_id: str) -> Path:
+    """Deterministic merge-worktree path unique per (repo, target, task).
+
+    Including ``task_id`` guarantees two concurrent merges into the same target
+    branch never share a worktree directory.
+    """
     safe = target_branch.replace("/", "_")
-    return repo_path.parent / f".conclave-merge-{repo_path.name}-{safe}"
+    safe_task = task_id.replace("/", "_")
+    return repo_path.parent / f".conclave-merge-{repo_path.name}-{safe}-{safe_task}"
 
 
 def _commit_message(task: Task) -> str:

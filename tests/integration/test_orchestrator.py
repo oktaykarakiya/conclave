@@ -252,3 +252,109 @@ async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_
     assert await orchestrator.recover(project.id) == 1
     again = await repo.get_task(db, claimed.id)
     assert again is not None and again.state is TaskState.approved
+
+
+# --- ENG-5: merge hardening ---------------------------------------------------
+
+
+async def test_merge_conflict_detected_by_merge(db: Database, tmp_path: Path) -> None:
+    """``_merge`` returns ``MergeResult.conflict`` for a real merge conflict.
+
+    Two branches that both modified the same file differently produce a conflict
+    that must be surfaced — never silently swallowed as success."""
+    from conclave.engine.orchestrator import MergeResult
+
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    _project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+
+    # Create a feature branch with a commit modifying FEATURE.txt.
+    await run_git(repo_path, "checkout", "-b", "feature")
+    (repo_path / "FEATURE.txt").write_text("feature content\n")
+    await run_git(repo_path, "add", "-A")
+    await run_git(repo_path, "commit", "-m", "feature work")
+
+    # Switch to main and make a conflicting change to the same file.
+    await run_git(repo_path, "checkout", "main")
+    (repo_path / "FEATURE.txt").write_text("conflicting main content\n")
+    await run_git(repo_path, "add", "-A")
+    await run_git(repo_path, "commit", "-m", "conflicting main change")
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    result = await orchestrator._merge(repo_path, "main", "feature", "task-1")
+    assert result is MergeResult.conflict
+
+
+async def test_merge_conflict_marks_task_failed_and_preserves_branch(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``_merge`` reports a conflict, the orchestrator must fail the task
+    (not mark it done) and preserve the task branch so the operator can resolve it."""
+    from conclave.engine.orchestrator import MergeResult
+
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    # Inject a _merge that always returns conflict — simulates the merge failing
+    # while keeping the rest of the pipeline (developer → review → gate) intact.
+    # (No ``self`` param: monkeypatch.setattr stores the function in the instance
+    # __dict__, so Python does NOT auto-bind it as a bound method.)
+    async def _fake_merge(
+        _repo_path: Path, _target_branch: str, _task_branch: str, _task_id: str,
+    ) -> MergeResult:
+        return MergeResult.conflict
+
+    monkeypatch.setattr(orchestrator, "_merge", _fake_merge)
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    result = await orchestrator.process_task(claimed)
+
+    # Must signal failure — no silent success on a conflicted merge.
+    assert result is False
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.failed
+    assert "merge conflict" in (final.result_summary or "")
+    assert "main" in (final.result_summary or "")
+
+    # The task branch must survive — work is preserved, not discarded.
+    code, branches = await run_git(repo_path, "branch", "--list", f"conclave/{task.id}")
+    assert code == 0
+    assert f"conclave/{task.id}" in branches
+
+    # Verify the failure event was emitted with a merge-conflict reason.
+    events = await repo.list_events(db, task_id=task.id)
+    fail_events = [e for e in events if e.type == "task.failed"]
+    assert len(fail_events) == 1
+    assert fail_events[0].payload.get("reason") == "merge_conflict"
+
+
+def test_merge_worktree_path_unique_per_task() -> None:
+    """``wm_merge_path`` must produce distinct paths for different task ids so
+    concurrent merges into the same target never share a worktree directory."""
+    from conclave.engine.orchestrator import wm_merge_path
+
+    p1 = wm_merge_path(Path("/repo"), "main", "task-abc-123")
+    p2 = wm_merge_path(Path("/repo"), "main", "task-xyz-456")
+    assert p1 != p2
+    assert "task-abc-123" in str(p1)
+    assert "task-xyz-456" in str(p2)
+
+    # Same task id, different targets → different paths.
+    p3 = wm_merge_path(Path("/repo"), "develop", "task-1")
+    p4 = wm_merge_path(Path("/repo"), "main", "task-1")
+    assert p3 != p4
