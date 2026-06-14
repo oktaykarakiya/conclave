@@ -129,11 +129,69 @@ class PlanningOrchestrator:
         return msg
 
     async def approve_session(self, session_id: str) -> list[str]:
-        """Create real Task rows from all planning task nodes and mark completed."""
+        """Create real Task rows from all planning task nodes and mark completed.
+
+        Guarded by session status so that:
+        * ``completed`` — idempotent: returns the existing task IDs without creating new ones.
+        * ``cancelled`` — rejects with ValueError.
+        * ``active`` — cancels & awaits the background discussion loop before creating tasks,
+          avoiding a race between the loop's own status writes and task creation.
+        * ``stable`` — proceeds with task creation as normal.
+        """
         session = await repo.get_planning_session(self._db, session_id)
         if session is None:
             raise ValueError("session not found")
 
+        # --- status guard ---------------------------------------------------
+        if session.status == PlanningSessionStatus.completed:
+            # Idempotent: tasks already created — return their ids without creating more.
+            nodes = await repo.list_planning_task_nodes(self._db, session_id)
+            return [n.task_id for n in nodes if n.task_id]
+
+        if session.status == PlanningSessionStatus.cancelled:
+            raise ValueError("session is cancelled")
+
+        if session.status == PlanningSessionStatus.active:
+            # Cancel the background discussion loop first so it cannot race
+            # task creation with its own status writes (e.g. marking itself
+            # stable in _run_discussion after we've started materialising).
+            bg = self._active_sessions.pop(session_id, None)
+            if bg is not None:
+                bg.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await bg
+            # Re-read status — the loop may have already set it to stable
+            # before we cancelled it.  If it somehow ended up completed or
+            # cancelled during the await we bail out.
+            session = await repo.get_planning_session(self._db, session_id)
+            if session is None:
+                raise ValueError("session not found")
+            if session.status == PlanningSessionStatus.completed:
+                # Already materialised by a concurrent call — idempotent return.
+                nodes = await repo.list_planning_task_nodes(self._db, session_id)
+                return [n.task_id for n in nodes if n.task_id]
+            if session.status == PlanningSessionStatus.cancelled:
+                raise ValueError("session is cancelled")
+            # If the loop already set us to stable, proceed; otherwise we
+            # transition manually (the loop was cancelled before it could).
+            if session.status != PlanningSessionStatus.stable:
+                await repo.update_planning_session_status(
+                    self._db, session_id, PlanningSessionStatus.stable
+                )
+                # Re-read so the local variable reflects the new status.
+                session = await repo.get_planning_session(self._db, session_id)
+                if session is None:
+                    raise ValueError("session not found")
+
+        # At this point session.status must be stable (either originally, or
+        # we just settled an active session).  Any other unexpected status
+        # (e.g. a future status added later) is rejected.
+        if session.status != PlanningSessionStatus.stable:
+            raise ValueError(
+                f"session cannot be approved in status {session.status}"
+            )
+
+        # --- task materialisation -------------------------------------------
         nodes = await repo.list_planning_task_nodes(self._db, session_id)
 
         # Create a parent task representing the session itself
@@ -206,15 +264,6 @@ class PlanningOrchestrator:
             planning_session_id=session_id,
             payload={"planning_session_id": session_id},
         )
-        # Clean up background task — cancel AND await so the cancelled loop
-        # fully unwinds before we return.  Mirrors cancel_session: a
-        # fire-and-forget cancel races the loop's own DB writes (e.g. the
-        # final status update emitted inside _run_discussion).
-        bg = self._active_sessions.pop(session_id, None)
-        if bg is not None:
-            bg.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await bg
         return created_ids
 
     async def shutdown(self) -> None:

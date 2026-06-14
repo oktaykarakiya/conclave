@@ -540,7 +540,15 @@ async def list_planning_task_nodes(
 async def approve_planning_session(
     session_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
-    task_ids = await daemon.planning_orchestrator.approve_session(session_id)
+    try:
+        task_ids = await daemon.planning_orchestrator.approve_session(session_id)
+    except ValueError as exc:
+        msg = str(exc)
+        if "session not found" in msg:
+            raise HTTPException(status_code=404, detail=msg) from exc
+        if "session is cancelled" in msg:
+            raise HTTPException(status_code=409, detail=msg) from exc
+        raise HTTPException(status_code=400, detail=msg) from exc
     return {"approved": True, "task_ids": task_ids, "count": len(task_ids)}
 
 
@@ -548,7 +556,12 @@ async def approve_planning_session(
 async def cancel_planning_session(
     session_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, bool]:
-    await daemon.planning_orchestrator.cancel_session(session_id)
+    try:
+        await daemon.planning_orchestrator.cancel_session(session_id)
+    except ValueError as exc:
+        if "session not found" in str(exc):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise
     return {"cancelled": True}
 
 

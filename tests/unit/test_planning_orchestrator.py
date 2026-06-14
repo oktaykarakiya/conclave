@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from conclave.db import Database
 from conclave.db import repositories as repo
 from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatus
@@ -194,6 +196,44 @@ class _BlockingProvider:
 
     async def run_agent(self, *, profile, prompt, timeout_seconds, cwd=None, on_chunk=None):
         await asyncio.Event().wait()  # never returns
+        return AgentResult(ok=True, text="unreachable", model_reported="fake", cost_usd=0.0)
+
+
+class _OneShotThenBlockProvider:
+    """Returns one planner response with a task breakdown, then blocks forever.
+
+    Used to test approve_session on active sessions: the initial planner turn
+    creates task nodes, but the session stays active because the provider never
+    returns again, letting us verify that approve_session cancels the loop
+    before creating real tasks.
+    """
+
+    _PLANNER_INITIAL = """Here is the initial task breakdown.
+
+```json
+{
+  "message": "Breakdown with tasks.",
+  "task_changes": [
+    {"action": "add", "parent_id": null, "title": "Task Alpha", "description": "First task"},
+    {"action": "add", "parent_id": null, "title": "Task Beta", "description": "Second task"}
+  ],
+  "ready": false
+}
+```"""
+
+    _has_initial: bool
+
+    def __init__(self) -> None:
+        self._has_initial = False
+
+    async def run_agent(self, *, profile, prompt, timeout_seconds, cwd=None, on_chunk=None):
+        if "Planning Facilitator Agent" in prompt and not self._has_initial:
+            self._has_initial = True
+            return AgentResult(
+                ok=True, text=self._PLANNER_INITIAL, model_reported="fake", cost_usd=0.0,
+            )
+        # All subsequent calls block forever, keeping the session active.
+        await asyncio.Event().wait()
         return AgentResult(ok=True, text="unreachable", model_reported="fake", cost_usd=0.0)
 
 
@@ -426,3 +466,138 @@ async def test_daemon_shutdown_cascades_to_planning_orchestrator(
     assert not daemon._bg_tasks
     assert not daemon.planning_orchestrator._active_sessions
     assert not daemon.planning_orchestrator._bg_tasks
+
+
+# --- approve_session guards (PLAN-2) ----------------------------------------
+
+
+async def test_approve_session_idempotent(db: Database) -> None:
+    """Re-approving a completed session returns the same task_ids and creates
+    zero additional Task rows."""
+    project = await repo.create_project(
+        db, name="idempotent-test", path="/tmp/idempotent-test", default_branch="main",
+    )
+    bus = EventBus(db)
+    orchestrator = PlanningOrchestrator(db, bus, _QuickFakeProvider())
+
+    # Start a session and wait for the discussion loop to finish.
+    # _QuickFakeProvider produces APPROVED responses for all reviewers, so the
+    # session reaches stable after round 1.
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Idempotency Test",
+        prompt="Test that re-approval is idempotent.",
+        max_rounds=2,
+    )
+
+    # Wait for the background discussion loop to complete (session → stable).
+    for _ in range(100):
+        refreshed = await repo.get_planning_session(db, session.id)
+        assert refreshed is not None
+        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("session never reached stable/completed")
+
+    # First approval — materialises tasks.
+    first_ids = await orchestrator.approve_session(session.id)
+    assert len(first_ids) > 0
+
+    # Count tasks linked to the session after first approval.
+    nodes_after_first = await repo.list_planning_task_nodes(db, session.id)
+    first_task_count = sum(1 for n in nodes_after_first if n.task_id)
+    assert first_task_count > 0
+
+    # Second approval — must be idempotent: returns the same node-derived
+    # task IDs (the session parent task is not returned on re-approval) and
+    # creates ZERO additional Task rows.
+    second_ids = await orchestrator.approve_session(session.id)
+    # The idempotent return is [n.task_id for n in nodes if n.task_id] —
+    # every planning node that already has a linked task.
+    expected_ids = [n.task_id for n in nodes_after_first if n.task_id]
+    assert second_ids == expected_ids
+
+    nodes_after_second = await repo.list_planning_task_nodes(db, session.id)
+    second_task_count = sum(1 for n in nodes_after_second if n.task_id)
+    assert second_task_count == first_task_count
+
+
+async def test_approve_session_on_active_cancels_loop_before_create(db: Database) -> None:
+    """Approving an active session cancels the bg loop and creates exactly
+    one set of tasks — no duplicates from a racing discussion."""
+    project = await repo.create_project(
+        db, name="active-approve-test", path="/tmp/active-approve-test",
+        default_branch="main",
+    )
+    bus = EventBus(db)
+    # _OneShotThenBlockProvider: initial planner turn creates 2 task nodes,
+    # then blocks forever so the session stays active.
+    orchestrator = PlanningOrchestrator(db, bus, _OneShotThenBlockProvider())
+
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Active Approve Test",
+        prompt="Test that active approval cancels loop first.",
+    )
+    # Let the spawned task enter _run_discussion and complete the initial
+    # planner turn (which creates task nodes), then block.
+    await asyncio.sleep(0.1)
+
+    # Sanity: session is active and has task nodes.
+    refreshed = await repo.get_planning_session(db, session.id)
+    assert refreshed is not None
+    assert refreshed.status == PlanningSessionStatus.active
+    assert session.id in orchestrator._active_sessions
+
+    nodes_before = await repo.list_planning_task_nodes(db, session.id)
+    assert len(nodes_before) == 2  # Task Alpha + Task Beta
+
+    # Approve the active session — must cancel and await the loop before
+    # materialising tasks.
+    task_ids = await orchestrator.approve_session(session.id)
+
+    # The session is no longer tracked as active.
+    assert session.id not in orchestrator._active_sessions
+
+    # Session is now completed.
+    session_after = await repo.get_planning_session(db, session.id)
+    assert session_after is not None
+    assert session_after.status == PlanningSessionStatus.completed
+
+    # Tasks were created: 1 session parent + 2 node tasks.
+    assert len(task_ids) == 3
+
+    # Re-approval is idempotent — no new tasks created.
+    second_ids = await orchestrator.approve_session(session.id)
+    # Idempotent return gives node-derived task IDs (no session parent).
+    nodes_after = await repo.list_planning_task_nodes(db, session.id)
+    expected_repeat = [n.task_id for n in nodes_after if n.task_id]
+    assert second_ids == expected_repeat
+
+
+async def test_approve_session_rejects_cancelled(db: Database) -> None:
+    """Approving a cancelled session raises ValueError."""
+    project = await repo.create_project(
+        db, name="cancelled-reject-test", path="/tmp/cancelled-reject-test",
+        default_branch="main",
+    )
+    bus = EventBus(db)
+    orchestrator = PlanningOrchestrator(db, bus, _QuickFakeProvider())
+
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Cancelled Reject Test",
+        prompt="Test that cancelled session approval is rejected.",
+    )
+
+    # Cancel the session.
+    await orchestrator.cancel_session(session.id)
+
+    refreshed = await repo.get_planning_session(db, session.id)
+    assert refreshed is not None
+    assert refreshed.status == PlanningSessionStatus.cancelled
+
+    # Approving a cancelled session must raise.
+    with pytest.raises(ValueError, match="session is cancelled"):
+        await orchestrator.approve_session(session.id)
