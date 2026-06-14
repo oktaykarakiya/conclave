@@ -13,7 +13,11 @@ from .db import repositories as repo
 
 async def seed_global_defaults(db: Database) -> None:
     if await repo.get_engine_profile(db, "system-default") is None:
-        await repo.upsert_engine_profile(db, name="system-default", arg_mode="inherit")
+        # Default to the most capable model at max reasoning. Operators can switch the
+        # profile to `inherit` (host default) or `env` (e.g. DeepSeek) from the UI.
+        await repo.upsert_engine_profile(
+            db, name="system-default", arg_mode="flag", model="claude-opus-4-8", effort="max"
+        )
     for name, (role, persona_md) in DEFAULT_PERSONAS.items():
         if await repo.get_agent(db, name) is None:
             await repo.upsert_agent(db, name=name, role=role.value, persona_md=persona_md)

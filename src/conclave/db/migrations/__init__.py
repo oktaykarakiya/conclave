@@ -190,6 +190,76 @@ CREATE TABLE coverage (
 CREATE UNIQUE INDEX idx_coverage_region ON coverage(project_id, region);
 """
 
+_SQL_002 = """
+ALTER TABLE repo_knowledge ADD COLUMN ai_enriched INTEGER NOT NULL DEFAULT 0;
+"""
+
+_SQL_003 = """
+CREATE TABLE planning_sessions (
+  id              TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL,
+  title           TEXT NOT NULL DEFAULT '',
+  prompt          TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'active',
+  turn_number     INTEGER NOT NULL DEFAULT 0,
+  max_rounds      INTEGER NOT NULL DEFAULT 5,
+  created_at      TEXT NOT NULL,
+  completed_at    TEXT,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_planning_sessions_project ON planning_sessions(project_id, created_at DESC);
+
+CREATE TABLE planning_messages (
+  id              TEXT PRIMARY KEY,
+  session_id      TEXT NOT NULL,
+  agent           TEXT NOT NULL,
+  role            TEXT NOT NULL DEFAULT 'agent',
+  content         TEXT NOT NULL,
+  turn_number     INTEGER NOT NULL DEFAULT 0,
+  parent_id       TEXT,
+  metadata_json   TEXT NOT NULL DEFAULT '{}',
+  created_at      TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_planning_messages_session ON planning_messages(session_id, turn_number, id);
+
+CREATE TABLE planning_task_nodes (
+  id              TEXT PRIMARY KEY,
+  session_id      TEXT NOT NULL,
+  parent_id       TEXT,
+  title           TEXT NOT NULL,
+  description     TEXT NOT NULL DEFAULT '',
+  status          TEXT NOT NULL DEFAULT 'proposed',
+  level           INTEGER NOT NULL DEFAULT 0,
+  sort_order      INTEGER NOT NULL DEFAULT 0,
+  task_id         TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY(parent_id) REFERENCES planning_task_nodes(id) ON DELETE SET NULL
+);
+CREATE INDEX idx_planning_tasks_session ON planning_task_nodes(session_id, parent_id);
+
+ALTER TABLE events ADD COLUMN planning_session_id TEXT;
+CREATE INDEX idx_events_planning_session ON events(planning_session_id, id);
+"""
+
+_SQL_004 = """
+ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;
+CREATE INDEX idx_tasks_parent ON tasks(parent_task_id);
+"""
+
+_SQL_005 = """
+ALTER TABLE usage ADD COLUMN input_tokens INTEGER;
+ALTER TABLE usage ADD COLUMN output_tokens INTEGER;
+ALTER TABLE usage ADD COLUMN cache_read_tokens INTEGER;
+ALTER TABLE usage ADD COLUMN cache_creation_tokens INTEGER;
+"""
+
 MIGRATIONS: list[Migration] = [
     Migration(version=1, name="initial_schema", sql=_SQL_001),
+    Migration(version=2, name="add_ai_enriched_to_repo_knowledge", sql=_SQL_002),
+    Migration(version=3, name="add_planning_sessions", sql=_SQL_003),
+    Migration(version=4, name="add_parent_task_id_to_tasks", sql=_SQL_004),
+    Migration(version=5, name="add_tokens_to_usage", sql=_SQL_005),
 ]

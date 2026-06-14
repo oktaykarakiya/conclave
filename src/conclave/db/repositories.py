@@ -25,6 +25,13 @@ from .models import (
     TaskState,
     VerdictRow,
 )
+from .planning_models import (
+    PlanningMessage,
+    PlanningNodeStatus,
+    PlanningSession,
+    PlanningSessionStatus,
+    PlanningTaskNode,
+)
 
 # --- projects ---------------------------------------------------------------
 
@@ -89,14 +96,18 @@ async def create_task(
     use_planner: bool | None = None,
     state: TaskState = TaskState.inbox,
     origin: TaskOrigin = TaskOrigin.operator,
+    parent_task_id: str | None = None,
 ) -> Task:
     tid = new_id()
     ts = now_iso()
     up = None if use_planner is None else int(use_planner)
     await db.execute(
         "INSERT INTO tasks(id, project_id, title, request, level, state, use_planner, origin, "
-        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (tid, project_id, title, request, level, state.value, up, origin.value, ts, ts),
+        "parent_task_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            tid, project_id, title, request, level, state.value, up, origin.value,
+            parent_task_id, ts, ts,
+        ),
     )
     task = await get_task(db, tid)
     assert task is not None
@@ -120,6 +131,13 @@ async def list_tasks(
             "SELECT * FROM tasks WHERE project_id = ? AND state = ? ORDER BY created_at DESC",
             (project_id, state.value),
         )
+    return [Task.from_row(r) for r in rows]
+
+
+async def get_child_tasks(db: Database, parent_task_id: str) -> list[Task]:
+    rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at", (parent_task_id,)
+    )
     return [Task.from_row(r) for r in rows]
 
 
@@ -166,16 +184,50 @@ async def update_task_fields(
 
 
 async def claim_next_approved(db: Database, project_id: str) -> Task | None:
-    """Atomically pick the oldest ``approved`` task and mark it ``in_progress``."""
+    """Atomically pick the oldest ``approved`` task and mark it ``in_progress``.
+
+    Skips tasks whose parent is failed or blocked, and tasks that are themselves blocked.
+    """
     cur = await db.conn.execute(
         "UPDATE tasks SET state = 'in_progress', updated_at = ? "
-        "WHERE id = (SELECT id FROM tasks WHERE project_id = ? AND state = 'approved' "
-        "ORDER BY created_at LIMIT 1) RETURNING *",
+        "WHERE id = ("
+        "  SELECT t.id FROM tasks t "
+        "  WHERE t.project_id = ? AND t.state = 'approved' "
+        "  AND ("
+        "    t.parent_task_id IS NULL OR t.parent_task_id NOT IN ("
+        "      SELECT id FROM tasks WHERE state IN ('failed', 'blocked')"
+        "    )"
+        "  )"
+        "  ORDER BY t.created_at LIMIT 1"
+        ") RETURNING *",
         (now_iso(), project_id),
     )
     row = await cur.fetchone()
     await db.conn.commit()
     return Task.from_row(row) if row else None
+
+
+async def block_descendants(db: Database, task_id: str) -> int:
+    """Recursively mark all descendant tasks as blocked. Returns count of blocked tasks."""
+    blocked = 0
+    queue = [task_id]
+    while queue:
+        parent = queue.pop(0)
+        cur = await db.conn.execute(
+            "SELECT id FROM tasks WHERE parent_task_id = ? "
+            "AND state NOT IN ('done', 'failed', 'cancelled', 'blocked')",
+            (parent,),
+        )
+        children = [r["id"] for r in await cur.fetchall()]
+        for child_id in children:
+            await db.execute(
+                "UPDATE tasks SET state = 'blocked', updated_at = ? WHERE id = ?",
+                (now_iso(), child_id),
+            )
+            blocked += 1
+            queue.append(child_id)
+    await db.conn.commit()
+    return blocked
 
 
 async def recover_in_progress(db: Database, project_id: str) -> int:
@@ -257,20 +309,23 @@ async def append_event(
     type: str,
     project_id: str | None = None,
     task_id: str | None = None,
+    planning_session_id: str | None = None,
     agent: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> EventRow:
     ts = now_iso()
     cur = await db.conn.execute(
-        "INSERT INTO events(project_id, task_id, agent, type, payload_json, ts) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (project_id, task_id, agent, type, json.dumps(payload or {}), ts),
+        "INSERT INTO events(project_id, task_id, planning_session_id, agent, type, "
+        "payload_json, ts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (project_id, task_id, planning_session_id, agent, type, json.dumps(payload or {}), ts),
     )
     await db.conn.commit()
     return EventRow(
         id=int(cur.lastrowid or 0),
         project_id=project_id,
         task_id=task_id,
+        planning_session_id=planning_session_id,
         agent=agent,
         type=type,
         payload=payload or {},
@@ -315,11 +370,19 @@ async def add_usage(
     model_reported: str | None = None,
     cost_usd: float | None = None,
     num_turns: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
 ) -> None:
     await db.execute(
         "INSERT INTO usage(id, project_id, task_id, agent, model_reported, cost_usd, "
-        "num_turns, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (new_id(), project_id, task_id, agent, model_reported, cost_usd, num_turns, now_iso()),
+        "num_turns, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, ts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            new_id(), project_id, task_id, agent, model_reported, cost_usd, num_turns,
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, now_iso(),
+        ),
     )
 
 
@@ -564,6 +627,7 @@ async def save_repo_knowledge(
     knowledge: dict[str, Any],
     sha: str | None = None,
     manifest_fingerprint: str | None = None,
+    ai_enriched: bool = False,
 ) -> RepoKnowledgeRow:
     prev = await db.fetchval(
         "SELECT COALESCE(MAX(version), 0) FROM repo_knowledge WHERE project_id = ?", (project_id,)
@@ -572,8 +636,11 @@ async def save_repo_knowledge(
     rid = new_id()
     await db.execute(
         "INSERT INTO repo_knowledge(id, project_id, version, sha, manifest_fingerprint, "
-        "knowledge_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (rid, project_id, version, sha, manifest_fingerprint, json.dumps(knowledge), now_iso()),
+        "ai_enriched, knowledge_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            rid, project_id, version, sha, manifest_fingerprint,
+            int(ai_enriched), json.dumps(knowledge), now_iso(),
+        ),
     )
     row = await db.fetchone("SELECT * FROM repo_knowledge WHERE id = ?", (rid,))
     assert row is not None
@@ -586,3 +653,215 @@ async def current_repo_knowledge(db: Database, project_id: str) -> RepoKnowledge
         (project_id,),
     )
     return RepoKnowledgeRow.from_row(row) if row else None
+
+
+async def latest_ai_knowledge(db: Database, project_id: str) -> RepoKnowledgeRow | None:
+    """Return the most recent AI-enriched knowledge row, or None."""
+    row = await db.fetchone(
+        "SELECT * FROM repo_knowledge WHERE project_id = ? AND ai_enriched = 1 "
+        "ORDER BY version DESC LIMIT 1",
+        (project_id,),
+    )
+    return RepoKnowledgeRow.from_row(row) if row else None
+
+
+# --- planning sessions --------------------------------------------------------
+
+
+async def create_planning_session(
+    db: Database,
+    *,
+    project_id: str,
+    title: str,
+    prompt: str,
+    max_rounds: int = 5,
+) -> PlanningSession:
+    sid = new_id()
+    ts = now_iso()
+    await db.execute(
+        "INSERT INTO planning_sessions(id, project_id, title, prompt, status, "
+        "turn_number, max_rounds, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        (sid, project_id, title, prompt, PlanningSessionStatus.active.value, max_rounds, ts),
+    )
+    session = await get_planning_session(db, sid)
+    assert session is not None
+    return session
+
+
+async def get_planning_session(db: Database, session_id: str) -> PlanningSession | None:
+    row = await db.fetchone(
+        "SELECT * FROM planning_sessions WHERE id = ?", (session_id,)
+    )
+    return PlanningSession.from_row(row) if row else None
+
+
+async def list_planning_sessions(db: Database, project_id: str) -> list[PlanningSession]:
+    rows = await db.fetchall(
+        "SELECT * FROM planning_sessions WHERE project_id = ? ORDER BY created_at DESC",
+        (project_id,),
+    )
+    return [PlanningSession.from_row(r) for r in rows]
+
+
+async def update_planning_session_status(
+    db: Database, session_id: str, status: PlanningSessionStatus
+) -> None:
+    completed_at = now_iso() if status in (
+        PlanningSessionStatus.completed, PlanningSessionStatus.cancelled
+    ) else None
+    await db.execute(
+        "UPDATE planning_sessions SET status = ?, completed_at = ? WHERE id = ?",
+        (status.value, completed_at, session_id),
+    )
+
+
+async def increment_planning_turn(db: Database, session_id: str) -> int:
+    cur = await db.conn.execute(
+        "UPDATE planning_sessions SET turn_number = turn_number + 1 WHERE id = ? "
+        "RETURNING turn_number",
+        (session_id,),
+    )
+    row = await cur.fetchone()
+    await db.conn.commit()
+    return int(row["turn_number"]) if row else 0
+
+
+# --- planning messages --------------------------------------------------------
+
+
+async def add_planning_message(
+    db: Database,
+    *,
+    session_id: str,
+    agent: str,
+    role: str,
+    content: str,
+    turn_number: int,
+    parent_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> PlanningMessage:
+    mid = new_id()
+    await db.execute(
+        "INSERT INTO planning_messages(id, session_id, agent, role, content, "
+        "turn_number, parent_id, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (mid, session_id, agent, role, content, turn_number, parent_id,
+         json.dumps(metadata or {}), now_iso()),
+    )
+    msg = await _get_planning_message(db, mid)
+    assert msg is not None
+    return msg
+
+
+async def _get_planning_message(db: Database, message_id: str) -> PlanningMessage | None:
+    row = await db.fetchone(
+        "SELECT * FROM planning_messages WHERE id = ?", (message_id,)
+    )
+    return PlanningMessage.from_row(row) if row else None
+
+
+async def list_planning_messages(db: Database, session_id: str) -> list[PlanningMessage]:
+    rows = await db.fetchall(
+        "SELECT * FROM planning_messages WHERE session_id = ? ORDER BY turn_number, id",
+        (session_id,),
+    )
+    return [PlanningMessage.from_row(r) for r in rows]
+
+
+# --- planning task nodes ------------------------------------------------------
+
+
+async def add_planning_task_node(
+    db: Database,
+    *,
+    session_id: str,
+    parent_id: str | None,
+    title: str,
+    description: str,
+    level: int,
+    sort_order: int,
+) -> PlanningTaskNode:
+    nid = new_id()
+    ts = now_iso()
+    await db.execute(
+        "INSERT INTO planning_task_nodes(id, session_id, parent_id, title, description, "
+        "status, level, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (nid, session_id, parent_id, title, description,
+         PlanningNodeStatus.proposed.value, level, sort_order, ts, ts),
+    )
+    node = await get_planning_task_node(db, nid)
+    assert node is not None
+    return node
+
+
+async def get_planning_task_node(db: Database, node_id: str) -> PlanningTaskNode | None:
+    row = await db.fetchone(
+        "SELECT * FROM planning_task_nodes WHERE id = ?", (node_id,)
+    )
+    return PlanningTaskNode.from_row(row) if row else None
+
+
+async def update_planning_task_node(
+    db: Database,
+    *,
+    node_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    status: str | None = None,
+    task_id: str | None = None,
+) -> None:
+    sets: list[str] = []
+    params: list[Any] = []
+    if title is not None:
+        sets.append("title = ?")
+        params.append(title)
+    if description is not None:
+        sets.append("description = ?")
+        params.append(description)
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+    if task_id is not None:
+        sets.append("task_id = ?")
+        params.append(task_id)
+    if not sets:
+        return
+    sets.append("updated_at = ?")
+    params.append(now_iso())
+    params.append(node_id)
+    await db.execute(
+        f"UPDATE planning_task_nodes SET {', '.join(sets)} WHERE id = ?", tuple(params)
+    )
+
+
+async def delete_planning_task_node(db: Database, node_id: str) -> None:
+    # Null out parent references on children first
+    await db.execute(
+        "UPDATE planning_task_nodes SET parent_id = NULL WHERE parent_id = ?", (node_id,)
+    )
+    await db.execute("DELETE FROM planning_task_nodes WHERE id = ?", (node_id,))
+
+
+async def list_planning_task_nodes(db: Database, session_id: str) -> list[PlanningTaskNode]:
+    rows = await db.fetchall(
+        "SELECT * FROM planning_task_nodes WHERE session_id = ? ORDER BY level, sort_order",
+        (session_id,),
+    )
+    return [PlanningTaskNode.from_row(r) for r in rows]
+
+
+async def list_planning_task_nodes_by_parent(
+    db: Database, session_id: str, parent_id: str | None
+) -> list[PlanningTaskNode]:
+    if parent_id is None:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_task_nodes WHERE session_id = ? AND parent_id IS NULL "
+            "ORDER BY sort_order",
+            (session_id,),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_task_nodes WHERE session_id = ? AND parent_id = ? "
+            "ORDER BY sort_order",
+            (session_id, parent_id),
+        )
+    return [PlanningTaskNode.from_row(r) for r in rows]

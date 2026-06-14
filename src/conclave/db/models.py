@@ -26,6 +26,7 @@ class TaskState(StrEnum):
     done = "done"
     failed = "failed"
     cancelled = "cancelled"
+    blocked = "blocked"  # parent task failed, cannot proceed
 
 
 class TaskOrigin(StrEnum):
@@ -77,12 +78,14 @@ class Task(BaseModel):
     branch: str | None = None
     result_summary: str | None = None
     origin: TaskOrigin = TaskOrigin.operator
+    parent_task_id: str | None = None
     created_at: str
     updated_at: str
 
     @classmethod
     def from_row(cls, row: Any) -> Task:
         up = row["use_planner"]
+        ptid = row["parent_task_id"] if "parent_task_id" in row.keys() else None
         return cls(
             id=row["id"],
             project_id=row["project_id"],
@@ -95,6 +98,7 @@ class Task(BaseModel):
             branch=row["branch"],
             result_summary=row["result_summary"],
             origin=TaskOrigin(row["origin"]),
+            parent_task_id=ptid,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -106,6 +110,7 @@ class EventRow(BaseModel):
     id: int
     project_id: str | None = None
     task_id: str | None = None
+    planning_session_id: str | None = None
     agent: str | None = None
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -117,6 +122,9 @@ class EventRow(BaseModel):
             id=row["id"],
             project_id=row["project_id"],
             task_id=row["task_id"],
+            planning_session_id=(
+                row["planning_session_id"] if "planning_session_id" in row.keys() else None
+            ),
             agent=row["agent"],
             type=row["type"],
             payload=_loads(row["payload_json"], {}),
@@ -164,10 +172,15 @@ class UsageRow(BaseModel):
     model_reported: str | None = None
     cost_usd: float | None = None
     num_turns: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
     ts: str
 
     @classmethod
     def from_row(cls, row: Any) -> UsageRow:
+        keys = row.keys()
         return cls(
             id=row["id"],
             project_id=row["project_id"],
@@ -176,6 +189,12 @@ class UsageRow(BaseModel):
             model_reported=row["model_reported"],
             cost_usd=row["cost_usd"],
             num_turns=row["num_turns"],
+            input_tokens=row["input_tokens"] if "input_tokens" in keys else None,
+            output_tokens=row["output_tokens"] if "output_tokens" in keys else None,
+            cache_read_tokens=row["cache_read_tokens"] if "cache_read_tokens" in keys else None,
+            cache_creation_tokens=(
+                row["cache_creation_tokens"] if "cache_creation_tokens" in keys else None
+            ),
             ts=row["ts"],
         )
 
@@ -284,6 +303,7 @@ class RepoKnowledgeRow(BaseModel):
     version: int
     sha: str | None = None
     manifest_fingerprint: str | None = None
+    ai_enriched: bool = False
     knowledge: dict[str, Any] = Field(default_factory=dict)
     created_at: str
 
@@ -295,6 +315,7 @@ class RepoKnowledgeRow(BaseModel):
             version=row["version"],
             sha=row["sha"],
             manifest_fingerprint=row["manifest_fingerprint"],
+            ai_enriched=bool(row["ai_enriched"]) if "ai_enriched" in row.keys() else False,
             knowledge=_loads(row["knowledge_json"], {}),
             created_at=row["created_at"],
         )

@@ -3,6 +3,9 @@
 One :class:`ProjectWorker` per active project claims approved tasks and runs them
 through the orchestrator. The :class:`Daemon` owns the shared db/bus/provider and the
 worker registry, and is reachable from the web layer via ``app.state.daemon``.
+
+On startup, projects that were imported before the AI analyser was wired in are
+automatically backfilled with an AI enrichment pass.
 """
 
 from __future__ import annotations
@@ -12,11 +15,14 @@ import contextlib
 import logging
 from pathlib import Path
 
+from .config import load_project_config
 from .db import Database
 from .db import repositories as repo
 from .engine import Orchestrator
 from .events import EventBus
+from .planning.session import PlanningOrchestrator
 from .providers import Provider
+from .repo_intel import RepoKnowledge, ai_enrich
 
 logger = logging.getLogger("conclave.runtime")
 
@@ -77,7 +83,9 @@ class Daemon:
         self.provider = provider
         self.bus = EventBus(db)
         self.orchestrator = Orchestrator(db, self.bus, provider, home)
+        self.planning_orchestrator = PlanningOrchestrator(db, self.bus, provider)
         self._workers: dict[str, ProjectWorker] = {}
+        self._bg_tasks: set[asyncio.Task[None]] = set()
         self._workers_enabled = workers_enabled
 
     async def start(self) -> None:
@@ -85,6 +93,38 @@ class Daemon:
             return
         for project in await repo.list_projects(self.db):
             await self.start_worker(project.id)
+            # Kick off AI backfill in the background if this project was never
+            # AI-enriched (e.g. imported before the feature was wired in).
+            ai_row = await repo.latest_ai_knowledge(self.db, project.id)
+            if ai_row is None:
+                task = asyncio.create_task(self._backfill_ai(project))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+
+    async def _backfill_ai(self, project: object) -> None:
+        """Run AI enrichment for a project that missed it on import."""
+        from .db.models import Project as ProjectModel
+        p: ProjectModel = project  # type: ignore[assignment]
+        try:
+            logger.info("backfill: starting AI enrichment for project %s", p.id)
+            current = await repo.current_repo_knowledge(self.db, p.id)
+            if current is None:
+                logger.warning("backfill: no knowledge at all for %s, skipping", p.id)
+                return
+            if current.ai_enriched:
+                logger.info("backfill: project %s already AI-enriched, skipping", p.id)
+                return
+            config = load_project_config(p.config)
+            heuristic = RepoKnowledge(**current.knowledge)
+            await ai_enrich(
+                self.db, self.bus, self.provider, p, config,
+                heuristic=heuristic,
+                sha=current.sha,
+                fingerprint=current.manifest_fingerprint or "",
+            )
+            logger.info("backfill: AI enrichment complete for project %s", p.id)
+        except Exception:
+            logger.exception("backfill: AI enrichment failed for project %s", p.id)
 
     async def shutdown(self) -> None:
         for worker in list(self._workers.values()):

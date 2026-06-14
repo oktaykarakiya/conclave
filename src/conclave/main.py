@@ -25,7 +25,10 @@ def cli() -> None:
     db = Database(home / "conclave.db")
     daemon = Daemon(db, home, ClaudeCliProvider())
     app = create_app(daemon)
-    host = os.environ.get("CONCLAVE_HOST", "127.0.0.1")
+    # Personal/single-user tool: bind all interfaces by default so the UI is reachable
+    # from the LAN (e.g. your phone). Run only on a trusted network — the API is
+    # intentionally unauthenticated. Set CONCLAVE_HOST=127.0.0.1 to restrict to loopback.
+    host = os.environ.get("CONCLAVE_HOST", "0.0.0.0")
     port = int(os.environ.get("CONCLAVE_PORT", "8700"))
     uvicorn.run(app, host=host, port=port, log_level="info")
 

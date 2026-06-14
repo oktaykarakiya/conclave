@@ -16,6 +16,7 @@ export interface Task {
   level: number | null;
   branch: string | null;
   result_summary: string | null;
+  parent_task_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -73,4 +74,53 @@ export interface Integrity {
   expired: number;
   expired_patterns: string[];
   healthy: boolean;
+}
+
+export interface RepoKnowledge {
+  languages: string[];
+  frameworks: string[];
+  commands: Record<string, string>;
+  architecture_summary: string;
+  conventions: string[];
+  layout: Record<string, string[]>;
+  protected_globs: string[];
+  ai_enriched: boolean;
+}
+
+export interface PlanningSession {
+  id: string;
+  project_id: string;
+  title: string;
+  prompt: string;
+  status: "active" | "stable" | "completed" | "cancelled";
+  turn_number: number;
+  max_rounds: number;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface PlanningMessage {
+  id: string;
+  session_id: string;
+  agent: string;
+  role: "agent" | "human";
+  content: string;
+  turn_number: number;
+  parent_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface PlanningTaskNode {
+  id: string;
+  session_id: string;
+  parent_id: string | null;
+  title: string;
+  description: string;
+  status: "proposed" | "refined" | "approved";
+  level: number;
+  sort_order: number;
+  task_id: string | null;
+  created_at: string;
+  updated_at: string;
 }

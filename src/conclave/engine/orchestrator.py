@@ -9,7 +9,9 @@ in SQLite and every step emits an event.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -19,11 +21,11 @@ from ..config import ConclaveConfig, load_project_config, resolve_agent
 from ..db import Database, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType
-from ..providers import Provider
+from ..providers import AgentResult, Provider
 from ..repo_intel.knowledge import render_preamble
 from .baseline import build_baseline_preamble
 from .gate import run_tests
-from .gitio import run_git
+from .gitio import run_git, run_shell
 from .memory import AttemptMemory
 from .pipeline import get_agent_pipeline
 from .runner import AgentRunner
@@ -31,6 +33,14 @@ from .verdict import ParsedVerdict, check_grounding, parse_verdict
 from .worktree import WorktreeError, WorktreeManager
 
 _PROJECT_RULE_FILES = ("CONCLAVE.md", "CLAUDE.md")
+
+# A single reviewer dispatch can transiently return empty/non-ok (provider hiccup).
+# Retry it a few times before giving up, so one flaky call doesn't discard the
+# developer's work and re-run the whole develop→review loop.
+_REVIEWER_DISPATCH_RETRIES = 2
+_REVIEWER_RETRY_BACKOFF_S = 3.0
+
+logger = logging.getLogger("conclave.engine.orchestrator")
 
 
 class Orchestrator:
@@ -72,9 +82,40 @@ class Orchestrator:
         _, sha = await run_git(worktree, "rev-parse", "HEAD")
         checkpoint = sha.strip()
 
+        # Provision the worktree environment ONCE (e.g. venv + deps) before any agent
+        # runs, so developer self-checks, reviewer verification, and the green-gate all
+        # share one toolchain. Without this, agents fall back to host-global tools and
+        # report "clean" against a different environment than the gate enforces.
+        setup_cmd = config.execution.setup_command
+        if setup_cmd:
+            await self._bus.emit(
+                type=EventType.log,
+                project_id=project.id,
+                task_id=task.id,
+                payload={"stage": "setup", "message": "provisioning worktree environment"},
+            )
+            rc, out = await run_shell(worktree, setup_cmd, timeout_seconds=900)
+            if rc != 0:
+                return await self._fail_early(
+                    task, wm, task_branch,
+                    f"worktree setup failed (exit {rc}):\n{out[-1000:]}",
+                )
+
         knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
         knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
         rules = _read_project_rules(worktree)
+        if setup_cmd:
+            rules += (
+                "\n\n## Worktree environment (MANDATORY)\n"
+                "A provisioned virtualenv exists at `.venv/` in the worktree root with all "
+                "dependencies installed. Run EVERY verification through it so your checks match "
+                "the green-gate exactly:\n"
+                "- `.venv/bin/pytest -q`\n"
+                "- `.venv/bin/mypy`\n"
+                "- `.venv/bin/ruff check src tests`\n"
+                "Do NOT use system-wide `pytest`/`mypy`/`ruff` — they are a different toolchain "
+                "and will disagree with the gate."
+            )
         test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
         gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
 
@@ -117,7 +158,9 @@ class Orchestrator:
                 if use_memory:
                     memory.add(attempts - 1, previous_diff, feedback)
                 await run_git(worktree, "reset", "--hard", checkpoint)
-                await run_git(worktree, "clean", "-fd")
+                # Preserve the provisioned .venv across attempts; rebuilding it each retry
+                # is slow and pointless.
+                await run_git(worktree, "clean", "-fd", "-e", ".venv")
 
             dev_prompt = task.request + plan_preamble + baseline_preamble
             if use_memory:
@@ -269,6 +312,37 @@ class Orchestrator:
             f"```json\n{match.group(1)}\n```\n=== END PLAN ===\n"
         )
 
+    async def _dispatch_reviewer(
+        self,
+        runner: AgentRunner,
+        agent: str,
+        prompt: str,
+        task: Task,
+        worktree: Path,
+        knowledge: str,
+        rules: str,
+    ) -> AgentResult:
+        """Run one reviewer, retrying transient empty/non-ok dispatches with backoff."""
+        result = AgentResult(ok=False, error="not dispatched")
+        for attempt in range(_REVIEWER_DISPATCH_RETRIES + 1):
+            result = await runner.run(
+                agent=agent,
+                prompt=prompt,
+                task_id=task.id,
+                worktree=worktree,
+                repo_knowledge=knowledge,
+                project_rules=rules,
+            )
+            if result.ok and result.text.strip():
+                return result
+            if attempt < _REVIEWER_DISPATCH_RETRIES:
+                logger.info(
+                    "reviewer %s returned no usable response (try %d/%d); retrying",
+                    agent, attempt + 1, _REVIEWER_DISPATCH_RETRIES + 1,
+                )
+                await asyncio.sleep(_REVIEWER_RETRY_BACKOFF_S)
+        return result
+
     async def _review(
         self,
         runner: AgentRunner,
@@ -287,20 +361,28 @@ class Orchestrator:
             payload={"pipeline": pipeline},
         )
         reviewer_prompt = f"Review the changes made for this task:\n{task.request}"
+        passes = 0
         for agent in pipeline:
-            result = await runner.run(
-                agent=agent,
-                prompt=reviewer_prompt,
-                task_id=task.id,
-                worktree=worktree,
-                repo_knowledge=knowledge,
-                project_rules=rules,
+            result = await self._dispatch_reviewer(
+                runner, agent, reviewer_prompt, task, worktree, knowledge, rules
             )
-            if result.ok:
+            if result.ok and result.text.strip():
                 verdict = parse_verdict(result.text)
             else:
+                # Transient infra failure even after retries: a single reviewer that
+                # can't run is NOT a code defect, so record a non-blocking 'unknown'
+                # (like the grounding downgrade) instead of failing the whole attempt.
                 verdict = ParsedVerdict(
-                    verdict="fail", reason=f"{agent} agent error: {result.error}", source="none"
+                    verdict="unknown",
+                    reason=f"{agent} agent unavailable after retries: {result.error}",
+                    source="none",
+                )
+                await self._bus.emit(
+                    type=EventType.grounding_warning, project_id=project_id, task_id=task.id,
+                    agent=agent,
+                    payload={
+                        "warning": f"{agent} dispatch failed after retries; skipped (non-blocking)"
+                    },
                 )
             warnings: list[str] = []
             if config.experimental.grounding_checks:
@@ -332,9 +414,22 @@ class Orchestrator:
                 type=EventType.verdict, project_id=project_id, task_id=task.id, agent=agent,
                 payload={"verdict": verdict.verdict, "reason": verdict.reason},
             )
-            if verdict.verdict in ("fail", "block"):
+            if verdict.verdict in ("fail", "block", "decline"):
                 header = f"{agent.upper()} FEEDBACK ({verdict.verdict.upper()})"
                 return True, f"\n{header}:\n{verdict.reason}\n"
+            if verdict.verdict == "pass":
+                passes += 1
+        # ENG-3: never merge on an all-'unknown' round. If reviewers were derived but
+        # none rendered a usable PASS — e.g. the model backend was rate-limited/degraded
+        # and every reviewer fell back to non-blocking 'unknown' — the review tier is
+        # effectively offline. Fail the attempt so the retry loop re-runs it (giving the
+        # backend time to recover) rather than auto-merging unvetted code.
+        if pipeline and passes == 0:
+            return True, (
+                "\nREVIEW INCONCLUSIVE: no reviewer returned a usable verdict "
+                "(all 'unknown' — the model backend was likely unavailable). "
+                "Not merging without at least one grounded review; retrying.\n"
+            )
         return False, ""
 
     async def _finish_success(
@@ -391,6 +486,9 @@ class Orchestrator:
             type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
             payload={"reason": reason, "attempts": attempts},
         )
+        blocked = await repo.block_descendants(self._db, task.id)
+        if blocked:
+            logger.info("blocked %d descendant tasks after %s failed", blocked, task.id)
         await wm.cleanup(task.id, task_branch)
         return False
 
@@ -403,6 +501,9 @@ class Orchestrator:
             type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
             payload={"reason": message},
         )
+        blocked = await repo.block_descendants(self._db, task.id)
+        if blocked:
+            logger.info("blocked %d descendant tasks after %s failed early", blocked, task.id)
         await wm.cleanup(task.id, task_branch)
         return False
 

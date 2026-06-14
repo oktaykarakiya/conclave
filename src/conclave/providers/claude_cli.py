@@ -84,6 +84,12 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
     model_reported: str | None = None
     cost_usd: float | None = None
     num_turns: int | None = None
+    tokens: dict[str, int | None] = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_read_tokens": None,
+        "cache_creation_tokens": None,
+    }
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
@@ -99,6 +105,12 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
         turns = parsed.get("num_turns")
         if isinstance(turns, int):
             num_turns = turns
+        usage = parsed.get("usage")
+        if isinstance(usage, dict):
+            tokens["input_tokens"] = _as_int(usage.get("input_tokens"))
+            tokens["output_tokens"] = _as_int(usage.get("output_tokens"))
+            tokens["cache_read_tokens"] = _as_int(usage.get("cache_read_input_tokens"))
+            tokens["cache_creation_tokens"] = _as_int(usage.get("cache_creation_input_tokens"))
 
     ok = exit_code == 0 or bool(_SUCCESS_HINT.search(text))
     return AgentResult(
@@ -107,5 +119,13 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
         model_reported=model_reported,
         cost_usd=cost_usd,
         num_turns=num_turns,
+        input_tokens=tokens["input_tokens"],
+        output_tokens=tokens["output_tokens"],
+        cache_read_tokens=tokens["cache_read_tokens"],
+        cache_creation_tokens=tokens["cache_creation_tokens"],
         exit_code=exit_code,
     )
+
+
+def _as_int(value: object) -> int | None:
+    return value if isinstance(value, int) else None

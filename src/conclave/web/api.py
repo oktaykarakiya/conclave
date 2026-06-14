@@ -26,15 +26,18 @@ from ..db import (
     VerdictRow,
 )
 from ..db import repositories as repo
+from ..db.planning_models import PlanningMessage, PlanningSession, PlanningTaskNode
 from ..events import EventType
 from ..providers import ProfileTestResult, ResolvedProfile, probe_profile
-from ..repo_intel import onboard
+from ..repo_intel import RepoKnowledge, ai_enrich, onboard
 from ..runtime import Daemon
 from ..verification import quarantine_integrity
 from .deps import get_daemon
 from .schemas import (
     AgentUpsert,
     ConfigPatch,
+    PlanningMessageInput,
+    PlanningSessionCreate,
     ProfileInput,
     ProjectCreate,
     QuarantineInput,
@@ -92,7 +95,11 @@ async def create_project(
     project = await repo.create_project(
         daemon.db, name=body.name, path=str(path), default_branch=body.default_branch
     )
-    await onboard(daemon.db, daemon.bus, project)
+    config = load_project_config(project.config)
+    await onboard(
+        daemon.db, daemon.bus, project,
+        provider=daemon.provider, config=config,
+    )
     await daemon.start_worker(project.id)
     return await _require_project(daemon, project.id)
 
@@ -112,13 +119,39 @@ async def detach_project(project_id: str, daemon: Daemon = Depends(get_daemon)) 
 @router.post("/projects/{project_id}/onboard")
 async def reonboard(project_id: str, daemon: Daemon = Depends(get_daemon)) -> RepoKnowledgeRow:
     project = await _require_project(daemon, project_id)
-    return await onboard(daemon.db, daemon.bus, project, force=True)
+    config = load_project_config(project.config)
+    return await onboard(
+        daemon.db, daemon.bus, project, force=True,
+        provider=daemon.provider, config=config,
+    )
 
 
 @router.get("/projects/{project_id}/knowledge")
 async def get_knowledge(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
     row = await repo.current_repo_knowledge(daemon.db, project_id)
-    return row.knowledge if row else {}
+    if row is None:
+        return {}
+    return {**row.knowledge, "ai_enriched": row.ai_enriched}
+
+
+@router.post("/projects/{project_id}/ai-analyze")
+async def ai_analyze(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
+    """Force re-run the AI repo analysis regardless of staleness."""
+    project = await _require_project(daemon, project_id)
+    config = load_project_config(project.config)
+    current = await repo.current_repo_knowledge(daemon.db, project_id)
+    if current is None:
+        raise HTTPException(status_code=400, detail="run onboarding first (no knowledge exists)")
+    heuristic = RepoKnowledge(**current.knowledge)
+    row = await ai_enrich(
+        daemon.db, daemon.bus, daemon.provider, project, config,
+        heuristic=heuristic,
+        sha=current.sha,
+        fingerprint=current.manifest_fingerprint or "",
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="AI analysis failed (see server logs)")
+    return {**row.knowledge, "ai_enriched": row.ai_enriched}
 
 
 @router.get("/projects/{project_id}/config")
@@ -250,6 +283,69 @@ async def list_task_events(
     return await repo.list_events(daemon.db, task_id=task_id, after_id=after_id)
 
 
+@router.post("/tasks/{task_id}/cascade-approve")
+async def cascade_approve_task(
+    task_id: str, daemon: Daemon = Depends(get_daemon)
+) -> dict[str, Any]:
+    """Approve a task and all its descendants in dependency order (BFS)."""
+    task = await _require_task(daemon, task_id)
+    approved_ids: list[str] = []
+    queue = [task]
+    while queue:
+        current = queue.pop(0)
+        if current.state == TaskState.inbox:
+            await repo.set_task_state(daemon.db, current.id, TaskState.approved)
+            await daemon.bus.emit(
+                type=EventType.task_approved, task_id=current.id,
+                payload={"cascade": True, "root": task_id},
+            )
+            approved_ids.append(current.id)
+        children = await repo.get_child_tasks(daemon.db, current.id)
+        queue.extend(children)
+    return {"approved": True, "cascade": True, "task_ids": approved_ids, "count": len(approved_ids)}
+
+
+@router.get("/tasks/{task_id}/usage")
+async def get_task_usage(
+    task_id: str, daemon: Daemon = Depends(get_daemon)
+) -> dict[str, Any]:
+    """Return per-agent token usage + totals for a single task (cost intentionally omitted)."""
+    await _require_task(daemon, task_id)
+    rows = await daemon.db.fetchall(
+        "SELECT agent, model_reported, num_turns, input_tokens, output_tokens, "
+        "cache_read_tokens, cache_creation_tokens, ts FROM usage "
+        "WHERE task_id = ? ORDER BY ts",
+        (task_id,),
+    )
+    entries = [
+        {
+            "agent": r["agent"],
+            "model_reported": r["model_reported"],
+            "num_turns": r["num_turns"],
+            "input_tokens": r["input_tokens"],
+            "output_tokens": r["output_tokens"],
+            "cache_read_tokens": r["cache_read_tokens"],
+            "cache_creation_tokens": r["cache_creation_tokens"],
+            "ts": r["ts"],
+        }
+        for r in rows
+    ]
+
+    def _sum(field: str) -> int:
+        return sum(int(e[field]) for e in entries if e[field] is not None)
+
+    return {
+        "task_id": task_id,
+        "entries": entries,
+        "total_turns": _sum("num_turns"),
+        "input_tokens": _sum("input_tokens"),
+        "output_tokens": _sum("output_tokens"),
+        "cache_read_tokens": _sum("cache_read_tokens"),
+        "cache_creation_tokens": _sum("cache_creation_tokens"),
+        "agent_count": len(entries),
+    }
+
+
 @router.get("/tasks/{task_id}/verdicts")
 async def list_task_verdicts(
     task_id: str, daemon: Daemon = Depends(get_daemon)
@@ -353,6 +449,79 @@ async def upsert_agent(
     return await repo.upsert_agent(
         daemon.db, name=name, role=body.role, persona_md=body.persona_md, project_id=body.project_id
     )
+
+
+# --- agent-ception planning sessions -----------------------------------------
+
+
+@router.get("/projects/{project_id}/planning/sessions")
+async def list_planning_sessions(
+    project_id: str, daemon: Daemon = Depends(get_daemon)
+) -> list[PlanningSession]:
+    await _require_project(daemon, project_id)
+    return await repo.list_planning_sessions(daemon.db, project_id)
+
+
+@router.post("/projects/{project_id}/planning/sessions")
+async def create_planning_session(
+    project_id: str, body: PlanningSessionCreate, daemon: Daemon = Depends(get_daemon)
+) -> PlanningSession:
+    await _require_project(daemon, project_id)
+    return await daemon.planning_orchestrator.create_and_start(
+        project_id=project_id,
+        title=body.title,
+        prompt=body.prompt,
+        max_rounds=body.max_rounds,
+    )
+
+
+@router.get("/planning/sessions/{session_id}")
+async def get_planning_session(
+    session_id: str, daemon: Daemon = Depends(get_daemon)
+) -> PlanningSession:
+    session = await repo.get_planning_session(daemon.db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="planning session not found")
+    return session
+
+
+@router.get("/planning/sessions/{session_id}/messages")
+async def list_planning_messages(
+    session_id: str, daemon: Daemon = Depends(get_daemon)
+) -> list[PlanningMessage]:
+    return await repo.list_planning_messages(daemon.db, session_id)
+
+
+@router.post("/planning/sessions/{session_id}/messages")
+async def add_planning_message(
+    session_id: str, body: PlanningMessageInput, daemon: Daemon = Depends(get_daemon)
+) -> PlanningMessage:
+    return await daemon.planning_orchestrator.add_human_message(
+        session_id, body.content
+    )
+
+
+@router.get("/planning/sessions/{session_id}/tasks")
+async def list_planning_task_nodes(
+    session_id: str, daemon: Daemon = Depends(get_daemon)
+) -> list[PlanningTaskNode]:
+    return await repo.list_planning_task_nodes(daemon.db, session_id)
+
+
+@router.post("/planning/sessions/{session_id}/approve")
+async def approve_planning_session(
+    session_id: str, daemon: Daemon = Depends(get_daemon)
+) -> dict[str, Any]:
+    task_ids = await daemon.planning_orchestrator.approve_session(session_id)
+    return {"approved": True, "task_ids": task_ids, "count": len(task_ids)}
+
+
+@router.post("/planning/sessions/{session_id}/cancel")
+async def cancel_planning_session(
+    session_id: str, daemon: Daemon = Depends(get_daemon)
+) -> dict[str, bool]:
+    await daemon.planning_orchestrator.cancel_session(session_id)
+    return {"cancelled": True}
 
 
 def _validate_arg_mode(value: str) -> None:

@@ -22,6 +22,7 @@ from .types import EventType
 class EventFilter:
     project_id: str | None = None
     task_id: str | None = None
+    planning_session_id: str | None = None
     agent: str | None = None
     types: frozenset[str] | None = None
 
@@ -29,6 +30,11 @@ class EventFilter:
         if self.project_id is not None and event.project_id != self.project_id:
             return False
         if self.task_id is not None and event.task_id != self.task_id:
+            return False
+        if (
+            self.planning_session_id is not None
+            and event.planning_session_id != self.planning_session_id
+        ):
             return False
         if self.agent is not None and event.agent != self.agent:
             return False
@@ -98,6 +104,7 @@ class EventBus:
         type: EventType | str,
         project_id: str | None = None,
         task_id: str | None = None,
+        planning_session_id: str | None = None,
         agent: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> EventRow:
@@ -106,6 +113,7 @@ class EventBus:
             type=str(type),
             project_id=project_id,
             task_id=task_id,
+            planning_session_id=planning_session_id,
             agent=agent,
             payload=payload,
         )
@@ -118,6 +126,7 @@ class EventBus:
         *,
         project_id: str | None = None,
         task_id: str | None = None,
+        planning_session_id: str | None = None,
         agent: str | None = None,
         types: list[str] | None = None,
         maxsize: int = 1000,
@@ -125,6 +134,7 @@ class EventBus:
         event_filter = EventFilter(
             project_id=project_id,
             task_id=task_id,
+            planning_session_id=planning_session_id,
             agent=agent,
             types=frozenset(types) if types else None,
         )

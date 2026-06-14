@@ -101,6 +101,14 @@ class ExecutionSettings(BaseModel):
     parallel_reviewers: bool = Field(default=False)
     stop_on_failure: bool = Field(default=False)
     auto_merge: bool = Field(default=True, description="Fast-forward/merge into target on success.")
+    setup_command: str | None = Field(
+        default=None,
+        description=(
+            "Provisioning command run ONCE per worktree before any agent, e.g. to build a "
+            "virtualenv and install deps. Agents and the green-gate then share this environment, "
+            "so reviewer checks match the gate. None => no provisioning."
+        ),
+    )
     baseline_test_command: str | None = Field(
         default=None,
         description="Test command for the baseline snapshot. None => use learned repo command.",
@@ -135,6 +143,51 @@ _DEFAULT_IGNORE_PATTERNS = [
 ]
 
 
+class LevelConditions(BaseModel):
+    """Heuristic thresholds that classify a task into a planning level (0-4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_chars: int = Field(default=0, ge=0, description="Minimum request length in characters.")
+    max_chars: int | None = Field(
+        default=None, description="Maximum request length (None = unbounded)."
+    )
+    required_keywords: list[str] = Field(
+        default_factory=list, description="Keywords that must appear in the request."
+    )
+    file_count_estimate: int | None = Field(
+        default=None, description="Estimated files touched (None = not used for classification)."
+    )
+
+
+class L2Settings(BaseModel):
+    """Enhanced one-shot planning: acceptance criteria + risk assessment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    require_acceptance_criteria: bool = Field(default=True)
+    require_risk_assessment: bool = Field(default=True)
+
+
+class L3Settings(BaseModel):
+    """Multi-stage planning: PRD-lite → architecture note → stories."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    produce_prd: bool = Field(default=True)
+    produce_arch_note: bool = Field(default=True)
+    decompose_into_stories: bool = Field(default=True)
+
+
+class L4Settings(BaseModel):
+    """Epic-level planning: decompose into child tasks re-queued in the task system."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    auto_create_children: bool = Field(default=True)
+    max_child_tasks: int = Field(default=20, ge=1, le=100)
+
+
 class PlanningSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -151,6 +204,19 @@ class PlanningSettings(BaseModel):
     ignore_patterns: list[str] = Field(default_factory=lambda: list(_DEFAULT_IGNORE_PATTERNS))
     min_level: int = Field(default=0, ge=0, le=4, description="Floor on scale-adaptive planning.")
     max_level: int = Field(default=4, ge=0, le=4, description="Cap on scale-adaptive planning.")
+    level_thresholds: dict[int, LevelConditions] = Field(
+        default_factory=lambda: {
+            0: LevelConditions(min_chars=0, max_chars=50),
+            1: LevelConditions(min_chars=0, max_chars=400),
+            2: LevelConditions(min_chars=200, required_keywords=["implement", "feature"]),
+            3: LevelConditions(min_chars=500, file_count_estimate=5),
+            4: LevelConditions(min_chars=1000, file_count_estimate=10),
+        },
+        description="Heuristic thresholds mapping level → classification conditions.",
+    )
+    l2_settings: L2Settings = Field(default_factory=L2Settings)
+    l3_settings: L3Settings = Field(default_factory=L3Settings)
+    l4_settings: L4Settings = Field(default_factory=L4Settings)
 
 
 class ConditionalAgent(BaseModel):

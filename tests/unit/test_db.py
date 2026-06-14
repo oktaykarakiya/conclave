@@ -8,10 +8,10 @@ from conclave.db import repositories as repo
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 1
+    assert version == 5
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 1
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 5
 
 
 async def test_project_crud_and_config(db: Database) -> None:
@@ -54,6 +54,32 @@ async def test_task_lifecycle_claim_and_recover(db: Database) -> None:
     assert updated.branch == "conclave/x"
     assert updated.level == 2
     assert updated.plan == {"approach": "a"}
+
+
+async def test_claim_never_reclaims_terminal_tasks(db: Database) -> None:
+    """Regression: claim must only ever pick 'approved' tasks — never done/failed.
+
+    A precedence bug once made the parent-skip clause match terminal tasks when no
+    failed/blocked tasks existed, re-running completed work.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    done = await repo.create_task(db, project_id=p.id, request="done", state=TaskState.approved)
+    await repo.set_task_state(db, done.id, TaskState.done)
+
+    # No approved tasks remain (and zero failed/blocked) → claim must return None.
+    assert await repo.claim_next_approved(db, p.id) is None
+
+    # A child whose parent failed must be skipped, but a healthy approved task is claimed.
+    parent = await repo.create_task(db, project_id=p.id, request="parent", state=TaskState.approved)
+    await repo.set_task_state(db, parent.id, TaskState.failed)
+    child = await repo.create_task(
+        db, project_id=p.id, request="child", state=TaskState.approved, parent_task_id=parent.id
+    )
+    ok = await repo.create_task(db, project_id=p.id, request="ok", state=TaskState.approved)
+    claimed = await repo.claim_next_approved(db, p.id)
+    assert claimed is not None
+    assert claimed.id == ok.id  # not the failed-parent child
+    assert child.id != claimed.id
 
 
 async def test_events_stream_after_id(db: Database) -> None:

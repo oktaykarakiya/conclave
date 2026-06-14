@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "./api";
-import { Button, ConfigPanel, LivePanel, ProfilesPanel, QuarantinePanel, TasksPanel } from "./panels";
+import { Button, ConfigPanel, KnowledgePanel, LivePanel, ProfilesPanel, QuarantinePanel, TasksPanel, AgentCeptionPanel } from "./panels";
 import type { Project } from "./types";
 
-const TABS = ["Tasks", "Live", "Config", "Profiles", "Quarantine"] as const;
+const TABS = ["Tasks", "Live", "Config", "Profiles", "Quarantine", "Knowledge", "Agent-ception"] as const;
 type Tab = (typeof TABS)[number];
 
 const modalInput =
@@ -100,6 +100,8 @@ export default function App() {
               {tab === "Config" && <ConfigPanel projectId={selected.id} />}
               {tab === "Profiles" && <ProfilesPanel />}
               {tab === "Quarantine" && <QuarantinePanel projectId={selected.id} />}
+              {tab === "Knowledge" && <KnowledgePanel projectId={selected.id} />}
+              {tab === "Agent-ception" && <AgentCeptionPanel projectId={selected.id} />}
             </section>
           </>
         ) : (

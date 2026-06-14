@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from .analyst import analyze_repo, onboard
+from .analyst import ai_enrich, analyze_repo, onboard
 from .knowledge import RepoKnowledge, manifest_fingerprint, render_preamble
 
 __all__ = [
     "RepoKnowledge",
+    "ai_enrich",
     "analyze_repo",
     "manifest_fingerprint",
     "onboard",

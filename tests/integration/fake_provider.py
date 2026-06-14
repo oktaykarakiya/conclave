@@ -2,7 +2,7 @@
 
 It inspects the assembled prompt to act as the right agent: the planner emits a JSON
 plan; reviewers emit a verdict; the developer (optionally) edits a file in the worktree
-cwd to produce a real diff.
+cwd to produce a real diff; the repo-analyst emits a valid enrichment JSON.
 """
 
 from __future__ import annotations
@@ -13,6 +13,43 @@ from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 
 _PASS = '```json\n{"verdict": "pass", "reason": "looks correct", "evidence": []}\n```'
 _PLAN = '```json\n{"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}\n```'
+_AI_KNOWLEDGE = (
+    '```json\n'
+    '{"languages": [], "frameworks": [], '
+    '"commands": {}, '
+    '"architecture_summary": "A minimal git repository with a README.", '
+    '"conventions": [], "protected_globs": [], '
+    '"layout": {"dirs": []}}\n'
+    '```'
+)
+
+# Deterministic planning discussion responses for agent-ception tests
+_PLANNING_PLANNER_INITIAL = """Here is the initial task breakdown for this feature.
+
+```json
+{
+  "message": "I've broken this down into implementation tasks.",
+  "task_changes": [
+    {"action": "add", "parent_id": null, "title": "Add auth middleware", "description": "Auth mw"},
+    {"action": "add", "parent_id": null, "title": "Set up database schema", "description": "DB"},
+    {"action": "add", "parent_id": null, "title": "Write integration tests", "description": "Tests"}
+  ],
+  "ready": false
+}
+```"""
+
+_PLANNING_PLANNER_REFINE = """Thank you for the feedback. I've refined the task list accordingly.
+
+```json
+{
+  "message": "Refined based on reviewer feedback.",
+  "task_changes": [],
+  "ready": true
+}
+```"""
+
+_PLANNING_APPROVED = "APPROVED. The plan looks complete and well-structured."
+_PLANNING_CHANGES = "CHANGES_REQUESTED. There are some issues that need addressing."
 
 
 class FakeProvider:
@@ -33,11 +70,45 @@ class FakeProvider:
         on_chunk: OnChunk | None = None,
     ) -> AgentResult:
         self.prompts.append(prompt)
+        # --- orchestrator flows (matched FIRST) ---
+        # These discriminators are unique to the orchestrator and never appear in planning
+        # prompts. They must win over the planning-persona checks below, because the code
+        # reviewers reuse the same persona names ("Architect Agent", "Security Agent", …):
+        # a code-review dispatch must return a parseable verdict, not the planning "APPROVED".
         if "Produce a structured plan" in prompt:
             return AgentResult(ok=True, text=_PLAN, model_reported="fake", cost_usd=0.0)
         if "Review the changes made for this task" in prompt:
             return AgentResult(ok=True, text=_PASS, model_reported="fake", cost_usd=0.0)
-        # developer
+        # repo-analyst enrichment prompt
+        if "Repository Analysis" in prompt and "AI Enrichment" in prompt:
+            return AgentResult(ok=True, text=_AI_KNOWLEDGE, model_reported="fake", cost_usd=0.0)
+        # --- agent-ception planning discussion ---
+        if "Planning Facilitator Agent" in prompt:
+            # Planner: return initial breakdown on first call, refinement later
+            if "# Discussion So Far" in prompt or "## Discussion So Far" in prompt:
+                return AgentResult(
+                    ok=True, text=_PLANNING_PLANNER_REFINE, model_reported="fake", cost_usd=0.0,
+                )
+            return AgentResult(
+                ok=True, text=_PLANNING_PLANNER_INITIAL, model_reported="fake", cost_usd=0.0,
+            )
+        if "Architect Agent" in prompt or "Tester Agent" in prompt:
+            return AgentResult(
+                ok=True, text=_PLANNING_APPROVED, model_reported="fake", cost_usd=0.0,
+            )
+        if "Security Agent" in prompt:
+            return AgentResult(
+                ok=True, text=_PLANNING_APPROVED, model_reported="fake", cost_usd=0.0,
+            )
+        if "Senior Reviewer Agent" in prompt:
+            return AgentResult(
+                ok=True, text=_PLANNING_APPROVED, model_reported="fake", cost_usd=0.0,
+            )
+        if "Risk Agent" in prompt:
+            return AgentResult(
+                ok=True, text=_PLANNING_APPROVED, model_reported="fake", cost_usd=0.0,
+            )
+        # developer fallback
         if self.developer_writes and cwd is not None:
             (Path(cwd) / self.filename).write_text("done\n", encoding="utf-8")
         return AgentResult(

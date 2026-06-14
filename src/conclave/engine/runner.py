@@ -46,7 +46,7 @@ class AgentRunner:
         *,
         agent: str,
         prompt: str,
-        task_id: str,
+        task_id: str | None = None,
         worktree: Path,
         repo_knowledge: str = "",
         project_rules: str = "",
@@ -84,6 +84,10 @@ class AgentRunner:
             model_reported=result.model_reported,
             cost_usd=result.cost_usd,
             num_turns=result.num_turns,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_creation_tokens=result.cache_creation_tokens,
         )
         await self._bus.emit(
             type=EventType.agent_result,

@@ -53,3 +53,13 @@ class AgentUpsert(BaseModel):
     role: str = "conditional"
     persona_md: str
     project_id: str | None = None
+
+
+class PlanningSessionCreate(BaseModel):
+    title: str = ""
+    prompt: str
+    max_rounds: int = 5
+
+
+class PlanningMessageInput(BaseModel):
+    content: str
