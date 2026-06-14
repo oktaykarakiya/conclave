@@ -66,8 +66,15 @@ async def get_project(db: Database, project_id: str) -> Project | None:
     return Project.from_row(row) if row else None
 
 
-async def list_projects(db: Database) -> list[Project]:
-    rows = await db.fetchall("SELECT * FROM projects ORDER BY created_at")
+async def list_projects(
+    db: Database, limit: int | None = None, offset: int = 0
+) -> list[Project]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM projects ORDER BY created_at LIMIT ? OFFSET ?", (limit, offset)
+        )
+    else:
+        rows = await db.fetchall("SELECT * FROM projects ORDER BY created_at")
     return [Project.from_row(r) for r in rows]
 
 
@@ -122,9 +129,26 @@ async def get_task(db: Database, task_id: str) -> Task | None:
 
 
 async def list_tasks(
-    db: Database, project_id: str, state: TaskState | None = None
+    db: Database,
+    project_id: str,
+    state: TaskState | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[Task]:
-    if state is None:
+    if limit is not None:
+        if state is None:
+            rows = await db.fetchall(
+                "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC "
+                "LIMIT ? OFFSET ?",
+                (project_id, limit, offset),
+            )
+        else:
+            rows = await db.fetchall(
+                "SELECT * FROM tasks WHERE project_id = ? AND state = ? "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (project_id, state.value, limit, offset),
+            )
+    elif state is None:
         rows = await db.fetchall(
             "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC", (project_id,)
         )
@@ -386,10 +410,19 @@ async def add_verdict(
     )
 
 
-async def list_verdicts(db: Database, task_id: str) -> list[VerdictRow]:
-    rows = await db.fetchall(
-        "SELECT * FROM verdicts WHERE task_id = ? ORDER BY attempt, created_at", (task_id,)
-    )
+async def list_verdicts(
+    db: Database, task_id: str, limit: int | None = None, offset: int = 0
+) -> list[VerdictRow]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM verdicts WHERE task_id = ? ORDER BY attempt, created_at "
+            "LIMIT ? OFFSET ?",
+            (task_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM verdicts WHERE task_id = ? ORDER BY attempt, created_at", (task_id,)
+        )
     return [VerdictRow.from_row(r) for r in rows]
 
 
@@ -490,6 +523,34 @@ async def usage_summary(db: Database, project_id: str) -> dict[str, Any]:
     return {"calls": int(row["calls"]), "total_cost_usd": float(row["total_cost"])}
 
 
+async def get_task_usage(db: Database, task_id: str) -> dict[str, Any]:
+    """Return token-usage totals for a single task computed entirely in SQL (DoS hardening — WEB-1).
+
+    Uses ``COALESCE(SUM(...), 0)`` so a single aggregate row is returned regardless of how many
+    usage rows exist — no Python-side iteration over unbounded rows.
+    """
+    row = await db.fetchone(
+        "SELECT COALESCE(SUM(num_turns), 0) AS total_turns, "
+        "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+        "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+        "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+        "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, "
+        "COUNT(*) AS agent_count "
+        "FROM usage WHERE task_id = ?",
+        (task_id,),
+    )
+    assert row is not None  # COUNT(*) always yields a row
+    return {
+        "task_id": task_id,
+        "total_turns": int(row["total_turns"]),
+        "input_tokens": int(row["input_tokens"]),
+        "output_tokens": int(row["output_tokens"]),
+        "cache_read_tokens": int(row["cache_read_tokens"]),
+        "cache_creation_tokens": int(row["cache_creation_tokens"]),
+        "agent_count": int(row["agent_count"]),
+    }
+
+
 # --- baselines --------------------------------------------------------------
 
 
@@ -538,10 +599,18 @@ async def add_quarantine(
     return QuarantineEntry.from_row(row)
 
 
-async def list_quarantine(db: Database, project_id: str) -> list[QuarantineEntry]:
-    rows = await db.fetchall(
-        "SELECT * FROM quarantine WHERE project_id = ? ORDER BY until", (project_id,)
-    )
+async def list_quarantine(
+    db: Database, project_id: str, limit: int | None = None, offset: int = 0
+) -> list[QuarantineEntry]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM quarantine WHERE project_id = ? ORDER BY until LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM quarantine WHERE project_id = ? ORDER BY until", (project_id,)
+        )
     return [QuarantineEntry.from_row(r) for r in rows]
 
 
@@ -647,12 +716,21 @@ async def get_engine_profile(
 
 
 async def list_engine_profiles(
-    db: Database, project_id: str | None = None
+    db: Database, project_id: str | None = None,
+    limit: int | None = None, offset: int = 0,
 ) -> list[EngineProfileRow]:
-    rows = await db.fetchall(
-        "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? ORDER BY name",
-        (project_id,),
-    )
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? "
+            "ORDER BY name LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? "
+            "ORDER BY name",
+            (project_id,),
+        )
     return [EngineProfileRow.from_row(r) for r in rows]
 
 
@@ -703,11 +781,21 @@ async def get_agent(
     return AgentPersona.from_row(row) if row else None
 
 
-async def list_agents(db: Database, project_id: str | None = None) -> list[AgentPersona]:
-    rows = await db.fetchall(
-        "SELECT * FROM agents WHERE project_id IS NULL OR project_id = ? ORDER BY name",
-        (project_id,),
-    )
+async def list_agents(
+    db: Database, project_id: str | None = None,
+    limit: int | None = None, offset: int = 0,
+) -> list[AgentPersona]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM agents WHERE project_id IS NULL OR project_id = ? "
+            "ORDER BY name LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM agents WHERE project_id IS NULL OR project_id = ? ORDER BY name",
+            (project_id,),
+        )
     return [AgentPersona.from_row(r) for r in rows]
 
 
@@ -789,11 +877,20 @@ async def get_planning_session(db: Database, session_id: str) -> PlanningSession
     return PlanningSession.from_row(row) if row else None
 
 
-async def list_planning_sessions(db: Database, project_id: str) -> list[PlanningSession]:
-    rows = await db.fetchall(
-        "SELECT * FROM planning_sessions WHERE project_id = ? ORDER BY created_at DESC",
-        (project_id,),
-    )
+async def list_planning_sessions(
+    db: Database, project_id: str, limit: int | None = None, offset: int = 0
+) -> list[PlanningSession]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_sessions WHERE project_id = ? ORDER BY created_at DESC "
+            "LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_sessions WHERE project_id = ? ORDER BY created_at DESC",
+            (project_id,),
+        )
     return [PlanningSession.from_row(r) for r in rows]
 
 
@@ -887,11 +984,20 @@ async def _get_planning_message(db: Database, message_id: str) -> PlanningMessag
     return PlanningMessage.from_row(row) if row else None
 
 
-async def list_planning_messages(db: Database, session_id: str) -> list[PlanningMessage]:
-    rows = await db.fetchall(
-        "SELECT * FROM planning_messages WHERE session_id = ? ORDER BY turn_number, id",
-        (session_id,),
-    )
+async def list_planning_messages(
+    db: Database, session_id: str, limit: int | None = None, offset: int = 0
+) -> list[PlanningMessage]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_messages WHERE session_id = ? "
+            "ORDER BY turn_number, id LIMIT ? OFFSET ?",
+            (session_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_messages WHERE session_id = ? ORDER BY turn_number, id",
+            (session_id,),
+        )
     return [PlanningMessage.from_row(r) for r in rows]
 
 
@@ -969,11 +1075,21 @@ async def delete_planning_task_node(db: Database, node_id: str) -> None:
     await db.execute("DELETE FROM planning_task_nodes WHERE id = ?", (node_id,))
 
 
-async def list_planning_task_nodes(db: Database, session_id: str) -> list[PlanningTaskNode]:
-    rows = await db.fetchall(
-        "SELECT * FROM planning_task_nodes WHERE session_id = ? ORDER BY level, sort_order",
-        (session_id,),
-    )
+async def list_planning_task_nodes(
+    db: Database, session_id: str, limit: int | None = None, offset: int = 0
+) -> list[PlanningTaskNode]:
+    if limit is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_task_nodes WHERE session_id = ? "
+            "ORDER BY level, sort_order LIMIT ? OFFSET ?",
+            (session_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM planning_task_nodes WHERE session_id = ? "
+            "ORDER BY level, sort_order",
+            (session_id,),
+        )
     return [PlanningTaskNode.from_row(r) for r in rows]
 
 

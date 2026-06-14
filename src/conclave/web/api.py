@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
 
 from .. import __version__
@@ -36,6 +36,7 @@ from .deps import get_daemon
 from .schemas import (
     AgentUpsert,
     ConfigPatch,
+    PaginationParams,
     PlanningMessageInput,
     PlanningSessionCreate,
     ProfileInput,
@@ -44,6 +45,15 @@ from .schemas import (
     SecretInput,
     TaskCreate,
 )
+
+
+async def _pagination(
+    limit: int = Query(50, ge=1, le=500, description="Max items per page"),
+    offset: int = Query(0, ge=0, description="Items to skip"),
+) -> PaginationParams:
+    """Shared pagination dependency — bounds every list endpoint (DoS hardening — WEB-1)."""
+    return PaginationParams(limit=limit, offset=offset)
+
 
 router = APIRouter(prefix="/api")
 
@@ -79,8 +89,13 @@ async def get_config_schema() -> dict[str, Any]:
 
 
 @router.get("/projects")
-async def list_projects(daemon: Daemon = Depends(get_daemon)) -> list[Project]:
-    return await repo.list_projects(daemon.db)
+async def list_projects(
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
+) -> list[Project]:
+    return await repo.list_projects(
+        daemon.db, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/projects")
@@ -193,9 +208,13 @@ async def get_usage(project_id: str, daemon: Daemon = Depends(get_daemon)) -> di
 
 @router.get("/projects/{project_id}/quarantine")
 async def list_quarantine(
-    project_id: str, daemon: Daemon = Depends(get_daemon)
+    project_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[QuarantineEntry]:
-    return await repo.list_quarantine(daemon.db, project_id)
+    return await repo.list_quarantine(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.get("/projects/{project_id}/quarantine/integrity")
@@ -226,10 +245,15 @@ async def delete_quarantine(entry_id: str, daemon: Daemon = Depends(get_daemon))
 
 @router.get("/projects/{project_id}/tasks")
 async def list_tasks(
-    project_id: str, state: str | None = None, daemon: Daemon = Depends(get_daemon)
+    project_id: str,
+    state: str | None = None,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[Task]:
     task_state = TaskState(state) if state else None
-    return await repo.list_tasks(daemon.db, project_id, task_state)
+    return await repo.list_tasks(
+        daemon.db, project_id, task_state, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/projects/{project_id}/tasks")
@@ -317,48 +341,24 @@ async def cascade_approve_task(
 async def get_task_usage(
     task_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
-    """Return per-agent token usage + totals for a single task (cost intentionally omitted)."""
+    """Return SQL-aggregated token-usage totals for a single task (cost intentionally omitted).
+
+    All aggregation happens in SQL via ``COALESCE(SUM(...), 0)`` — a single aggregate row
+    is returned regardless of how many usage rows exist (DoS hardening — WEB-1).
+    """
     await _require_task(daemon, task_id)
-    rows = await daemon.db.fetchall(
-        "SELECT agent, model_reported, num_turns, input_tokens, output_tokens, "
-        "cache_read_tokens, cache_creation_tokens, ts FROM usage "
-        "WHERE task_id = ? ORDER BY ts",
-        (task_id,),
-    )
-    entries = [
-        {
-            "agent": r["agent"],
-            "model_reported": r["model_reported"],
-            "num_turns": r["num_turns"],
-            "input_tokens": r["input_tokens"],
-            "output_tokens": r["output_tokens"],
-            "cache_read_tokens": r["cache_read_tokens"],
-            "cache_creation_tokens": r["cache_creation_tokens"],
-            "ts": r["ts"],
-        }
-        for r in rows
-    ]
-
-    def _sum(field: str) -> int:
-        return sum(int(e[field]) for e in entries if e[field] is not None)
-
-    return {
-        "task_id": task_id,
-        "entries": entries,
-        "total_turns": _sum("num_turns"),
-        "input_tokens": _sum("input_tokens"),
-        "output_tokens": _sum("output_tokens"),
-        "cache_read_tokens": _sum("cache_read_tokens"),
-        "cache_creation_tokens": _sum("cache_creation_tokens"),
-        "agent_count": len(entries),
-    }
+    return await repo.get_task_usage(daemon.db, task_id)
 
 
 @router.get("/tasks/{task_id}/verdicts")
 async def list_task_verdicts(
-    task_id: str, daemon: Daemon = Depends(get_daemon)
+    task_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[VerdictRow]:
-    return await repo.list_verdicts(daemon.db, task_id)
+    return await repo.list_verdicts(
+        daemon.db, task_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 # --- engine profiles --------------------------------------------------------
@@ -366,9 +366,13 @@ async def list_task_verdicts(
 
 @router.get("/profiles")
 async def list_profiles(
-    project_id: str | None = None, daemon: Daemon = Depends(get_daemon)
+    project_id: str | None = None,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[EngineProfileRow]:
-    return await repo.list_engine_profiles(daemon.db, project_id)
+    return await repo.list_engine_profiles(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/profiles")
@@ -445,9 +449,13 @@ async def set_secret(body: SecretInput, daemon: Daemon = Depends(get_daemon)) ->
 
 @router.get("/agents")
 async def list_agents(
-    project_id: str | None = None, daemon: Daemon = Depends(get_daemon)
+    project_id: str | None = None,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[AgentPersona]:
-    return await repo.list_agents(daemon.db, project_id)
+    return await repo.list_agents(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.put("/agents/{name}")
@@ -464,10 +472,14 @@ async def upsert_agent(
 
 @router.get("/projects/{project_id}/planning/sessions")
 async def list_planning_sessions(
-    project_id: str, daemon: Daemon = Depends(get_daemon)
+    project_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningSession]:
     await _require_project(daemon, project_id)
-    return await repo.list_planning_sessions(daemon.db, project_id)
+    return await repo.list_planning_sessions(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/projects/{project_id}/planning/sessions")
@@ -495,9 +507,13 @@ async def get_planning_session(
 
 @router.get("/planning/sessions/{session_id}/messages")
 async def list_planning_messages(
-    session_id: str, daemon: Daemon = Depends(get_daemon)
+    session_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningMessage]:
-    return await repo.list_planning_messages(daemon.db, session_id)
+    return await repo.list_planning_messages(
+        daemon.db, session_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/planning/sessions/{session_id}/messages")
@@ -511,9 +527,13 @@ async def add_planning_message(
 
 @router.get("/planning/sessions/{session_id}/tasks")
 async def list_planning_task_nodes(
-    session_id: str, daemon: Daemon = Depends(get_daemon)
+    session_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningTaskNode]:
-    return await repo.list_planning_task_nodes(daemon.db, session_id)
+    return await repo.list_planning_task_nodes(
+        daemon.db, session_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.post("/planning/sessions/{session_id}/approve")

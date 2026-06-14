@@ -369,6 +369,83 @@ async def test_usage_summary(db: Database) -> None:
     assert abs(summary["total_cost_usd"] - 0.15) < 1e-9
 
 
+async def test_get_task_usage_sql_aggregation(db: Database) -> None:
+    """get_task_usage uses COALESCE(SUM(...)) — a single aggregate row regardless of row count."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    t = await repo.create_task(db, project_id=p.id, request="x")
+
+    # Add multiple usage rows with varying token counts.
+    await repo.add_usage(
+        db, agent="dev", task_id=t.id, project_id=p.id,
+        num_turns=3, input_tokens=100, output_tokens=50,
+        cache_read_tokens=20, cache_creation_tokens=10,
+    )
+    await repo.add_usage(
+        db, agent="tester", task_id=t.id, project_id=p.id,
+        num_turns=1, input_tokens=80, output_tokens=30,
+        cache_read_tokens=15, cache_creation_tokens=5,
+    )
+
+    usage = await repo.get_task_usage(db, t.id)
+    assert usage["task_id"] == t.id
+    assert usage["total_turns"] == 4  # 3 + 1
+    assert usage["input_tokens"] == 180  # 100 + 80
+    assert usage["output_tokens"] == 80  # 50 + 30
+    assert usage["cache_read_tokens"] == 35  # 20 + 15
+    assert usage["cache_creation_tokens"] == 15  # 10 + 5
+    assert usage["agent_count"] == 2  # two distinct usage rows
+
+    # A task with no usage rows returns zeros — not an error.
+    t2 = await repo.create_task(db, project_id=p.id, request="no-usage")
+    empty = await repo.get_task_usage(db, t2.id)
+    assert empty["total_turns"] == 0
+    assert empty["input_tokens"] == 0
+    assert empty["agent_count"] == 0
+
+
+async def test_list_functions_honor_limit_offset(db: Database) -> None:
+    """Repo list functions append LIMIT ? OFFSET ? when limit is provided."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Create several tasks to paginate over.
+    for i in range(10):
+        await repo.create_task(db, project_id=p.id, request=f"task-{i}")
+
+    # Without limit, all tasks are returned.
+    all_tasks = await repo.list_tasks(db, p.id)
+    assert len(all_tasks) == 10
+
+    # With limit, only the requested count is returned.
+    page1 = await repo.list_tasks(db, p.id, limit=3, offset=0)
+    assert len(page1) == 3
+
+    # Offset skips the first items.
+    page2 = await repo.list_tasks(db, p.id, limit=3, offset=3)
+    assert len(page2) == 3
+    # Verify no overlap — offsets produce distinct pages.
+    ids1 = {t.id for t in page1}
+    ids2 = {t.id for t in page2}
+    assert ids1.isdisjoint(ids2)
+
+    # Offset past the end returns empty.
+    tail = await repo.list_tasks(db, p.id, limit=5, offset=100)
+    assert tail == []
+
+    # Quarantine and verdicts also support pagination.
+    entries = await repo.list_quarantine(db, p.id, limit=5, offset=0)
+    assert entries == []
+
+    # Verdicts pagination.
+    t = all_tasks[0]
+    await repo.add_verdict(db, task_id=t.id, attempt=1, agent="reviewer", verdict="pass")
+    await repo.add_verdict(db, task_id=t.id, attempt=1, agent="security", verdict="pass")
+    v_page = await repo.list_verdicts(db, t.id, limit=1, offset=0)
+    assert len(v_page) == 1
+    v_page2 = await repo.list_verdicts(db, t.id, limit=1, offset=1)
+    assert len(v_page2) == 1
+    assert v_page[0].id != v_page2[0].id
+
+
 async def test_transaction_commits_all_on_success(db: Database) -> None:
     """Every statement inside a transaction() persists once the block exits cleanly."""
     p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")

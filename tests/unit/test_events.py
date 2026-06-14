@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from conclave.db import Database
 from conclave.db import repositories as repo
 from conclave.events import EventBus, EventType
@@ -51,3 +53,35 @@ async def test_context_manager_unsubscribes(db: Database) -> None:
         assert (await asyncio.wait_for(sub.__anext__(), timeout=1.0)).type == "a"
         assert bus.subscriber_count() == 1
     assert bus.subscriber_count() == 0
+
+
+async def test_subscriber_cap_raises_when_full(db: Database) -> None:
+    """EventBus.subscribe() must raise RuntimeError when subscriber count reaches max."""
+    bus = EventBus(db, max_subscribers=3)
+    # Fill to capacity
+    s1 = bus.subscribe()
+    s2 = bus.subscribe()
+    s3 = bus.subscribe()
+    assert bus.subscriber_count() == 3
+
+    with pytest.raises(RuntimeError, match="subscriber cap reached"):
+        bus.subscribe()
+
+    # After unsubscribing one, a new subscriber can join.
+    s1.close()
+    assert bus.subscriber_count() == 2
+    s4 = bus.subscribe()
+    assert bus.subscriber_count() == 3
+
+    # Clean up so the test doesn't leak subscribers.
+    s2.close()
+    s3.close()
+    s4.close()
+
+
+async def test_default_queue_maxsize_is_256(db: Database) -> None:
+    """The per-subscriber queue maxsize defaults to 256 (not the old 1000)."""
+    bus = EventBus(db)
+    sub = bus.subscribe()
+    assert sub.queue.maxsize == 256
+    sub.close()
