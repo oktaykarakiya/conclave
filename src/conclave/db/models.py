@@ -8,10 +8,16 @@ records (projects, tasks, events, …). JSON columns are parsed on load via
 from __future__ import annotations
 
 import json
+import logging
 from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# A single corrupt row must never 500 a list endpoint or stall the worker's claim loop,
+# so from_row decoding degrades gracefully and records the corruption here instead of
+# raising it up the stack.
+logger = logging.getLogger("conclave.db.models")
 
 
 class ProjectMode(StrEnum):
@@ -35,9 +41,36 @@ class TaskOrigin(StrEnum):
 
 
 def _loads(value: Any, fallback: Any) -> Any:
+    """Decode a JSON column, tolerating corruption.
+
+    A malformed ``*_json`` cell falls back to its caller-supplied default (and is logged)
+    rather than raising JSONDecodeError out of ``from_row`` — one bad row must not take
+    down the whole task/project list endpoint or crash the worker.
+    """
     if value is None:
         return fallback
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("corrupt JSON column, falling back to %r (raw=%r)", fallback, value)
+        return fallback
+
+
+def _enum[E: StrEnum](enum_cls: type[E], value: Any, default: E) -> E:
+    """Parse an enum column, tolerating unknown values.
+
+    The mirror of :func:`_loads` for enum columns: an unrecognised stored string (newer
+    schema, or genuine corruption) falls back to ``default`` instead of raising ValueError.
+    ``default`` is each field's already-declared safe value — notably ``TaskState.inbox``,
+    a non-claimable state, so a corrupt task can never be picked up and run.
+    """
+    try:
+        return enum_cls(value)
+    except ValueError:
+        logger.warning(
+            "unknown %s value %r, falling back to %s", enum_cls.__name__, value, default.value
+        )
+        return default
 
 
 class Project(BaseModel):
@@ -58,7 +91,7 @@ class Project(BaseModel):
             name=row["name"],
             path=row["path"],
             default_branch=row["default_branch"],
-            mode=ProjectMode(row["mode"]),
+            mode=_enum(ProjectMode, row["mode"], ProjectMode.task_queue),
             config=_loads(row["config_json"], {}),
             created_at=row["created_at"],
         )
@@ -92,12 +125,12 @@ class Task(BaseModel):
             title=row["title"],
             request=row["request"],
             level=row["level"],
-            state=TaskState(row["state"]),
+            state=_enum(TaskState, row["state"], TaskState.inbox),
             use_planner=None if up is None else bool(up),
             plan=_loads(row["plan_json"], None),
             branch=row["branch"],
             result_summary=row["result_summary"],
-            origin=TaskOrigin(row["origin"]),
+            origin=_enum(TaskOrigin, row["origin"], TaskOrigin.operator),
             parent_task_id=ptid,
             created_at=row["created_at"],
             updated_at=row["updated_at"],

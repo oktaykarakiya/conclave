@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from conclave.db import Database, ProjectMode, TaskState
+from conclave.db import Database, ProjectMode, TaskOrigin, TaskState
 from conclave.db import repositories as repo
+from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatus
 
 
 async def test_migrations_apply(db: Database) -> None:
@@ -219,3 +220,70 @@ async def test_transaction_rolls_back_all_on_error(db: Database) -> None:
     await repo.set_task_state(db, t1.id, TaskState.approved)
     again = await repo.get_task(db, t1.id)
     assert again is not None and again.state is TaskState.approved
+
+
+async def test_corrupt_task_row_loads_with_safe_defaults(db: Database) -> None:
+    """A task row with an unknown enum and corrupt JSON must load — not 500 the list.
+
+    A single bad row used to raise ValueError/JSONDecodeError out of ``Task.from_row``,
+    taking down the whole task-list endpoint and stalling the worker's claim loop.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO tasks (id, project_id, title, request, state, plan_json, origin, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("bad", p.id, "t", "do x", "weird", "{not json", "alien", "2026-01-01", "2026-01-01"),
+    )
+
+    # Both the direct fetch and the list path (worker claim loop / list endpoint) survive.
+    task = await repo.get_task(db, "bad")
+    assert task is not None
+    assert task.state is TaskState.inbox  # non-claimable, so a corrupt task is never run
+    assert task.origin is TaskOrigin.operator
+    assert task.plan is None
+    assert any(t.id == "bad" for t in await repo.list_tasks(db, p.id))
+
+
+async def test_corrupt_project_row_loads_with_safe_defaults(db: Database) -> None:
+    """A project row with an unknown mode and corrupt config JSON survives list_projects."""
+    await db.execute(
+        "INSERT INTO projects (id, name, path, default_branch, mode, config_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("bad", "bad", "/tmp/bad", "main", "wild", "{bad json", "2026-01-01"),
+    )
+    bad = next(p for p in await repo.list_projects(db) if p.id == "bad")
+    assert bad.mode is ProjectMode.task_queue
+    assert bad.config == {}
+
+
+async def test_corrupt_event_row_loads_with_empty_payload(db: Database) -> None:
+    """An event row with corrupt payload JSON loads with an empty payload — no raise."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO events (project_id, type, payload_json, ts) VALUES (?, ?, ?, ?)",
+        (p.id, "agent.output_chunk", "{not json", "2026-01-01"),
+    )
+    events = await repo.list_events(db, project_id=p.id)
+    assert len(events) == 1
+    assert events[0].payload == {}
+
+
+async def test_corrupt_planning_rows_load_with_safe_defaults(db: Database) -> None:
+    """Planning session/node rows with unknown status strings fall back to safe defaults."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO planning_sessions (id, project_id, title, prompt, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("sess", p.id, "t", "plan it", "bogus", "2026-01-01"),
+    )
+    await db.execute(
+        "INSERT INTO planning_task_nodes (id, session_id, title, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("node", "sess", "a node", "nonsense", "2026-01-01", "2026-01-01"),
+    )
+    sess = await repo.get_planning_session(db, "sess")
+    assert sess is not None
+    assert sess.status is PlanningSessionStatus.active
+    nodes = await repo.list_planning_task_nodes(db, "sess")
+    assert len(nodes) == 1
+    assert nodes[0].status is PlanningNodeStatus.proposed

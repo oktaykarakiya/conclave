@@ -7,10 +7,15 @@ with ``from_row()`` classmethods that decode JSON columns and parse enums.
 from __future__ import annotations
 
 import json
+import logging
 from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# Mirror conclave.db.models: a corrupt planning row degrades to safe defaults (and is
+# logged) rather than raising out of from_row and 500-ing the planning endpoints.
+logger = logging.getLogger("conclave.db.planning_models")
 
 
 class PlanningSessionStatus(StrEnum):
@@ -27,9 +32,33 @@ class PlanningNodeStatus(StrEnum):
 
 
 def _loads(value: Any, fallback: Any) -> Any:
+    """Decode a JSON column, tolerating corruption (mirror of :func:`conclave.db.models._loads`).
+
+    A malformed ``*_json`` cell falls back to its caller-supplied default (and is logged)
+    rather than raising JSONDecodeError out of ``from_row``.
+    """
     if value is None:
         return fallback
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("corrupt JSON column, falling back to %r (raw=%r)", fallback, value)
+        return fallback
+
+
+def _enum[E: StrEnum](enum_cls: type[E], value: Any, default: E) -> E:
+    """Parse an enum column, tolerating unknown values (mirror of :func:`conclave.db.models._enum`).
+
+    An unrecognised stored status falls back to ``default`` (the field's declared safe
+    value) instead of raising ValueError out of ``from_row``.
+    """
+    try:
+        return enum_cls(value)
+    except ValueError:
+        logger.warning(
+            "unknown %s value %r, falling back to %s", enum_cls.__name__, value, default.value
+        )
+        return default
 
 
 class PlanningSession(BaseModel):
@@ -52,7 +81,7 @@ class PlanningSession(BaseModel):
             project_id=row["project_id"],
             title=row["title"],
             prompt=row["prompt"],
-            status=PlanningSessionStatus(row["status"]),
+            status=_enum(PlanningSessionStatus, row["status"], PlanningSessionStatus.active),
             turn_number=row["turn_number"],
             max_rounds=row["max_rounds"],
             created_at=row["created_at"],
@@ -111,7 +140,7 @@ class PlanningTaskNode(BaseModel):
             parent_id=row["parent_id"],
             title=row["title"],
             description=row["description"],
-            status=PlanningNodeStatus(row["status"]),
+            status=_enum(PlanningNodeStatus, row["status"], PlanningNodeStatus.proposed),
             level=row["level"],
             sort_order=row["sort_order"],
             task_id=row["task_id"],
