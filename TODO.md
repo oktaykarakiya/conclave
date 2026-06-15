@@ -1,7 +1,7 @@
 # Conclave — TODO / Roadmap
 
 Forward-looking roadmap. The autonomous engine, Agent-ception planning, web UI, and the swarm
-hardening pass are complete (**146 tests**, `ruff` + `mypy --strict` clean). See `CHANGELOG.md` for
+hardening pass are complete (**222 tests**, `ruff` + `mypy --strict` clean). See `CHANGELOG.md` for
 what shipped and `docs/AUDIT.md` for the hardening backlog detail.
 
 ## Current state
@@ -50,6 +50,17 @@ or retire**. If merging, reconcile with the Agent-ception planning module.
 - [ ] Config UI: schema-driven forms (`/api/config/schema` exists; currently a JSON editor)
 - [ ] `DELETE /api/tasks/{id}` — emit a bus event + decide cascade/cleanup for orphaned `events`
 
+## Post-launch polish (from the deployment-readiness QA swarm; non-blocking)
+- [ ] `run_git` has no timeout — a hung git op (hook/index-lock/slow FS) can stall a worker
+- [ ] `gc_events`/usage GC is only reachable via the test-gated `_baseline()` path (no-test-command
+      projects never prune) — run GC unconditionally / on a sweep
+- [ ] minor leaks: completed planning sessions in `_active_sessions`; unpruned `_merge_locks`
+- [ ] a cancel on the final review attempt is labelled `failed` instead of `cancelled`
+- [ ] frontend nits: `h-screen`→`h-dvh` (mobile chrome); remove the now-unused shared `Section`;
+      surface errors from fire-and-forget Resume/Pause/Re-analyze; modal/drawer Escape + focus-trap;
+      `usePlanningStream` reconnect (5s poll covers it today)
+- [ ] tests: WebSocket handlers (`web/ws.py`) have no direct coverage; tighten planning-API poll timing
+
 ## Phase 3 / later
 - [ ] Second provider (OpenAI / Anthropic SDK) behind the `Provider` seam
 - [ ] Podman container packaging (host process only today)
@@ -66,6 +77,6 @@ or retire**. If merging, reconcile with the Agent-ception planning module.
 ## Run / quality reference
 ```bash
 ./conclave                                    # bootstraps venv, serves on 0.0.0.0:8700
-ruff check src tests && mypy && pytest -q     # the quality gate (146 tests)
+ruff check src tests && mypy && pytest -q     # the quality gate (222 tests)
 cd frontend && npm install && npm run build   # rebuild the SPA into src/conclave/web/static
 ```

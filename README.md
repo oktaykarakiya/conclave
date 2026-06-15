@@ -28,6 +28,12 @@ even config).
 - **Hardened engine** — atomic SQLite transactions, dependency-ordered task claims, crash-safe task
   lifecycle, reviewer-retry with a "no merge without a real review" guard, and bounded resource use.
 
+## Prerequisites
+
+- **`claude` CLI** installed and authenticated (on your `PATH`, logged in) — Conclave drives it as the
+  engine. Alternatively/additionally, a DeepSeek or Anthropic-compatible API key for an Engine Profile.
+- **Python ≥ 3.12** and **git**. (Node ≥ 18 is only needed for frontend development.)
+
 ## Quick start
 
 ```bash
@@ -41,7 +47,8 @@ Then, entirely in the web UI:
    repo automatically.
 2. **Engine profiles** — keep the system default (your logged-in Claude / opus-4-8), or add a
    **DeepSeek** profile (`arg_mode = env`, base URL `https://api.deepseek.com/anthropic`, model
-   `deepseek-v4-pro[1m]`, your API key) and hit **Test** to verify it end-to-end.
+   `deepseek-v4-pro[1m]` — or whichever model your DeepSeek account exposes — and your API key), then
+   hit **Test** to verify it end-to-end.
 3. **Plan or create a task** — use *Agent-ception* to decompose a big goal, or create a task directly;
    approve it (or auto-approve) and watch the team on the **Live** tab: develop → grounded review →
    green-gate → commit → merge into your target branch.
@@ -60,7 +67,7 @@ Set `CONCLAVE_HOST=127.0.0.1` to restrict it to loopback. Multi-user auth/RBAC i
 ## Status
 
 The autonomous task-queue engine, Agent-ception planning, web UI, engine profiles, repo onboarding,
-and quarantine are complete and hardened (**146 tests**, `ruff` + `mypy --strict` clean). On the
+and quarantine are complete and hardened (**222 tests**, `ruff` + `mypy --strict` clean). On the
 roadmap (see `TODO.md`): the continuous **Autonomous Bug-Fixer** mode, BMad-style scale-adaptive
 planning, post-mortem agent, notifications, and true token streaming.
 
@@ -69,7 +76,7 @@ planning, post-mortem agent, notifications, and true token streaming.
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-pytest -q                    # 146 tests (deterministic; a fake provider — no LLM cost)
+pytest -q                    # 222 tests (deterministic; a fake provider — no LLM cost)
 ruff check src tests && mypy # lint + strict types
 
 cd frontend && npm install && npm run build   # rebuild the SPA into the daemon's static dir

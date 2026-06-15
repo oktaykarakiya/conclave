@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Conclave launcher: bootstraps a local venv on first run, then starts the daemon.
-# Usage: ./conclave            (starts the web daemon on http://127.0.0.1:8700)
-#        CONCLAVE_PORT=9000 ./conclave
+# Usage:
+#   ./conclave                                   # serves on 0.0.0.0:8700
+#   CONCLAVE_HOST=127.0.0.1 ./conclave           # restrict to loopback
+#   CONCLAVE_PORT=9000 ./conclave                # custom port
+#   CONCLAVE_HOME=/path/to/data ./conclave       # data dir (default ~/.local/share/conclave)
+#   PYTHON=python3.12 ./conclave                 # pick the interpreter used to build the venv
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -9,6 +13,11 @@ VENV="$HERE/.venv"
 PYTHON="${PYTHON:-python3}"
 
 if [ ! -x "$VENV/bin/python" ]; then
+  if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+    echo "[conclave] error: Python >= 3.12 is required (found: $("$PYTHON" --version 2>&1))." >&2
+    echo "[conclave] install Python 3.12+ or run: PYTHON=python3.12 ./conclave" >&2
+    exit 1
+  fi
   echo "[conclave] creating virtualenv at $VENV ..."
   "$PYTHON" -m venv "$VENV"
   "$VENV/bin/python" -m pip install --quiet --upgrade pip

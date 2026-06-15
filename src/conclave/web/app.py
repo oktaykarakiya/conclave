@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -130,6 +132,73 @@ async def _send_413(send: _Send) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+def _allowed_origins() -> set[str]:
+    raw = os.environ.get("CONCLAVE_ALLOWED_ORIGINS", "")
+    return {o.strip() for o in raw.split(",") if o.strip()}
+
+
+class _OriginGuardMiddleware:
+    """Block cross-origin **mutating** HTTP requests (CSRF) and **WebSocket** connections
+    (CSWSH) from a browser origin that is neither same-origin nor allowlisted.
+
+    Rationale: Conclave is unauthenticated by design, so a malicious site the operator
+    visits could otherwise POST to the API or open ``ws://`` to read the event stream
+    (WebSockets bypass the same-origin policy). Same-origin requests — the SPA, including
+    from another device where the page is served by and connects to the same host:port —
+    and non-browser clients (no ``Origin`` header, e.g. curl) are always allowed.
+    Read-only cross-origin GETs are already prevented from reading the response by the
+    browser's same-origin policy, so they are not blocked here. Extra origins may be
+    permitted via the ``CONCLAVE_ALLOWED_ORIGINS`` env (comma-separated).
+    """
+
+    _MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    def __init__(self, app: _ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        typ = scope.get("type")
+        if typ not in ("http", "websocket") or (
+            typ == "http" and scope.get("method", "GET") not in self._MUTATING
+        ):
+            await self._app(scope, receive, send)
+            return
+
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        origin = headers.get(b"origin")
+        if origin is None:  # non-browser client (curl, server-to-server, tests)
+            await self._app(scope, receive, send)
+            return
+
+        host = headers.get(b"host", b"").decode("latin-1")
+        origin_s = origin.decode("latin-1")
+        same_origin = origin_s.split("://", 1)[-1] == host
+        if same_origin or origin_s in _allowed_origins():
+            await self._app(scope, receive, send)
+            return
+
+        # Cross-origin browser request to a guarded surface — reject.
+        if typ == "http":
+            await _send_403_origin(send)
+        else:
+            with contextlib.suppress(Exception):
+                await receive()  # consume websocket.connect before refusing the handshake
+            await send({"type": "websocket.close", "code": 1008})
+
+
+async def _send_403_origin(send: _Send) -> None:
+    body = b'{"detail":"Cross-origin request blocked (Origin not allowed)."}'
+    await send({
+        "type": "http.response.start",
+        "status": 403,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
 def create_app(daemon: Daemon, *, manage_lifecycle: bool = True) -> FastAPI:
     """Build the app. When ``manage_lifecycle`` is set, the app connects the DB, seeds
     defaults, and starts workers on startup (and tears down on shutdown). Tests that
@@ -151,6 +220,7 @@ def create_app(daemon: Daemon, *, manage_lifecycle: bool = True) -> FastAPI:
     app.include_router(api_router)
     app.include_router(ws_router)
     app.add_middleware(_BodySizeLimitMiddleware, max_bytes=_MAX_BODY_BYTES)
+    app.add_middleware(_OriginGuardMiddleware)
 
     static_dir = Path(__file__).parent / "static"
     if (static_dir / "index.html").is_file():

@@ -551,7 +551,7 @@ function ProfileCard({
         {p.auth_secret_id && (
           <>
             <dt className="text-zinc-500">auth</dt>
-            <dd className="text-emerald-400" title="API key stored as an encrypted secret">
+            <dd className="text-emerald-400" title="API key stored as a write-only secret (plaintext at rest in the local SQLite DB; never returned by the API)">
               key set
             </dd>
           </>

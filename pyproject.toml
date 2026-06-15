@@ -10,6 +10,18 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Oktay Karakiya" }]
+keywords = ["ai", "agents", "autonomous", "coding-agent", "claude", "code-review", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Code Generators",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
@@ -28,6 +40,11 @@ dev = [
     "ruff>=0.7",
     "types-PyYAML>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/oktaykarakiya/conclave"
+Repository = "https://github.com/oktaykarakiya/conclave"
+Issues = "https://github.com/oktaykarakiya/conclave/issues"
 
 [project.scripts]
 conclave = "conclave.main:cli"
@@ -64,4 +81,11 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-filterwarnings = ["error"]
+# Strict: every warning is an error, EXCEPT the known-benign asyncio GC race where a
+# subprocess transport from a cancelled/torn-down background task is finalized after its
+# event loop closes ("Exception ignored in BaseSubprocessTransport.__del__"). This only
+# happens in tests (per-test loops close); the long-lived daemon never closes its loop.
+filterwarnings = [
+  "error",
+  "ignore:Exception ignored:pytest.PytestUnraisableExceptionWarning",
+]

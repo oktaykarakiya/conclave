@@ -16,7 +16,7 @@ cd frontend && npm install && cd ..
 This is exactly what Conclave's own green-gate enforces on every task:
 
 ```bash
-ruff check src tests && mypy && pytest -q   # Python: lint + strict types + 146 tests
+ruff check src tests && mypy && pytest -q   # Python: lint + strict types + 222 tests
 cd frontend && npx tsc --noEmit             # TypeScript: strict
 cd frontend && npm run build                # rebuild the SPA into src/conclave/web/static
 ```
@@ -42,6 +42,8 @@ cd frontend && npm run build                # rebuild the SPA into src/conclave/
 ## Conventions
 
 - Config is **SQLite-backed and edited via the UI** — never hand-edit YAML or introduce config files.
-- DB migrations are **append-only** (bump `schema_version`); never edit an applied migration.
+- DB migrations are **append-only**: add a new entry to the `MIGRATIONS` list in
+  `src/conclave/db/migrations/` (the runner records `schema_version` atomically); never edit an
+  already-applied migration.
 - Keep the web API resilient: validate inputs (return 4xx, never 500 on bad input) and bound list
   endpoints.
