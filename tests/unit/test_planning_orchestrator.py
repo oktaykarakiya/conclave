@@ -323,7 +323,10 @@ class _QuickFakeProvider:
   "ready": true
 }
 ```"""
-    _APPROVED = "APPROVED. The plan looks complete."
+    _APPROVED = (
+        "The plan looks complete.\n"
+        '```json\n{"verdict": "pass", "reason": "complete"}\n```'
+    )
 
     _has_initial: bool
 
@@ -702,7 +705,12 @@ class _GatedProvider:
                 model_reported="fake",
                 cost_usd=0.0,
             )
-        return AgentResult(ok=True, text="APPROVED.", model_reported="fake", cost_usd=0.0)
+        return AgentResult(
+            ok=True,
+            text='```json\n{"verdict": "pass", "reason": "ok"}\n```',
+            model_reported="fake",
+            cost_usd=0.0,
+        )
 
 
 async def test_concurrent_turns_on_same_session_are_serialized(db: Database) -> None:
@@ -781,3 +789,162 @@ async def test_concurrent_turns_on_same_session_are_serialized(db: Database) -> 
     assert len(sort_orders) == len(set(sort_orders)), (
         f"sort_order collision detected: {sort_orders}"
     )
+
+
+# --- regression: structured verdicts, not substring matching -----------------
+
+
+class _FailVerdictWithApprovedProseProvider:
+    """Reviewers whose prose contains the word 'APPROVED' but whose structured
+    verdict is 'fail'.  Locks in that stabilisation keys on ``parse_verdict``,
+    not a naive ``"APPROVED" in text`` substring — which this text would wrongly
+    satisfy, flipping a rejection into a false consensus.
+    """
+
+    def __init__(self) -> None:
+        self._planner_calls = 0
+
+    async def run_agent(self, *, profile, prompt, timeout_seconds, cwd=None, on_chunk=None):
+        if "Planning Facilitator" in prompt:
+            self._planner_calls += 1
+            if self._planner_calls == 1:
+                text = (
+                    '```json\n{"message":"init","task_changes":'
+                    '[{"action":"add","parent_id":null,"title":"Task A","description":"d"}],'
+                    '"ready":false}\n```'
+                )
+            else:
+                text = '```json\n{"message":"done","task_changes":[],"ready":true}\n```'
+            return AgentResult(ok=True, text=text, model_reported="fake", cost_usd=0.0)
+        # Reviewer: prose name-drops "APPROVED" but the structured verdict is fail.
+        return AgentResult(
+            ok=True,
+            text=(
+                "This plan is NOT APPROVED in its current form — gaps remain.\n"
+                '```json\n{"verdict": "fail", "reason": "gaps remain"}\n```'
+            ),
+            model_reported="fake",
+            cost_usd=0.0,
+        )
+
+
+async def test_reviewer_prose_with_approved_word_does_not_count_as_approval(
+    db: Database,
+) -> None:
+    """A reviewer that name-drops 'APPROVED' in prose but returns a 'fail'
+    verdict must NOT be counted as an approval.  Consensus can never fire, so the
+    session reaches stable only via the max-rounds fallback.  Under the old
+    substring gate the 'APPROVED' prose would have wrongly triggered consensus
+    (leaving stabilization_reason unset)."""
+    project = await repo.create_project(
+        db, name="verdict-test", path="/tmp/verdict-test", default_branch="main",
+    )
+    orchestrator = PlanningOrchestrator(
+        db, EventBus(db), _FailVerdictWithApprovedProseProvider()
+    )
+
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Verdict Gate",
+        prompt="Decompose a feature.",
+        max_rounds=2,
+    )
+
+    for _ in range(300):
+        refreshed = await repo.get_planning_session(db, session.id)
+        assert refreshed is not None
+        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("session never reached stable/completed")
+
+    after = await repo.get_planning_session(db, session.id)
+    assert after is not None
+    assert after.status == PlanningSessionStatus.stable
+    assert after.stabilization_reason == "max_rounds_reached"
+
+
+# --- regression: reviewers vote on the post-refinement tree ------------------
+
+
+class _MutateThenReadyProvider:
+    """Planner that, in a later turn, mutates the tree (adds 'BadTask') AND sets
+    ready:true in the same turn.  Reviewers reject any tree containing 'BadTask'.
+
+    Under the corrected round order (planner first, then reviewers) the reviewers
+    vote on the *mutated* tree, reject it, and the session never reaches
+    consensus.  Under the old order (reviewers vote, then the planner mutates and
+    readies in the same round) the session would have stabilised a 'BadTask' tree
+    the reviewers never approved.
+    """
+
+    def __init__(self) -> None:
+        self._planner_calls = 0
+
+    async def run_agent(self, *, profile, prompt, timeout_seconds, cwd=None, on_chunk=None):
+        if "Planning Facilitator" in prompt:
+            self._planner_calls += 1
+            if self._planner_calls == 1:
+                text = (
+                    '```json\n{"message":"init","task_changes":'
+                    '[{"action":"add","parent_id":null,"title":"GoodTask","description":"d"}],'
+                    '"ready":false}\n```'
+                )
+            else:
+                # Mutate (add BadTask) AND declare ready in the same turn.
+                text = (
+                    '```json\n{"message":"refine","task_changes":'
+                    '[{"action":"add","parent_id":null,"title":"BadTask","description":"d"}],'
+                    '"ready":true}\n```'
+                )
+            return AgentResult(ok=True, text=text, model_reported="fake", cost_usd=0.0)
+        # Reviewer: reject any tree that contains BadTask.
+        verdict = "fail" if "BadTask" in prompt else "pass"
+        return AgentResult(
+            ok=True,
+            text=f'```json\n{{"verdict": "{verdict}", "reason": "r"}}\n```',
+            model_reported="fake",
+            cost_usd=0.0,
+        )
+
+
+async def test_reviewers_vote_on_post_refinement_tree(db: Database) -> None:
+    """The planner's mutate-and-ready turn must be reviewed before stabilising.
+
+    Because the planner adds 'BadTask' (which reviewers reject) in the same turn
+    it signals ready, consensus can never fire on that tree — the session falls
+    through to the max-rounds fallback.  This proves reviewers evaluate the
+    post-refinement tree, closing the 'approve V, ship V+1' gap."""
+    project = await repo.create_project(
+        db, name="order-test", path="/tmp/order-test", default_branch="main",
+    )
+    orchestrator = PlanningOrchestrator(db, EventBus(db), _MutateThenReadyProvider())
+
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Round Order",
+        prompt="Decompose a feature.",
+        max_rounds=3,
+    )
+
+    for _ in range(300):
+        refreshed = await repo.get_planning_session(db, session.id)
+        assert refreshed is not None
+        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("session never reached stable/completed")
+
+    after = await repo.get_planning_session(db, session.id)
+    assert after is not None
+    assert after.status == PlanningSessionStatus.stable
+    # No false consensus on the unreviewed 'BadTask' tree — only the max-rounds
+    # fallback could have stabilised it.
+    assert after.stabilization_reason == "max_rounds_reached"
+
+    # The mutating turn did run, so BadTask was added to the tree.
+    nodes = await repo.list_planning_task_nodes(db, session.id)
+    titles = sorted(n.title for n in nodes)
+    assert titles == ["BadTask", "GoodTask"], f"Unexpected titles: {titles}"

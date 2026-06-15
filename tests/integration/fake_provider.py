@@ -81,8 +81,14 @@ _PLANNING_PLANNER_REFINE = """Thank you for the feedback. I've refined the task 
 }
 ```"""
 
-_PLANNING_APPROVED = "APPROVED. The plan looks complete and well-structured."
-_PLANNING_CHANGES = "CHANGES_REQUESTED. There are some issues that need addressing."
+_PLANNING_APPROVED = (
+    "The plan looks complete and well-structured.\n"
+    '```json\n{"verdict": "pass", "reason": "complete and well-structured"}\n```'
+)
+_PLANNING_CHANGES = (
+    "There are some issues that need addressing.\n"
+    '```json\n{"verdict": "fail", "reason": "issues need addressing"}\n```'
+)
 
 
 class FakeProvider:
@@ -123,7 +129,8 @@ class FakeProvider:
         # These discriminators are unique to the orchestrator and never appear in planning
         # prompts. They must win over the planning-persona checks below, because the code
         # reviewers reuse the same persona names ("Architect Agent", "Security Agent", …):
-        # a code-review dispatch must return a parseable verdict, not the planning "APPROVED".
+        # a code-review dispatch is keyed on its unique instruction so the broad planning
+        # persona-name checks below don't intercept it. (Both now return a JSON verdict.)
         if "Produce a structured plan" in prompt:
             return AgentResult(ok=True, text=_PLAN, model_reported="fake", cost_usd=0.0)
         if "Review the changes made for this task" in prompt:

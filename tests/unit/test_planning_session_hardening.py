@@ -211,8 +211,8 @@ async def test_max_rounds_stabilization_persists_reason(db: Database) -> None:
         max_rounds=0,
     )
 
-    # Wait for the background discussion loop to finish (Round 0 runs, then
-    # the empty for-loop hits the max-rounds branch immediately).
+    # Wait for the background discussion loop to finish (with max_rounds=0 the
+    # round loop body never runs, so it hits the max-rounds branch immediately).
     for _ in range(100):
         refreshed = await repo.get_planning_session(db, session.id)
         assert refreshed is not None

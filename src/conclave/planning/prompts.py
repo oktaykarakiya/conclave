@@ -75,8 +75,12 @@ structural soundness. This is a PLANNING review — there is no code yet.
 ## Response:
 - Start with your overall assessment.
 - List specific issues or missing tasks you identify.
-- End with **APPROVED** if you agree with the current breakdown, or
-  **CHANGES_REQUESTED** if you see issues that need resolution.
+- After your assessment, end with a fenced JSON verdict block — `"pass"` to endorse the
+  breakdown for implementation, or `"fail"` (with a `"reason"`) if changes are needed:
+
+```json
+{"verdict": "pass", "reason": "one-line summary"}
+```
 """
 
 TESTER_DISCUSSION = """# Tester Agent (Planning Review)
@@ -98,8 +102,12 @@ perspective. This is a PLANNING review — there is no code yet.
 ## Response:
 - Start with your overall assessment.
 - List specific testability concerns or missing test tasks.
-- End with **APPROVED** if the tasks are sufficiently testable, or
-  **CHANGES_REQUESTED** if test coverage gaps exist.
+- After your assessment, end with a fenced JSON verdict block — `"pass"` to endorse the
+  breakdown for implementation, or `"fail"` (with a `"reason"`) if changes are needed:
+
+```json
+{"verdict": "pass", "reason": "one-line summary"}
+```
 """
 
 SECURITY_DISCUSSION = """# Security Agent (Planning Review)
@@ -122,8 +130,12 @@ This is a PLANNING review — there is no code yet.
 ## Response:
 - Start with your overall security assessment.
 - List specific security concerns or missing security tasks.
-- End with **APPROVED** if security concerns are adequately addressed, or
-  **CHANGES_REQUESTED** if there are unresolved security issues.
+- After your assessment, end with a fenced JSON verdict block — `"pass"` to endorse the
+  breakdown for implementation, or `"fail"` (with a `"reason"`) if changes are needed:
+
+```json
+{"verdict": "pass", "reason": "one-line summary"}
+```
 """
 
 REVIEWER_DISCUSSION = """# Senior Reviewer Agent (Planning Review)
@@ -143,8 +155,12 @@ review — there is no code yet.
 ## Response:
 - Start with your overall assessment of the plan.
 - List any missing, unclear, or redundant tasks.
-- End with **APPROVED** to signal you endorse the plan for implementation, or
-  **CHANGES_REQUESTED** if improvements are needed.
+- After your assessment, end with a fenced JSON verdict block — `"pass"` to endorse the
+  breakdown for implementation, or `"fail"` (with a `"reason"`) if changes are needed:
+
+```json
+{"verdict": "pass", "reason": "one-line summary"}
+```
 """
 
 RISK_DISCUSSION = """# Risk Agent (Planning Review)
@@ -165,8 +181,12 @@ radius analysis. This is a PLANNING review — there is no code yet.
 ## Response:
 - Start with your risk assessment.
 - Identify the highest-risk tasks and suggest mitigations.
-- End with **APPROVED** if risks are well-understood and manageable, or
-  **CHANGES_REQUESTED** if you see unaddressed risks.
+- After your assessment, end with a fenced JSON verdict block — `"pass"` to endorse the
+  breakdown for implementation, or `"fail"` (with a `"reason"`) if changes are needed:
+
+```json
+{"verdict": "pass", "reason": "one-line summary"}
+```
 """
 
 DISCUSSION_AGENTS: list[tuple[str, str]] = [

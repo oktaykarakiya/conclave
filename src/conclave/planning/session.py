@@ -22,6 +22,7 @@ from ..db.planning_models import (
     PlanningSessionStatus,
     PlanningTaskNode,
 )
+from ..engine.verdict import parse_verdict
 from ..events import EventBus, EventType
 from ..providers import Provider, ResolvedProfile
 from .prompts import (
@@ -331,10 +332,11 @@ class PlanningOrchestrator:
                     payload={"planning_session_id": session.id},
                 )
 
-                # Round 0: initial planner breakdown
-                await self._agent_turn(
-                    session.id, _PLANNER, PLANNER_DISCUSSION, session.prompt
-                )
+                # Sticky approvals: a reviewer's verdict stays valid until the
+                # planner next changes the tree.  We clear them whenever the
+                # planner mutates the breakdown, so only reviewers whose approval
+                # is stale (or who never approved) are re-run each round.
+                approved: set[str] = set()
 
                 for round_num in range(1, session.max_rounds + 1):
                     # Check if session was cancelled during execution
@@ -342,23 +344,20 @@ class PlanningOrchestrator:
                     if current is None or current.status == PlanningSessionStatus.cancelled:
                         return
 
-                    # Reviewer round: each reviewer critiques the current plan
-                    approvals: set[str] = set()
-                    for agent_name, system_prompt in DISCUSSION_AGENTS:
-                        if agent_name == _PLANNER:
-                            continue  # planner responds after reviewers
-                        context = await self._build_context(session.id)
-                        result = await self._agent_turn(
-                            session.id, agent_name, system_prompt, context
-                        )
-                        if result and "APPROVED" in result:
-                            approvals.add(agent_name)
-
-                    # Planner refinement round: incorporate feedback
-                    context = await self._build_context(session.id)
-                    planner_result = await self._agent_turn(
+                    # Planner turn first: the initial breakdown on round 1, a
+                    # refinement (incorporating reviewer feedback) thereafter.
+                    # Reviewers then vote on this exact tree, so the plan that
+                    # stabilises is the one they actually endorsed.
+                    context = (
+                        session.prompt
+                        if round_num == 1
+                        else await self._build_context(session.id)
+                    )
+                    planner_result, tasks_changed = await self._agent_turn(
                         session.id, _PLANNER, PLANNER_DISCUSSION, context
                     )
+                    if tasks_changed:
+                        approved.clear()  # tree moved — every prior approval is stale
 
                     # Check if planner signalled readiness
                     planner_ready = False
@@ -367,8 +366,22 @@ class PlanningOrchestrator:
                         if data is not None:
                             planner_ready = data.get("ready", False)
 
+                    # Reviewer round: each reviewer votes on the current tree.
+                    # Skip any whose approval already covers it (sticky approval).
+                    for agent_name, system_prompt in DISCUSSION_AGENTS:
+                        if agent_name == _PLANNER:
+                            continue  # the planner already spoke this round
+                        if agent_name in approved:
+                            continue  # already endorsed the current tree
+                        context = await self._build_context(session.id)
+                        result, _ = await self._agent_turn(
+                            session.id, agent_name, system_prompt, context
+                        )
+                        if result and parse_verdict(result).verdict == "pass":
+                            approved.add(agent_name)
+
                     # Session is stable when all mandatory agents approve + planner ready
-                    if planner_ready and approvals.issuperset(APPROVAL_AGENTS):
+                    if planner_ready and approved.issuperset(APPROVAL_AGENTS):
                         await repo.update_planning_session_status(
                             self._db, session.id, PlanningSessionStatus.stable
                         )
@@ -432,10 +445,11 @@ class PlanningOrchestrator:
         agent_name: str,
         system_prompt: str,
         user_message: str,
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """Dispatch one agent, store its message, and parse task changes.
 
-        Returns the agent's response text, or None on failure.
+        Returns ``(response_text, tasks_changed)`` — the agent's response text
+        (or None on failure), and whether this turn mutated the task tree.
 
         The entire body runs under a per-session lock so only one turn
         mutates a given session at a time — human interjections are
@@ -446,7 +460,7 @@ class PlanningOrchestrator:
         async with self._get_session_lock(session_id):
             session = await repo.get_planning_session(self._db, session_id)
             if session is None:
-                return None
+                return None, False
 
             turn = await repo.increment_planning_turn(self._db, session_id)
 
@@ -471,10 +485,9 @@ class PlanningOrchestrator:
             if agent_name == _PLANNER:
                 data = _extract_json_block(result_text)
                 if data is not None and "task_changes" in data:
-                    await self._apply_task_changes(
+                    tasks_changed = await self._apply_task_changes(
                         session_id, session.project_id, data["task_changes"]
                     )
-                    tasks_changed = True
 
             # Persist the message
             await repo.add_planning_message(
@@ -508,7 +521,7 @@ class PlanningOrchestrator:
                     payload={"planning_session_id": session_id, "turn": turn},
                 )
 
-            return result_text
+            return result_text, tasks_changed
 
     # ------------------------------------------------------------------
     # helpers
@@ -539,10 +552,16 @@ class PlanningOrchestrator:
         # Feature request
         parts.append(f"## Feature Request\n{session.prompt}\n")
 
-        # Prior discussion (last N messages to stay within context limits)
+        # Prior discussion: keep the last N agent messages, but never drop human
+        # interjections — operator steering must stay in context even in long
+        # sessions where it would otherwise scroll out of the window.
         if messages:
+            humans = [m for m in messages if m.role == "human"]
+            agents = [m for m in messages if m.role != "human"]
+            kept = humans + agents[-_MAX_CONTEXT_MSGS:]
+            kept.sort(key=lambda m: m.turn_number)
             parts.append("## Discussion So Far\n")
-            for msg in messages[-_MAX_CONTEXT_MSGS:]:
+            for msg in kept:
                 label = "HUMAN" if msg.role == "human" else msg.agent.upper()
                 parts.append(
                     f"**{label}** (turn {msg.turn_number}):\n{msg.content}\n"
@@ -559,7 +578,9 @@ class PlanningOrchestrator:
             "Each existing task above is shown as (id=...). To revise one, use "
             '{"action":"update","id":"<that id>",...} or {"action":"remove","id":"<that id>"}; '
             "only use \"add\" for genuinely NEW tasks. Do NOT re-add a task that already exists. "
-            "Reviewer agents: end with APPROVED or CHANGES_REQUESTED."
+            "Reviewer agents: end with a fenced ```json block containing "
+            '{"verdict": "pass"} to endorse the plan, or '
+            '{"verdict": "fail", "reason": "..."} to request changes.'
         )
         return "\n".join(parts)
 
@@ -622,24 +643,29 @@ class PlanningOrchestrator:
 
     async def _apply_task_changes(
         self, session_id: str, project_id: str, changes: Any
-    ) -> None:
+    ) -> bool:
         """Apply task tree modifications from planner JSON output.
 
         Safe-parses *changes*: ignores non-list input, skips entries with a
         missing or unknown node id, and scopes ``update``/``remove`` to the
         current session so a change can never mutate another session's nodes.
+
+        Returns ``True`` only if the tree was actually mutated (an add/update/
+        remove took effect), so the caller can tell a real refinement from a
+        no-op (e.g. an empty ``task_changes`` list).
         """
         if not isinstance(changes, list):
             logger.warning(
                 "task_changes is not a list (type=%s) for session %s — ignoring",
                 type(changes).__name__, session_id,
             )
-            return
+            return False
 
         # Existing titles (case-insensitive) guard against the planner re-adding a
         # task instead of updating it — keeps the tree from duplicating across rounds.
         existing = await repo.list_planning_task_nodes(self._db, session_id)
         seen_titles = {n.title.strip().lower() for n in existing}
+        changed = False
         for change in changes:
             action = change.get("action")
             try:
@@ -681,6 +707,7 @@ class PlanningOrchestrator:
                             "title": node.title,
                         },
                     )
+                    changed = True
                 elif action == "update":
                     update_id = change.get("id")
                     if not update_id:
@@ -708,6 +735,7 @@ class PlanningOrchestrator:
                         title=change.get("title"),
                         description=change.get("description"),
                     )
+                    changed = True
                 elif action == "remove":
                     remove_id = change.get("id")
                     if not remove_id:
@@ -730,10 +758,13 @@ class PlanningOrchestrator:
                         )
                         continue
                     await repo.delete_planning_task_node(self._db, remove_id)
+                    changed = True
             except Exception:
                 logger.exception(
                     "failed to apply task change: %s", json.dumps(change)[:200]
                 )
+
+        return changed
 
 
 # ------------------------------------------------------------------
