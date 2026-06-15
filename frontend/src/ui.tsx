@@ -13,6 +13,7 @@ export const STATE_COLORS: Record<string, string> = {
   in_progress: "bg-amber-500",
   done: "bg-emerald-600",
   failed: "bg-rose-600",
+  blocked: "bg-orange-600",
   cancelled: "bg-zinc-500",
 };
 

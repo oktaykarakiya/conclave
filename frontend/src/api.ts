@@ -91,8 +91,6 @@ export const api = {
   getConfig: (id: string) => req<Record<string, unknown>>("GET", `/api/projects/${id}/config`),
   patchConfig: (id: string, config: unknown) =>
     req<unknown>("PATCH", `/api/projects/${id}/config`, { config }),
-  usage: (id: string) =>
-    req<{ calls: number; total_cost_usd: number }>("GET", `/api/projects/${id}/usage`),
 
   listTasks: (id: string, opts?: string | ListTasksOptions) => {
     const o: ListTasksOptions = typeof opts === "string" ? { state: opts } : opts ?? {};

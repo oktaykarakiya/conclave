@@ -26,6 +26,7 @@ export interface EventRow {
   id: number;
   project_id: string | null;
   task_id: string | null;
+  planning_session_id: string | null;
   agent: string | null;
   type: string;
   payload: Record<string, unknown>;
