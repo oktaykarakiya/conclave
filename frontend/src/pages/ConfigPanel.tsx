@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../api";
 import { Button, Spinner } from "../ui";
@@ -64,13 +64,13 @@ function formatServerError(
   return { title: raw.slice(0, 300), fields: [] };
 }
 
-// Auto-grows with content (no fixed vh height-trap) but stays inside the
-// section: a min height keeps short configs comfortable, a max height keeps
-// long ones from swallowing the page. `whitespace-pre overflow-x-auto` scrolls
-// long JSON lines inside the box instead of overflowing the viewport on mobile.
-// Vertical resize handle is desktop-only to avoid fighting touch scroll.
+// The editor fills the remaining viewport height (`h-full`) and scrolls
+// INTERNALLY rather than auto-growing the page: no fixed vh height-trap, no
+// page/window scroll. `resize-none` because the height is dictated by the
+// flex parent, not the user. `whitespace-pre overflow-auto` scrolls long JSON
+// (both axes) inside the box instead of overflowing the viewport.
 const editorClass =
-  "block w-full min-h-[180px] max-h-[60vh] resize-none md:resize-y overflow-auto " +
+  "block h-full w-full resize-none overflow-auto " +
   "whitespace-pre rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2.5 " +
   "font-mono text-[13px] leading-relaxed text-zinc-100 outline-none " +
   "focus:border-indigo-500 focus-visible:ring-1 focus-visible:ring-indigo-500/40 " +
@@ -131,15 +131,6 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
     const id = setTimeout(() => setFormatted(false), 1200);
     return () => clearTimeout(id);
   }, [formatted]);
-
-  // Auto-grow the textarea to fit its content (capped by max-h via CSS).
-  // Runs whenever the text or the editor's mounted state changes.
-  useLayoutEffect(() => {
-    const el = taRef.current;
-    if (!el || !loaded) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [text, loaded]);
 
   function onEdit(next: string) {
     setText(next);
@@ -211,9 +202,9 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
         : "Save config";
 
   return (
-    <div className="space-y-3">
-      {/* Header (the collapsible section title lives in App.tsx) */}
-      <div className="flex items-start justify-between gap-3">
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      {/* Header — FIXED (the collapsible section title lives in App.tsx) */}
+      <div className="flex shrink-0 items-start justify-between gap-3">
         <p id={DESC_ID} className="min-w-0 max-w-2xl text-sm text-zinc-400">
           Edit the raw project config JSON — target branch, per-agent
           models/effort, the green-gate, planning, and more. Changes are
@@ -234,53 +225,56 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
         )}
       </div>
 
-      {/* Body: loading / load-error / editor */}
-      {loading ? (
-        <div className="flex min-h-[180px] items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
-          <span className="flex items-center gap-2 text-sm text-zinc-500">
-            <Spinner />
-            Loading configuration…
-          </span>
-        </div>
-      ) : loadError ? (
-        <div className="space-y-3 rounded-lg border border-rose-900/60 bg-rose-950/40 p-4">
-          <div className="text-sm font-semibold text-rose-300">
-            Couldn’t load the project config
+      {/* Body — fills the remaining viewport height; scrolls INTERNALLY */}
+      <div className="min-h-0 flex-1">
+        {loading ? (
+          <div className="flex h-full min-h-[180px] items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
+            <span className="flex items-center gap-2 text-sm text-zinc-500">
+              <Spinner />
+              Loading configuration…
+            </span>
           </div>
-          <p className="text-sm text-rose-200/80">
-            Saving is disabled to avoid overwriting your real config with an
-            empty editor. Retry the load, then edit.
-          </p>
-          <p className="font-mono text-xs break-words text-rose-300/70 select-text">
-            {loadError}
-          </p>
-          <Button variant="ghost" onClick={load} title="Reload the config from the server">
-            Retry load
-          </Button>
-        </div>
-      ) : (
-        <textarea
-          ref={taRef}
-          className={editorClass}
-          spellCheck={false}
-          autoCorrect="off"
-          autoCapitalize="off"
-          autoComplete="off"
-          wrap="off"
-          value={text}
-          onChange={(e) => onEdit(e.target.value)}
-          onKeyDown={onKeyDown}
-          aria-label="Project configuration JSON editor"
-          aria-describedby={DESC_ID}
-        />
-      )}
+        ) : loadError ? (
+          <div className="h-full space-y-3 overflow-y-auto rounded-lg border border-rose-900/60 bg-rose-950/40 p-4">
+            <div className="text-sm font-semibold text-rose-300">
+              Couldn’t load the project config
+            </div>
+            <p className="text-sm text-rose-200/80">
+              Saving is disabled to avoid overwriting your real config with an
+              empty editor. Retry the load, then edit.
+            </p>
+            <p className="font-mono text-xs break-words text-rose-300/70 select-text">
+              {loadError}
+            </p>
+            <Button variant="ghost" onClick={load} title="Reload the config from the server">
+              Retry load
+            </Button>
+          </div>
+        ) : (
+          <textarea
+            ref={taRef}
+            className={editorClass}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+            autoComplete="off"
+            wrap="off"
+            value={text}
+            onChange={(e) => onEdit(e.target.value)}
+            onKeyDown={onKeyDown}
+            aria-label="Project configuration JSON editor"
+            aria-describedby={DESC_ID}
+          />
+        )}
+      </div>
 
-      {/* Server / client error panel (never a raw JSON blob) */}
+      {/* Server / client error panel (never a raw JSON blob) — FIXED, but
+          caps its own height and scrolls internally if many fields fail. */}
       {errorPanel && (
         <div
           role="alert"
           aria-live="polite"
-          className="rounded-lg border border-rose-900/60 bg-rose-950/40 p-3"
+          className="max-h-[30vh] shrink-0 overflow-y-auto rounded-lg border border-rose-900/60 bg-rose-950/40 p-3"
         >
           <div className="text-sm font-semibold text-rose-300">
             {errorPanel.title}
@@ -301,8 +295,8 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      {/* Actions — wrap on narrow screens so nothing is pushed off-canvas */}
-      <div className="flex flex-wrap items-center gap-2">
+      {/* Actions — FIXED; wrap on narrow screens so nothing is pushed off-canvas */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
         <Button
           variant="primary"
           onClick={() => void save()}

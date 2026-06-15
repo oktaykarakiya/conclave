@@ -9,16 +9,14 @@ import {
   LivePanel,
   ProfilesPanel,
   QuarantinePanel,
-  Section,
   Spinner,
   TasksPanel,
   input,
 } from "./panels";
 import type { Project } from "./types";
 
-// In-page accordion sections, in mandatory order. `anchor` is used by the
-// sticky jump nav to scroll to each <Section id>.
-const SECTIONS = [
+// Dedicated page per menu item, in order. Agent-ception is first + the default.
+const TABS = [
   "Agent-ception",
   "Tasks",
   "Live",
@@ -27,12 +25,12 @@ const SECTIONS = [
   "Quarantine",
   "Knowledge",
 ] as const;
-
-const anchorOf = (name: string) => `section-${name.toLowerCase().replace(/[^a-z]+/g, "-")}`;
+type Tab = (typeof TABS)[number];
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>("Agent-ception");
   const [showAttach, setShowAttach] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -58,12 +56,30 @@ export default function App() {
 
   const selected = projects.find((p) => p.id === selectedId) ?? null;
 
-  function jumpTo(name: string) {
-    document.getElementById(anchorOf(name))?.scrollIntoView({ behavior: "smooth", block: "start" });
+  // Each page fills exactly the content viewport and scrolls INTERNALLY — the page
+  // itself never exceeds the screen (the section below is overflow-hidden).
+  function renderPage() {
+    if (!selected) return null;
+    switch (tab) {
+      case "Agent-ception":
+        return <AgentCeptionPanel projectId={selected.id} />;
+      case "Tasks":
+        return <TasksPanel projectId={selected.id} />;
+      case "Live":
+        return <LivePanel projectId={selected.id} />;
+      case "Config":
+        return <ConfigPanel projectId={selected.id} />;
+      case "Profiles":
+        return <ProfilesPanel />;
+      case "Quarantine":
+        return <QuarantinePanel projectId={selected.id} />;
+      case "Knowledge":
+        return <KnowledgePanel projectId={selected.id} />;
+    }
   }
 
   return (
-    <div className="flex h-screen flex-col bg-zinc-950 text-zinc-100 md:flex-row">
+    <div className="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100 md:flex-row">
       {/* Mobile top bar with hamburger */}
       <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900 px-4 py-3 md:hidden">
         <button
@@ -165,7 +181,7 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="flex flex-1 flex-col overflow-hidden">
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {loading && !selected ? (
           <div className="flex flex-1 items-center justify-center gap-3 text-zinc-500">
             <Spinner size={18} />
@@ -196,42 +212,26 @@ export default function App() {
               </div>
             </header>
 
-            {/* Sticky in-page jump nav */}
-            <nav className="sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-zinc-800 bg-zinc-950/90 px-4 py-2 backdrop-blur sm:px-6">
-              {SECTIONS.map((s) => (
+            {/* Tab nav — one dedicated page per item */}
+            <nav className="flex shrink-0 gap-1 overflow-x-auto border-b border-zinc-800 px-2 sm:px-4">
+              {TABS.map((t) => (
                 <button
-                  key={s}
-                  onClick={() => jumpTo(s)}
-                  className="shrink-0 rounded-full px-3 py-1 text-xs font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none"
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={`shrink-0 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors focus-visible:outline-none ${
+                    tab === t
+                      ? "border-indigo-500 text-white"
+                      : "border-transparent text-zinc-400 hover:text-zinc-200"
+                  }`}
                 >
-                  {s}
+                  {t}
                 </button>
               ))}
             </nav>
 
-            <div className="flex-1 space-y-3 overflow-y-auto p-4 sm:p-6">
-              <Section id={anchorOf("Agent-ception")} title="Agent-ception" defaultOpen lazy>
-                <AgentCeptionPanel projectId={selected.id} />
-              </Section>
-              <Section id={anchorOf("Tasks")} title="Tasks" defaultOpen>
-                <TasksPanel projectId={selected.id} />
-              </Section>
-              <Section id={anchorOf("Live")} title="Live" lazy>
-                <LivePanel projectId={selected.id} />
-              </Section>
-              <Section id={anchorOf("Config")} title="Config">
-                <ConfigPanel projectId={selected.id} />
-              </Section>
-              <Section id={anchorOf("Profiles")} title="Profiles">
-                <ProfilesPanel />
-              </Section>
-              <Section id={anchorOf("Quarantine")} title="Quarantine">
-                <QuarantinePanel projectId={selected.id} />
-              </Section>
-              <Section id={anchorOf("Knowledge")} title="Knowledge">
-                <KnowledgePanel projectId={selected.id} />
-              </Section>
-            </div>
+            {/* Content viewport — fixed height; the active page scrolls internally
+                so no page is ever taller than the screen. */}
+            <section className="min-h-0 flex-1 overflow-hidden p-4 sm:p-6">{renderPage()}</section>
           </>
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">

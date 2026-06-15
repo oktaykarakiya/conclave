@@ -73,7 +73,7 @@ export function KnowledgePanel({ projectId }: { projectId: string }) {
   // stale knowledge, the error renders as a dismissible banner above the content.
   if (error && isEmpty) {
     return (
-      <div className="space-y-4">
+      <div className="flex h-full min-h-0 flex-col space-y-4 overflow-y-auto">
         <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-200">
           <div className="font-semibold text-rose-100">Failed to load repository knowledge</div>
           <div className="mt-1 break-words text-rose-200/90">{error}</div>
@@ -87,7 +87,7 @@ export function KnowledgePanel({ projectId }: { projectId: string }) {
 
   if (isEmpty) {
     return (
-      <div className="flex flex-col items-center justify-center rounded-xl border border-zinc-800 bg-zinc-900 px-6 py-12 text-center">
+      <div className="flex h-full min-h-0 flex-col items-center justify-center overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900 px-6 py-12 text-center">
         <div className="mb-3 text-3xl text-zinc-700" aria-hidden="true">
           ◇
         </div>
@@ -104,7 +104,9 @@ export function KnowledgePanel({ projectId }: { projectId: string }) {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-col">
+      {/* Fixed header region: error banner, summary/actions, progress. */}
+      <div className="shrink-0 space-y-4">
       {/* F7: non-blocking error banner — preserves the stale content below. */}
       {error && (
         <div className="flex items-start gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-200">
@@ -155,7 +157,10 @@ export function KnowledgePanel({ projectId }: { projectId: string }) {
           <span>AI analysis running — this may take a moment…</span>
         </div>
       )}
+      </div>
 
+      {/* Scrollable knowledge sections — the page never grows past the viewport. */}
+      <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
       {/* Architecture summary (F2: collapsed by default with show more/less). */}
       {architecture.trim() !== "" && (
         <Section title="Architecture">
@@ -233,6 +238,7 @@ export function KnowledgePanel({ projectId }: { projectId: string }) {
             <EmptyNote>—</EmptyNote>
           )}
         </Section>
+      </div>
       </div>
     </div>
   );
@@ -459,7 +465,11 @@ function KnowledgeSkeleton() {
   // F8: use min-h (not fixed h-) so blocks stretch to real content and don't
   // snap-shrink on arrival, and mirror the real section count more closely.
   return (
-    <div className="space-y-4" aria-busy="true" aria-live="polite">
+    <div
+      className="flex h-full min-h-0 flex-col space-y-4 overflow-y-auto"
+      aria-busy="true"
+      aria-live="polite"
+    >
       <span className="sr-only">Loading repository knowledge…</span>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="h-6 w-32 animate-pulse rounded-full bg-zinc-800" />

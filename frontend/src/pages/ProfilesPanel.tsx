@@ -212,12 +212,15 @@ export function ProfilesPanel() {
   );
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+    // Root fills the fixed-height content viewport. On mobile the whole
+    // (stacked) grid scrolls as one region; on desktop each column scrolls
+    // independently so the page itself never grows taller than the screen.
+    <div className="grid h-full min-h-0 grid-cols-1 gap-4 overflow-y-auto md:grid-cols-2 md:overflow-hidden">
       {/* ---------------------------------------------------------------- */}
       {/* Add / edit form                                                  */}
       {/* ---------------------------------------------------------------- */}
       <form
-        className="min-w-0 space-y-4 rounded-xl border border-zinc-800 bg-zinc-900 p-4"
+        className="min-h-0 min-w-0 space-y-4 rounded-xl border border-zinc-800 bg-zinc-900 p-4 md:overflow-y-auto"
         onSubmit={(e) => {
           e.preventDefault();
           save();
@@ -422,44 +425,48 @@ export function ProfilesPanel() {
       {/* ---------------------------------------------------------------- */}
       {/* Profile list                                                     */}
       {/* ---------------------------------------------------------------- */}
-      <div className="min-w-0 space-y-3">
-        <div className={sectionHeader}>
+      <div className="flex min-h-0 min-w-0 flex-col gap-3">
+        <div className={`${sectionHeader} shrink-0`}>
           <h3 className={sectionTitle}>Profiles</h3>
           {!loading && profiles.length > 0 && (
             <span className="text-xs tabular-nums text-zinc-500">{profiles.length}</span>
           )}
         </div>
 
-        {loading ? (
-          <Card className="flex items-center justify-center gap-2 py-8 text-sm text-zinc-500">
-            <Spinner size={14} /> Loading profiles…
-          </Card>
-        ) : listError ? (
-          <div
-            role="alert"
-            className="rounded-xl border border-rose-900/60 bg-rose-950/50 px-4 py-3 text-sm break-words text-rose-300"
-          >
-            {listError}
-          </div>
-        ) : profiles.length === 0 ? (
-          <Card className="py-10 text-center text-sm text-zinc-500">
-            No profiles yet — use the form to create one.
-          </Card>
-        ) : (
-          <ul role="list" aria-label="Engine profiles" className="space-y-2">
-            {profiles.map((p) => (
-              <li key={p.id}>
-                <ProfileCard
-                  profile={p}
-                  active={editingId === p.id}
-                  deleting={deletingId === p.id}
-                  onEdit={() => startEdit(p)}
-                  onDelete={() => remove(p)}
-                />
-              </li>
-            ))}
-          </ul>
-        )}
+        {/* Variable-length list scrolls within the column on desktop; on
+            mobile the parent grid owns the scroll so this stays static. */}
+        <div className="min-h-0 md:flex-1 md:overflow-y-auto">
+          {loading ? (
+            <Card className="flex items-center justify-center gap-2 py-8 text-sm text-zinc-500">
+              <Spinner size={14} /> Loading profiles…
+            </Card>
+          ) : listError ? (
+            <div
+              role="alert"
+              className="rounded-xl border border-rose-900/60 bg-rose-950/50 px-4 py-3 text-sm break-words text-rose-300"
+            >
+              {listError}
+            </div>
+          ) : profiles.length === 0 ? (
+            <Card className="py-10 text-center text-sm text-zinc-500">
+              No profiles yet — use the form to create one.
+            </Card>
+          ) : (
+            <ul role="list" aria-label="Engine profiles" className="space-y-2">
+              {profiles.map((p) => (
+                <li key={p.id}>
+                  <ProfileCard
+                    profile={p}
+                    active={editingId === p.id}
+                    deleting={deletingId === p.id}
+                    onEdit={() => startEdit(p)}
+                    onDelete={() => remove(p)}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </div>
     </div>
   );

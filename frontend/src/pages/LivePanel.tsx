@@ -446,9 +446,9 @@ export function LivePanel({ projectId }: { projectId: string }) {
   const connecting = status === "connecting" && events.length === 0;
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex h-full min-h-0 flex-col gap-2">
       {/* Header: status, filter, counts. Wraps to two rows on narrow screens. */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 shrink-0">
         <StatusPill status={status} />
         <input
           value={filter}
@@ -465,11 +465,11 @@ export function LivePanel({ projectId }: { projectId: string }) {
         </span>
       </div>
 
-      {/* Log body — a self-contained, capped-height scroller (no page-scroll trap). */}
+      {/* Log body — fills remaining height & scrolls internally (no page-scroll trap). */}
       <div
         ref={scrollerRef}
         onScroll={onScroll}
-        className="relative max-h-[60vh] overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950 px-1 py-1 font-mono text-xs sm:max-h-[480px]"
+        className="relative min-h-0 flex-1 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950 px-1 py-1 font-mono text-xs"
       >
         {connecting ? (
           <LogSkeleton />

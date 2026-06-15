@@ -468,12 +468,16 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
   const showTyping = isActive && (!lastMsg || lastMsg.role === "human");
 
   return (
-    <div className="flex flex-col gap-4 lg:grid lg:h-[72vh] lg:grid-cols-[260px_1fr_320px]">
+    <div className="flex h-full min-h-0 flex-col lg:grid lg:min-h-0 lg:grid-cols-[260px_1fr_320px] lg:gap-4">
+      {/* On mobile this single region scrolls the stacked columns so the page
+          fits the mobile content area; on lg it becomes `contents` so the three
+          columns are direct grid children, each scrolling independently. */}
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto lg:contents">
       {/* ----------------------------------------------------------------- */}
       {/* Left: session list + new-session form                            */}
       {/* ----------------------------------------------------------------- */}
-      <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0">
-        <div className="border-b border-zinc-800 px-3 py-3">
+      <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0 lg:overflow-hidden">
+        <div className="shrink-0 border-b border-zinc-800 px-3 py-3">
           <SectionHeader
             right={
               <span className="text-xs tabular-nums text-zinc-500">
@@ -485,7 +489,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
           </SectionHeader>
         </div>
 
-        <div className="space-y-1.5 p-2 lg:flex-1 lg:overflow-y-auto">
+        <div className="min-h-0 space-y-1.5 p-2 lg:flex-1 lg:overflow-y-auto">
           {sessionsLoading && (
             <div className="space-y-1.5">
               {[0, 1, 2].map((i) => (
@@ -545,7 +549,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
         </div>
 
         {/* New session form */}
-        <div className="space-y-2 border-t border-zinc-800 p-3">
+        <div className="shrink-0 space-y-2 border-t border-zinc-800 p-3">
           <label
             htmlFor="acp-new-goal"
             className="block text-xs font-medium text-zinc-400"
@@ -597,7 +601,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
       <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0 lg:overflow-hidden">
         {/* Header */}
         {activeSession ? (
-          <div className="flex flex-col gap-2 border-b border-zinc-800 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex shrink-0 flex-col gap-2 border-b border-zinc-800 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex min-w-0 items-center gap-2">
               <StatusDot status={activeSession.status} />
               <span
@@ -650,14 +654,14 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
             </div>
           </div>
         ) : (
-          <div className="border-b border-zinc-800 px-4 py-3">
+          <div className="shrink-0 border-b border-zinc-800 px-4 py-3">
             <SectionHeader>Discussion</SectionHeader>
           </div>
         )}
 
         {/* Error banner */}
         {error && (
-          <div className="flex items-start justify-between gap-3 border-b border-rose-900/50 bg-rose-950/40 px-4 py-2 text-xs text-rose-300">
+          <div className="flex shrink-0 items-start justify-between gap-3 border-b border-rose-900/50 bg-rose-950/40 px-4 py-2 text-xs text-rose-300">
             <span className="break-words">{error}</span>
             <button
               type="button"
@@ -670,13 +674,14 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
           </div>
         )}
 
-        {/* Messages — capped height on every breakpoint so a long transcript
-            stays a scrollable feed rather than a wall of text; fills the column
-            at lg+ where the panel becomes a fixed-height 3-column layout. */}
+        {/* Messages — the scrolling transcript feed. On lg it fills the column
+            and scrolls independently; on mobile it grows naturally inside the
+            page's single scroll region so the whole page never exceeds one
+            screen. */}
         <div
           ref={scrollRef}
           onScroll={onScroll}
-          className="max-h-[60vh] space-y-4 overflow-y-auto p-4 lg:max-h-none lg:flex-1"
+          className="min-h-0 space-y-4 p-4 lg:flex-1 lg:overflow-y-auto"
         >
           {!activeSessionId && (
             <div className="flex min-h-[160px] flex-col items-center justify-center gap-2 text-center text-sm text-zinc-500">
@@ -731,7 +736,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
 
         {/* Input bar */}
         {activeSessionId && (isActive || isStable) && (
-          <div className="flex items-end gap-2 border-t border-zinc-800 p-3">
+          <div className="flex shrink-0 items-end gap-2 border-t border-zinc-800 p-3">
             <textarea
               ref={inputRef}
               aria-label={
@@ -779,7 +784,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
           </div>
         )}
         {activeSessionId && isClosed && (
-          <div className="border-t border-zinc-800 px-4 py-2.5 text-center text-xs text-zinc-500">
+          <div className="shrink-0 border-t border-zinc-800 px-4 py-2.5 text-center text-xs text-zinc-500">
             This session is {activeSession?.status}. The transcript is read-only.
           </div>
         )}
@@ -798,6 +803,7 @@ export function AgentCeptionPanel({ projectId }: { projectId: string }) {
         approving={approving}
         onApprove={approveSession}
       />
+      </div>
     </div>
   );
 }
@@ -926,8 +932,8 @@ function TaskTreePanel({
   }>({ open: true, n: 0 });
 
   return (
-    <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0">
-      <div className="space-y-2 border-b border-zinc-800 px-3 py-3">
+    <div className="flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 lg:min-h-0 lg:overflow-hidden">
+      <div className="shrink-0 space-y-2 border-b border-zinc-800 px-3 py-3">
         <SectionHeader
           right={
             <span className="text-xs tabular-nums text-zinc-500">{total}</span>
@@ -978,7 +984,7 @@ function TaskTreePanel({
         )}
       </div>
 
-      <div className="p-2 lg:max-h-none lg:flex-1 lg:overflow-y-auto">
+      <div className="min-h-0 p-2 lg:flex-1 lg:overflow-y-auto">
         {loading && (
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-zinc-500">
             <Spinner /> Loading tasks…
@@ -1009,7 +1015,7 @@ function TaskTreePanel({
       </div>
 
       {canApprove && total > 0 && (
-        <div className="border-t border-zinc-800 p-3 [&>button]:flex [&>button]:w-full [&>button]:items-center [&>button]:justify-center">
+        <div className="shrink-0 border-t border-zinc-800 p-3 [&>button]:flex [&>button]:w-full [&>button]:items-center [&>button]:justify-center">
           <Button variant="primary" onClick={onApprove} disabled={approving}>
             {approving ? (
               <span className="flex items-center gap-2">

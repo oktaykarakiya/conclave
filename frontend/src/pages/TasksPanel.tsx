@@ -222,15 +222,19 @@ export function TasksPanel({ projectId }: { projectId: string }) {
   );
 
   return (
-    // Single-column on phones; two columns from lg up. No fixed height —
-    // content flows inside the parent accordion <Section>.
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+    // Fills the fixed-height content viewport: single column on phones, two
+    // columns from lg up. The grid itself is h-full/min-h-0 and each column
+    // manages its own internal scroll so the page never grows past one screen.
+    // Row tracks are bounded to minmax(0,1fr) so a stacked verdicts panel on
+    // mobile gets a definite height (enabling its inner scroll) instead of
+    // pushing the window taller; on lg there is a single full-height row.
+    <div className="grid h-full min-h-0 grid-cols-1 grid-rows-[minmax(0,1fr)] gap-4 [grid-auto-rows:minmax(0,1fr)] lg:grid-cols-2 lg:grid-rows-1 lg:[grid-auto-rows:auto]">
       {/* ------------------------------------------------------------------ */}
-      {/* Left column: create + filters + list                                */}
+      {/* Left column: create + filters (fixed) + list (scrolls internally)   */}
       {/* ------------------------------------------------------------------ */}
-      <div className="min-w-0 space-y-3">
-        {/* Create task */}
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+      <div className="flex min-h-0 min-w-0 flex-col gap-3">
+        {/* Create task (fixed) */}
+        <div className="shrink-0 rounded-xl border border-zinc-800 bg-zinc-900 p-4">
           <textarea
             className={`${input} h-24 resize-none`}
             placeholder="Describe the task for the team…"
@@ -276,14 +280,14 @@ export function TasksPanel({ projectId }: { projectId: string }) {
         {error && (
           <div
             role="alert"
-            className="rounded-xl border border-rose-900/60 bg-rose-950/60 p-3 text-sm text-rose-300"
+            className="shrink-0 rounded-xl border border-rose-900/60 bg-rose-950/60 p-3 text-sm text-rose-300"
           >
             {error}
           </div>
         )}
 
-        {/* Filter chips + search */}
-        <div className="space-y-2">
+        {/* Filter chips + search (fixed) */}
+        <div className="shrink-0 space-y-2">
           {/* Horizontally scrollable single row on phones (Linear/GitHub
               pattern) so the chips never wrap into the search bar. */}
           <div className="-mx-1 flex items-center gap-1.5 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -357,8 +361,10 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           </div>
         </div>
 
-        {/* List body: loading / empty / error / rows */}
-        <div className="space-y-1.5">
+        {/* List body (scrolls internally): loading / empty / error / rows.
+            -mr-1/pr-1 give the scrollbar a small gutter without clipping
+            focus rings on the right edge of rows. */}
+        <div className="-mr-1 min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1">
           {loading ? (
             <ListSkeleton />
           ) : tasks.length === 0 ? (
@@ -410,8 +416,8 @@ export function TasksPanel({ projectId }: { projectId: string }) {
       {/* never sits as a big empty block above the list on mobile.           */}
       {/* ------------------------------------------------------------------ */}
       {selectedTask && (
-        <div className="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-          <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="flex h-full min-h-0 min-w-0 flex-col rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <div className="mb-3 flex shrink-0 items-center justify-between gap-2">
             <h3 className="min-w-0 text-sm font-semibold uppercase tracking-wide text-zinc-300">
               Verdicts
             </h3>
@@ -436,12 +442,14 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           </div>
 
           <div
-            className="mb-3 truncate text-xs text-zinc-500"
+            className="mb-3 shrink-0 truncate text-xs text-zinc-500"
             title={selectedTask.title || selectedTask.request}
           >
             {selectedTask.title || selectedTask.request}
           </div>
 
+          {/* Verdict list scrolls internally; header/subtitle stay fixed. */}
+          <div className="-mr-1 min-h-0 flex-1 overflow-y-auto pr-1">
           {verdicts.length === 0 ? (
             selectedTask.state === "in_progress" ||
             selectedTask.state === "approved" ? (
@@ -489,6 +497,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
               ))}
             </div>
           )}
+          </div>
         </div>
       )}
     </div>

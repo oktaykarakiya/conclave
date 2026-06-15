@@ -163,7 +163,9 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
   const healthy = integrity?.healthy ?? true;
 
   return (
-    <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-col gap-4">
+      {/* Fixed top region: header + integrity + degraded detail + add disclosure */}
+      <div className="shrink-0 space-y-4">
       {/* Header: title + integrity stat (stacks on mobile) */}
       <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
         <div>
@@ -285,8 +287,10 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
           </Card>
         )}
       </div>
+      </div>
 
-      {/* List */}
+      {/* List — scrolls within the page; top region stays fixed */}
+      <div className="min-h-0 flex-1 overflow-y-auto">
       {loading ? (
         <div
           className="flex items-center justify-center gap-2 py-10 text-sm text-zinc-500"
@@ -318,6 +322,7 @@ export function QuarantinePanel({ projectId }: { projectId: string }) {
           ))}
         </div>
       )}
+      </div>
     </div>
   );
 }
