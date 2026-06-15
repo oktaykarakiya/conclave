@@ -327,6 +327,28 @@ async def cancel_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dic
     return {"cancelled": False, "note": "in-progress cancellation is not supported in the MVP"}
 
 
+@router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, str]:
+    task = await _require_task(daemon, task_id)
+    if task.state == TaskState.in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail="cannot delete an in_progress task — cancel it first",
+        )
+    deleted = await repo.delete_task(daemon.db, task_id)
+    if not deleted:
+        # Defense-in-depth: the repo-level WHERE guard also caught it.
+        raise HTTPException(
+            status_code=409,
+            detail="cannot delete an in_progress task — cancel it first",
+        )
+    # Emit after the delete so the tombstone event persists (queryable by project_id).
+    await daemon.bus.emit(
+        type=EventType.task_deleted, project_id=task.project_id, task_id=task_id,
+    )
+    return {"deleted": task_id}
+
+
 @router.get("/tasks/{task_id}/events")
 async def list_task_events(
     task_id: str, after_id: int = 0, daemon: Daemon = Depends(get_daemon)

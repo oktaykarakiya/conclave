@@ -679,6 +679,110 @@ async def test_add_quarantine_accepts_valid_until(
     assert any(e["until"] == "2026-12-31" for e in entries)
 
 
+# --- delete_task tests --------------------------------------------------------
+
+
+async def test_delete_task_emits_event_and_cleans_orphans(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """DELETE /api/tasks/{id} on non-in_progress task returns 200, emits task.deleted,
+    and removes child events+usage rows."""
+    repo_path = tmp_path / "repo_del_ok"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "p_del_ok", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    # Create an inbox task.
+    t = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "do a thing"}
+    )
+    assert t.status_code == 200
+    task_id = t.json()["id"]
+
+    # Add mock child rows: events and usage (the ones without FK cascades).
+    await repo.append_event(
+        db, type="log", project_id=project_id, task_id=task_id,
+        payload={"msg": "hello"},
+    )
+    await repo.add_usage(
+        db, agent="dev", task_id=task_id, project_id=project_id,
+        num_turns=1, input_tokens=10, output_tokens=20,
+    )
+
+    # Delete the task.
+    resp = await client.delete(f"/api/tasks/{task_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"deleted": task_id}
+
+    # Task must be gone.
+    assert await repo.get_task(db, task_id) is None
+
+    # Child events referencing this task (the "log" event) must be gone;
+    # the task.deleted tombstone event persists (queryable by project_id).
+    events = await repo.list_events(db, task_id=task_id)
+    assert all(
+        e.type == "task.deleted" for e in events
+    ), f"non-tombstone events remain: {events}"
+
+    # Usage referencing this task must be gone.
+    usage = await repo.get_task_usage(db, task_id)
+    # Aggregate query still returns a row (COUNT(*) with task_id) but totals should be 0
+    # meaning no rows matched.
+    assert usage["total_turns"] == 0, f"orphaned usage remains: {usage}"
+
+    # The task.deleted event must have been emitted.
+    all_events = await repo.list_events(db, project_id=project_id)
+    deleted_events = [e for e in all_events if e.type == "task.deleted"]
+    assert len(deleted_events) == 1, f"expected 1 task.deleted event, got {len(deleted_events)}"
+    assert deleted_events[0].project_id == project_id
+
+
+async def test_delete_task_in_progress_returns_409(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """DELETE /api/tasks/{id} on an in_progress task returns 409 and does not delete."""
+    repo_path = tmp_path / "repo_del_409"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "p_del_409", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    t = await client.post(
+        f"/api/projects/{project_id}/tasks", json={"request": "do a thing"}
+    )
+    assert t.status_code == 200
+    task_id = t.json()["id"]
+
+    # Manually move to in_progress.
+    await repo.set_task_state(db, task_id, TaskState.in_progress)
+
+    resp = await client.delete(f"/api/tasks/{task_id}")
+    assert resp.status_code == 409, f"expected 409, got {resp.status_code}: {resp.text}"
+    assert "in_progress" in resp.json()["detail"].lower()
+
+    # Task must still exist.
+    task = await repo.get_task(db, task_id)
+    assert task is not None
+    assert task.state == TaskState.in_progress
+
+
+async def test_delete_task_not_found_returns_404(
+    client: httpx.AsyncClient,
+) -> None:
+    """DELETE /api/tasks/{id} on a non-existent task returns 404."""
+    resp = await client.delete("/api/tasks/nonexistent-id")
+    assert resp.status_code == 404
+
+
 # --- detach_project tests ----------------------------------------------------
 
 

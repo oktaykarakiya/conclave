@@ -177,6 +177,32 @@ async def set_task_state(db: Database, task_id: str, state: TaskState) -> None:
     )
 
 
+async def delete_task(db: Database, task_id: str) -> bool:
+    """Atomically delete a task and its orphaned child rows.
+
+    ``attempts`` and ``verdicts`` auto-cascade via ``ON DELETE CASCADE`` FK.
+    ``events`` and ``usage`` have no FK — they are deleted explicitly inside
+    the same transaction so nothing is left dangling.
+
+    The ``WHERE state != 'in_progress'`` guard is defense-in-depth against a
+    TOCTOU between the API-layer check and this delete: if the task was claimed
+    between the read and the write the DELETE simply won't match (zero rows).
+
+    Returns ``True`` if the task row was deleted, ``False`` if it was
+    ``in_progress`` (or didn't exist).
+    """
+    async with db.transaction() as conn:
+        # Remove orphan-prone child rows first — events and usage lack FK cascades.
+        await conn.execute("DELETE FROM events WHERE task_id = ?", (task_id,))
+        await conn.execute("DELETE FROM usage WHERE task_id = ?", (task_id,))
+        # Delete the task; attempts + verdicts cascade via FK.
+        cur = await conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND state != 'in_progress'",
+            (task_id,),
+        )
+        return cur.rowcount > 0
+
+
 async def approve_task(db: Database, task_id: str) -> bool:
     """Atomically set state to ``approved`` only if currently in an approvable state.
 
