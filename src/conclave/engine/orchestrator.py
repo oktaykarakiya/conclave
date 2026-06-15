@@ -25,7 +25,7 @@ from ..events import EventBus, EventType
 from ..providers import AgentResult, Provider
 from ..repo_intel.knowledge import render_preamble
 from .baseline import build_baseline_preamble
-from .gate import run_tests
+from .gate import apply_quarantine, run_tests
 from .gitio import run_git, run_shell
 from .memory import AttemptMemory
 from .pipeline import get_agent_pipeline
@@ -163,6 +163,9 @@ class Orchestrator:
                 knowledge_row.knowledge if knowledge_row else None,
             )
             test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
+            # Inject active quarantine exclusions so flaky quarantined tests
+            # don't fail the baseline snapshot or the green-gate.
+            test_command = await apply_quarantine(self._db, project.id, test_command)
             gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
 
             baseline_preamble = await self._baseline(
