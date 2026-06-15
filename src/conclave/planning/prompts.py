@@ -36,10 +36,10 @@ Always output a JSON block with your discussion message AND any task tree change
 {
   "message": "Your discussion message to the team, explaining your reasoning...",
   "task_changes": [
-    {"action": "add", "parent_id": null, "title": "Short imperative title", "description": "..."},
-    {"action": "add", "parent_id": "<parent-node-id>", "title": "...", "description": "..."},
-    {"action": "update", "id": "<node-id>", "title": "...", "description": "..."},
-    {"action": "remove", "id": "<node-id>"}
+    {"action": "add", "id": "epic-1", "parent_id": null, "title": "Title", "description": "..."},
+    {"action": "add", "id": "step-1", "parent_id": "epic-1", "title": "...", "description": "..."},
+    {"action": "update", "id": "<existing-node-id>", "title": "...", "description": "..."},
+    {"action": "remove", "id": "<existing-node-id>"}
   ],
   "ready": false
 }
@@ -53,6 +53,9 @@ all reviewer concerns are resolved.
 - Tasks should be ordered logically (dependencies first).
 - Every task must have a clear acceptance criteria in its description.
 - Use the existing discussion context and task tree to inform your changes.
+- To nest subtasks, give each new `add` a unique `id` you choose and set the
+  child's `parent_id` to that id (or to an existing node's shown `(id=...)`).
+  Add a parent and its children in the SAME submission so they link correctly.
 """
 
 ARCHITECT_DISCUSSION = """# Architect Agent (Planning Review)

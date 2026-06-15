@@ -633,6 +633,9 @@ class PlanningOrchestrator:
             "Each existing task above is shown as (id=...). To revise one, use "
             '{"action":"update","id":"<that id>",...} or {"action":"remove","id":"<that id>"}; '
             "only use \"add\" for genuinely NEW tasks. Do NOT re-add a task that already exists. "
+            "To nest a subtask, give each new add a unique \"id\" and set the child's "
+            "\"parent_id\" to that id (or to an existing (id=...)); add a parent and its "
+            "children together in the same response. "
             "Reviewer agents: end with a fenced ```json block containing "
             '{"verdict": "pass"} to endorse the plan, or '
             '{"verdict": "fail", "reason": "..."} to request changes.'
@@ -704,6 +707,10 @@ class PlanningOrchestrator:
         Safe-parses *changes*: ignores non-list input, skips entries with a
         missing or unknown node id, and scopes ``update``/``remove`` to the
         current session so a change can never mutate another session's nodes.
+        New ``add`` entries may carry a planner-chosen ``id`` handle and a
+        ``parent_id`` naming either an existing node or another ``add`` in the
+        same batch; an unresolvable parent places the task at top level instead
+        of failing the change on a foreign-key error.
 
         Returns ``True`` only if the tree was actually mutated (an add/update/
         remove took effect), so the caller can tell a real refinement from a
@@ -720,26 +727,47 @@ class PlanningOrchestrator:
         # task instead of updating it — keeps the tree from duplicating across rounds.
         existing = await repo.list_planning_task_nodes(self._db, session_id)
         seen_titles = {n.title.strip().lower() for n in existing}
+        title_to_id = {n.title.strip().lower(): n.id for n in existing}
+        # Maps a planner-assigned handle (e.g. "epic-1") to the real DB node id, so a
+        # child added in the SAME batch can name its parent before that parent has a
+        # persisted id.  Without it every nested "add" hit a FOREIGN KEY error and was
+        # silently dropped, collapsing the tree to just its top-level nodes.
+        id_map: dict[str, str] = {}
         changed = False
         for change in changes:
             action = change.get("action")
             try:
                 if action == "add":
                     title = change.get("title", "Untitled")
-                    if title.strip().lower() in seen_titles:
+                    tl = title.strip().lower()
+                    planner_id = change.get("id")
+                    if tl in seen_titles:
+                        # Don't duplicate, but still expose the existing node under the
+                        # planner's handle so siblings added now can nest beneath it.
+                        if planner_id and tl in title_to_id:
+                            id_map[planner_id] = title_to_id[tl]
                         logger.info(
                             "skipping duplicate add %r in session %s", title, session_id
                         )
                         continue
-                    seen_titles.add(title.strip().lower())
-                    parent_id = change.get("parent_id")
+                    seen_titles.add(tl)
+                    # Resolve the parent reference through the in-batch handle map,
+                    # then verify it names a real node in THIS session; otherwise place
+                    # the task at top level rather than crashing on a bad foreign key.
+                    raw_parent = change.get("parent_id")
+                    parent_id: str | None = None
                     level = 0
-                    if parent_id:
-                        parent = await repo.get_planning_task_node(
-                            self._db, parent_id
-                        )
-                        if parent:
+                    if raw_parent:
+                        candidate = id_map.get(raw_parent, raw_parent)
+                        parent = await repo.get_planning_task_node(self._db, candidate)
+                        if parent is not None and parent.session_id == session_id:
+                            parent_id = candidate
                             level = parent.level + 1
+                        else:
+                            logger.info(
+                                "add %r names unknown parent %r in session %s — "
+                                "placing at top level", title, raw_parent, session_id,
+                            )
                     siblings = await repo.list_planning_task_nodes_by_parent(
                         self._db, session_id, parent_id
                     )
@@ -747,11 +775,15 @@ class PlanningOrchestrator:
                         self._db,
                         session_id=session_id,
                         parent_id=parent_id,
-                        title=change.get("title", "Untitled"),
+                        title=title,
                         description=change.get("description", ""),
                         level=level,
                         sort_order=len(siblings),
                     )
+                    # Record handles so later changes in this batch can reference it.
+                    title_to_id[tl] = node.id
+                    if planner_id:
+                        id_map[planner_id] = node.id
                     await self._bus.emit(
                         type=EventType.planning_task_proposed,
                         project_id=project_id,
@@ -770,6 +802,7 @@ class PlanningOrchestrator:
                             "update change missing id in session %s — skipping", session_id
                         )
                         continue
+                    update_id = id_map.get(update_id, update_id)
                     target = await repo.get_planning_task_node(self._db, update_id)
                     if target is None:
                         logger.warning(
@@ -798,6 +831,7 @@ class PlanningOrchestrator:
                             "remove change missing id in session %s — skipping", session_id
                         )
                         continue
+                    remove_id = id_map.get(remove_id, remove_id)
                     target = await repo.get_planning_task_node(self._db, remove_id)
                     if target is None:
                         logger.warning(

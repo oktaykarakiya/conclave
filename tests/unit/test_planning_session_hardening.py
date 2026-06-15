@@ -273,3 +273,84 @@ async def test_apply_task_changes_remove_within_session_succeeds(db: Database) -
 
     refreshed = await repo.get_planning_task_node(db, node.id)
     assert refreshed is None  # node was deleted
+
+
+# ---------------------------------------------------------------------------
+# 7. Nested add — in-batch parent linking (FK-crash / data-loss regression)
+# ---------------------------------------------------------------------------
+
+
+async def test_apply_task_changes_nests_child_under_same_batch_parent(db: Database) -> None:
+    """A child 'add' may reference a parent 'add' from the same batch by handle.
+
+    Regression: the planner names new parents by its own id (e.g. "epic-1"); that
+    handle is not a DB id, so the child INSERT used to fail the parent_task_id
+    foreign key and the child was silently dropped, collapsing the tree.
+    """
+    project = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    session = await repo.create_planning_session(
+        db, project_id=project.id, title="T", prompt="Do X",
+    )
+
+    orchestrator = _make_orchestrator(db)
+    changes = [
+        {"action": "add", "id": "epic-1", "parent_id": None, "title": "Epic One"},
+        {"action": "add", "id": "step-1", "parent_id": "epic-1", "title": "Step One"},
+    ]
+    await orchestrator._apply_task_changes(session.id, project.id, changes)
+
+    nodes = await repo.list_planning_task_nodes(db, session.id)
+    by_title = {n.title: n for n in nodes}
+    assert set(by_title) == {"Epic One", "Step One"}  # child was NOT dropped
+    epic, child = by_title["Epic One"], by_title["Step One"]
+    assert child.parent_id == epic.id  # linked to the real DB id, not "epic-1"
+    assert child.level == epic.level + 1
+
+
+async def test_apply_task_changes_unknown_parent_falls_back_to_top_level(db: Database) -> None:
+    """An 'add' naming a parent that resolves to nothing is kept at top level."""
+    project = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    session = await repo.create_planning_session(
+        db, project_id=project.id, title="T", prompt="Do X",
+    )
+
+    orchestrator = _make_orchestrator(db)
+    changes = [
+        {"action": "add", "parent_id": "ghost-parent", "title": "Orphan", "description": "o"},
+    ]
+    await orchestrator._apply_task_changes(session.id, project.id, changes)
+
+    nodes = await repo.list_planning_task_nodes(db, session.id)
+    assert len(nodes) == 1  # created, not dropped on a bad foreign key
+    assert nodes[0].title == "Orphan"
+    assert nodes[0].parent_id is None
+    assert nodes[0].level == 0
+
+
+async def test_apply_task_changes_child_links_to_deduped_parent(db: Database) -> None:
+    """A re-added (deduped) parent still exposes its handle so children nest under it.
+
+    Mirrors a later round: the planner re-emits an existing epic (skipped as a
+    duplicate) alongside a brand-new child that references the epic by handle.
+    """
+    project = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    session = await repo.create_planning_session(
+        db, project_id=project.id, title="T", prompt="Do X",
+    )
+    epic = await repo.add_planning_task_node(
+        db, session_id=session.id, parent_id=None,
+        title="Existing Epic", description="e", level=0, sort_order=0,
+    )
+
+    orchestrator = _make_orchestrator(db)
+    changes = [
+        {"action": "add", "id": "epic-1", "parent_id": None, "title": "Existing Epic"},
+        {"action": "add", "id": "step-1", "parent_id": "epic-1", "title": "Fresh Step"},
+    ]
+    await orchestrator._apply_task_changes(session.id, project.id, changes)
+
+    nodes = await repo.list_planning_task_nodes(db, session.id)
+    titles = sorted(n.title for n in nodes)
+    assert titles == ["Existing Epic", "Fresh Step"]  # dup not re-added; child added
+    child = next(n for n in nodes if n.title == "Fresh Step")
+    assert child.parent_id == epic.id  # linked to the pre-existing epic
