@@ -14,10 +14,10 @@ from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatu
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 6
+    assert version == 7
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 6
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 7
 
 
 async def test_migration_failure_is_atomic(
@@ -28,16 +28,16 @@ async def test_migration_failure_is_atomic(
 
     Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
     replays the same migration and wedges on a duplicate-column error. The fixture DB is
-    already at version 6; we inject a v7 migration whose first statement succeeds (creates
-    a probe table) and whose second fails — ``input_tokens`` was already added by migration
-    5, so re-adding it raises a duplicate-column error — which is exactly that wedge.
+    already at version 7; we inject a v8 migration whose first statement succeeds (creates
+    a probe table) and whose second fails — ``stabilization_reason`` was already added by
+    migration 7, so re-adding it raises a duplicate-column error — which is exactly that wedge.
     """
     failing = Migration(
-        version=7,
+        version=8,
         name="injected_failure",
         sql=(
             "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
-            "ALTER TABLE usage ADD COLUMN input_tokens INTEGER;"
+            "ALTER TABLE planning_sessions ADD COLUMN stabilization_reason TEXT;"
         ),
     )
     monkeypatch.setattr("conclave.db.database.MIGRATIONS", [failing])
@@ -46,7 +46,7 @@ async def test_migration_failure_is_atomic(
         await db._apply_migrations()
 
     # Version did not advance past the last good migration...
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 6
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 7
     # ...and the partial DDL (the probe table from the first statement) was rolled back.
     assert (
         await db.fetchval(

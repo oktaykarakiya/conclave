@@ -944,6 +944,16 @@ async def update_planning_session_status(
     )
 
 
+async def update_planning_session_stabilization_reason(
+    db: Database, session_id: str, reason: str
+) -> None:
+    """Persist a short description of why the session auto-stabilised."""
+    await db.execute(
+        "UPDATE planning_sessions SET stabilization_reason = ? WHERE id = ?",
+        (reason, session_id),
+    )
+
+
 async def increment_planning_turn(db: Database, session_id: str) -> int:
     async with db._write() as conn:
         cur = await conn.execute(
