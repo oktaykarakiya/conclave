@@ -324,7 +324,24 @@ async def cancel_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dic
         await repo.set_task_state(daemon.db, task_id, TaskState.cancelled)
         await daemon.bus.emit(type=EventType.task_cancelled, task_id=task_id)
         return {"cancelled": True}
-    return {"cancelled": False, "note": "in-progress cancellation is not supported in the MVP"}
+    if task.state == TaskState.in_progress:
+        cancelled = await daemon.request_cancel(task_id)
+        if cancelled:
+            return {"cancelled": True}
+        # The task finished between the state check and the cancel request — the
+        # event was already cleaned up. Report what actually happened.
+        updated = await repo.get_task(daemon.db, task_id)
+        if updated is not None and updated.state == TaskState.cancelled:
+            return {"cancelled": True}
+        raise HTTPException(
+            status_code=409,
+            detail="task is no longer in_progress — refresh and retry if needed",
+        )
+    # Terminal states (done, failed, already cancelled) — clear error.
+    raise HTTPException(
+        status_code=409,
+        detail=f"cannot cancel a task in state {task.state.value}",
+    )
 
 
 @router.delete("/tasks/{task_id}")

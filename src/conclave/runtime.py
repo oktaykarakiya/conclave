@@ -66,7 +66,20 @@ class ProjectWorker:
                 # Work claimed — reset backoff so the next idle cycle starts
                 # from the minimum.
                 self._current_idle_sleep = self._idle_sleep
-                await self._orchestrator.process_task(task)
+                # Register a cancellation event so the cancel endpoint can signal
+                # cooperative cancellation for this specific task.
+                cancel_event = asyncio.Event()
+                self._orchestrator._cancel_events[task.id] = cancel_event
+                try:
+                    await self._orchestrator.process_task(
+                        task, cancel_event=cancel_event,
+                    )
+                finally:
+                    # Clean the event entry regardless of outcome — the
+                    # orchestrator's _finish_cancelled also cleans it, but
+                    # this finally is the belt-and-suspenders so the dict
+                    # can never leak entries.
+                    self._orchestrator._cancel_events.pop(task.id, None)
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep the worker alive on unexpected errors
@@ -208,6 +221,16 @@ class Daemon:
             return False
         worker.paused = paused
         return True
+
+    async def request_cancel(self, task_id: str) -> bool:
+        """Request cooperative cancellation for an in-progress *task_id*.
+
+        Returns ``True`` when a cancellation event was set (the task was in-flight).
+        Returns ``False`` when the task is not currently being processed, meaning the
+        caller should handle non-running states directly (e.g. transition inbox/approved
+        to cancelled, or return a no-op for terminal states).
+        """
+        return self.orchestrator.request_cancel(task_id)
 
     async def cleanup_in_progress_work(self, project_id: str) -> None:
         """Cancel in-progress tasks and clean their worktrees for a stopped worker.

@@ -74,13 +74,31 @@ class Orchestrator:
         # "main" concurrently can never race on a shared worktree path or
         # clobber each other's ref update.
         self._merge_locks: dict[str, asyncio.Lock] = {}
+        # Per-task cancellation events — set by the daemon through
+        # :meth:`request_cancel` and checked by :meth:`process_task` between
+        # every pipeline stage for cooperative cancellation.
+        self._cancel_events: dict[str, asyncio.Event] = {}
 
     async def recover(self, project_id: str) -> tuple[int, int]:
         """Crash recovery: return orphaned in_progress tasks to approved and re-block
         descendants of failed/blocked parents. Returns ``(recovered, reblocked)``."""
         return await repo.recover_in_progress(self._db, project_id)
 
-    async def process_task(self, task: Task) -> bool:
+    def request_cancel(self, task_id: str) -> bool:
+        """Signal cooperative cancellation for *task_id*.
+
+        Returns ``True`` when a cancellation event was set (the task was in-flight),
+        ``False`` when no event exists (the task is not currently being processed).
+        The caller (daemon/cancel endpoint) still transitions non-running tasks
+        (inbox/approved) directly — this only covers the in-progress path.
+        """
+        event = self._cancel_events.get(task_id)
+        if event is None:
+            return False
+        event.set()
+        return True
+
+    async def process_task(self, task: Task, *, cancel_event: asyncio.Event | None = None) -> bool:
         project = await repo.get_project(self._db, task.project_id)
         if project is None:
             return False
@@ -133,6 +151,10 @@ class Orchestrator:
                         f"worktree setup failed (exit {rc}):\n{out[-1000:]}",
                     )
 
+            # Cooperative cancellation — check after setup, before baseline.
+            if cancel_event is not None and cancel_event.is_set():
+                return await self._finish_cancelled(task, wm, task_branch)
+
             knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
             knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
             rules = _read_project_rules(worktree)
@@ -148,8 +170,13 @@ class Orchestrator:
                 events_retention=config.execution.retention_events_max,
             )
             plan_preamble = await self._maybe_plan(
-                runner, task, worktree, knowledge, rules, baseline_preamble, config
+                runner, task, worktree, knowledge, rules, baseline_preamble, config,
+                cancel_event=cancel_event,
             )
+
+            # Cooperative cancellation — check after planning, before developer loop.
+            if cancel_event is not None and cancel_event.is_set():
+                return await self._finish_cancelled(task, wm, task_branch)
 
             memory = AttemptMemory(config.experimental.cross_attempt_memory_entries)
             use_memory = config.experimental.cross_attempt_memory
@@ -212,6 +239,10 @@ class Orchestrator:
                     failed = True
                     break
 
+                # Cooperative cancellation — check before developer dispatch.
+                if cancel_event is not None and cancel_event.is_set():
+                    return await self._finish_cancelled(task, wm, task_branch)
+
                 dev = await runner.run(
                     agent="developer",
                     prompt=dev_prompt,
@@ -219,6 +250,7 @@ class Orchestrator:
                     worktree=worktree,
                     repo_knowledge=knowledge,
                     project_rules=rules,
+                    cancel_event=cancel_event,
                 )
                 if not dev.ok:
                     feedback = f"Developer agent error: {dev.error}"
@@ -248,9 +280,13 @@ class Orchestrator:
                 review_tree = review_tree.strip()
                 await repo.end_attempt(self._db, attempt_id, diff_stat=_diff_stat(current_diff))
 
+                # Cooperative cancellation — check after developer, before review.
+                if cancel_event is not None and cancel_event.is_set():
+                    return await self._finish_cancelled(task, wm, task_branch)
+
                 failed, feedback, review_timed_out = await self._review(
                     runner, task, project.id, worktree, current_diff, attempts, config, knowledge,
-                    rules, started, budget,
+                    rules, started, budget, cancel_event=cancel_event,
                 )
                 if review_timed_out:
                     timed_out = True
@@ -280,6 +316,10 @@ class Orchestrator:
                 await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
                 if test_command and config.execution.require_full_green:
+                    # Cooperative cancellation — check before the gate (which may be slow).
+                    if cancel_event is not None and cancel_event.is_set():
+                        return await self._finish_cancelled(task, wm, task_branch)
+
                     # HARD cap: abort before running the test gate if the wall-clock
                     # budget has been exhausted. The gate itself may be slow; checking
                     # here prevents a very long test run from blowing past the cap.
@@ -342,6 +382,10 @@ class Orchestrator:
                 task, wm, task_branch,
                 f"unhandled exception processing task {task.id}",
             )
+        finally:
+            # Always clean the cancellation event so the dict doesn't leak memory
+            # — harmless no-op when the entry was already removed by _finish_cancelled.
+            self._cancel_events.pop(task.id, None)
 
     # --- phases ---------------------------------------------------------------
 
@@ -389,6 +433,8 @@ class Orchestrator:
         rules: str,
         baseline_preamble: str,
         config: ConclaveConfig,
+        *,
+        cancel_event: asyncio.Event | None = None,
     ) -> str:
         if not config.experimental.planner_enabled:
             return ""
@@ -411,6 +457,7 @@ class Orchestrator:
             worktree=worktree,
             repo_knowledge=knowledge,
             project_rules=rules,
+            cancel_event=cancel_event,
         )
         if not result.ok:
             return ""
@@ -440,6 +487,8 @@ class Orchestrator:
         worktree: Path,
         knowledge: str,
         rules: str,
+        *,
+        cancel_event: asyncio.Event | None = None,
     ) -> tuple[AgentResult, ParsedVerdict]:
         """Run one reviewer; retry ONLY a genuinely empty/timeout/CLI-missing dispatch.
 
@@ -464,6 +513,7 @@ class Orchestrator:
                 worktree=worktree,
                 repo_knowledge=knowledge,
                 project_rules=rules,
+                cancel_event=cancel_event,
             )
             parsed = parse_verdict(result.text)
             if parsed.source != "none" or result.text.strip():
@@ -489,6 +539,8 @@ class Orchestrator:
         rules: str,
         started: float,
         budget: float,
+        *,
+        cancel_event: asyncio.Event | None = None,
     ) -> tuple[bool, str, bool]:
         """Review the current diff through the derived agent pipeline.
 
@@ -504,6 +556,10 @@ class Orchestrator:
         reviewer_prompt = f"Review the changes made for this task:\n{task.request}"
         passes = 0
         for agent in pipeline:
+            # Cooperative cancellation — check between each reviewer dispatch.
+            if cancel_event is not None and cancel_event.is_set():
+                return True, "cancelled", False
+
             # HARD cap: abort the review if the wall-clock budget has been exceeded
             # before dispatching this reviewer. The orchestrator will fail the task
             # as timed-out rather than retrying the attempt.
@@ -517,7 +573,8 @@ class Orchestrator:
             # non-blocking 'unknown' — a single reviewer that can't run is NOT a code defect,
             # so it must not fail the whole attempt (mirrors the grounding downgrade).
             result, verdict = await self._dispatch_reviewer(
-                runner, agent, reviewer_prompt, task, worktree, knowledge, rules
+                runner, agent, reviewer_prompt, task, worktree, knowledge, rules,
+                cancel_event=cancel_event,
             )
             if verdict.source == "none" and not result.text.strip():
                 verdict = ParsedVerdict(
@@ -691,6 +748,29 @@ class Orchestrator:
         if blocked:
             logger.info("blocked %d descendant tasks after %s failed early", blocked, task.id)
         await wm.cleanup(task.id, task_branch)
+        return False
+
+    async def _finish_cancelled(
+        self, task: Task, wm: WorktreeManager, task_branch: str
+    ) -> bool:
+        """Transition *task* to ``cancelled``, clean its worktree, emit the event.
+
+        Returns ``False`` so the worker loop continues to the next task. The
+        cancellation-event entry in ``_cancel_events`` is cleaned here; the
+        ``finally`` block in :meth:`process_task` is a belt-and-suspenders no-op
+        when this already ran.
+        """
+        await repo.finalize_task(
+            self._db, task.id, state=TaskState.cancelled,
+            result_summary="cancelled by operator",
+        )
+        await self._bus.emit(
+            type=EventType.task_cancelled, project_id=task.project_id, task_id=task.id,
+        )
+        # Worktree cleanup is tolerant of missing paths (git worktree remove --force
+        # handles absent/locked worktrees).
+        await wm.cleanup(task.id, task_branch)
+        self._cancel_events.pop(task.id, None)
         return False
 
     async def _merge(

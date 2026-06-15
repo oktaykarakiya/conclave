@@ -7,6 +7,7 @@ without rewiring the orchestrator — it is deliberately minimal (no dead branch
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -44,6 +45,7 @@ class Provider(Protocol):
         timeout_seconds: int,
         cwd: Path | None = None,
         on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> AgentResult: ...
 
 
