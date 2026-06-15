@@ -548,3 +548,104 @@ async def test_body_size_middleware_accepts_at_or_below_limit(
         json={"name": "bs_ok", "path": str(repo_path), "default_branch": "main"},
     )
     assert resp.status_code == 200, resp.text
+
+
+# --- task-state filter validation --------------------------------------------
+
+
+async def test_list_tasks_rejects_bogus_state(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """GET .../tasks?state=bogus must return 422 (FastAPI enum validation), not 500."""
+    repo_path = tmp_path / "repo_state_val"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "state_val", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    resp = await client.get(
+        f"/api/projects/{project_id}/tasks", params={"state": "bogus"}
+    )
+    assert resp.status_code == 422, (
+        f"Expected 422 for bogus state, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_list_tasks_accepts_valid_state(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """GET .../tasks?state=approved must return 200 with filtered results."""
+    repo_path = tmp_path / "repo_state_ok"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "state_ok", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    resp = await client.get(
+        f"/api/projects/{project_id}/tasks", params={"state": "approved"}
+    )
+    assert resp.status_code == 200
+
+
+# --- quarantine until-date validation ----------------------------------------
+
+
+async def test_add_quarantine_rejects_malformed_until(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """POST .../quarantine with a malformed until date must return 422."""
+    repo_path = tmp_path / "repo_q_malformed"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "q_mal", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    resp = await client.post(
+        f"/api/projects/{project_id}/quarantine",
+        json={"pattern": "*.tmp", "reason": "test", "until": "not-a-date"},
+    )
+    assert resp.status_code == 422, (
+        f"Expected 422 for malformed until, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_add_quarantine_accepts_valid_until(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """POST .../quarantine with a valid YYYY-MM-DD date must return 200 and create the entry."""
+    repo_path = tmp_path / "repo_q_valid"
+    await _init_repo(repo_path)
+
+    created = await client.post(
+        "/api/projects",
+        json={"name": "q_ok", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200
+    project_id = created.json()["id"]
+
+    resp = await client.post(
+        f"/api/projects/{project_id}/quarantine",
+        json={"pattern": "*.tmp", "reason": "test", "until": "2026-12-31"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["pattern"] == "*.tmp"
+    assert data["until"] == "2026-12-31"
+
+    # Verify it appears in the listing
+    listing = await client.get(f"/api/projects/{project_id}/quarantine")
+    assert listing.status_code == 200
+    entries = listing.json()
+    assert any(e["until"] == "2026-12-31" for e in entries)

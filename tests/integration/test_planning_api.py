@@ -297,3 +297,61 @@ async def test_404_on_missing_session(
     client, _pid = client_with_session
     resp = await client.get("/api/planning/sessions/nonexistent")
     assert resp.status_code == 404
+
+
+async def test_404_missing_session_messages(
+    client_with_session: tuple[httpx.AsyncClient, str],
+) -> None:
+    """GET /planning/sessions/{unknown}/messages must return 404, not 500 or empty list."""
+    client, _pid = client_with_session
+    resp = await client.get("/api/planning/sessions/nonexistent/messages")
+    assert resp.status_code == 404, (
+        f"Expected 404 for missing session messages, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_404_missing_session_tasks(
+    client_with_session: tuple[httpx.AsyncClient, str],
+) -> None:
+    """GET /planning/sessions/{unknown}/tasks must return 404, not 500 or empty list."""
+    client, _pid = client_with_session
+    resp = await client.get("/api/planning/sessions/nonexistent/tasks")
+    assert resp.status_code == 404, (
+        f"Expected 404 for missing session tasks, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_404_missing_session_post_message(
+    client_with_session: tuple[httpx.AsyncClient, str],
+) -> None:
+    """POST /planning/sessions/{unknown}/messages must return 404, not 500."""
+    client, _pid = client_with_session
+    resp = await client.post(
+        "/api/planning/sessions/nonexistent/messages",
+        json={"content": "hello"},
+    )
+    assert resp.status_code == 404, (
+        f"Expected 404 for missing session post-message, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_404_missing_session_approve(
+    client_with_session: tuple[httpx.AsyncClient, str],
+) -> None:
+    """POST /planning/sessions/{unknown}/approve must return 404, not 500."""
+    client, _pid = client_with_session
+    resp = await client.post("/api/planning/sessions/nonexistent/approve")
+    assert resp.status_code == 404, (
+        f"Expected 404 for missing session approve, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_404_missing_session_cancel(
+    client_with_session: tuple[httpx.AsyncClient, str],
+) -> None:
+    """POST /planning/sessions/{unknown}/cancel must return 404, not 500."""
+    client, _pid = client_with_session
+    resp = await client.post("/api/planning/sessions/nonexistent/cancel")
+    assert resp.status_code == 404, (
+        f"Expected 404 for missing session cancel, got {resp.status_code}: {resp.text}"
+    )

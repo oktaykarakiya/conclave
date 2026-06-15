@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ProjectCreate(BaseModel):
@@ -47,6 +48,18 @@ class QuarantineInput(BaseModel):
     pattern: str
     reason: str
     until: str  # YYYY-MM-DD
+
+    @field_validator("until")
+    @classmethod
+    def _validate_until_date(cls, v: str) -> str:
+        """Reject non-ISO dates so the stored string always parses as YYYY-MM-DD."""
+        try:
+            date.fromisoformat(v)
+        except ValueError as exc:
+            raise ValueError(
+                f"until must be a valid YYYY-MM-DD date, got: {v!r}"
+            ) from exc
+        return v
 
 
 class AgentUpsert(BaseModel):

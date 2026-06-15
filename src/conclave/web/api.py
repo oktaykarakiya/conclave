@@ -75,6 +75,20 @@ async def _require_task(daemon: Daemon, task_id: str) -> Task:
     return task
 
 
+async def _require_planning_session(
+    daemon: Daemon, session_id: str
+) -> PlanningSession:
+    """Look up a planning session, raising 404 when missing.
+
+    This mirrors _require_project: every session-scoped endpoint calls it first
+    so a bogus session ID returns 404 instead of 500 (or an empty surrogate).
+    """
+    session = await repo.get_planning_session(daemon.db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="planning session not found")
+    return session
+
+
 # --- meta -------------------------------------------------------------------
 
 
@@ -249,13 +263,12 @@ async def delete_quarantine(entry_id: str, daemon: Daemon = Depends(get_daemon))
 @router.get("/projects/{project_id}/tasks")
 async def list_tasks(
     project_id: str,
-    state: str | None = None,
+    state: TaskState | None = None,
     pagination: PaginationParams = Depends(_pagination),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[Task]:
-    task_state = TaskState(state) if state else None
     return await repo.list_tasks(
-        daemon.db, project_id, task_state, limit=pagination.limit, offset=pagination.offset
+        daemon.db, project_id, state, limit=pagination.limit, offset=pagination.offset
     )
 
 
@@ -524,10 +537,7 @@ async def create_planning_session(
 async def get_planning_session(
     session_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> PlanningSession:
-    session = await repo.get_planning_session(daemon.db, session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="planning session not found")
-    return session
+    return await _require_planning_session(daemon, session_id)
 
 
 @router.get("/planning/sessions/{session_id}/messages")
@@ -536,6 +546,7 @@ async def list_planning_messages(
     pagination: PaginationParams = Depends(_pagination),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningMessage]:
+    await _require_planning_session(daemon, session_id)
     return await repo.list_planning_messages(
         daemon.db, session_id, limit=pagination.limit, offset=pagination.offset
     )
@@ -545,6 +556,7 @@ async def list_planning_messages(
 async def add_planning_message(
     session_id: str, body: PlanningMessageInput, daemon: Daemon = Depends(get_daemon)
 ) -> PlanningMessage:
+    await _require_planning_session(daemon, session_id)
     return await daemon.planning_orchestrator.add_human_message(
         session_id, body.content
     )
@@ -556,6 +568,7 @@ async def list_planning_task_nodes(
     pagination: PaginationParams = Depends(_pagination),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[PlanningTaskNode]:
+    await _require_planning_session(daemon, session_id)
     return await repo.list_planning_task_nodes(
         daemon.db, session_id, limit=pagination.limit, offset=pagination.offset
     )
@@ -565,12 +578,11 @@ async def list_planning_task_nodes(
 async def approve_planning_session(
     session_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
+    await _require_planning_session(daemon, session_id)
     try:
         task_ids = await daemon.planning_orchestrator.approve_session(session_id)
     except ValueError as exc:
         msg = str(exc)
-        if "session not found" in msg:
-            raise HTTPException(status_code=404, detail=msg) from exc
         if "session is cancelled" in msg:
             raise HTTPException(status_code=409, detail=msg) from exc
         raise HTTPException(status_code=400, detail=msg) from exc
@@ -581,12 +593,11 @@ async def approve_planning_session(
 async def cancel_planning_session(
     session_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, bool]:
+    await _require_planning_session(daemon, session_id)
     try:
         await daemon.planning_orchestrator.cancel_session(session_id)
     except ValueError as exc:
-        if "session not found" in str(exc):
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        raise
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"cancelled": True}
 
 
