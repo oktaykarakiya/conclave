@@ -177,6 +177,32 @@ async def set_task_state(db: Database, task_id: str, state: TaskState) -> None:
     )
 
 
+async def delete_task(db: Database, task_id: str) -> bool:
+    """Atomically delete a task and its orphaned child rows.
+
+    ``attempts`` and ``verdicts`` auto-cascade via ``ON DELETE CASCADE`` FK.
+    ``events`` and ``usage`` have no FK — they are deleted explicitly inside
+    the same transaction so nothing is left dangling.
+
+    The ``WHERE state != 'in_progress'`` guard is defense-in-depth against a
+    TOCTOU between the API-layer check and this delete: if the task was claimed
+    between the read and the write the DELETE simply won't match (zero rows).
+
+    Returns ``True`` if the task row was deleted, ``False`` if it was
+    ``in_progress`` (or didn't exist).
+    """
+    async with db.transaction() as conn:
+        # Remove orphan-prone child rows first — events and usage lack FK cascades.
+        await conn.execute("DELETE FROM events WHERE task_id = ?", (task_id,))
+        await conn.execute("DELETE FROM usage WHERE task_id = ?", (task_id,))
+        # Delete the task; attempts + verdicts cascade via FK.
+        cur = await conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND state != 'in_progress'",
+            (task_id,),
+        )
+        return cur.rowcount > 0
+
+
 async def approve_task(db: Database, task_id: str) -> bool:
     """Atomically set state to ``approved`` only if currently in an approvable state.
 
@@ -346,6 +372,20 @@ async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
     return blocked
 
 
+async def get_in_progress_tasks(db: Database, project_id: str) -> list[Task]:
+    """Return all tasks currently ``in_progress`` for a project.
+
+    Used by :meth:`Daemon.cleanup_in_progress_work` when detaching a project so the
+    caller can tear down worktrees before the project row (and its FK-cascaded
+    children) are deleted.
+    """
+    rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE project_id = ? AND state = 'in_progress'",
+        (project_id,),
+    )
+    return [Task.from_row(r) for r in rows]
+
+
 async def recover_in_progress(db: Database, project_id: str) -> tuple[int, int]:
     """Reset orphaned ``in_progress`` tasks to ``approved`` and re-block descendants
     of ``failed``/``blocked`` parents (crash recovery).
@@ -506,6 +546,21 @@ async def list_events(
             "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit)
         )
     return [EventRow.from_row(r) for r in rows]
+
+
+async def gc_events(db: Database, project_id: str, keep: int = 10_000) -> None:
+    """Prune ``events`` rows beyond the most-recent *keep* per project.
+
+    Uses the same subquery-DELETE pattern as :func:`gc_baselines`: keeps the highest-id
+    rows and drops the rest.  The DELETE is cheap when the row count is below *keep*
+    (the subquery returns all ids, so none match the NOT IN).  The operation runs
+    through the standard serialized write so it composes safely with concurrent appends.
+    """
+    await db.execute(
+        "DELETE FROM events WHERE project_id = ? AND id NOT IN "
+        "(SELECT id FROM events WHERE project_id = ? ORDER BY id DESC LIMIT ?)",
+        (project_id, project_id, keep),
+    )
 
 
 # --- usage ------------------------------------------------------------------
@@ -926,6 +981,16 @@ async def update_planning_session_status(
     await db.execute(
         "UPDATE planning_sessions SET status = ?, completed_at = ? WHERE id = ?",
         (status.value, completed_at, session_id),
+    )
+
+
+async def update_planning_session_stabilization_reason(
+    db: Database, session_id: str, reason: str
+) -> None:
+    """Persist a short description of why the session auto-stabilised."""
+    await db.execute(
+        "UPDATE planning_sessions SET stabilization_reason = ? WHERE id = ?",
+        (reason, session_id),
     )
 
 

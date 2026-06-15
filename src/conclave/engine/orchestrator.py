@@ -25,7 +25,7 @@ from ..events import EventBus, EventType
 from ..providers import AgentResult, Provider
 from ..repo_intel.knowledge import render_preamble
 from .baseline import build_baseline_preamble
-from .gate import run_tests
+from .gate import apply_quarantine, run_tests
 from .gitio import run_git, run_shell
 from .memory import AttemptMemory
 from .pipeline import get_agent_pipeline
@@ -40,6 +40,11 @@ _PROJECT_RULE_FILES = ("CONCLAVE.md", "CLAUDE.md")
 # developer's work and re-run the whole develop→review loop.
 _REVIEWER_DISPATCH_RETRIES = 2
 _REVIEWER_RETRY_BACKOFF_S = 3.0
+
+# Hard cap on diff characters injected into agent prompts to prevent context-window
+# overflow from very large diffs. The truncation marker includes the original size so
+# the agent can still reason about scope.
+_MAX_DIFF_CHARS = 40_000
 
 logger = logging.getLogger("conclave.engine.orchestrator")
 
@@ -69,13 +74,31 @@ class Orchestrator:
         # "main" concurrently can never race on a shared worktree path or
         # clobber each other's ref update.
         self._merge_locks: dict[str, asyncio.Lock] = {}
+        # Per-task cancellation events — set by the daemon through
+        # :meth:`request_cancel` and checked by :meth:`process_task` between
+        # every pipeline stage for cooperative cancellation.
+        self._cancel_events: dict[str, asyncio.Event] = {}
 
     async def recover(self, project_id: str) -> tuple[int, int]:
         """Crash recovery: return orphaned in_progress tasks to approved and re-block
         descendants of failed/blocked parents. Returns ``(recovered, reblocked)``."""
         return await repo.recover_in_progress(self._db, project_id)
 
-    async def process_task(self, task: Task) -> bool:
+    def request_cancel(self, task_id: str) -> bool:
+        """Signal cooperative cancellation for *task_id*.
+
+        Returns ``True`` when a cancellation event was set (the task was in-flight),
+        ``False`` when no event exists (the task is not currently being processed).
+        The caller (daemon/cancel endpoint) still transitions non-running tasks
+        (inbox/approved) directly — this only covers the in-progress path.
+        """
+        event = self._cancel_events.get(task_id)
+        if event is None:
+            return False
+        event.set()
+        return True
+
+    async def process_task(self, task: Task, *, cancel_event: asyncio.Event | None = None) -> bool:
         project = await repo.get_project(self._db, task.project_id)
         if project is None:
             return False
@@ -128,6 +151,10 @@ class Orchestrator:
                         f"worktree setup failed (exit {rc}):\n{out[-1000:]}",
                     )
 
+            # Cooperative cancellation — check after setup, before baseline.
+            if cancel_event is not None and cancel_event.is_set():
+                return await self._finish_cancelled(task, wm, task_branch)
+
             knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
             knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
             rules = _read_project_rules(worktree)
@@ -136,14 +163,23 @@ class Orchestrator:
                 knowledge_row.knowledge if knowledge_row else None,
             )
             test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
+            # Inject active quarantine exclusions so flaky quarantined tests
+            # don't fail the baseline snapshot or the green-gate.
+            test_command = await apply_quarantine(self._db, project.id, test_command)
             gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
 
             baseline_preamble = await self._baseline(
-                project.id, worktree, checkpoint, target_branch, test_command, gate_timeout
+                project.id, worktree, checkpoint, target_branch, test_command, gate_timeout,
+                events_retention=config.execution.retention_events_max,
             )
             plan_preamble = await self._maybe_plan(
-                runner, task, worktree, knowledge, rules, baseline_preamble, config
+                runner, task, worktree, knowledge, rules, baseline_preamble, config,
+                cancel_event=cancel_event,
             )
+
+            # Cooperative cancellation — check after planning, before developer loop.
+            if cancel_event is not None and cancel_event.is_set():
+                return await self._finish_cancelled(task, wm, task_branch)
 
             memory = AttemptMemory(config.experimental.cross_attempt_memory_entries)
             use_memory = config.experimental.cross_attempt_memory
@@ -158,7 +194,7 @@ class Orchestrator:
             timed_out = False
 
             while attempts < max_retries:
-                if budget > 0 and (time.monotonic() - started) / 60.0 >= budget:
+                if _check_budget(started, budget):
                     timed_out = True
                     failed = True
                     break
@@ -194,8 +230,21 @@ class Orchestrator:
                     if previous_diff:
                         dev_prompt += (
                             "\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n"
-                            + previous_diff + "\n```"
+                            + _truncate_diff(previous_diff) + "\n```"
                         )
+
+                # HARD cap: abort the task if the wall-clock budget has been exceeded
+                # before launching the developer agent. The top-of-loop check catches
+                # inter-attempt overruns; this one catches a series of fast attempts
+                # whose cumulative setup (planning, baseline) ate the budget.
+                if _check_budget(started, budget):
+                    timed_out = True
+                    failed = True
+                    break
+
+                # Cooperative cancellation — check before developer dispatch.
+                if cancel_event is not None and cancel_event.is_set():
+                    return await self._finish_cancelled(task, wm, task_branch)
 
                 dev = await runner.run(
                     agent="developer",
@@ -204,6 +253,7 @@ class Orchestrator:
                     worktree=worktree,
                     repo_knowledge=knowledge,
                     project_rules=rules,
+                    cancel_event=cancel_event,
                 )
                 if not dev.ok:
                     feedback = f"Developer agent error: {dev.error}"
@@ -221,6 +271,7 @@ class Orchestrator:
                 # reviewers and grounding see — not just modifications to tracked files.
                 await run_git(worktree, "add", "-A")
                 _, current_diff = await run_git(worktree, "diff", "--cached", checkpoint)
+                current_diff = _truncate_diff(current_diff)
                 # ENG-2: snapshot the exact staged tree the reviewers are about to review.
                 # Reviewers run with --dangerously-skip-permissions and CAN write to the
                 # worktree, but anything they touch falls outside ``current_diff`` (so grounding
@@ -232,10 +283,18 @@ class Orchestrator:
                 review_tree = review_tree.strip()
                 await repo.end_attempt(self._db, attempt_id, diff_stat=_diff_stat(current_diff))
 
-                failed, feedback = await self._review(
+                # Cooperative cancellation — check after developer, before review.
+                if cancel_event is not None and cancel_event.is_set():
+                    return await self._finish_cancelled(task, wm, task_branch)
+
+                failed, feedback, review_timed_out = await self._review(
                     runner, task, project.id, worktree, current_diff, attempts, config, knowledge,
-                    rules,
+                    rules, started, budget, cancel_event=cancel_event,
                 )
+                if review_timed_out:
+                    timed_out = True
+                    failed = True
+                    break
                 if failed:
                     await self._bus.emit(
                         type=EventType.attempt_failed,
@@ -260,6 +319,18 @@ class Orchestrator:
                 await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
                 if test_command and config.execution.require_full_green:
+                    # Cooperative cancellation — check before the gate (which may be slow).
+                    if cancel_event is not None and cancel_event.is_set():
+                        return await self._finish_cancelled(task, wm, task_branch)
+
+                    # HARD cap: abort before running the test gate if the wall-clock
+                    # budget has been exhausted. The gate itself may be slow; checking
+                    # here prevents a very long test run from blowing past the cap.
+                    if _check_budget(started, budget):
+                        timed_out = True
+                        failed = True
+                        break
+
                     gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
                     if not gate.passed:
                         # ENG-7: distinguish infra failures (timeout / missing command)
@@ -314,6 +385,10 @@ class Orchestrator:
                 task, wm, task_branch,
                 f"unhandled exception processing task {task.id}",
             )
+        finally:
+            # Always clean the cancellation event so the dict doesn't leak memory
+            # — harmless no-op when the entry was already removed by _finish_cancelled.
+            self._cancel_events.pop(task.id, None)
 
     # --- phases ---------------------------------------------------------------
 
@@ -325,6 +400,7 @@ class Orchestrator:
         target_branch: str,
         test_command: str | None,
         gate_timeout: int,
+        events_retention: int = 10_000,
     ) -> str:
         if not test_command:
             return ""
@@ -345,6 +421,10 @@ class Orchestrator:
             failures = gate.output
         await repo.save_baseline(self._db, project_id, checkpoint, failures)
         await repo.gc_baselines(self._db, project_id)
+        # Prune old events per-project so the events table stays bounded under load.
+        # The DELETE is cheap when under the cap (no rows match) and is index-covered
+        # by the existing (project_id, id) index.
+        await repo.gc_events(self._db, project_id, keep=events_retention)
         return build_baseline_preamble(target_branch, failures)
 
     async def _maybe_plan(
@@ -356,6 +436,8 @@ class Orchestrator:
         rules: str,
         baseline_preamble: str,
         config: ConclaveConfig,
+        *,
+        cancel_event: asyncio.Event | None = None,
     ) -> str:
         if not config.experimental.planner_enabled:
             return ""
@@ -378,6 +460,7 @@ class Orchestrator:
             worktree=worktree,
             repo_knowledge=knowledge,
             project_rules=rules,
+            cancel_event=cancel_event,
         )
         if not result.ok:
             return ""
@@ -407,6 +490,8 @@ class Orchestrator:
         worktree: Path,
         knowledge: str,
         rules: str,
+        *,
+        cancel_event: asyncio.Event | None = None,
     ) -> tuple[AgentResult, ParsedVerdict]:
         """Run one reviewer; retry ONLY a genuinely empty/timeout/CLI-missing dispatch.
 
@@ -431,6 +516,7 @@ class Orchestrator:
                 worktree=worktree,
                 repo_knowledge=knowledge,
                 project_rules=rules,
+                cancel_event=cancel_event,
             )
             parsed = parse_verdict(result.text)
             if parsed.source != "none" or result.text.strip():
@@ -454,7 +540,17 @@ class Orchestrator:
         config: ConclaveConfig,
         knowledge: str,
         rules: str,
-    ) -> tuple[bool, str]:
+        started: float,
+        budget: float,
+        *,
+        cancel_event: asyncio.Event | None = None,
+    ) -> tuple[bool, str, bool]:
+        """Review the current diff through the derived agent pipeline.
+
+        Returns ``(failed, feedback, timed_out)``. ``timed_out`` is ``True`` when the
+        wall-clock budget was exceeded mid-review — the caller must abort the task, not
+        retry the attempt.
+        """
         pipeline = get_agent_pipeline(current_diff, config.agents)
         await self._bus.emit(
             type=EventType.pipeline_derived, project_id=project_id, task_id=task.id,
@@ -463,6 +559,16 @@ class Orchestrator:
         reviewer_prompt = f"Review the changes made for this task:\n{task.request}"
         passes = 0
         for agent in pipeline:
+            # Cooperative cancellation — check between each reviewer dispatch.
+            if cancel_event is not None and cancel_event.is_set():
+                return True, "cancelled", False
+
+            # HARD cap: abort the review if the wall-clock budget has been exceeded
+            # before dispatching this reviewer. The orchestrator will fail the task
+            # as timed-out rather than retrying the attempt.
+            if _check_budget(started, budget):
+                return True, "Wall-clock budget exceeded during review.", True
+
             # ENG-4: _dispatch_reviewer already parsed the output; the verdict is used as-is.
             # A parseable verdict (even one whose process exited non-zero) and any usable
             # text both come back here untouched. Only a genuinely empty response (no verdict
@@ -470,7 +576,8 @@ class Orchestrator:
             # non-blocking 'unknown' — a single reviewer that can't run is NOT a code defect,
             # so it must not fail the whole attempt (mirrors the grounding downgrade).
             result, verdict = await self._dispatch_reviewer(
-                runner, agent, reviewer_prompt, task, worktree, knowledge, rules
+                runner, agent, reviewer_prompt, task, worktree, knowledge, rules,
+                cancel_event=cancel_event,
             )
             if verdict.source == "none" and not result.text.strip():
                 verdict = ParsedVerdict(
@@ -517,7 +624,7 @@ class Orchestrator:
             )
             if verdict.verdict in ("fail", "block", "decline"):
                 header = f"{agent.upper()} FEEDBACK ({verdict.verdict.upper()})"
-                return True, f"\n{header}:\n{verdict.reason}\n"
+                return True, f"\n{header}:\n{verdict.reason}\n", False
             if verdict.verdict == "pass":
                 passes += 1
         # ENG-3: never merge on an all-'unknown' round. If reviewers were derived but
@@ -530,8 +637,8 @@ class Orchestrator:
                 "\nREVIEW INCONCLUSIVE: no reviewer returned a usable verdict "
                 "(all 'unknown' — the model backend was likely unavailable). "
                 "Not merging without at least one grounded review; retrying.\n"
-            )
-        return False, ""
+            ), False
+        return False, "", False
 
     async def _finish_success(
         self,
@@ -646,6 +753,29 @@ class Orchestrator:
         await wm.cleanup(task.id, task_branch)
         return False
 
+    async def _finish_cancelled(
+        self, task: Task, wm: WorktreeManager, task_branch: str
+    ) -> bool:
+        """Transition *task* to ``cancelled``, clean its worktree, emit the event.
+
+        Returns ``False`` so the worker loop continues to the next task. The
+        cancellation-event entry in ``_cancel_events`` is cleaned here; the
+        ``finally`` block in :meth:`process_task` is a belt-and-suspenders no-op
+        when this already ran.
+        """
+        await repo.finalize_task(
+            self._db, task.id, state=TaskState.cancelled,
+            result_summary="cancelled by operator",
+        )
+        await self._bus.emit(
+            type=EventType.task_cancelled, project_id=task.project_id, task_id=task.id,
+        )
+        # Worktree cleanup is tolerant of missing paths (git worktree remove --force
+        # handles absent/locked worktrees).
+        await wm.cleanup(task.id, task_branch)
+        self._cancel_events.pop(task.id, None)
+        return False
+
     async def _merge(
         self, repo_path: Path, target_branch: str, task_branch: str, task_id: str
     ) -> MergeResult:
@@ -747,6 +877,25 @@ def _commit_message(task: Task) -> str:
     first_line = next((ln.strip() for ln in task.request.splitlines() if ln.strip()), task.id)
     subject = task.title or first_line
     return f"feat(conclave): {subject[:72]}\n\n{task.request}"
+
+
+def _check_budget(started: float, budget_minutes: float) -> bool:
+    """Return ``True`` when the wall-clock budget has been exceeded.
+
+    Called before every agent dispatch within an attempt (developer, each reviewer, gate)
+    so a single long-running agent call can't blow past the configured cap — the task is
+    failed as timed-out as soon as the cap is reached.
+    """
+    if budget_minutes <= 0:
+        return False
+    return (time.monotonic() - started) / 60.0 >= budget_minutes
+
+
+def _truncate_diff(diff: str) -> str:
+    """Truncate an oversized diff with a clear marker so it doesn't overflow context."""
+    if len(diff) <= _MAX_DIFF_CHARS:
+        return diff
+    return diff[:_MAX_DIFF_CHARS] + f"\n... [diff truncated — original was {len(diff)} chars]"
 
 
 def _diff_stat(diff: str) -> str:

@@ -7,6 +7,7 @@ cwd to produce a real diff; the repo-analyst emits a valid enrichment JSON.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
@@ -115,6 +116,7 @@ class FakeProvider:
         timeout_seconds: int,
         cwd: Path | None = None,
         on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> AgentResult:
         self.prompts.append(prompt)
         # --- orchestrator flows (matched FIRST) ---

@@ -71,6 +71,7 @@ class PlanningSession(BaseModel):
     status: PlanningSessionStatus = PlanningSessionStatus.active
     turn_number: int = 0
     max_rounds: int = 5
+    stabilization_reason: str | None = None
     created_at: str
     completed_at: str | None = None
 
@@ -84,6 +85,7 @@ class PlanningSession(BaseModel):
             status=_enum(PlanningSessionStatus, row["status"], PlanningSessionStatus.active),
             turn_number=row["turn_number"],
             max_rounds=row["max_rounds"],
+            stabilization_reason=row["stabilization_reason"],
             created_at=row["created_at"],
             completed_at=row["completed_at"],
         )

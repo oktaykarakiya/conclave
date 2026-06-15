@@ -47,6 +47,7 @@ class ClaudeCliProvider:
         timeout_seconds: int,
         cwd: Path | None = None,
         on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> AgentResult:
         invocation = build_invocation(profile)
         # Strip provider-controlled env vars from the parent environment so they
@@ -107,25 +108,55 @@ class ClaudeCliProvider:
             await proc.wait()
             return "".join(parts)
 
-        try:
-            raw = await asyncio.wait_for(drive(), timeout=timeout_seconds)
-        except TimeoutError:
-            # Terminate the entire process group so descendant subagents
-            # (e.g. tools spawned by the CLI) aren't orphaned.  Two-phase
-            # escalation — SIGTERM first for a graceful shutdown window,
-            # then SIGKILL for any stragglers.
-            try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                await asyncio.sleep(0.3)
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+        drive_task = asyncio.create_task(drive())
+        cancel_wait_task: asyncio.Task[None] | None = None
+
+        if cancel_event is not None:
+            cancel_wait_task = asyncio.create_task(_wait_cancel(cancel_event))
+            done, _pending = await asyncio.wait(
+                [drive_task, cancel_wait_task],
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        else:
+            done, _pending = await asyncio.wait(
+                [drive_task],
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+        # --- cancellation won the race ---
+        if cancel_wait_task is not None and cancel_wait_task in done:
+            await _kill_process_group(proc.pid)
             with contextlib.suppress(ProcessLookupError):
                 await proc.wait()
-            return AgentResult(ok=False, error=f"timed out after {timeout_seconds}s")
+            drive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await drive_task
+            return AgentResult(ok=False, error="cancelled")
 
-        return _parse_envelope(raw, proc.returncode)
+        # --- drive completed normally ---
+        if drive_task in done:
+            raw: str = drive_task.result()
+            if cancel_wait_task is not None:
+                cancel_wait_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cancel_wait_task
+            return _parse_envelope(raw, proc.returncode)
+
+        # --- timeout: neither completed in time ---
+        await _kill_process_group(proc.pid)
+        with contextlib.suppress(ProcessLookupError):
+            await proc.wait()
+        drive_task.cancel()
+        if cancel_wait_task is not None:
+            cancel_wait_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await drive_task
+        if cancel_wait_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_wait_task
+        return AgentResult(ok=False, error=f"timed out after {timeout_seconds}s")
 
 
 def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
@@ -178,3 +209,24 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
 
 def _as_int(value: object) -> int | None:
     return value if isinstance(value, int) else None
+
+
+async def _kill_process_group(pid: int) -> None:
+    """Two-phase process-group termination: SIGTERM, brief grace, then SIGKILL.
+
+    Descendant subagents (e.g. tools spawned by the CLI) share the process group
+    so a targeted ``killpg`` ensures they are not orphaned.
+    """
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+        await asyncio.sleep(0.3)
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+async def _wait_cancel(event: asyncio.Event) -> None:
+    """Bridge :meth:`asyncio.Event.wait` (which returns ``True``) to a ``None``-returning
+    coroutine so ``asyncio.create_task`` type-checks against ``Task[None]``."""
+    await event.wait()

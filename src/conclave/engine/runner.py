@@ -7,6 +7,7 @@ records usage, and emits dispatch/result events.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from ..config import ArgMode, ConclaveConfig, resolve_agent
@@ -50,6 +51,7 @@ class AgentRunner:
         worktree: Path,
         repo_knowledge: str = "",
         project_rules: str = "",
+        cancel_event: asyncio.Event | None = None,
     ) -> AgentResult:
         persona = await repo.get_agent(self._db, agent, self._project_id)
         system = (
@@ -75,6 +77,7 @@ class AgentRunner:
             prompt=full_prompt,
             timeout_seconds=settings.timeout_minutes * 60,
             cwd=worktree,
+            cancel_event=cancel_event,
         )
         await repo.add_usage(
             self._db,

@@ -18,26 +18,36 @@ from pathlib import Path
 from .config import load_project_config
 from .db import Database
 from .db import repositories as repo
-from .engine import Orchestrator
+from .engine import Orchestrator, WorktreeManager
 from .events import EventBus
 from .planning.session import PlanningOrchestrator
 from .providers import Provider
-from .repo_intel import RepoKnowledge, ai_enrich
+from .repo_intel import RepoKnowledge, ai_enrich, onboard
 
 logger = logging.getLogger("conclave.runtime")
 
 
 class ProjectWorker:
     def __init__(
-        self, db: Database, orchestrator: Orchestrator, project_id: str, *, idle_sleep: float = 2.0
+        self,
+        db: Database,
+        orchestrator: Orchestrator,
+        project_id: str,
+        *,
+        idle_sleep: float = 2.0,
+        max_idle_sleep: float = 30.0,
     ) -> None:
         self._db = db
         self._orchestrator = orchestrator
         self.project_id = project_id
         self._idle_sleep = idle_sleep
+        self._max_idle_sleep = max_idle_sleep
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self.paused = False
+        # Current backoff sleep — grows on consecutive idle iterations and resets
+        # to ``_idle_sleep`` whenever work is claimed.
+        self._current_idle_sleep = idle_sleep
 
     async def start(self) -> None:
         await self._orchestrator.recover(self.project_id)
@@ -51,14 +61,39 @@ class ProjectWorker:
                     continue
                 task = await repo.claim_next_approved(self._db, self.project_id)
                 if task is None:
-                    await asyncio.sleep(self._idle_sleep)
+                    await self._idle_backoff()
                     continue
-                await self._orchestrator.process_task(task)
+                # Work claimed — reset backoff so the next idle cycle starts
+                # from the minimum.
+                self._current_idle_sleep = self._idle_sleep
+                # Register a cancellation event so the cancel endpoint can signal
+                # cooperative cancellation for this specific task.
+                cancel_event = asyncio.Event()
+                self._orchestrator._cancel_events[task.id] = cancel_event
+                try:
+                    await self._orchestrator.process_task(
+                        task, cancel_event=cancel_event,
+                    )
+                finally:
+                    # Clean the event entry regardless of outcome — the
+                    # orchestrator's _finish_cancelled also cleans it, but
+                    # this finally is the belt-and-suspenders so the dict
+                    # can never leak entries.
+                    self._orchestrator._cancel_events.pop(task.id, None)
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep the worker alive on unexpected errors
                 logger.exception("worker error for project %s", self.project_id)
                 await asyncio.sleep(self._idle_sleep)
+
+    # --- Internal helpers ----------------------------------------------------
+
+    async def _idle_backoff(self) -> None:
+        """Sleep for the current backoff duration then double it (capped)."""
+        await asyncio.sleep(self._current_idle_sleep)
+        self._current_idle_sleep = min(
+            self._current_idle_sleep * 2, self._max_idle_sleep
+        )
 
     async def stop(self) -> None:
         self._stop.set()
@@ -126,6 +161,28 @@ class Daemon:
         except Exception:
             logger.exception("backfill: AI enrichment failed for project %s", p.id)
 
+    async def _onboard_project(self, project: object) -> None:
+        """Run onboarding for a newly-created project as a tracked background task.
+
+        This runs after :meth:`create_project` returns so the endpoint is fast.
+        An onboarding failure is logged but never fatal — the project remains
+        usable (it just won't have repo knowledge yet, which the operator can
+        obtain later via the re-onboard endpoint).
+        """
+        from .db.models import Project as ProjectModel
+        p: ProjectModel = project  # type: ignore[assignment]
+        try:
+            config = load_project_config(p.config)
+            await onboard(
+                self.db, self.bus, p,
+                provider=self.provider, config=config,
+            )
+            logger.info("onboarding complete for project %s", p.id)
+        except Exception:
+            logger.exception(
+                "onboarding failed for project %s (project is still usable)", p.id
+            )
+
     async def shutdown(self) -> None:
         # 1. Stop per-project workers so no new tasks are claimed.
         for worker in list(self._workers.values()):
@@ -164,3 +221,54 @@ class Daemon:
             return False
         worker.paused = paused
         return True
+
+    async def request_cancel(self, task_id: str) -> bool:
+        """Request cooperative cancellation for an in-progress *task_id*.
+
+        Returns ``True`` when a cancellation event was set (the task was in-flight).
+        Returns ``False`` when the task is not currently being processed, meaning the
+        caller should handle non-running states directly (e.g. transition inbox/approved
+        to cancelled, or return a no-op for terminal states).
+        """
+        return self.orchestrator.request_cancel(task_id)
+
+    async def cleanup_in_progress_work(self, project_id: str) -> None:
+        """Cancel in-progress tasks and clean their worktrees for a stopped worker.
+
+        Must be called AFTER :meth:`stop_worker` so no new tasks can be claimed
+        by the project's worker between the query and the cleanup. Each in-progress
+        task's on-disk worktree is removed (``--force``), then the task is marked
+        ``cancelled``. Exceptions during cleanup are caught and logged so one bad
+        worktree cannot block project detachment.
+
+        FK ``ON DELETE CASCADE`` handles removing the cancelled rows when the
+        project itself is deleted — this method only ensures the disk worktrees
+        are gone first.
+        """
+        from .db.models import TaskState
+
+        project = await repo.get_project(self.db, project_id)
+        if project is None:
+            return
+
+        in_progress = await repo.get_in_progress_tasks(self.db, project_id)
+        if not in_progress:
+            return
+
+        wm = WorktreeManager(
+            Path(project.path),
+            self.home / "projects" / project_id / "worktrees",
+        )
+
+        for task in in_progress:
+            # Clean the worktree before cancelling.  git worktree remove --force
+            # handles locked/incomplete worktrees; if the path doesn't exist at
+            # all the call still exits non-zero, so we catch and continue.
+            try:
+                await wm.cleanup(task.id, task_branch=None)
+            except Exception:
+                logger.exception(
+                    "failed to clean worktree for task %s during project detach; "
+                    "continuing", task.id,
+                )
+            await repo.set_task_state(self.db, task.id, TaskState.cancelled)

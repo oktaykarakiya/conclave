@@ -18,6 +18,7 @@ class EventType(StrEnum):
     task_cancelled = "task.cancelled"
     task_committed = "task.committed"
     task_merged = "task.merged"
+    task_deleted = "task.deleted"
     task_done = "task.done"
     task_failed = "task.failed"
     # planning

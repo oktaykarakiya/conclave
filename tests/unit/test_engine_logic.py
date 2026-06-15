@@ -1,4 +1,5 @@
-"""Unit tests for the ported engine logic: verdicts, grounding, pipeline, memory."""
+"""Unit tests for the ported engine logic: verdicts, grounding, pipeline, memory,
+budget checks, and diff truncation."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from conclave.engine import (
     parse_verdict,
     trim_output,
 )
+from conclave.engine.orchestrator import _MAX_DIFF_CHARS, _check_budget, _truncate_diff
 
 # --- parse_verdict ----------------------------------------------------------
 
@@ -241,3 +243,133 @@ def test_build_venv_guidance_handles_empty_config(tmp_path: Path) -> None:
     assert "pytest" not in result
     assert "mypy" not in result
     assert "ruff" not in result
+
+
+# --- _check_budget -----------------------------------------------------------
+
+
+def test_check_budget_returns_true_when_exceeded() -> None:
+    """A budget of 0.001 minutes started 0.1 seconds ago is already exceeded."""
+    import time
+    started = time.monotonic() - 0.1  # started 100ms ago
+    assert _check_budget(started, 0.001) is True
+
+
+def test_check_budget_returns_false_when_not_exceeded() -> None:
+    """A budget of 60 minutes started just now is not exceeded."""
+    import time
+    started = time.monotonic()
+    assert _check_budget(started, 60.0) is False
+
+
+def test_check_budget_returns_false_when_budget_is_zero() -> None:
+    """A budget of 0 means 'no cap' — never exceeded."""
+    import time
+    started = time.monotonic() - 3600  # started an hour ago
+    assert _check_budget(started, 0.0) is False
+
+
+# --- _truncate_diff ----------------------------------------------------------
+
+
+def test_truncate_diff_truncates_oversized_diff_and_includes_marker() -> None:
+    """A diff larger than _MAX_DIFF_CHARS is truncated with a clear marker."""
+    big = "x" * (_MAX_DIFF_CHARS + 100)
+    result = _truncate_diff(big)
+    assert len(result) < len(big)
+    assert "[diff truncated — original was" in result
+    assert str(len(big)) in result
+    # The truncated content should be the first _MAX_DIFF_CHARS chars plus the marker.
+    assert result.startswith("x" * _MAX_DIFF_CHARS)
+
+
+def test_truncate_diff_leaves_small_diff_unchanged() -> None:
+    """A diff under the cap is returned verbatim."""
+    small = "diff --git a/x b/x\n+hello"
+    result = _truncate_diff(small)
+    assert result == small
+
+
+def test_truncate_diff_at_exact_boundary_is_unchanged() -> None:
+    """A diff exactly at _MAX_DIFF_CHARS is not truncated."""
+    exact = "y" * _MAX_DIFF_CHARS
+    result = _truncate_diff(exact)
+    assert result == exact
+    assert "[diff truncated" not in result
+
+
+# --- check_grounding path traversal ------------------------------------------
+
+
+def test_grounding_rejects_path_traversal_with_dot_dot(tmp_path: Path) -> None:
+    """Evidence paths containing '..' escape the worktree and must be rejected.
+
+    Uses a subdirectory as the worktree so that ``..`` truly escapes to a parent
+    directory outside the sandbox.
+    """
+    workdir = tmp_path / "worktree"
+    workdir.mkdir()
+    (workdir / "src").mkdir()
+    (workdir / "src" / "a.py").write_text("x = 1\n")
+    # File OUTSIDE the worktree (in tmp_path, parent of workdir).
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n")
+    # Include the traversal path in the diff and also create a valid in-diff file
+    # so the evidence doesn't fail solely on the "not in diff" check.
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n@@ -0,0 +1 @@\n+x = 1\n"
+        "diff --git a/src/../../outside.txt b/src/../../outside.txt\n@@ -0,0 +1 @@\n+secret"
+    )
+    v = parse_verdict(
+        '```json\n{"verdict": "fail", "reason": "bad", '
+        '"evidence": [{"file": "src/../../outside.txt", "line": 1}]}\n```'
+    )
+    out, warnings = check_grounding(v, diff, workdir)
+    assert out.verdict == "unknown"
+    assert "DOWNGRADED" in out.reason
+    assert any("outside the worktree" in w for w in warnings)
+
+
+def test_grounding_rejects_absolute_path(tmp_path: Path) -> None:
+    """Evidence paths that are absolute escape the worktree and must be rejected."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n")
+    # The diff must contain the absolute path so the evidence passes the
+    # "not in diff" check and reaches the path-traversal guard.
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n@@ -0,0 +1 @@\n+x = 1\n"
+        "diff --git a//etc/passwd b//etc/passwd\n@@ -0,0 +1 @@\n+secret"
+    )
+    v = parse_verdict(
+        '```json\n{"verdict": "fail", "reason": "bad", '
+        '"evidence": [{"file": "/etc/passwd", "line": 1}]}\n```'
+    )
+    out, warnings = check_grounding(v, diff, tmp_path)
+    assert out.verdict == "unknown"
+    assert "DOWNGRADED" in out.reason
+    assert any("outside the worktree" in w for w in warnings)
+
+
+def test_grounding_rejects_path_traversal_with_symlink(tmp_path: Path) -> None:
+    """A symlink pointing outside the worktree must not bypass the traversal guard."""
+    workdir = tmp_path / "worktree"
+    workdir.mkdir()
+    (workdir / "src").mkdir()
+    (workdir / "src" / "a.py").write_text("x = 1\n")
+    # File OUTSIDE the worktree.
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret\n")
+    # Create a symlink that resolves outside the worktree.
+    (workdir / "src" / "escape").symlink_to(outside)
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n@@ -0,0 +1 @@\n+x = 1\n"
+        "diff --git a/src/escape b/src/escape\n@@ -0,0 +1 @@\n+secret"
+    )
+    v = parse_verdict(
+        '```json\n{"verdict": "fail", "reason": "bad", '
+        '"evidence": [{"file": "src/escape", "line": 1}]}\n```'
+    )
+    out, warnings = check_grounding(v, diff, workdir)
+    assert out.verdict == "unknown"
+    assert "DOWNGRADED" in out.reason
+    assert any("outside the worktree" in w for w in warnings)

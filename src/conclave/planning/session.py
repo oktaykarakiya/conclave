@@ -387,6 +387,9 @@ class PlanningOrchestrator:
                 await repo.update_planning_session_status(
                     self._db, session.id, PlanningSessionStatus.stable
                 )
+                await repo.update_planning_session_stabilization_reason(
+                    self._db, session.id, "max_rounds_reached"
+                )
                 await self._bus.emit(
                     type=EventType.planning_session_stable,
                     project_id=session.project_id,
@@ -468,7 +471,9 @@ class PlanningOrchestrator:
             if agent_name == _PLANNER:
                 data = _extract_json_block(result_text)
                 if data is not None and "task_changes" in data:
-                    await self._apply_task_changes(session_id, data["task_changes"])
+                    await self._apply_task_changes(
+                        session_id, session.project_id, data["task_changes"]
+                    )
                     tasks_changed = True
 
             # Persist the message
@@ -616,9 +621,21 @@ class PlanningOrchestrator:
         return "\n".join(lines) if lines else "(no tasks yet)"
 
     async def _apply_task_changes(
-        self, session_id: str, changes: list[dict[str, Any]]
+        self, session_id: str, project_id: str, changes: Any
     ) -> None:
-        """Apply task tree modifications from planner JSON output."""
+        """Apply task tree modifications from planner JSON output.
+
+        Safe-parses *changes*: ignores non-list input, skips entries with a
+        missing or unknown node id, and scopes ``update``/``remove`` to the
+        current session so a change can never mutate another session's nodes.
+        """
+        if not isinstance(changes, list):
+            logger.warning(
+                "task_changes is not a list (type=%s) for session %s — ignoring",
+                type(changes).__name__, session_id,
+            )
+            return
+
         # Existing titles (case-insensitive) guard against the planner re-adding a
         # task instead of updating it — keeps the tree from duplicating across rounds.
         existing = await repo.list_planning_task_nodes(self._db, session_id)
@@ -656,7 +673,7 @@ class PlanningOrchestrator:
                     )
                     await self._bus.emit(
                         type=EventType.planning_task_proposed,
-                        project_id=None,  # filled by caller context
+                        project_id=project_id,
                         planning_session_id=session_id,
                         payload={
                             "planning_session_id": session_id,
@@ -665,14 +682,54 @@ class PlanningOrchestrator:
                         },
                     )
                 elif action == "update":
+                    update_id = change.get("id")
+                    if not update_id:
+                        logger.warning(
+                            "update change missing id in session %s — skipping", session_id
+                        )
+                        continue
+                    target = await repo.get_planning_task_node(self._db, update_id)
+                    if target is None:
+                        logger.warning(
+                            "update change for unknown node %r in session %s — skipping",
+                            update_id, session_id,
+                        )
+                        continue
+                    if target.session_id != session_id:
+                        logger.warning(
+                            "update change for node %r targets session %s, "
+                            "but we are session %s — skipping",
+                            update_id, target.session_id, session_id,
+                        )
+                        continue
                     await repo.update_planning_task_node(
                         self._db,
-                        node_id=change["id"],
+                        node_id=update_id,
                         title=change.get("title"),
                         description=change.get("description"),
                     )
                 elif action == "remove":
-                    await repo.delete_planning_task_node(self._db, change["id"])
+                    remove_id = change.get("id")
+                    if not remove_id:
+                        logger.warning(
+                            "remove change missing id in session %s — skipping", session_id
+                        )
+                        continue
+                    target = await repo.get_planning_task_node(self._db, remove_id)
+                    if target is None:
+                        logger.warning(
+                            "remove change for unknown node %r in session %s — skipping",
+                            remove_id, session_id,
+                        )
+                        continue
+                    if target.session_id != session_id:
+                        logger.warning(
+                            "remove change for node %r targets session %s, "
+                            "but we are session %s — skipping",
+                            remove_id, target.session_id, session_id,
+                        )
+                        continue
+                    await repo.delete_planning_task_node(self._db, remove_id)
             except Exception:
                 logger.exception(
                     "failed to apply task change: %s", json.dumps(change)[:200]

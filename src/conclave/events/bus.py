@@ -4,6 +4,10 @@ Each :meth:`EventBus.emit` persists the event to the ``events`` table (durable l
 replayable audit trail) and fans it out to every matching live subscriber. Fan-out is
 non-blocking: a slow subscriber's bounded queue drops its oldest events rather than
 stalling the orchestrator — the full record is always in the DB for backfill.
+
+When an event is evicted the subscriber's ``dropped`` counter is incremented and
+exposed via the ``gap_detected`` property so the consumer can detect data loss and
+trigger a refetch / resync against the DB.
 """
 
 from __future__ import annotations
@@ -48,6 +52,13 @@ class Subscriber:
 
     Use as an async iterator (``async for event in sub``) and as a context manager
     so the subscription is removed on exit.
+
+    When the bounded queue overflows and an event is evicted, ``dropped`` is
+    incremented and the :attr:`gap_detected` property signals the loss to the
+    consumer.  The property is reset to ``False`` after each successful
+    ``__anext__`` delivery so the consumer sees exactly one signal per gap.
+    Consumers can use :func:`conclave.db.repositories.list_events` to backfill
+    the dropped window.
     """
 
     def __init__(self, bus: EventBus, event_filter: EventFilter, maxsize: int = 256) -> None:
@@ -55,6 +66,8 @@ class Subscriber:
         self._filter = event_filter
         self.queue: asyncio.Queue[EventRow] = asyncio.Queue(maxsize=maxsize)
         self.dropped = 0
+        self.gap_detected: bool = False
+        self._gap_pending: bool = False
 
     def offer(self, event: EventRow) -> None:
         if not self._filter.matches(event):
@@ -62,9 +75,12 @@ class Subscriber:
         try:
             self.queue.put_nowait(event)
         except asyncio.QueueFull:
+            # Evict the oldest event to make room and flag the gap so the
+            # consumer can detect data loss after the next __anext__ returns.
             try:
                 self.queue.get_nowait()
                 self.dropped += 1
+                self._gap_pending = True
             except asyncio.QueueEmpty:
                 pass
             try:
@@ -76,6 +92,15 @@ class Subscriber:
         return self
 
     async def __anext__(self) -> EventRow:
+        """Return the next event.
+
+        The public :attr:`gap_detected` flag is a snapshot of whether any
+        events were dropped since the *previous* ``__anext__`` call.  It is set
+        here before the next event is delivered and cleared afterward, so the
+        consumer can check it after ``__anext__`` returns.
+        """
+        self.gap_detected = self._gap_pending
+        self._gap_pending = False
         return await self.queue.get()
 
     def close(self) -> None:
