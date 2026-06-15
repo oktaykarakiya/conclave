@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from conclave.config import load_project_config
 from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
+from conclave.engine.orchestrator import _check_budget
 from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
@@ -180,10 +182,12 @@ async def test_review_all_empty_reviewers_record_unknown_and_block(
     runner = AgentRunner(db, EventBus(db), _EmptyReviewerProvider(), project.id, config)
     orchestrator = Orchestrator(db, EventBus(db), _EmptyReviewerProvider(), tmp_path / "home")
 
-    failed, feedback = await orchestrator._review(
-        runner, task, project.id, repo_path, "diff --git a/x.py b/x.py\n", 1, config, "", ""
+    failed, feedback, review_timed_out = await orchestrator._review(
+        runner, task, project.id, repo_path, "diff --git a/x.py b/x.py\n", 1, config, "", "",
+        started=time.monotonic(), budget=0.0,
     )
 
+    assert review_timed_out is False
     assert failed is True
     assert "REVIEW INCONCLUSIVE" in feedback
 
@@ -550,3 +554,82 @@ async def test_no_venv_guidance_when_setup_does_not_create_venv(
     # No prompt should contain venv guidance.
     for p in provider.prompts:
         assert "Worktree environment (MANDATORY)" not in p
+
+
+# --- Mid-attempt timeout ------------------------------------------------------
+
+
+async def test_mid_attempt_timeout(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wall-clock hard cap must abort the task mid-attempt — not just at the
+    top of the attempt loop. We use a monkeypatched ``_check_budget`` that returns
+    True after the developer dispatch to simulate a budget being exhausted during
+    an agent call, avoiding timing-sensitive sleeps."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {
+                "target_branch": "main",
+                # Any positive budget enables the check; the monkeypatch overrides it.
+                "wall_clock_budget_minutes": 1,
+            },
+            "agent_overrides": {"developer": {"max_retries": 1}},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+
+    # Let _check_budget return True only after the developer has run — but return
+    # False for the top-of-loop and pre-developer checks so the developer actually
+    # executes. We want to catch the mid-attempt check inside _review().
+    original = _check_budget
+    call_count = [0]
+
+    def _timeout_after_developer(started: float, budget_minutes: float) -> bool:
+        call_count[0] += 1
+        # First few calls (top-of-loop, pre-developer): return False so the
+        # developer gets dispatched. After that, return True to simulate the
+        # budget being exhausted during the developer's long run.
+        if call_count[0] <= 2:
+            return False
+        return True
+
+    monkeypatch.setattr(
+        "conclave.engine.orchestrator._check_budget", _timeout_after_developer
+    )
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    result = await orchestrator.process_task(claimed)
+
+    # The task must be failed, not completed — the timeout prevented completion.
+    assert result is False
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.failed
+    assert "timeout" in (final.result_summary or "")
+
+    # The task_failed event must carry reason='timeout'.
+    events = await repo.list_events(db, task_id=task.id)
+    fail_events = [e for e in events if e.type == "task.failed"]
+    assert len(fail_events) >= 1
+    assert any(e.payload.get("reason") == "timeout" for e in fail_events)
+
+    # The reviewers should not have been dispatched because _review returned
+    # timed_out=True before entering the reviewer loop.
+    verdicts = await repo.list_verdicts(db, task.id)
+    assert len(verdicts) == 0, (
+        "No reviewer should have been dispatched after the timeout fired"
+    )
+
+    # Restore original so other tests aren't affected.
+    monkeypatch.setattr(
+        "conclave.engine.orchestrator._check_budget", original
+    )

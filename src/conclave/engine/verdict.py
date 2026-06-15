@@ -100,7 +100,17 @@ def check_grounding(
         if file not in current_diff:
             warnings.append(f"grounding: evidence file {file!r} not in this task's diff")
             continue
-        if not (worktree / file).is_file():
+        # Resolve the evidence path safely before checking on-disk existence.
+        # A crafted evidence path with '..' or an absolute path can escape the
+        # worktree — reject those outright so grounding never reads outside the
+        # task's sandbox.
+        resolved = (worktree / file).resolve()
+        if not resolved.is_relative_to(worktree.resolve()):
+            warnings.append(
+                f"grounding: evidence file {file!r} resolves outside the worktree — rejected"
+            )
+            continue
+        if not resolved.is_file():
             warnings.append(f"grounding: evidence file {file!r} does not exist on disk")
             continue
         grounded += 1

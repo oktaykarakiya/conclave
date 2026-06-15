@@ -41,6 +41,11 @@ _PROJECT_RULE_FILES = ("CONCLAVE.md", "CLAUDE.md")
 _REVIEWER_DISPATCH_RETRIES = 2
 _REVIEWER_RETRY_BACKOFF_S = 3.0
 
+# Hard cap on diff characters injected into agent prompts to prevent context-window
+# overflow from very large diffs. The truncation marker includes the original size so
+# the agent can still reason about scope.
+_MAX_DIFF_CHARS = 40_000
+
 logger = logging.getLogger("conclave.engine.orchestrator")
 
 
@@ -159,7 +164,7 @@ class Orchestrator:
             timed_out = False
 
             while attempts < max_retries:
-                if budget > 0 and (time.monotonic() - started) / 60.0 >= budget:
+                if _check_budget(started, budget):
                     timed_out = True
                     failed = True
                     break
@@ -195,8 +200,17 @@ class Orchestrator:
                     if previous_diff:
                         dev_prompt += (
                             "\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n"
-                            + previous_diff + "\n```"
+                            + _truncate_diff(previous_diff) + "\n```"
                         )
+
+                # HARD cap: abort the task if the wall-clock budget has been exceeded
+                # before launching the developer agent. The top-of-loop check catches
+                # inter-attempt overruns; this one catches a series of fast attempts
+                # whose cumulative setup (planning, baseline) ate the budget.
+                if _check_budget(started, budget):
+                    timed_out = True
+                    failed = True
+                    break
 
                 dev = await runner.run(
                     agent="developer",
@@ -222,6 +236,7 @@ class Orchestrator:
                 # reviewers and grounding see — not just modifications to tracked files.
                 await run_git(worktree, "add", "-A")
                 _, current_diff = await run_git(worktree, "diff", "--cached", checkpoint)
+                current_diff = _truncate_diff(current_diff)
                 # ENG-2: snapshot the exact staged tree the reviewers are about to review.
                 # Reviewers run with --dangerously-skip-permissions and CAN write to the
                 # worktree, but anything they touch falls outside ``current_diff`` (so grounding
@@ -233,10 +248,14 @@ class Orchestrator:
                 review_tree = review_tree.strip()
                 await repo.end_attempt(self._db, attempt_id, diff_stat=_diff_stat(current_diff))
 
-                failed, feedback = await self._review(
+                failed, feedback, review_timed_out = await self._review(
                     runner, task, project.id, worktree, current_diff, attempts, config, knowledge,
-                    rules,
+                    rules, started, budget,
                 )
+                if review_timed_out:
+                    timed_out = True
+                    failed = True
+                    break
                 if failed:
                     await self._bus.emit(
                         type=EventType.attempt_failed,
@@ -261,6 +280,14 @@ class Orchestrator:
                 await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
                 if test_command and config.execution.require_full_green:
+                    # HARD cap: abort before running the test gate if the wall-clock
+                    # budget has been exhausted. The gate itself may be slow; checking
+                    # here prevents a very long test run from blowing past the cap.
+                    if _check_budget(started, budget):
+                        timed_out = True
+                        failed = True
+                        break
+
                     gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
                     if not gate.passed:
                         # ENG-7: distinguish infra failures (timeout / missing command)
@@ -460,7 +487,15 @@ class Orchestrator:
         config: ConclaveConfig,
         knowledge: str,
         rules: str,
-    ) -> tuple[bool, str]:
+        started: float,
+        budget: float,
+    ) -> tuple[bool, str, bool]:
+        """Review the current diff through the derived agent pipeline.
+
+        Returns ``(failed, feedback, timed_out)``. ``timed_out`` is ``True`` when the
+        wall-clock budget was exceeded mid-review — the caller must abort the task, not
+        retry the attempt.
+        """
         pipeline = get_agent_pipeline(current_diff, config.agents)
         await self._bus.emit(
             type=EventType.pipeline_derived, project_id=project_id, task_id=task.id,
@@ -469,6 +504,12 @@ class Orchestrator:
         reviewer_prompt = f"Review the changes made for this task:\n{task.request}"
         passes = 0
         for agent in pipeline:
+            # HARD cap: abort the review if the wall-clock budget has been exceeded
+            # before dispatching this reviewer. The orchestrator will fail the task
+            # as timed-out rather than retrying the attempt.
+            if _check_budget(started, budget):
+                return True, "Wall-clock budget exceeded during review.", True
+
             # ENG-4: _dispatch_reviewer already parsed the output; the verdict is used as-is.
             # A parseable verdict (even one whose process exited non-zero) and any usable
             # text both come back here untouched. Only a genuinely empty response (no verdict
@@ -523,7 +564,7 @@ class Orchestrator:
             )
             if verdict.verdict in ("fail", "block", "decline"):
                 header = f"{agent.upper()} FEEDBACK ({verdict.verdict.upper()})"
-                return True, f"\n{header}:\n{verdict.reason}\n"
+                return True, f"\n{header}:\n{verdict.reason}\n", False
             if verdict.verdict == "pass":
                 passes += 1
         # ENG-3: never merge on an all-'unknown' round. If reviewers were derived but
@@ -536,8 +577,8 @@ class Orchestrator:
                 "\nREVIEW INCONCLUSIVE: no reviewer returned a usable verdict "
                 "(all 'unknown' — the model backend was likely unavailable). "
                 "Not merging without at least one grounded review; retrying.\n"
-            )
-        return False, ""
+            ), False
+        return False, "", False
 
     async def _finish_success(
         self,
@@ -753,6 +794,25 @@ def _commit_message(task: Task) -> str:
     first_line = next((ln.strip() for ln in task.request.splitlines() if ln.strip()), task.id)
     subject = task.title or first_line
     return f"feat(conclave): {subject[:72]}\n\n{task.request}"
+
+
+def _check_budget(started: float, budget_minutes: float) -> bool:
+    """Return ``True`` when the wall-clock budget has been exceeded.
+
+    Called before every agent dispatch within an attempt (developer, each reviewer, gate)
+    so a single long-running agent call can't blow past the configured cap — the task is
+    failed as timed-out as soon as the cap is reached.
+    """
+    if budget_minutes <= 0:
+        return False
+    return (time.monotonic() - started) / 60.0 >= budget_minutes
+
+
+def _truncate_diff(diff: str) -> str:
+    """Truncate an oversized diff with a clear marker so it doesn't overflow context."""
+    if len(diff) <= _MAX_DIFF_CHARS:
+        return diff
+    return diff[:_MAX_DIFF_CHARS] + f"\n... [diff truncated — original was {len(diff)} chars]"
 
 
 def _diff_stat(diff: str) -> str:
