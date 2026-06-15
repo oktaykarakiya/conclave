@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -60,10 +61,17 @@ async def run_shell(
     if timeout_seconds is None:
         stdout, _ = await proc.communicate()
         return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
+    # Shield communicate() so a timeout does not *cancel* it — cancelling mid-read
+    # leaves the subprocess pipe transport dangling, which asyncio later GC-warns
+    # about ("Exception ignored in BaseSubprocessTransport.__del__"). Instead we let
+    # it keep running, kill the process, then await it so the transport closes cleanly.
+    comm = asyncio.ensure_future(proc.communicate())
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+        stdout, _ = await asyncio.wait_for(asyncio.shield(comm), timeout=timeout_seconds)
     except TimeoutError:
         await _kill_process_group(proc, timeout_seconds)
+        with contextlib.suppress(Exception):
+            await comm  # completes now the process is dead; closes the pipe transport
         return 124, f"(command timed out after {timeout_seconds}s)"
     return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
 
