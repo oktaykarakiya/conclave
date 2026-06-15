@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -14,7 +16,7 @@ from conclave.bootstrap import seed_global_defaults
 from conclave.db import Database
 from conclave.db import repositories as repo
 from conclave.db.models import TaskState
-from conclave.engine import run_git
+from conclave.engine import WorktreeManager, run_git
 from conclave.runtime import Daemon
 from conclave.web import create_app
 
@@ -36,7 +38,26 @@ async def client(db: Database, tmp_path: Path) -> AsyncIterator[httpx.AsyncClien
     app = create_app(daemon, manage_lifecycle=False)
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
+        try:
+            yield c
+        finally:
+            await daemon.shutdown()
+
+
+@pytest_asyncio.fixture
+async def client_with_workers(
+    db: Database, tmp_path: Path
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Fixture with workers enabled for testing worker lifecycle (detach/onboard)."""
+    await seed_global_defaults(db)
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=True)
+    app = create_app(daemon, manage_lifecycle=False)
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        try:
+            yield c
+        finally:
+            await daemon.shutdown()
 
 
 async def test_health_and_schema(client: httpx.AsyncClient) -> None:
@@ -59,9 +80,16 @@ async def test_project_task_flow(client: httpx.AsyncClient, tmp_path: Path) -> N
     assert created.status_code == 200, created.text
     project_id = created.json()["id"]
 
-    # onboarding learned the test command from package.json
-    knowledge = await client.get(f"/api/projects/{project_id}/knowledge")
-    assert knowledge.json()["commands"]["test"] == "npm test"
+    # onboarding now runs in the background; poll until knowledge is ready
+    import asyncio as _asyncio
+    knowledge_data: dict = {}
+    for _ in range(20):
+        knowledge = await client.get(f"/api/projects/{project_id}/knowledge")
+        knowledge_data = knowledge.json()
+        if knowledge_data and knowledge_data.get("commands"):
+            break
+        await _asyncio.sleep(0.1)
+    assert knowledge_data["commands"]["test"] == "npm test"
 
     # create a task (inbox), then approve it
     task = await client.post(
@@ -649,3 +677,175 @@ async def test_add_quarantine_accepts_valid_until(
     assert listing.status_code == 200
     entries = listing.json()
     assert any(e["until"] == "2026-12-31" for e in entries)
+
+
+# --- detach_project tests ----------------------------------------------------
+
+
+async def test_detach_project_stops_worker_and_cleans_orphans(
+    client_with_workers: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """DELETE /projects/{id} stops the worker, cleans in-progress worktrees,
+    and cascade-deletes all child rows."""
+    repo_path = tmp_path / "repo_detach"
+    await _init_repo(repo_path)
+
+    created = await client_with_workers.post(
+        "/api/projects",
+        json={"name": "detach-me", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200, created.text
+    project_id = created.json()["id"]
+
+    # Verify the worker was registered.
+    daemon = client_with_workers._transport.app.state.daemon
+    assert project_id in daemon._workers
+
+    # Create an in_progress task directly in the DB (simulating a running worker).
+    task = await repo.create_task(
+        db, project_id=project_id, request="test task", state=TaskState.in_progress
+    )
+
+    # Create a real git worktree so we can verify disk cleanup.
+    wm = WorktreeManager(
+        repo_path, daemon.home / "projects" / project_id / "worktrees"
+    )
+    task_branch = f"conclave/{task.id}"
+    worktree_path = await wm.create(task.id, "main", task_branch)
+    assert worktree_path.is_dir(), "worktree was not created on disk"
+
+    # --- detach ---
+    resp = await client_with_workers.delete(f"/api/projects/{project_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"detached": project_id}
+
+    # Worker must be removed from the registry.
+    assert project_id not in daemon._workers, "worker was not removed from _workers"
+
+    # Worktree directory must be gone.
+    assert not worktree_path.exists(), "worktree directory was not cleaned up"
+
+    # Project must be deleted from DB.
+    assert await repo.get_project(db, project_id) is None, "project row still exists"
+
+    # Task must be cascade-deleted.
+    assert await repo.get_task(db, task.id) is None, "task row was not cascade-deleted"
+
+
+async def test_detach_project_idempotent(
+    client_with_workers: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """Detaching the same project twice must not 500."""
+    repo_path = tmp_path / "repo_detach_idem"
+    await _init_repo(repo_path)
+
+    created = await client_with_workers.post(
+        "/api/projects",
+        json={"name": "detach-twice", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200, created.text
+    project_id = created.json()["id"]
+
+    # First detach.
+    r1 = await client_with_workers.delete(f"/api/projects/{project_id}")
+    assert r1.status_code == 200, r1.text
+
+    # Second detach — must not 500 (project already gone).
+    r2 = await client_with_workers.delete(f"/api/projects/{project_id}")
+    assert r2.status_code == 200, f"second detach returned {r2.status_code}: {r2.text}"
+    assert r2.json() == {"detached": project_id}
+
+
+# --- create_project tests ----------------------------------------------------
+
+
+async def test_create_project_returns_before_onboarding_finishes(
+    client_with_workers: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """POST /projects returns before the background onboarding completes."""
+    import conclave.runtime as runtime_mod
+
+    repo_path = tmp_path / "repo_fast_create"
+    await _init_repo(repo_path)
+
+    # Replace onboard with a blocking stub so onboarding never finishes
+    # during the test window.
+    original_onboard = runtime_mod.onboard
+    block_event = asyncio.Event()
+
+    async def _blocking_onboard(*args, **kwargs):  # type: ignore[no-untyped-def]
+        await block_event.wait()
+
+    runtime_mod.onboard = _blocking_onboard
+    try:
+        created = await client_with_workers.post(
+            "/api/projects",
+            json={"name": "fast-create", "path": str(repo_path), "default_branch": "main"},
+        )
+        assert created.status_code == 200, created.text
+        project_id = created.json()["id"]
+
+        # Project must be immediately queryable.
+        get_resp = await client_with_workers.get(f"/api/projects/{project_id}")
+        assert get_resp.status_code == 200, "project not queryable after create"
+
+        # Worker must have been started.
+        daemon = client_with_workers._transport.app.state.daemon
+        assert project_id in daemon._workers, "worker was not started"
+
+        # Knowledge must NOT exist yet (onboarding hasn't finished).
+        knowledge = await client_with_workers.get(
+            f"/api/projects/{project_id}/knowledge"
+        )
+        assert knowledge.json() == {}, "knowledge exists before onboarding finished"
+    finally:
+        # Unblock the stubbed onboard so the background task can drain.
+        runtime_mod.onboard = original_onboard
+        block_event.set()
+        # Give the background task a moment to complete.
+        await asyncio.sleep(0.2)
+
+
+async def test_create_project_onboarding_failure_not_fatal(
+    client_with_workers: httpx.AsyncClient, tmp_path: Path, caplog
+) -> None:
+    """POST /projects returns 200 even when onboarding raises; project is usable."""
+    import conclave.runtime as runtime_mod
+
+    repo_path = tmp_path / "repo_onboard_fail"
+    await _init_repo(repo_path)
+
+    original_onboard = runtime_mod.onboard
+
+    async def _failing_onboard(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated onboarding failure")
+
+    caplog.set_level(logging.ERROR, logger="conclave.runtime")
+    runtime_mod.onboard = _failing_onboard
+    try:
+        created = await client_with_workers.post(
+            "/api/projects",
+            json={"name": "onboard-fail", "path": str(repo_path), "default_branch": "main"},
+        )
+        assert created.status_code == 200, (
+            f"expected 200 despite onboarding failure, got {created.status_code}: {created.text}"
+        )
+        project_id = created.json()["id"]
+
+        # Project must be queryable.
+        get_resp = await client_with_workers.get(f"/api/projects/{project_id}")
+        assert get_resp.status_code == 200, "project not queryable after failed onboarding"
+
+        # Worker must have been started.
+        daemon = client_with_workers._transport.app.state.daemon
+        assert project_id in daemon._workers, "worker was not started after onboarding failure"
+
+        # The failure must have been logged.
+        await asyncio.sleep(0.2)
+        error_records = [r for r in caplog.records if "onboarding failed" in r.message]
+        assert len(error_records) >= 1, (
+            f"expected onboarding failure to be logged, got records: "
+            f"{[r.message for r in caplog.records]}"
+        )
+    finally:
+        runtime_mod.onboard = original_onboard

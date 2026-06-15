@@ -6,6 +6,7 @@ returned). Engine profiles can be tested before saving via /api/profiles/test.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -127,12 +128,13 @@ async def create_project(
     project = await repo.create_project(
         daemon.db, name=body.name, path=str(path), default_branch=body.default_branch
     )
-    config = load_project_config(project.config)
-    await onboard(
-        daemon.db, daemon.bus, project,
-        provider=daemon.provider, config=config,
-    )
     await daemon.start_worker(project.id)
+    # Run onboarding as a tracked background task so the endpoint returns
+    # promptly.  An onboarding failure is logged but never fatal — the project
+    # remains usable.
+    task = asyncio.create_task(daemon._onboard_project(project))
+    daemon._bg_tasks.add(task)
+    task.add_done_callback(daemon._bg_tasks.discard)
     return await _require_project(daemon, project.id)
 
 
@@ -144,6 +146,7 @@ async def get_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -> 
 @router.delete("/projects/{project_id}")
 async def detach_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, str]:
     await daemon.stop_worker(project_id)
+    await daemon.cleanup_in_progress_work(project_id)
     await repo.delete_project(daemon.db, project_id)
     return {"detached": project_id}
 

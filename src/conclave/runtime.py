@@ -18,11 +18,11 @@ from pathlib import Path
 from .config import load_project_config
 from .db import Database
 from .db import repositories as repo
-from .engine import Orchestrator
+from .engine import Orchestrator, WorktreeManager
 from .events import EventBus
 from .planning.session import PlanningOrchestrator
 from .providers import Provider
-from .repo_intel import RepoKnowledge, ai_enrich
+from .repo_intel import RepoKnowledge, ai_enrich, onboard
 
 logger = logging.getLogger("conclave.runtime")
 
@@ -148,6 +148,28 @@ class Daemon:
         except Exception:
             logger.exception("backfill: AI enrichment failed for project %s", p.id)
 
+    async def _onboard_project(self, project: object) -> None:
+        """Run onboarding for a newly-created project as a tracked background task.
+
+        This runs after :meth:`create_project` returns so the endpoint is fast.
+        An onboarding failure is logged but never fatal — the project remains
+        usable (it just won't have repo knowledge yet, which the operator can
+        obtain later via the re-onboard endpoint).
+        """
+        from .db.models import Project as ProjectModel
+        p: ProjectModel = project  # type: ignore[assignment]
+        try:
+            config = load_project_config(p.config)
+            await onboard(
+                self.db, self.bus, p,
+                provider=self.provider, config=config,
+            )
+            logger.info("onboarding complete for project %s", p.id)
+        except Exception:
+            logger.exception(
+                "onboarding failed for project %s (project is still usable)", p.id
+            )
+
     async def shutdown(self) -> None:
         # 1. Stop per-project workers so no new tasks are claimed.
         for worker in list(self._workers.values()):
@@ -186,3 +208,44 @@ class Daemon:
             return False
         worker.paused = paused
         return True
+
+    async def cleanup_in_progress_work(self, project_id: str) -> None:
+        """Cancel in-progress tasks and clean their worktrees for a stopped worker.
+
+        Must be called AFTER :meth:`stop_worker` so no new tasks can be claimed
+        by the project's worker between the query and the cleanup. Each in-progress
+        task's on-disk worktree is removed (``--force``), then the task is marked
+        ``cancelled``. Exceptions during cleanup are caught and logged so one bad
+        worktree cannot block project detachment.
+
+        FK ``ON DELETE CASCADE`` handles removing the cancelled rows when the
+        project itself is deleted — this method only ensures the disk worktrees
+        are gone first.
+        """
+        from .db.models import TaskState
+
+        project = await repo.get_project(self.db, project_id)
+        if project is None:
+            return
+
+        in_progress = await repo.get_in_progress_tasks(self.db, project_id)
+        if not in_progress:
+            return
+
+        wm = WorktreeManager(
+            Path(project.path),
+            self.home / "projects" / project_id / "worktrees",
+        )
+
+        for task in in_progress:
+            # Clean the worktree before cancelling.  git worktree remove --force
+            # handles locked/incomplete worktrees; if the path doesn't exist at
+            # all the call still exits non-zero, so we catch and continue.
+            try:
+                await wm.cleanup(task.id, task_branch=None)
+            except Exception:
+                logger.exception(
+                    "failed to clean worktree for task %s during project detach; "
+                    "continuing", task.id,
+                )
+            await repo.set_task_state(self.db, task.id, TaskState.cancelled)

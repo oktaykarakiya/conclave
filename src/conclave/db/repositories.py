@@ -346,6 +346,20 @@ async def _block_descendants(conn: aiosqlite.Connection, task_id: str) -> int:
     return blocked
 
 
+async def get_in_progress_tasks(db: Database, project_id: str) -> list[Task]:
+    """Return all tasks currently ``in_progress`` for a project.
+
+    Used by :meth:`Daemon.cleanup_in_progress_work` when detaching a project so the
+    caller can tear down worktrees before the project row (and its FK-cascaded
+    children) are deleted.
+    """
+    rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE project_id = ? AND state = 'in_progress'",
+        (project_id,),
+    )
+    return [Task.from_row(r) for r in rows]
+
+
 async def recover_in_progress(db: Database, project_id: str) -> tuple[int, int]:
     """Reset orphaned ``in_progress`` tasks to ``approved`` and re-block descendants
     of ``failed``/``blocked`` parents (crash recovery).
