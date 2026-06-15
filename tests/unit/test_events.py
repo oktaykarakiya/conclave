@@ -85,3 +85,72 @@ async def test_default_queue_maxsize_is_256(db: Database) -> None:
     sub = bus.subscribe()
     assert sub.queue.maxsize == 256
     sub.close()
+
+
+# ---------------------------------------------------------------------------
+# Gap detection — backpressure signalling
+# ---------------------------------------------------------------------------
+
+
+async def test_gap_detected_false_when_no_overflow(db: Database) -> None:
+    """gap_detected stays False when the queue never overflows."""
+    bus = EventBus(db)
+    sub = bus.subscribe(maxsize=10)
+    await bus.emit(type=EventType.log, payload={"i": 1})
+    await bus.emit(type=EventType.log, payload={"i": 2})
+
+    assert sub.gap_detected is False
+    evt = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    assert evt.payload["i"] == 1
+    assert sub.gap_detected is False
+
+    evt = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    assert evt.payload["i"] == 2
+    assert sub.gap_detected is False
+
+
+async def test_gap_detected_set_when_queue_overflows(db: Database) -> None:
+    """When the bounded queue overflows, gap_detected becomes True on the next read."""
+    bus = EventBus(db)
+    sub = bus.subscribe(maxsize=3)
+    # Fill and overflow the queue.
+    for i in range(5):
+        await bus.emit(type=EventType.log, payload={"i": i})
+    assert sub.dropped >= 2  # at least 2 events evicted
+
+    # The next event delivered must have gap_detected=True.
+    evt = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    assert sub.gap_detected is True
+    assert evt.payload is not None
+
+
+async def test_gap_detected_resets_after_read(db: Database) -> None:
+    """gap_detected must reset to False on the second read after the gap signal."""
+    bus = EventBus(db)
+    sub = bus.subscribe(maxsize=3)
+    # Fill and overflow.
+    for i in range(5):
+        await bus.emit(type=EventType.log, payload={"i": i})
+
+    # First read after overflow — gap_detected must be True.
+    evt1 = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    assert sub.gap_detected is True
+
+    # Second read — gap_detected must reset to False.
+    evt2 = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    assert sub.gap_detected is False
+    assert evt2.id != evt1.id
+
+
+async def test_overflow_preserves_gap_detected_with_existing_test(db: Database) -> None:
+    """The original overflow test behaviour still holds + gap_detected is signalled."""
+    bus = EventBus(db)
+    sub = bus.subscribe(maxsize=10)
+    for i in range(50):
+        await bus.emit(type=EventType.log, payload={"i": i})
+    assert sub.queue.qsize() == 10
+    assert sub.dropped == 40
+    # The first read after overflow must signal a gap.
+    latest = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    assert latest.payload["i"] == 40
+    assert sub.gap_detected is True

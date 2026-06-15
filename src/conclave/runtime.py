@@ -29,15 +29,25 @@ logger = logging.getLogger("conclave.runtime")
 
 class ProjectWorker:
     def __init__(
-        self, db: Database, orchestrator: Orchestrator, project_id: str, *, idle_sleep: float = 2.0
+        self,
+        db: Database,
+        orchestrator: Orchestrator,
+        project_id: str,
+        *,
+        idle_sleep: float = 2.0,
+        max_idle_sleep: float = 30.0,
     ) -> None:
         self._db = db
         self._orchestrator = orchestrator
         self.project_id = project_id
         self._idle_sleep = idle_sleep
+        self._max_idle_sleep = max_idle_sleep
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self.paused = False
+        # Current backoff sleep — grows on consecutive idle iterations and resets
+        # to ``_idle_sleep`` whenever work is claimed.
+        self._current_idle_sleep = idle_sleep
 
     async def start(self) -> None:
         await self._orchestrator.recover(self.project_id)
@@ -51,14 +61,26 @@ class ProjectWorker:
                     continue
                 task = await repo.claim_next_approved(self._db, self.project_id)
                 if task is None:
-                    await asyncio.sleep(self._idle_sleep)
+                    await self._idle_backoff()
                     continue
+                # Work claimed — reset backoff so the next idle cycle starts
+                # from the minimum.
+                self._current_idle_sleep = self._idle_sleep
                 await self._orchestrator.process_task(task)
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep the worker alive on unexpected errors
                 logger.exception("worker error for project %s", self.project_id)
                 await asyncio.sleep(self._idle_sleep)
+
+    # --- Internal helpers ----------------------------------------------------
+
+    async def _idle_backoff(self) -> None:
+        """Sleep for the current backoff duration then double it (capped)."""
+        await asyncio.sleep(self._current_idle_sleep)
+        self._current_idle_sleep = min(
+            self._current_idle_sleep * 2, self._max_idle_sleep
+        )
 
     async def stop(self) -> None:
         self._stop.set()
