@@ -33,8 +33,21 @@ from .prompts import (
 
 logger = logging.getLogger("conclave.planning")
 
-# Planner is the coordinator; it talks first and after each review round
+# Planner is the coordinator; it opens each round before the reviewers vote.
 _PLANNER = "planner"
+# The senior "final reviewer" runs last (sequentially) so it can weigh the
+# specialists' critiques; the orthogonal specialists are dispatched in parallel.
+_SENIOR_REVIEWER = "reviewer"
+# Reviewers other than the senior one, dispatched concurrently each round.
+_SPECIALIST_AGENTS: list[tuple[str, str]] = [
+    (name, prompt)
+    for name, prompt in DISCUSSION_AGENTS
+    if name not in (_PLANNER, _SENIOR_REVIEWER)
+]
+_SENIOR_REVIEWER_PROMPT: str | None = next(
+    (prompt for name, prompt in DISCUSSION_AGENTS if name == _SENIOR_REVIEWER),
+    None,
+)
 # Max context messages to include (keeps prompt size bounded)
 _MAX_CONTEXT_MSGS = 20
 
@@ -366,19 +379,47 @@ class PlanningOrchestrator:
                         if data is not None:
                             planner_ready = data.get("ready", False)
 
-                    # Reviewer round: each reviewer votes on the current tree.
-                    # Skip any whose approval already covers it (sticky approval).
-                    for agent_name, system_prompt in DISCUSSION_AGENTS:
-                        if agent_name == _PLANNER:
-                            continue  # the planner already spoke this round
-                        if agent_name in approved:
-                            continue  # already endorsed the current tree
-                        context = await self._build_context(session.id)
-                        result, _ = await self._agent_turn(
-                            session.id, agent_name, system_prompt, context
+                    # Reviewer round. The orthogonal specialists (architect,
+                    # tester, security, risk) review independently and are
+                    # dispatched in parallel; the senior "final reviewer" then
+                    # runs last, sequentially, so it can weigh their critiques.
+                    # Skip any whose approval already covers this tree (sticky).
+                    batch = [
+                        (name, prompt)
+                        for name, prompt in _SPECIALIST_AGENTS
+                        if name not in approved
+                    ]
+                    if batch:
+                        # One shared snapshot: specialists review identical state
+                        # (and can't see each other — reduces anchoring bias).
+                        shared = await self._build_context(session.id)
+                        results = await asyncio.gather(
+                            *(
+                                self._agent_turn(
+                                    session.id, name, prompt, shared, serialize=False
+                                )
+                                for name, prompt in batch
+                            )
                         )
-                        if result and parse_verdict(result).verdict == "pass":
-                            approved.add(agent_name)
+                        for (name, _prompt), (text, _changed) in zip(
+                            batch, results, strict=True
+                        ):
+                            if text and parse_verdict(text).verdict == "pass":
+                                approved.add(name)
+
+                    if (
+                        _SENIOR_REVIEWER_PROMPT is not None
+                        and _SENIOR_REVIEWER not in approved
+                    ):
+                        context = await self._build_context(session.id)
+                        text, _ = await self._agent_turn(
+                            session.id,
+                            _SENIOR_REVIEWER,
+                            _SENIOR_REVIEWER_PROMPT,
+                            context,
+                        )
+                        if text and parse_verdict(text).verdict == "pass":
+                            approved.add(_SENIOR_REVIEWER)
 
                     # Session is stable when all mandatory agents approve + planner ready
                     if planner_ready and approved.issuperset(APPROVAL_AGENTS):
@@ -445,19 +486,33 @@ class PlanningOrchestrator:
         agent_name: str,
         system_prompt: str,
         user_message: str,
+        *,
+        serialize: bool = True,
     ) -> tuple[str | None, bool]:
         """Dispatch one agent, store its message, and parse task changes.
 
         Returns ``(response_text, tasks_changed)`` — the agent's response text
         (or None on failure), and whether this turn mutated the task tree.
 
-        The entire body runs under a per-session lock so only one turn
-        mutates a given session at a time — human interjections are
+        When *serialize* is True the body runs under the per-session lock so only
+        one turn mutates a given session at a time — human interjections are
         serialized behind the discussion loop, preventing concurrent
-        read-modify-write on task_changes (title dedupe, sort_order)
-        and transcript ordering.
+        read-modify-write on task_changes (title dedupe, sort_order) and
+        transcript ordering.
+
+        Reviewer turns pass ``serialize=False`` so a round's specialists can be
+        dispatched concurrently: they never call ``_apply_task_changes`` (no
+        task-tree RMW to protect), and their only writes — the turn-counter
+        increment and the message insert — are each single-statement and
+        serialize at the database layer, so distinct turn numbers and intact
+        rows are guaranteed without holding the per-session lock.
         """
-        async with self._get_session_lock(session_id):
+        lock: contextlib.AbstractAsyncContextManager[Any] = (
+            self._get_session_lock(session_id)
+            if serialize
+            else contextlib.nullcontext()
+        )
+        async with lock:
             session = await repo.get_planning_session(self._db, session_id)
             if session is None:
                 return None, False

@@ -15,7 +15,7 @@ from conclave.db.planning_models import (
     PlanningTaskNode,
 )
 from conclave.events import EventBus
-from conclave.planning.session import PlanningOrchestrator
+from conclave.planning.session import _SPECIALIST_AGENTS, PlanningOrchestrator
 from conclave.providers import AgentResult
 from conclave.runtime import Daemon
 
@@ -948,3 +948,91 @@ async def test_reviewers_vote_on_post_refinement_tree(db: Database) -> None:
     nodes = await repo.list_planning_task_nodes(db, session.id)
     titles = sorted(n.title for n in nodes)
     assert titles == ["BadTask", "GoodTask"], f"Unexpected titles: {titles}"
+
+
+# --- regression: hybrid reviewer topology (parallel specialists, senior last) ---
+
+
+class _HybridTopologyProbeProvider:
+    """Proves the round's specialists are dispatched concurrently and the senior
+    "final reviewer" runs after them.
+
+    Each specialist call registers itself in flight and blocks on a barrier that
+    only releases once all specialists are in flight at once — so a sequential
+    dispatch would deadlock (and the test would time out). The senior reviewer
+    records how many specialists had completed before it started.
+    """
+
+    _PASS = '```json\n{"verdict": "pass", "reason": "ok"}\n```'
+
+    def __init__(self, num_specialists: int) -> None:
+        self._planner_calls = 0
+        self._num_specialists = num_specialists
+        self._in_flight = 0
+        self.max_in_flight = 0
+        self.specialists_done = 0
+        self.senior_started_after = -1
+        self._barrier = asyncio.Event()
+
+    async def run_agent(self, *, profile, prompt, timeout_seconds, cwd=None, on_chunk=None):
+        if "Planning Facilitator" in prompt:
+            self._planner_calls += 1
+            if self._planner_calls == 1:
+                text = (
+                    '```json\n{"message":"init","task_changes":'
+                    '[{"action":"add","parent_id":null,"title":"Task A","description":"d"}],'
+                    '"ready":true}\n```'
+                )
+            else:
+                text = '```json\n{"message":"done","task_changes":[],"ready":true}\n```'
+            return AgentResult(ok=True, text=text, model_reported="fake", cost_usd=0.0)
+        if "Senior Reviewer Agent" in prompt:
+            # Records the state at the moment the senior reviewer is dispatched.
+            self.senior_started_after = self.specialists_done
+            return AgentResult(ok=True, text=self._PASS, model_reported="fake", cost_usd=0.0)
+        # Specialist: block until every specialist is concurrently in flight.
+        self._in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        if self._in_flight >= self._num_specialists:
+            self._barrier.set()
+        await self._barrier.wait()
+        self._in_flight -= 1
+        self.specialists_done += 1
+        return AgentResult(ok=True, text=self._PASS, model_reported="fake", cost_usd=0.0)
+
+
+async def test_specialists_run_in_parallel_then_senior_reviewer(db: Database) -> None:
+    """The specialist reviewers are dispatched concurrently (proven by a barrier
+    that only releases when all are in flight at once), and the senior reviewer
+    runs only after every specialist has finished."""
+    n = len(_SPECIALIST_AGENTS)
+    project = await repo.create_project(
+        db, name="hybrid-test", path="/tmp/hybrid-test", default_branch="main",
+    )
+    provider = _HybridTopologyProbeProvider(num_specialists=n)
+    orchestrator = PlanningOrchestrator(db, EventBus(db), provider)
+
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Hybrid Topology",
+        prompt="Decompose a feature.",
+        max_rounds=1,
+    )
+
+    for _ in range(1000):
+        refreshed = await repo.get_planning_session(db, session.id)
+        assert refreshed is not None
+        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("session never reached stable/completed (parallel deadlock?)")
+
+    # All specialists were in flight simultaneously → dispatched in parallel.
+    assert provider.max_in_flight == n, (
+        f"specialists not concurrent: max_in_flight={provider.max_in_flight} (expected {n})"
+    )
+    # The senior reviewer started only after every specialist had completed.
+    assert provider.senior_started_after == n, (
+        f"senior reviewer did not run last: started_after={provider.senior_started_after}"
+    )
