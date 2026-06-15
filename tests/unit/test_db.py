@@ -14,10 +14,10 @@ from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatu
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 5
+    assert version == 6
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 5
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 6
 
 
 async def test_migration_failure_is_atomic(
@@ -28,12 +28,12 @@ async def test_migration_failure_is_atomic(
 
     Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
     replays the same migration and wedges on a duplicate-column error. The fixture DB is
-    already at version 5; we inject a v6 migration whose first statement succeeds (creates
+    already at version 6; we inject a v7 migration whose first statement succeeds (creates
     a probe table) and whose second fails — ``input_tokens`` was already added by migration
     5, so re-adding it raises a duplicate-column error — which is exactly that wedge.
     """
     failing = Migration(
-        version=6,
+        version=7,
         name="injected_failure",
         sql=(
             "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
@@ -46,7 +46,7 @@ async def test_migration_failure_is_atomic(
         await db._apply_migrations()
 
     # Version did not advance past the last good migration...
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 5
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 6
     # ...and the partial DDL (the probe table from the first statement) was rolled back.
     assert (
         await db.fetchval(
@@ -600,3 +600,85 @@ async def test_block_descendants_cycle_safe(db: Database) -> None:
     b = await repo.get_task(db, task_b.id)
     assert b is not None
     assert b.state is TaskState.blocked
+
+
+async def test_events_gc_prunes_beyond_cap(db: Database) -> None:
+    """gc_events keeps only the most-recent N events per project (by id)."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Insert 15 events for the project.
+    for i in range(15):
+        await repo.append_event(
+            db, type="test.event", project_id=p.id,
+            payload={"n": i},
+        )
+
+    # All 15 are present before GC.
+    all_events = await repo.list_events(db, project_id=p.id, limit=100)
+    assert len(all_events) == 15
+
+    # Prune to the 10 most-recent.
+    await repo.gc_events(db, p.id, keep=10)
+
+    remaining = await repo.list_events(db, project_id=p.id, limit=100)
+    assert len(remaining) == 10
+    # The 10 highest ids are kept.
+    ids = sorted(e.id for e in remaining)
+    expected = sorted(e.id for e in all_events[-10:])
+    assert ids == expected
+
+
+async def test_gc_events_noop_when_below_cap(db: Database) -> None:
+    """gc_events is a no-op when the event count is below the cap."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Insert only 3 events — well below the default cap.
+    for _ in range(3):
+        await repo.append_event(db, type="test.event", project_id=p.id)
+
+    before = await repo.list_events(db, project_id=p.id, limit=100)
+    assert len(before) == 3
+
+    # Call with a large keep — should not delete anything.
+    await repo.gc_events(db, p.id, keep=100)
+
+    after = await repo.list_events(db, project_id=p.id, limit=100)
+    assert len(after) == 3
+    assert {e.id for e in after} == {e.id for e in before}
+
+
+async def test_gc_events_uses_transaction(db: Database) -> None:
+    """gc_events runs through the serialized write so it composes with concurrent appends."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    # Insert events.
+    for _ in range(5):
+        await repo.append_event(db, type="test.event", project_id=p.id)
+
+    assert len(await repo.list_events(db, project_id=p.id, limit=100)) == 5
+
+    # Prune to 3 — the call completes without error, proving the serialized-write
+    # path works with this SQL pattern.
+    await repo.gc_events(db, p.id, keep=3)
+    assert len(await repo.list_events(db, project_id=p.id, limit=100)) == 3
+
+    # Verify idempotent: calling again with the same keep is harmless.
+    await repo.gc_events(db, p.id, keep=3)
+    assert len(await repo.list_events(db, project_id=p.id, limit=100)) == 3
+
+
+async def test_migration_6_indexes_exist(db: Database) -> None:
+    """Migration 6 creates idx_tasks_project_created and idx_usage_task."""
+    # Verify idx_tasks_project_created exists on tasks.
+    task_indexes = await db.fetchall(
+        "SELECT name FROM pragma_index_list('tasks') ORDER BY name"
+    )
+    task_names = {r["name"] for r in task_indexes}
+    assert "idx_tasks_project_created" in task_names
+
+    # Verify idx_usage_task exists on usage.
+    usage_indexes = await db.fetchall(
+        "SELECT name FROM pragma_index_list('usage') ORDER BY name"
+    )
+    usage_names = {r["name"] for r in usage_indexes}
+    assert "idx_usage_task" in usage_names

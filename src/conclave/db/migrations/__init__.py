@@ -256,10 +256,16 @@ ALTER TABLE usage ADD COLUMN cache_read_tokens INTEGER;
 ALTER TABLE usage ADD COLUMN cache_creation_tokens INTEGER;
 """
 
+_SQL_006 = """
+CREATE INDEX idx_tasks_project_created ON tasks(project_id, created_at DESC);
+CREATE INDEX idx_usage_task ON usage(task_id);
+"""
+
 MIGRATIONS: list[Migration] = [
     Migration(version=1, name="initial_schema", sql=_SQL_001),
     Migration(version=2, name="add_ai_enriched_to_repo_knowledge", sql=_SQL_002),
     Migration(version=3, name="add_planning_sessions", sql=_SQL_003),
     Migration(version=4, name="add_parent_task_id_to_tasks", sql=_SQL_004),
     Migration(version=5, name="add_tokens_to_usage", sql=_SQL_005),
+    Migration(version=6, name="add_task_usage_indexes", sql=_SQL_006),
 ]

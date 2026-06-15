@@ -139,7 +139,8 @@ class Orchestrator:
             gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
 
             baseline_preamble = await self._baseline(
-                project.id, worktree, checkpoint, target_branch, test_command, gate_timeout
+                project.id, worktree, checkpoint, target_branch, test_command, gate_timeout,
+                events_retention=config.execution.retention_events_max,
             )
             plan_preamble = await self._maybe_plan(
                 runner, task, worktree, knowledge, rules, baseline_preamble, config
@@ -325,6 +326,7 @@ class Orchestrator:
         target_branch: str,
         test_command: str | None,
         gate_timeout: int,
+        events_retention: int = 10_000,
     ) -> str:
         if not test_command:
             return ""
@@ -345,6 +347,10 @@ class Orchestrator:
             failures = gate.output
         await repo.save_baseline(self._db, project_id, checkpoint, failures)
         await repo.gc_baselines(self._db, project_id)
+        # Prune old events per-project so the events table stays bounded under load.
+        # The DELETE is cheap when under the cap (no rows match) and is index-covered
+        # by the existing (project_id, id) index.
+        await repo.gc_events(self._db, project_id, keep=events_retention)
         return build_baseline_preamble(target_branch, failures)
 
     async def _maybe_plan(

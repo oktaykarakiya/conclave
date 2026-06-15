@@ -121,6 +121,15 @@ class ExecutionSettings(BaseModel):
         ge=1,
         description="Timeout in seconds for the setup_command provisioning step.",
     )
+    retention_events_max: int = Field(
+        default=10_000,
+        ge=100,
+        description=(
+            "Maximum number of recent events to retain per project before GC prunes older rows. "
+            "A DELETE subquery keeps the highest-id rows; when the count is below this cap the "
+            "DELETE is cheap (no rows match)."
+        ),
+    )
 
 
 class ExperimentalSettings(BaseModel):

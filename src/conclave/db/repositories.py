@@ -508,6 +508,21 @@ async def list_events(
     return [EventRow.from_row(r) for r in rows]
 
 
+async def gc_events(db: Database, project_id: str, keep: int = 10_000) -> None:
+    """Prune ``events`` rows beyond the most-recent *keep* per project.
+
+    Uses the same subquery-DELETE pattern as :func:`gc_baselines`: keeps the highest-id
+    rows and drops the rest.  The DELETE is cheap when the row count is below *keep*
+    (the subquery returns all ids, so none match the NOT IN).  The operation runs
+    through the standard serialized write so it composes safely with concurrent appends.
+    """
+    await db.execute(
+        "DELETE FROM events WHERE project_id = ? AND id NOT IN "
+        "(SELECT id FROM events WHERE project_id = ? ORDER BY id DESC LIMIT ?)",
+        (project_id, project_id, keep),
+    )
+
+
 # --- usage ------------------------------------------------------------------
 
 
