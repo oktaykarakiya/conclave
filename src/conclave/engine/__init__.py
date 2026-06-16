@@ -5,6 +5,7 @@ from __future__ import annotations
 from .baseline import build_baseline_preamble, trim_output
 from .gate import GateResult, run_tests
 from .gitio import run_git, run_shell
+from .hunter import HunterCandidate, parse_hunter_candidate
 from .memory import AttemptMemory
 from .orchestrator import Orchestrator
 from .pipeline import get_agent_pipeline
@@ -16,6 +17,7 @@ __all__ = [
     "AgentRunner",
     "AttemptMemory",
     "GateResult",
+    "HunterCandidate",
     "Orchestrator",
     "ParsedVerdict",
     "WorktreeError",
@@ -24,6 +26,7 @@ __all__ = [
     "build_baseline_preamble",
     "check_grounding",
     "get_agent_pipeline",
+    "parse_hunter_candidate",
     "parse_verdict",
     "run_git",
     "run_shell",
