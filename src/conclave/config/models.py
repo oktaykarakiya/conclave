@@ -33,6 +33,7 @@ class AgentRole(StrEnum):
     conditional = "conditional"  # reviews only when diff triggers fire
     analyst = "analyst"  # repo intelligence
     hunter = "hunter"  # bug discovery (Phase 2)
+    repro = "repro"  # reproduction gate: prove a candidate with a failing test (Phase 2)
     postmortem = "postmortem"  # failure analysis
 
 
