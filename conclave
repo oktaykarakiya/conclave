@@ -5,6 +5,8 @@
 #   CONCLAVE_HOST=127.0.0.1 ./conclave           # restrict to loopback
 #   CONCLAVE_PORT=9000 ./conclave                # custom port
 #   CONCLAVE_HOME=/path/to/data ./conclave       # data dir (default ~/.local/share/conclave)
+#   CONCLAVE_ENGINE=claude ./conclave            # use the legacy claude CLI (default: opencode)
+#   CONCLAVE_OPENCODE_BIN=/path/to/opencode      # override opencode binary autodiscovery
 #   PYTHON=python3.12 ./conclave                 # pick the interpreter used to build the venv
 set -euo pipefail
 
@@ -29,6 +31,27 @@ if [ ! -f "$MARKER" ] || [ "$HERE/pyproject.toml" -nt "$MARKER" ]; then
   echo "[conclave] installing dependencies ..."
   "$VENV/bin/python" -m pip install --quiet -e "$HERE"
   touch "$MARKER"
+fi
+
+# --- Engine selection (opencode-native by default) ---------------------------
+# Conclave drives the opencode CLI by default; CONCLAVE_ENGINE=claude uses the legacy one.
+export CONCLAVE_ENGINE="${CONCLAVE_ENGINE:-opencode}"
+if [ "$CONCLAVE_ENGINE" = "opencode" ]; then
+  # opencode is frequently installed outside PATH (e.g. ~/.opencode/bin). Locate it once.
+  if [ -z "${CONCLAVE_OPENCODE_BIN:-}" ]; then
+    if command -v opencode >/dev/null 2>&1; then
+      CONCLAVE_OPENCODE_BIN="$(command -v opencode)"
+    elif [ -x "$HOME/.opencode/bin/opencode" ]; then
+      CONCLAVE_OPENCODE_BIN="$HOME/.opencode/bin/opencode"
+    fi
+    export CONCLAVE_OPENCODE_BIN
+  fi
+  if [ -n "${CONCLAVE_OPENCODE_BIN:-}" ]; then
+    echo "[conclave] engine: opencode ($CONCLAVE_OPENCODE_BIN)" >&2
+  else
+    echo "[conclave] warning: opencode not found — install it or set CONCLAVE_OPENCODE_BIN," >&2
+    echo "[conclave]          or run 'CONCLAVE_ENGINE=claude ./conclave' for the claude CLI." >&2
+  fi
 fi
 
 exec "$VENV/bin/python" -m conclave.main "$@"
