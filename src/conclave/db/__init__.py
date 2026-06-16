@@ -7,6 +7,9 @@ from .database import Database
 from .models import (
     AgentPersona,
     Baseline,
+    BugCandidate,
+    BugStatus,
+    CoverageRegion,
     EngineProfileRow,
     EventRow,
     Project,
@@ -23,6 +26,9 @@ from .models import (
 __all__ = [
     "AgentPersona",
     "Baseline",
+    "BugCandidate",
+    "BugStatus",
+    "CoverageRegion",
     "Database",
     "EngineProfileRow",
     "EventRow",

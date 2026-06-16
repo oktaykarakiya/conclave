@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from conclave.db import Database, ProjectMode, TaskOrigin, TaskState
+from conclave.db import (
+    BugCandidate,
+    BugStatus,
+    CoverageRegion,
+    Database,
+    ProjectMode,
+    TaskOrigin,
+    TaskState,
+)
 from conclave.db import repositories as repo
 from conclave.db.migrations import MIGRATIONS, Migration
 from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatus
@@ -679,6 +688,137 @@ async def test_corrupt_planning_rows_load_with_safe_defaults(db: Database) -> No
     nodes = await repo.list_planning_task_nodes(db, "sess")
     assert len(nodes) == 1
     assert nodes[0].status is PlanningNodeStatus.proposed
+
+
+async def test_bug_candidate_from_row_happy_path(db: Database) -> None:
+    """A fully-populated bug_candidates row round-trips through BugCandidate.from_row.
+
+    The enum status parses, consensus_json decodes to a dict, and every reproduction/handoff
+    column maps onto its model field.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO bug_candidates ("
+        "id, project_id, fingerprint, file, symbol, region, claim, severity, status, "
+        "repro_test_path, repro_test_body, repro_test_hash, attempts, decline_reason, "
+        "consensus_json, task_id, notes, discovered_at, last_examined_at, fixed_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "bc-happy", p.id, "fp-1", "src/x.py", "foo", "src/", "off-by-one in slice", "high",
+            "reproduced", "tests/test_x.py", "def test_x(): assert False", "deadbeef", 2, None,
+            '{"reviewers": 3, "agree": true}', "t-1", "a note", "2026-01-01", "2026-01-02", None,
+        ),
+    )
+
+    row = await db.fetchone("SELECT * FROM bug_candidates WHERE id = 'bc-happy'")
+    bc = BugCandidate.from_row(row)
+
+    assert bc.id == "bc-happy"
+    assert bc.project_id == p.id
+    assert bc.fingerprint == "fp-1"
+    assert bc.file == "src/x.py"
+    assert bc.symbol == "foo"
+    assert bc.region == "src/"
+    assert bc.claim == "off-by-one in slice"
+    assert bc.severity == "high"
+    assert bc.status is BugStatus.reproduced
+    assert bc.repro_test_path == "tests/test_x.py"
+    assert bc.repro_test_body == "def test_x(): assert False"
+    assert bc.repro_test_hash == "deadbeef"
+    assert bc.attempts == 2
+    assert bc.decline_reason is None
+    assert bc.consensus == {"reviewers": 3, "agree": True}
+    assert bc.task_id == "t-1"
+    assert bc.notes == "a note"
+    assert bc.discovered_at == "2026-01-01"
+    assert bc.last_examined_at == "2026-01-02"
+    assert bc.fixed_at is None
+
+
+async def test_bug_candidate_from_row_applies_column_defaults(db: Database) -> None:
+    """A minimal insert leans on the schema defaults: status 'discovered', attempts 0,
+    consensus '{}'. The model surfaces them as the natural initial state — distinct from the
+    corrupt-row sink exercised below."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, "
+        "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("bc-min", p.id, "fp-min", "claim", "2026-01-01", "2026-01-01"),
+    )
+    bc = BugCandidate.from_row(
+        await db.fetchone("SELECT * FROM bug_candidates WHERE id = 'bc-min'")
+    )
+    assert bc.status is BugStatus.discovered
+    assert bc.attempts == 0
+    assert bc.consensus == {}
+    assert bc.region is None
+    assert bc.repro_test_path is None
+
+
+async def test_corrupt_bug_candidate_row_loads_with_safe_defaults(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bug_candidates row with an unknown status and corrupt consensus JSON must load —
+    not raise out of from_row and stall the controller's ledger scan.
+
+    The unknown status degrades to ``declined_needs_human`` (non-actionable, human-routed)
+    so a corrupt candidate is never auto-picked for an auto-fix; corrupt consensus_json
+    decodes to ``{}``. Both fallbacks log a warning rather than raising.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, status, "
+        "consensus_json, discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("bc-bad", p.id, "fp-bad", "claim", "totally-bogus", "{not json", "2026-01-01",
+         "2026-01-01"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="conclave.db.models"):
+        bc = BugCandidate.from_row(
+            await db.fetchone("SELECT * FROM bug_candidates WHERE id = 'bc-bad'")
+        )
+
+    # Falls back to the safe, non-actionable sink — never an auto-pickable state.
+    assert bc.status is BugStatus.declined_needs_human
+    assert bc.status not in {BugStatus.discovered, BugStatus.reproduced}
+    assert bc.consensus == {}
+    # Both corruptions were logged (no raise), so the bad row is observable, not silent.
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "unknown BugStatus" in messages
+    assert "corrupt JSON column" in messages
+
+
+async def test_coverage_region_from_row(db: Database) -> None:
+    """A coverage row round-trips through CoverageRegion.from_row, including the scheduler
+    columns added by migration 8; omitting them applies the NOT NULL defaults (priority 0,
+    examined_count 0)."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO coverage (id, project_id, region, last_examined_at, priority, "
+        "examined_count) VALUES (?, ?, ?, ?, ?, ?)",
+        ("cov-1", p.id, "src/conclave/db", "2026-01-03", 5, 7),
+    )
+    cov = CoverageRegion.from_row(
+        await db.fetchone("SELECT * FROM coverage WHERE id = 'cov-1'")
+    )
+    assert cov.id == "cov-1"
+    assert cov.project_id == p.id
+    assert cov.region == "src/conclave/db"
+    assert cov.last_examined_at == "2026-01-03"
+    assert cov.priority == 5
+    assert cov.examined_count == 7
+
+    # A region that has never been examined leans on the defaults.
+    await db.execute(
+        "INSERT INTO coverage (id, project_id, region) VALUES (?, ?, ?)",
+        ("cov-fresh", p.id, "src/conclave/web"),
+    )
+    fresh = CoverageRegion.from_row(
+        await db.fetchone("SELECT * FROM coverage WHERE id = 'cov-fresh'")
+    )
+    assert fresh.last_examined_at is None
+    assert fresh.priority == 0
+    assert fresh.examined_count == 0
 
 
 async def test_block_descendants_cycle_safe(db: Database) -> None:
