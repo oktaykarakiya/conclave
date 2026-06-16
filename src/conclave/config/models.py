@@ -270,6 +270,78 @@ class AgentsPolicy(BaseModel):
     )
 
 
+class BugFixerPolicy(BaseModel):
+    """Default session limits for an autonomous Bug-Fixer run.
+
+    This is the single config source the bf-api start endpoint and the bf-controller's
+    run-controls both read, so an operator's per-session override and the controller's
+    loop bounds resolve from one place rather than drifting apart. Region priorities are
+    deliberately NOT here: they stay on :attr:`PlanningSettings.priorities` so the sweep
+    scheduler and the planner keep sharing one ranking.
+
+    ``wall_clock_budget_minutes`` defaults to ``None`` and *reuses*
+    ``execution.wall_clock_budget_minutes`` (the per-task retry-loop cap) at resolution
+    time, so a session inherits the same hard wall as ordinary tasks unless an operator
+    narrows it for that run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_candidates: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description="Cap on bug candidates the controller pursues before the session ends.",
+    )
+    max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=50,
+        description="Auto-fix attempts per candidate before it declines to a human.",
+    )
+    wall_clock_budget_minutes: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Hard wall-clock cap on one session. None reuses "
+            "execution.wall_clock_budget_minutes so a session shares the per-task cap."
+        ),
+    )
+
+
+class BugFixerSessionOverride(BaseModel):
+    """Per-session overrides carried on a Bug-Fixer start request.
+
+    Every field is optional: a value present here wins over the project's
+    :class:`BugFixerPolicy` default; an omitted (``None``) field falls back to it. This
+    is the start-request payload bf-api validates before handing the controller a
+    resolved :class:`BugFixerSessionConfig`. Bounds mirror the policy so an override can
+    never widen a limit past what the policy itself permits.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_candidates: int | None = Field(default=None, ge=1, le=1000)
+    max_attempts: int | None = Field(default=None, ge=1, le=50)
+    wall_clock_budget_minutes: int | None = Field(default=None, ge=0)
+
+
+class BugFixerSessionConfig(BaseModel):
+    """The fully-resolved limits a single Bug-Fixer session runs under.
+
+    Produced by :func:`conclave.config.resolver.resolve_bug_fixer_session` from the
+    project policy, the execution wall-clock default, and an optional per-session
+    override. Every field is concrete — the wall-clock fallback is already applied — so
+    the controller reads it without re-deriving precedence on each loop tick.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_candidates: int = Field(ge=1, le=1000)
+    max_attempts: int = Field(ge=1, le=50)
+    wall_clock_budget_minutes: int = Field(ge=0)
+
+
 class ProtectedSettings(BaseModel):
     """Paths agents must never modify. ``.env*`` and ``.git`` are an enforced floor
     (see :func:`conclave.config.resolver.effective_protected`); users may add, not remove."""
@@ -301,6 +373,7 @@ class ConclaveConfig(BaseModel):
     experimental: ExperimentalSettings = Field(default_factory=ExperimentalSettings)
     planning: PlanningSettings = Field(default_factory=PlanningSettings)
     agents: AgentsPolicy = Field(default_factory=AgentsPolicy)
+    bug_fixer: BugFixerPolicy = Field(default_factory=BugFixerPolicy)
     protected: ProtectedSettings = Field(default_factory=ProtectedSettings)
     agent_defaults: AgentSettings = Field(default_factory=AgentSettings)
     agent_overrides: dict[str, dict[str, object]] = Field(default_factory=dict)

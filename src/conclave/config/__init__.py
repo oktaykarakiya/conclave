@@ -7,6 +7,9 @@ from .models import (
     AgentSettings,
     AgentsPolicy,
     ArgMode,
+    BugFixerPolicy,
+    BugFixerSessionConfig,
+    BugFixerSessionOverride,
     ConclaveConfig,
     ConditionalAgent,
     DeclineConsensus,
@@ -22,6 +25,7 @@ from .resolver import (
     effective_protected,
     load_project_config,
     resolve_agent,
+    resolve_bug_fixer_session,
 )
 from .schema import agent_schema, config_schema, default_config_dict
 
@@ -30,6 +34,9 @@ __all__ = [
     "AgentSettings",
     "AgentsPolicy",
     "ArgMode",
+    "BugFixerPolicy",
+    "BugFixerSessionConfig",
+    "BugFixerSessionOverride",
     "ConclaveConfig",
     "ConditionalAgent",
     "DeclineConsensus",
@@ -46,4 +53,5 @@ __all__ = [
     "effective_protected",
     "load_project_config",
     "resolve_agent",
+    "resolve_bug_fixer_session",
 ]
