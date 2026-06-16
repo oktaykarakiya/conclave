@@ -46,6 +46,12 @@ class OpenCodeCliProvider:
             # A fixed title skips opencode's per-session title-generation LLM call.
             "--title", "conclave",
         ]
+        # Pin opencode's working directory EXPLICITLY. Passing cwd to the subprocess is
+        # not sufficient: opencode resolves its project directory independently of the
+        # inherited process cwd, and would otherwise edit the daemon's own checkout
+        # instead of the task worktree (silently corrupting the repo and merging nothing).
+        if cwd is not None:
+            args += ["--dir", str(cwd)]
         # opencode owns the default model; only override when a profile names an
         # opencode-format "provider/model" (claude-style names like "claude-opus-4-8"
         # have no "/" and are ignored so the opencode default is used).
