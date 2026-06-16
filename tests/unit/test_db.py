@@ -3,21 +3,35 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from conclave.db import Database, ProjectMode, TaskOrigin, TaskState
 from conclave.db import repositories as repo
-from conclave.db.migrations import Migration
+from conclave.db.migrations import MIGRATIONS, Migration
 from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatus
+
+# The 7-state machine the Bug-Fixer controller drives over bug_candidates.status. The column
+# is permissive TEXT (validation lives in the enum/Pydantic layer, like tasks.state), so this
+# tuple documents the canonical vocabulary and the migration test proves each value persists.
+BUG_CANDIDATE_STATUSES = (
+    "discovered",
+    "reproduced",
+    "fixing",
+    "fixed",
+    "dismissed_false_positive",
+    "declined_needs_human",
+    "deferred",
+)
 
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 7
+    assert version == 8
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 7
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 8
 
 
 async def test_migration_failure_is_atomic(
@@ -28,12 +42,12 @@ async def test_migration_failure_is_atomic(
 
     Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
     replays the same migration and wedges on a duplicate-column error. The fixture DB is
-    already at version 7; we inject a v8 migration whose first statement succeeds (creates
+    already at version 8; we inject a v9 migration whose first statement succeeds (creates
     a probe table) and whose second fails — ``stabilization_reason`` was already added by
     migration 7, so re-adding it raises a duplicate-column error — which is exactly that wedge.
     """
     failing = Migration(
-        version=8,
+        version=9,
         name="injected_failure",
         sql=(
             "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
@@ -46,7 +60,7 @@ async def test_migration_failure_is_atomic(
         await db._apply_migrations()
 
     # Version did not advance past the last good migration...
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 7
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 8
     # ...and the partial DDL (the probe table from the first statement) was rolled back.
     assert (
         await db.fetchval(
@@ -54,6 +68,108 @@ async def test_migration_failure_is_atomic(
         )
         == 0
     )
+
+
+async def test_migration_8_bug_candidate_ledger_schema(db: Database) -> None:
+    """Migration 8 reshapes bug_candidates into the 7-state ledger and extends coverage.
+
+    A fresh DB is at version 8. The old two-field status model (status DEFAULT 'candidate'
+    plus a separate ``reproduced`` boolean) is gone, replaced by a single permissive
+    ``status`` TEXT defaulting to 'discovered', alongside the reproduction/consensus columns;
+    coverage gains priority + examined_count.
+    """
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 8
+
+    cols = {r["name"]: r for r in await db.fetchall("PRAGMA table_info(bug_candidates)")}
+    # New columns are present...
+    for added in (
+        "region", "repro_test_path", "repro_test_body", "repro_test_hash",
+        "attempts", "decline_reason", "consensus_json",
+    ):
+        assert added in cols, f"bug_candidates is missing {added}"
+    # ...the retired boolean is gone, and the reshaped columns carry the documented defaults.
+    assert "reproduced" not in cols
+    assert cols["status"]["notnull"] == 1
+    assert cols["status"]["dflt_value"] == "'discovered'"
+    assert cols["attempts"]["notnull"] == 1
+    assert cols["attempts"]["dflt_value"] == "0"
+    assert cols["consensus_json"]["notnull"] == 1
+    assert cols["consensus_json"]["dflt_value"] == "'{}'"
+    # Preserved columns survive the rebuild.
+    for kept in (
+        "fingerprint", "file", "symbol", "claim", "severity", "task_id",
+        "notes", "discovered_at", "last_examined_at", "fixed_at",
+    ):
+        assert kept in cols
+
+    # The fingerprint unique index is recreated with the table.
+    indexes = {r["name"] for r in await db.fetchall("PRAGMA index_list('bug_candidates')")}
+    assert "idx_bug_fingerprint" in indexes
+
+    # coverage gains its scheduler columns with the documented NOT NULL defaults.
+    cov = {r["name"]: r for r in await db.fetchall("PRAGMA table_info(coverage)")}
+    assert cov["priority"]["notnull"] == 1 and cov["priority"]["dflt_value"] == "0"
+    assert cov["examined_count"]["notnull"] == 1 and cov["examined_count"]["dflt_value"] == "0"
+
+    # Each of the 7 status strings inserts cleanly — the column is permissive TEXT (no CHECK),
+    # so the ledger can hold any state the controller advances a candidate through.
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    for i, status in enumerate(BUG_CANDIDATE_STATUSES):
+        await db.execute(
+            "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, status, "
+            "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (f"bc{i}", p.id, f"fp{i}", "off-by-one in slice", status, "2026-01-01", "2026-01-01"),
+        )
+    persisted = {r["status"] for r in await db.fetchall("SELECT status FROM bug_candidates")}
+    assert persisted == set(BUG_CANDIDATE_STATUSES)
+
+    # Omitting status applies the 'discovered' default.
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, "
+        "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("bc-default", p.id, "fp-default", "claim", "2026-01-01", "2026-01-01"),
+    )
+    assert (
+        await db.fetchval("SELECT status FROM bug_candidates WHERE id = 'bc-default'")
+        == "discovered"
+    )
+
+
+async def test_migration_8_recreates_seeded_bug_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v8 DROP/recreate runs cleanly against a DB where the v1 scaffold physically exists.
+
+    A fresh DB never materializes the old bug_candidates shape, so we seed a DB at version 1
+    only — where the retired ``status DEFAULT 'candidate'`` + ``reproduced`` columns are real —
+    then migrate forward and confirm it reaches version 8 with the new schema. This exercises
+    the DROP against an actual prior table rather than a no-op on a missing one.
+    """
+    # Seed at version 1: expose only the initial-schema migration to the runner.
+    monkeypatch.setattr("conclave.db.database.MIGRATIONS", [MIGRATIONS[0]])
+    database = Database(tmp_path / "seeded.db")
+    await database.connect()
+    try:
+        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 1
+        v1_cols = {
+            r["name"] for r in await database.fetchall("PRAGMA table_info(bug_candidates)")
+        }
+        assert "reproduced" in v1_cols  # the old scaffold is genuinely present
+
+        # Expose the full migration set and roll the seeded DB forward to head.
+        monkeypatch.setattr("conclave.db.database.MIGRATIONS", MIGRATIONS)
+        await database._apply_migrations()
+
+        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 8
+        v8_cols = {
+            r["name"] for r in await database.fetchall("PRAGMA table_info(bug_candidates)")
+        }
+        assert "reproduced" not in v8_cols  # rebuilt without the retired boolean
+        assert {"region", "repro_test_path", "attempts", "consensus_json"} <= v8_cols
+        cov_cols = {r["name"] for r in await database.fetchall("PRAGMA table_info(coverage)")}
+        assert {"priority", "examined_count"} <= cov_cols
+    finally:
+        await database.close()
 
 
 async def test_project_crud_and_config(db: Database) -> None:
