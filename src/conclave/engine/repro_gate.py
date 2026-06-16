@@ -164,6 +164,45 @@ async def reproduce_bug(
     )
 
 
+def resolve_repro_test_path(
+    worktree: Path, candidate_path: object, *, tests_dir: str = "tests"
+) -> Path | None:
+    """The *bf-repro-realpath-guard*: resolve a model-chosen repro path under the tests tree.
+
+    Pure (no writes, no mkdir): it RESOLVES a candidate path on disk and reports whether it is a
+    legitimate in-tree test target, returning the resolved absolute :class:`~pathlib.Path`
+    (symlinks followed — the *realpath*) when accepted, or ``None`` for anything we refuse to write
+    through. The caller does the writing; this only decides.
+
+    This is the filesystem-aware counterpart to the lexical :func:`repro_pathguard`. That guard
+    vets the raw STRING (absolute, ``..``, ``~``, Windows separators, non-``test_*`` names) without
+    touching disk; this one is layered ON TOP for defense in depth and adds the one check a string
+    guard fundamentally cannot make — a *symlink escape*, where every lexical component looks
+    contained but a symlinked directory (or file) redirects the resolved target outside the tests
+    tree. So a candidate must FIRST clear ``repro_pathguard`` (rejecting absolute / ``..`` paths
+    before any disk access), THEN its realpath must be ``is_relative_to`` the resolved tests root.
+
+    Both sides are resolved before the comparison: the tests root via ``.resolve()`` too, so a
+    worktree reached through a symlinked prefix (a ``/tmp`` symlink, a pytest ``tmp_path``) still
+    compares correctly. Confinement is to ``<tests_dir>`` specifically — stricter than the bare
+    worktree — because a synthesized reproduction belongs under the project's tests tree and
+    nowhere else.
+    """
+    # Lexical gate first: cheap, and it rejects the raw-string escape vectors (absolute, ``..``,
+    # ``~``, ``\``, control chars, non-test names) before this layer ever touches the filesystem.
+    safe = repro_pathguard(candidate_path)
+    if safe is None:
+        return None
+    # Realpath both the candidate and the tests root, then demand containment. ``.resolve()``
+    # follows every existing symlink component, so a path that is lexically clean but escapes via a
+    # symlinked directory resolves outside ``tests_root`` and is refused here.
+    tests_root = (worktree / tests_dir).resolve()
+    target = (worktree / safe).resolve()
+    if not target.is_relative_to(tests_root):
+        return None
+    return target
+
+
 # --- module helpers ---
 
 
@@ -273,14 +312,15 @@ async def _run_with_infra_retry(
 
 
 def _write_repro(worktree: Path, safe_path: str, body: str) -> bool:
-    """Write the test body into the worktree at ``safe_path``, or refuse if it escapes.
+    """Write the test body into the worktree's tests tree at ``safe_path``, or refuse if it escapes.
 
-    ``safe_path`` already passed the bf-repro-pathguard, but the resolved target is re-checked
-    against the worktree root (mirroring :func:`check_grounding`) before any write — a path that
-    resolves outside the sandbox is refused rather than written through.
+    ``safe_path`` already passed the lexical bf-repro-pathguard, but this is the WRITER, so the
+    target is RE-RESOLVED on disk through :func:`resolve_repro_test_path` (the realpath confinement
+    that also catches a symlink escape, mirroring :func:`check_grounding`) before any byte is
+    written — a path resolving outside ``worktree/tests`` is refused rather than written through.
     """
-    target = (worktree / safe_path).resolve()
-    if not target.is_relative_to(worktree.resolve()):
+    target = resolve_repro_test_path(worktree, safe_path)
+    if target is None:
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body, encoding="utf-8")
