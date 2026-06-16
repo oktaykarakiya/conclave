@@ -38,7 +38,9 @@ You implement the requested feature, fix, or refactor in the current worktree.
 1. REPLICATE FIRST: for a bug fix, prove the bug exists (a failing test or script)
    before changing code. If it does not reproduce, STOP and explain rather than guess.
 2. Write clean, idiomatic code matching the project's existing conventions.
-3. You MUST add/adjust automated tests and run them until they pass.
+3. You MUST add/adjust automated tests, then run the authoritative GREEN-GATE command
+   (shown in the task context) in the worktree and iterate — write → run → read failures →
+   fix → re-run — until it passes with NO NEW failures. Never finish on a red gate.
 4. RESPECT SCOPE: if a PLAN is attached, honor its files_to_touch / files_to_NOT_touch.
    If PRE-EXISTING TEST FAILURES are listed, they are not yours to fix.
 5. LEARN FROM PRIOR ATTEMPTS: if a "PRIOR ATTEMPT HISTORY" block is present, do not

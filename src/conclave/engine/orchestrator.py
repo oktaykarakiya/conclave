@@ -221,6 +221,17 @@ class Orchestrator:
                     await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
                 dev_prompt = task.request + plan_preamble + baseline_preamble
+                if test_command:
+                    # Hand the developer the EXACT authoritative gate so its own
+                    # write→run→fix loop converges on what the orchestrator actually
+                    # enforces — not a partial self-check that passes here but fails the gate.
+                    dev_prompt += (
+                        "\n\nGREEN-GATE (authoritative — exactly what the orchestrator runs "
+                        "to accept your work). Before you finish, run this EXACT command in "
+                        "the worktree and iterate (write → run → read failures → fix → re-run) "
+                        "until it passes with NO NEW failures vs. the pre-existing baseline:\n"
+                        f"```\n{test_command}\n```\n"
+                    )
                 if use_memory:
                     dev_prompt += memory.build_preamble()
                 if feedback:
