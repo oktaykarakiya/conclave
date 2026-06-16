@@ -8,7 +8,7 @@ from pathlib import Path
 import uvicorn
 
 from .db import Database
-from .providers import ClaudeCliProvider
+from .providers import ClaudeCliProvider, OpenCodeCliProvider, Provider
 from .runtime import Daemon
 from .web import create_app
 
@@ -20,10 +20,19 @@ def conclave_home() -> Path:
     return Path.home() / ".local" / "share" / "conclave"
 
 
+def make_provider() -> Provider:
+    """Select the agent engine. ``CONCLAVE_ENGINE=opencode`` drives the opencode CLI;
+    anything else (default) keeps the legacy ``claude`` CLI during the transition."""
+    engine = os.environ.get("CONCLAVE_ENGINE", "claude").strip().lower()
+    if engine == "opencode":
+        return OpenCodeCliProvider()
+    return ClaudeCliProvider()
+
+
 def cli() -> None:
     home = conclave_home()
     db = Database(home / "conclave.db")
-    daemon = Daemon(db, home, ClaudeCliProvider())
+    daemon = Daemon(db, home, make_provider())
     app = create_app(daemon)
     # Personal/single-user tool: bind all interfaces by default so the UI is reachable
     # from the LAN (e.g. your phone). Run only on a trusted network — the API is
