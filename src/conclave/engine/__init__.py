@@ -13,6 +13,7 @@ from .orchestrator import Orchestrator
 from .pipeline import get_agent_pipeline
 from .region_scheduler import select_hunt_region
 from .repro import ReproTest, parse_repro_test, repro_pathguard
+from .repro_gate import ReproOutcome, ReproResult, reproduce_bug
 from .runner import AgentRunner, assemble_prompt
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
 from .worktree import WorktreeError, WorktreeManager
@@ -24,6 +25,8 @@ __all__ = [
     "HunterCandidate",
     "Orchestrator",
     "ParsedVerdict",
+    "ReproOutcome",
+    "ReproResult",
     "ReproTest",
     "WorktreeError",
     "WorktreeManager",
@@ -37,6 +40,7 @@ __all__ = [
     "parse_repro_test",
     "parse_verdict",
     "repro_pathguard",
+    "reproduce_bug",
     "run_git",
     "run_shell",
     "run_tests",
