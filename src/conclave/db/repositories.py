@@ -1450,3 +1450,19 @@ async def select_next_region(db: Database, project_id: str) -> CoverageRegion | 
         (project_id,),
     )
     return CoverageRegion.from_row(row) if row else None
+
+
+async def list_coverage_regions(db: Database, project_id: str) -> list[CoverageRegion]:
+    """Every coverage region for a project, in :func:`select_next_region`'s canonical order.
+
+    Same ordering key (least-recently-examined first, highest priority breaking ties, region
+    name as the deterministic final tiebreak) — this is the full-list form the region scheduler
+    walks when it must drop ``ignore_patterns`` matches that the single-row ``LIMIT 1`` SQL of
+    :func:`select_next_region` cannot express.
+    """
+    rows = await db.fetchall(
+        "SELECT * FROM coverage WHERE project_id = ? "
+        "ORDER BY last_examined_at ASC, priority DESC, region ASC",
+        (project_id,),
+    )
+    return [CoverageRegion.from_row(row) for row in rows]

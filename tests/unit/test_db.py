@@ -1278,3 +1278,30 @@ async def test_coverage_region_scoped_per_project(db: Database) -> None:
 
     assert (await repo.select_next_region(db, p1.id)).region == "only-p1"  # type: ignore[union-attr]
     assert await repo.select_next_region(db, p2.id) is None
+
+
+async def test_list_coverage_regions_canonical_order_and_scope(db: Database) -> None:
+    """list_coverage_regions returns every region in select_next_region's order, project-scoped."""
+    p1 = await repo.create_project(db, name="p1", path="/tmp/p1", default_branch="main")
+    p2 = await repo.create_project(db, name="p2", path="/tmp/p2", default_branch="main")
+    assert await repo.list_coverage_regions(db, p1.id) == []  # empty project
+
+    # never-examined (NULL); two examined on the same old day (priority tiebreak); one recent.
+    await repo.upsert_coverage_region(db, project_id=p1.id, region="never", priority=0)
+    await repo.upsert_coverage_region(
+        db, project_id=p1.id, region="old-hi", priority=9, last_examined_at="2026-01-01"
+    )
+    await repo.upsert_coverage_region(
+        db, project_id=p1.id, region="old-lo", priority=1, last_examined_at="2026-01-01"
+    )
+    await repo.upsert_coverage_region(
+        db, project_id=p1.id, region="recent", priority=9, last_examined_at="2026-06-01"
+    )
+    # A region in another project must not leak into p1's list.
+    await repo.upsert_coverage_region(db, project_id=p2.id, region="only-p2")
+
+    ordered = [r.region for r in await repo.list_coverage_regions(db, p1.id)]
+    assert ordered == ["never", "old-hi", "old-lo", "recent"]
+    # The first element always equals the single-row picker.
+    head = await repo.select_next_region(db, p1.id)
+    assert head is not None and head.region == ordered[0]

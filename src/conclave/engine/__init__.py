@@ -9,6 +9,7 @@ from .hunter import HunterCandidate, parse_hunter_candidate
 from .memory import AttemptMemory
 from .orchestrator import Orchestrator
 from .pipeline import get_agent_pipeline
+from .region_scheduler import select_hunt_region
 from .runner import AgentRunner, assemble_prompt
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
 from .worktree import WorktreeError, WorktreeManager
@@ -31,5 +32,6 @@ __all__ = [
     "run_git",
     "run_shell",
     "run_tests",
+    "select_hunt_region",
     "trim_output",
 ]
