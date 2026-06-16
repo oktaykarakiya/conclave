@@ -6,7 +6,5 @@ export * from "./ui";
 export * from "./pages/TasksPanel";
 export * from "./pages/LivePanel";
 export * from "./pages/ConfigPanel";
-export * from "./pages/ProfilesPanel";
 export * from "./pages/QuarantinePanel";
-export * from "./pages/KnowledgePanel";
 export * from "./pages/AgentCeptionPanel";

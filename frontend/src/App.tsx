@@ -5,9 +5,7 @@ import {
   AgentCeptionPanel,
   Button,
   ConfigPanel,
-  KnowledgePanel,
   LivePanel,
-  ProfilesPanel,
   QuarantinePanel,
   Spinner,
   TasksPanel,
@@ -21,9 +19,7 @@ const TABS = [
   "Tasks",
   "Live",
   "Config",
-  "Profiles",
   "Quarantine",
-  "Knowledge",
 ] as const;
 type Tab = (typeof TABS)[number];
 
@@ -69,12 +65,8 @@ export default function App() {
         return <LivePanel projectId={selected.id} />;
       case "Config":
         return <ConfigPanel projectId={selected.id} />;
-      case "Profiles":
-        return <ProfilesPanel />;
       case "Quarantine":
         return <QuarantinePanel projectId={selected.id} />;
-      case "Knowledge":
-        return <KnowledgePanel projectId={selected.id} />;
     }
   }
 
@@ -201,13 +193,6 @@ export default function App() {
                 <Button onClick={() => api.resume(selected.id)}>Resume</Button>
                 <Button variant="ghost" onClick={() => api.pause(selected.id)}>
                   Pause
-                </Button>
-                <Button
-                  variant="ghost"
-                  title="Re-runs AI repo analysis (takes a few minutes)"
-                  onClick={() => api.reonboard(selected.id)}
-                >
-                  Re-analyze
                 </Button>
               </div>
             </header>

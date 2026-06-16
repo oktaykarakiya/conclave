@@ -1,14 +1,11 @@
 import type {
-  EngineProfile,
   EventRow,
   Integrity,
   PlanningMessage,
   PlanningSession,
   PlanningTaskNode,
-  ProfileTestResult,
   Project,
   Quarantine,
-  RepoKnowledge,
   Task,
   Verdict,
 } from "./types";
@@ -45,18 +42,6 @@ export interface NewTask {
   auto_approve: boolean;
 }
 
-export interface ProfileBody {
-  name: string;
-  project_id: string | null;
-  arg_mode: string;
-  base_url: string | null;
-  model: string | null;
-  subagent_model: string | null;
-  effort: string | null;
-  auth_token: string | null;
-  extra_env: Record<string, string>;
-}
-
 export interface NewPlanningSession {
   title: string;
   prompt: string;
@@ -85,9 +70,6 @@ export const api = {
   detachProject: (id: string) => req<unknown>("DELETE", `/api/projects/${id}`),
   pause: (id: string) => req<unknown>("POST", `/api/projects/${id}/pause`),
   resume: (id: string) => req<unknown>("POST", `/api/projects/${id}/resume`),
-  reonboard: (id: string) => req<unknown>("POST", `/api/projects/${id}/onboard`),
-  getKnowledge: (id: string) => req<RepoKnowledge>("GET", `/api/projects/${id}/knowledge`),
-  aiAnalyze: (id: string) => req<RepoKnowledge>("POST", `/api/projects/${id}/ai-analyze`),
   getConfig: (id: string) => req<Record<string, unknown>>("GET", `/api/projects/${id}/config`),
   patchConfig: (id: string, config: unknown) =>
     req<unknown>("PATCH", `/api/projects/${id}/config`, { config }),
@@ -129,11 +111,6 @@ export const api = {
       cache_creation_tokens: number;
       agent_count: number;
     }>("GET", `/api/tasks/${tid}/usage`),
-
-  listProfiles: () => req<EngineProfile[]>("GET", "/api/profiles"),
-  saveProfile: (b: ProfileBody) => req<EngineProfile>("POST", "/api/profiles", b),
-  testProfile: (b: ProfileBody) => req<ProfileTestResult>("POST", "/api/profiles/test", b),
-  deleteProfile: (id: string) => req<unknown>("DELETE", `/api/profiles/${id}`),
 
   listQuarantine: (id: string) => req<Quarantine[]>("GET", `/api/projects/${id}/quarantine`),
   quarantineIntegrity: (id: string) =>
