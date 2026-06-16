@@ -35,6 +35,7 @@ from ..db import repositories as repo
 from ..events import EventBus, EventType
 from ..providers import Provider
 from ..repo_intel.knowledge import render_preamble
+from .coverage_ingest import ingest_coverage
 from .hunter import parse_hunter_candidate
 from .region_scheduler import select_hunt_region
 from .runner import AgentRunner
@@ -58,6 +59,12 @@ async def discover_bug(
     """
     knowledge_row = await repo.current_repo_knowledge(db, project.id)
     knowledge = knowledge_row.knowledge if knowledge_row else {}
+
+    # Refresh hunt priorities from the target repo's coverage report before selecting, so the
+    # sweep is genuinely coverage-aware. This is read-only on the working tree and writes only to
+    # this project's coverage rows; a missing/corrupt report is a no-op, leaving selection on the
+    # scheduler's flat seeding (least-recently-examined) rather than erroring the sweep.
+    await ingest_coverage(db, project.id, repo_path=Path(project.path))
 
     region = await select_hunt_region(
         db, project.id, layout_dirs=_layout_dirs(knowledge), planning=config.planning

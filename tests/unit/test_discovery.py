@@ -11,6 +11,7 @@ hunter reply discovers nothing.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from conclave.config import ConclaveConfig
 from conclave.db import BugStatus, Database, EventRow
@@ -90,6 +91,31 @@ async def test_discovers_persists_and_emits(db: Database) -> None:
     assert events[0].payload["status"] == BugStatus.discovered.value
     # The claim round-trips into the LOCAL event payload — a permitted local-only sink.
     assert events[0].payload["claim"] == found.claim
+
+
+# --- coverage-aware selection: the sweep hunts the thinnest-covered region --
+
+
+async def test_sweep_consumes_coverage_priorities(db: Database, tmp_path: Path) -> None:
+    """A sweep ingests the repo's coverage.json and hunts the thinnest-covered region first."""
+    p = await repo.create_project(db, name="demo", path=str(tmp_path), default_branch="main")
+    report = {
+        "files": {
+            "src/lo/a.py": {"summary": {"covered_lines": 1, "num_statements": 10}},  # 10%
+            "src/hi/b.py": {"summary": {"covered_lines": 9, "num_statements": 10}},  # 90%
+        }
+    }
+    (tmp_path / "coverage.json").write_text(json.dumps(report), encoding="utf-8")
+    bus = EventBus(db)
+    provider = _HunterProvider()
+
+    found = await discover_bug(db, bus, provider, p, ConclaveConfig())
+
+    # The low-coverage region outranks the high-coverage one and is the region actually swept —
+    # proof the ingest is wired in, not dead code.
+    assert found is not None and found.region == "src/lo"
+    rows = {r.region: r for r in await repo.list_coverage_regions(db, p.id)}
+    assert rows["src/lo"].priority == 90 and rows["src/hi"].priority == 10
 
 
 # --- dedupe: a repeat fingerprint is a silent no-op -------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .baseline import build_baseline_preamble, trim_output
+from .coverage_ingest import ingest_coverage
 from .discovery import discover_bug
 from .gate import GateResult, run_tests
 from .gitio import run_git, run_shell
@@ -29,6 +30,7 @@ __all__ = [
     "check_grounding",
     "discover_bug",
     "get_agent_pipeline",
+    "ingest_coverage",
     "parse_hunter_candidate",
     "parse_verdict",
     "run_git",
