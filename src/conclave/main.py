@@ -21,12 +21,12 @@ def conclave_home() -> Path:
 
 
 def make_provider() -> Provider:
-    """Select the agent engine. ``CONCLAVE_ENGINE=opencode`` drives the opencode CLI;
-    anything else (default) keeps the legacy ``claude`` CLI during the transition."""
-    engine = os.environ.get("CONCLAVE_ENGINE", "claude").strip().lower()
-    if engine == "opencode":
-        return OpenCodeCliProvider()
-    return ClaudeCliProvider()
+    """Select the agent engine. opencode is the default; ``CONCLAVE_ENGINE=claude`` opts
+    back into the legacy ``claude`` CLI."""
+    engine = os.environ.get("CONCLAVE_ENGINE", "opencode").strip().lower()
+    if engine == "claude":
+        return ClaudeCliProvider()
+    return OpenCodeCliProvider()
 
 
 def cli() -> None:

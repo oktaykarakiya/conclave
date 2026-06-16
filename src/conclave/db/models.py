@@ -232,38 +232,6 @@ class UsageRow(BaseModel):
         )
 
 
-class EngineProfileRow(BaseModel):
-    model_config = ConfigDict(extra="forbid", protected_namespaces=())
-
-    id: str
-    project_id: str | None = None
-    name: str
-    arg_mode: str = "inherit"
-    base_url: str | None = None
-    model: str | None = None
-    subagent_model: str | None = None
-    effort: str | None = None
-    auth_secret_id: str | None = None
-    extra_env: dict[str, str] = Field(default_factory=dict)
-    created_at: str
-
-    @classmethod
-    def from_row(cls, row: Any) -> EngineProfileRow:
-        return cls(
-            id=row["id"],
-            project_id=row["project_id"],
-            name=row["name"],
-            arg_mode=row["arg_mode"],
-            base_url=row["base_url"],
-            model=row["model"],
-            subagent_model=row["subagent_model"],
-            effort=row["effort"],
-            auth_secret_id=row["auth_secret_id"],
-            extra_env=_loads(row["extra_env_json"], {}),
-            created_at=row["created_at"],
-        )
-
-
 class AgentPersona(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -324,31 +292,5 @@ class QuarantineEntry(BaseModel):
             reason=row["reason"],
             until=row["until"],
             created_by=row["created_by"],
-            created_at=row["created_at"],
-        )
-
-
-class RepoKnowledgeRow(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    project_id: str
-    version: int
-    sha: str | None = None
-    manifest_fingerprint: str | None = None
-    ai_enriched: bool = False
-    knowledge: dict[str, Any] = Field(default_factory=dict)
-    created_at: str
-
-    @classmethod
-    def from_row(cls, row: Any) -> RepoKnowledgeRow:
-        return cls(
-            id=row["id"],
-            project_id=row["project_id"],
-            version=row["version"],
-            sha=row["sha"],
-            manifest_fingerprint=row["manifest_fingerprint"],
-            ai_enriched=bool(row["ai_enriched"]) if "ai_enriched" in row.keys() else False,
-            knowledge=_loads(row["knowledge_json"], {}),
             created_at=row["created_at"],
         )

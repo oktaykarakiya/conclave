@@ -17,12 +17,10 @@ from .database import Database
 from .models import (
     AgentPersona,
     Baseline,
-    EngineProfileRow,
     EventRow,
     Project,
     ProjectMode,
     QuarantineEntry,
-    RepoKnowledgeRow,
     Task,
     TaskOrigin,
     TaskState,
@@ -707,115 +705,6 @@ async def delete_quarantine(db: Database, entry_id: str) -> None:
     await db.execute("DELETE FROM quarantine WHERE id = ?", (entry_id,))
 
 
-# --- secrets (values are write-only via the API; never returned to the UI) ---
-
-
-async def set_secret(db: Database, name: str, value: str) -> str:
-    existing = await db.fetchone("SELECT id FROM secrets WHERE name = ?", (name,))
-    if existing is not None:
-        await db.execute("UPDATE secrets SET value = ? WHERE name = ?", (value, name))
-        return str(existing["id"])
-    sid = new_id()
-    await db.execute(
-        "INSERT INTO secrets(id, name, value, created_at) VALUES (?, ?, ?, ?)",
-        (sid, name, value, now_iso()),
-    )
-    return sid
-
-
-async def get_secret_value(db: Database, secret_id: str) -> str | None:
-    value = await db.fetchval("SELECT value FROM secrets WHERE id = ?", (secret_id,))
-    return None if value is None else str(value)
-
-
-async def list_secret_names(db: Database) -> list[str]:
-    rows = await db.fetchall("SELECT name FROM secrets ORDER BY name")
-    return [r["name"] for r in rows]
-
-
-# --- engine profiles --------------------------------------------------------
-
-
-async def upsert_engine_profile(
-    db: Database,
-    *,
-    name: str,
-    project_id: str | None = None,
-    arg_mode: str = "inherit",
-    base_url: str | None = None,
-    model: str | None = None,
-    subagent_model: str | None = None,
-    effort: str | None = None,
-    auth_secret_id: str | None = None,
-    extra_env: dict[str, str] | None = None,
-) -> EngineProfileRow:
-    scope = project_id or ""
-    existing = await db.fetchone(
-        "SELECT id FROM engine_profiles WHERE IFNULL(project_id, '') = ? AND name = ?",
-        (scope, name),
-    )
-    env_json = json.dumps(extra_env or {})
-    if existing is not None:
-        await db.execute(
-            "UPDATE engine_profiles SET arg_mode = ?, base_url = ?, model = ?, subagent_model = ?, "
-            "effort = ?, auth_secret_id = ?, extra_env_json = ? WHERE id = ?",
-            (arg_mode, base_url, model, subagent_model, effort, auth_secret_id, env_json,
-             existing["id"]),
-        )
-        pid = str(existing["id"])
-    else:
-        pid = new_id()
-        await db.execute(
-            "INSERT INTO engine_profiles(id, project_id, name, arg_mode, base_url, model, "
-            "subagent_model, effort, auth_secret_id, extra_env_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (pid, project_id, name, arg_mode, base_url, model, subagent_model, effort,
-             auth_secret_id, env_json, now_iso()),
-        )
-    row = await db.fetchone("SELECT * FROM engine_profiles WHERE id = ?", (pid,))
-    assert row is not None
-    return EngineProfileRow.from_row(row)
-
-
-async def get_engine_profile(
-    db: Database, name: str, project_id: str | None = None
-) -> EngineProfileRow | None:
-    """Project-scoped profile if present, else the global profile of that name."""
-    if project_id is not None:
-        row = await db.fetchone(
-            "SELECT * FROM engine_profiles WHERE project_id = ? AND name = ?", (project_id, name)
-        )
-        if row is not None:
-            return EngineProfileRow.from_row(row)
-    row = await db.fetchone(
-        "SELECT * FROM engine_profiles WHERE project_id IS NULL AND name = ?", (name,)
-    )
-    return EngineProfileRow.from_row(row) if row else None
-
-
-async def list_engine_profiles(
-    db: Database, project_id: str | None = None,
-    limit: int | None = None, offset: int = 0,
-) -> list[EngineProfileRow]:
-    if limit is not None:
-        rows = await db.fetchall(
-            "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? "
-            "ORDER BY name LIMIT ? OFFSET ?",
-            (project_id, limit, offset),
-        )
-    else:
-        rows = await db.fetchall(
-            "SELECT * FROM engine_profiles WHERE project_id IS NULL OR project_id = ? "
-            "ORDER BY name",
-            (project_id,),
-        )
-    return [EngineProfileRow.from_row(r) for r in rows]
-
-
-async def delete_engine_profile(db: Database, profile_id: str) -> None:
-    await db.execute("DELETE FROM engine_profiles WHERE id = ?", (profile_id,))
-
-
 # --- agent personas ---------------------------------------------------------
 
 
@@ -875,54 +764,6 @@ async def list_agents(
             (project_id,),
         )
     return [AgentPersona.from_row(r) for r in rows]
-
-
-# --- repo knowledge ---------------------------------------------------------
-
-
-async def save_repo_knowledge(
-    db: Database,
-    *,
-    project_id: str,
-    knowledge: dict[str, Any],
-    sha: str | None = None,
-    manifest_fingerprint: str | None = None,
-    ai_enriched: bool = False,
-) -> RepoKnowledgeRow:
-    prev = await db.fetchval(
-        "SELECT COALESCE(MAX(version), 0) FROM repo_knowledge WHERE project_id = ?", (project_id,)
-    )
-    version = int(prev) + 1
-    rid = new_id()
-    await db.execute(
-        "INSERT INTO repo_knowledge(id, project_id, version, sha, manifest_fingerprint, "
-        "ai_enriched, knowledge_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            rid, project_id, version, sha, manifest_fingerprint,
-            int(ai_enriched), json.dumps(knowledge), now_iso(),
-        ),
-    )
-    row = await db.fetchone("SELECT * FROM repo_knowledge WHERE id = ?", (rid,))
-    assert row is not None
-    return RepoKnowledgeRow.from_row(row)
-
-
-async def current_repo_knowledge(db: Database, project_id: str) -> RepoKnowledgeRow | None:
-    row = await db.fetchone(
-        "SELECT * FROM repo_knowledge WHERE project_id = ? ORDER BY version DESC LIMIT 1",
-        (project_id,),
-    )
-    return RepoKnowledgeRow.from_row(row) if row else None
-
-
-async def latest_ai_knowledge(db: Database, project_id: str) -> RepoKnowledgeRow | None:
-    """Return the most recent AI-enriched knowledge row, or None."""
-    row = await db.fetchone(
-        "SELECT * FROM repo_knowledge WHERE project_id = ? AND ai_enriched = 1 "
-        "ORDER BY version DESC LIMIT 1",
-        (project_id,),
-    )
-    return RepoKnowledgeRow.from_row(row) if row else None
 
 
 # --- planning sessions --------------------------------------------------------

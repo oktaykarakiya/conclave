@@ -2,7 +2,7 @@
 
 It inspects the assembled prompt to act as the right agent: the planner emits a JSON
 plan; reviewers emit a verdict; the developer (optionally) edits a file in the worktree
-cwd to produce a real diff; the repo-analyst emits a valid enrichment JSON.
+cwd to produce a real diff.
 """
 
 from __future__ import annotations
@@ -14,15 +14,6 @@ from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 
 _PASS = '```json\n{"verdict": "pass", "reason": "looks correct", "evidence": []}\n```'
 _PLAN = '```json\n{"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}\n```'
-_AI_KNOWLEDGE = (
-    '```json\n'
-    '{"languages": [], "frameworks": [], '
-    '"commands": {}, '
-    '"architecture_summary": "A minimal git repository with a README.", '
-    '"conventions": [], "protected_globs": [], '
-    '"layout": {"dirs": []}}\n'
-    '```'
-)
 
 # Deterministic planning discussion responses for agent-ception tests
 _PLANNING_PLANNER_INITIAL = """Here is the initial task breakdown for this feature.
@@ -141,9 +132,6 @@ class FakeProvider:
                 (Path(cwd) / "STRAY_REVIEWER.txt").write_text("stray\n", encoding="utf-8")
                 (Path(cwd) / self.filename).write_text("tampered\n", encoding="utf-8")
             return AgentResult(ok=True, text=_PASS, model_reported="fake", cost_usd=0.0)
-        # repo-analyst enrichment prompt
-        if "Repository Analysis" in prompt and "AI Enrichment" in prompt:
-            return AgentResult(ok=True, text=_AI_KNOWLEDGE, model_reported="fake", cost_usd=0.0)
         # --- agent-ception planning discussion ---
         if "Planning Facilitator Agent" in prompt:
             # Planner: return initial breakdown on first call, refinement later

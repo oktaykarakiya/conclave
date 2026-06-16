@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -48,7 +46,7 @@ async def client(db: Database, tmp_path: Path) -> AsyncIterator[httpx.AsyncClien
 async def client_with_workers(
     db: Database, tmp_path: Path
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """Fixture with workers enabled for testing worker lifecycle (detach/onboard)."""
+    """Fixture with workers enabled for testing worker lifecycle (create/detach)."""
     await seed_global_defaults(db)
     daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=True)
     app = create_app(daemon, manage_lifecycle=False)
@@ -80,17 +78,6 @@ async def test_project_task_flow(client: httpx.AsyncClient, tmp_path: Path) -> N
     assert created.status_code == 200, created.text
     project_id = created.json()["id"]
 
-    # onboarding now runs in the background; poll until knowledge is ready
-    import asyncio as _asyncio
-    knowledge_data: dict = {}
-    for _ in range(20):
-        knowledge = await client.get(f"/api/projects/{project_id}/knowledge")
-        knowledge_data = knowledge.json()
-        if knowledge_data and knowledge_data.get("commands"):
-            break
-        await _asyncio.sleep(0.1)
-    assert knowledge_data["commands"]["test"] == "npm test"
-
     # create a task (inbox), then approve it
     task = await client.post(
         f"/api/projects/{project_id}/tasks", json={"request": "do a thing"}
@@ -116,43 +103,6 @@ async def test_project_requires_git_repo(client: httpx.AsyncClient, tmp_path: Pa
     plain.mkdir()
     resp = await client.post("/api/projects", json={"name": "x", "path": str(plain)})
     assert resp.status_code == 400
-
-
-async def test_engine_profiles_crud_and_test(client: httpx.AsyncClient) -> None:
-    # create a DeepSeek-style env-routed profile with a secret token
-    resp = await client.post(
-        "/api/profiles",
-        json={
-            "name": "deepseek",
-            "arg_mode": "env",
-            "base_url": "https://api.deepseek.com/anthropic",
-            "model": "deepseek-v4-pro",
-            "subagent_model": "deepseek-v4-flash",
-            "effort": "max",
-            "auth_token": "sk-secret",
-        },
-    )
-    assert resp.status_code == 200
-    profile = resp.json()
-    assert profile["model"] == "deepseek-v4-pro"
-    assert profile["auth_secret_id"]  # token was stored as a secret and linked
-
-    listing = await client.get("/api/profiles")
-    names = {p["name"] for p in listing.json()}
-    assert {"system-default", "deepseek"} <= names
-
-    # the Test button: probe the system-default profile (fake provider => ok)
-    test = await client.post(
-        "/api/profiles/test", json={"name": "system-default", "arg_mode": "inherit"}
-    )
-    assert test.status_code == 200
-    assert test.json()["ok"] is True
-
-
-async def test_secrets_are_write_only(client: httpx.AsyncClient) -> None:
-    await client.post("/api/secrets", json={"name": "my_key", "value": "super-secret"})
-    listing = await client.get("/api/secrets")
-    assert listing.json() == ["my_key"]  # names only, never values
 
 
 async def test_agents_seeded_and_editable(client: httpx.AsyncClient) -> None:
@@ -545,17 +495,18 @@ async def test_body_size_middleware_rejects_content_length_over_limit(
 
     transport = _httpx.ASGITransport(app=client._transport.app)  # type: ignore[union-attr]
     async with _httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        resp = await c.post(
-            "/api/secrets",
-            json={"name": "test", "value": "val"},
+        resp = await c.put(
+            "/api/agents/body-size-probe",
+            json={"role": "conditional", "persona_md": "probe"},
         )
         # Normal request passes through.
         assert resp.status_code == 200
 
-        # Send with Content-Length > 2 MiB via raw request construction.
+        # Send with Content-Length > 2 MiB via raw request construction. The middleware
+        # rejects on the declared length before routing, so the target route is irrelevant.
         resp_big = await c.request(
-            "POST",
-            "/api/secrets",
+            "PUT",
+            "/api/agents/body-size-probe",
             headers={"Content-Length": str(3 * 1024 * 1024)},
             content=b"x" * 100,
         )
@@ -863,93 +814,28 @@ async def test_detach_project_idempotent(
 # --- create_project tests ----------------------------------------------------
 
 
-async def test_create_project_returns_before_onboarding_finishes(
+async def test_create_project_starts_worker_and_is_queryable(
     client_with_workers: httpx.AsyncClient, tmp_path: Path
 ) -> None:
-    """POST /projects returns before the background onboarding completes."""
-    import conclave.runtime as runtime_mod
+    """POST /projects creates a usable project and starts its worker immediately.
 
+    Repo context now comes from AGENTS.md (read by opencode), so creation does no
+    onboarding/analysis — the endpoint returns a ready project with a live worker.
+    """
     repo_path = tmp_path / "repo_fast_create"
     await _init_repo(repo_path)
 
-    # Replace onboard with a blocking stub so onboarding never finishes
-    # during the test window.
-    original_onboard = runtime_mod.onboard
-    block_event = asyncio.Event()
+    created = await client_with_workers.post(
+        "/api/projects",
+        json={"name": "fast-create", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200, created.text
+    project_id = created.json()["id"]
 
-    async def _blocking_onboard(*args, **kwargs):  # type: ignore[no-untyped-def]
-        await block_event.wait()
+    # Project must be immediately queryable.
+    get_resp = await client_with_workers.get(f"/api/projects/{project_id}")
+    assert get_resp.status_code == 200, "project not queryable after create"
 
-    runtime_mod.onboard = _blocking_onboard
-    try:
-        created = await client_with_workers.post(
-            "/api/projects",
-            json={"name": "fast-create", "path": str(repo_path), "default_branch": "main"},
-        )
-        assert created.status_code == 200, created.text
-        project_id = created.json()["id"]
-
-        # Project must be immediately queryable.
-        get_resp = await client_with_workers.get(f"/api/projects/{project_id}")
-        assert get_resp.status_code == 200, "project not queryable after create"
-
-        # Worker must have been started.
-        daemon = client_with_workers._transport.app.state.daemon
-        assert project_id in daemon._workers, "worker was not started"
-
-        # Knowledge must NOT exist yet (onboarding hasn't finished).
-        knowledge = await client_with_workers.get(
-            f"/api/projects/{project_id}/knowledge"
-        )
-        assert knowledge.json() == {}, "knowledge exists before onboarding finished"
-    finally:
-        # Unblock the stubbed onboard so the background task can drain.
-        runtime_mod.onboard = original_onboard
-        block_event.set()
-        # Give the background task a moment to complete.
-        await asyncio.sleep(0.2)
-
-
-async def test_create_project_onboarding_failure_not_fatal(
-    client_with_workers: httpx.AsyncClient, tmp_path: Path, caplog
-) -> None:
-    """POST /projects returns 200 even when onboarding raises; project is usable."""
-    import conclave.runtime as runtime_mod
-
-    repo_path = tmp_path / "repo_onboard_fail"
-    await _init_repo(repo_path)
-
-    original_onboard = runtime_mod.onboard
-
-    async def _failing_onboard(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise RuntimeError("simulated onboarding failure")
-
-    caplog.set_level(logging.ERROR, logger="conclave.runtime")
-    runtime_mod.onboard = _failing_onboard
-    try:
-        created = await client_with_workers.post(
-            "/api/projects",
-            json={"name": "onboard-fail", "path": str(repo_path), "default_branch": "main"},
-        )
-        assert created.status_code == 200, (
-            f"expected 200 despite onboarding failure, got {created.status_code}: {created.text}"
-        )
-        project_id = created.json()["id"]
-
-        # Project must be queryable.
-        get_resp = await client_with_workers.get(f"/api/projects/{project_id}")
-        assert get_resp.status_code == 200, "project not queryable after failed onboarding"
-
-        # Worker must have been started.
-        daemon = client_with_workers._transport.app.state.daemon
-        assert project_id in daemon._workers, "worker was not started after onboarding failure"
-
-        # The failure must have been logged.
-        await asyncio.sleep(0.2)
-        error_records = [r for r in caplog.records if "onboarding failed" in r.message]
-        assert len(error_records) >= 1, (
-            f"expected onboarding failure to be logged, got records: "
-            f"{[r.message for r in caplog.records]}"
-        )
-    finally:
-        runtime_mod.onboard = original_onboard
+    # Worker must have been started.
+    daemon = client_with_workers._transport.app.state.daemon
+    assert project_id in daemon._workers, "worker was not started"

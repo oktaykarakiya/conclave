@@ -1,6 +1,8 @@
 """Agent runner: turns a (persona, task) into a provider dispatch with events + usage.
 
-Resolves the per-agent Engine Profile (model/effort overrides + secret), assembles the
+opencode owns model/provider selection and auth through its own config, so a dispatch
+no longer resolves an Engine Profile from the database — it uses a fixed ``opencode``
+profile carrying only the per-agent model/effort overrides. The runner assembles the
 full prompt (persona + repo knowledge + project rules + task), invokes the provider,
 records usage, and emits dispatch/result events.
 """
@@ -10,11 +12,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from ..config import ArgMode, ConclaveConfig, resolve_agent
+from ..config import ArgMode, ConclaveConfig, Effort, resolve_agent
 from ..db import Database
 from ..db import repositories as repo
 from ..events import EventBus, EventType
-from ..providers import AgentResult, Provider, ResolvedProfile, resolve_profile
+from ..providers import AgentResult, Provider, ResolvedProfile
 
 
 def assemble_prompt(system: str, knowledge: str, rules: str, task_prompt: str) -> str:
@@ -60,9 +62,7 @@ class AgentRunner:
             else f"You are the {agent} agent of an autonomous software engineering team."
         )
         settings = resolve_agent(self._config, agent)
-        profile = await self._resolve_profile(
-            settings.engine_profile, settings.model, settings.effort
-        )
+        profile = self._resolve_profile(settings.model, settings.effort)
         full_prompt = assemble_prompt(system, repo_knowledge, project_rules, prompt)
 
         await self._bus.emit(
@@ -106,22 +106,19 @@ class AgentRunner:
         )
         return result
 
-    async def _resolve_profile(
-        self, profile_name: str, model: str | None, effort: object | None
+    def _resolve_profile(
+        self, model: str | None, effort: Effort | None
     ) -> ResolvedProfile:
-        effort_str = str(effort) if effort is not None else None
-        row = await repo.get_engine_profile(self._db, profile_name, self._project_id)
-        if row is None and profile_name != "system-default":
-            row = await repo.get_engine_profile(self._db, "system-default", self._project_id)
-        if row is None:
-            return ResolvedProfile(
-                name="system-default", arg_mode=ArgMode.inherit, model=model, effort=effort_str
-            )
-        auth = (
-            await repo.get_secret_value(self._db, row.auth_secret_id)
-            if row.auth_secret_id
-            else None
-        )
-        return resolve_profile(
-            row, auth_token=auth, model_override=model, effort_override=effort_str
+        """Build the fixed ``opencode`` dispatch profile for this agent.
+
+        opencode selects the model/provider and handles auth through its own config, so
+        Conclave no longer looks up a stored Engine Profile. Only the per-agent model and
+        effort overrides are carried through (``arg_mode=inherit`` adds no CLI flags; the
+        opencode provider ignores a model that is not an opencode-format ``provider/model``).
+        """
+        return ResolvedProfile(
+            name="opencode",
+            arg_mode=ArgMode.inherit,
+            model=model,
+            effort=str(effort) if effort is not None else None,
         )

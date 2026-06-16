@@ -43,26 +43,6 @@ export interface Verdict {
   grounded_count: number;
 }
 
-export interface EngineProfile {
-  id: string;
-  project_id: string | null;
-  name: string;
-  arg_mode: string;
-  base_url: string | null;
-  model: string | null;
-  subagent_model: string | null;
-  effort: string | null;
-  auth_secret_id: string | null;
-}
-
-export interface ProfileTestResult {
-  ok: boolean;
-  model_reported: string | null;
-  latency_ms: number | null;
-  cost_usd: number | null;
-  error: string | null;
-}
-
 export interface Quarantine {
   id: string;
   pattern: string;
@@ -76,17 +56,6 @@ export interface Integrity {
   expired: number;
   expired_patterns: string[];
   healthy: boolean;
-}
-
-export interface RepoKnowledge {
-  languages: string[];
-  frameworks: string[];
-  commands: Record<string, string>;
-  architecture_summary: string;
-  conventions: string[];
-  layout: Record<string, string[]>;
-  protected_globs: string[];
-  ai_enriched: boolean;
 }
 
 export interface PlanningSession {

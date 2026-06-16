@@ -1,12 +1,12 @@
 """REST API — the sole control surface for Conclave.
 
-Thin handlers over the repository layer + runtime. Secrets are write-only (never
-returned). Engine profiles can be tested before saving via /api/profiles/test.
+Thin handlers over the repository layer + runtime. Model/provider selection and auth
+are owned by opencode; repo context comes from each project's AGENTS.md, so there are
+no engine-profile, secret, or repo-knowledge endpoints here.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -15,14 +15,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
 
 from .. import __version__
-from ..config import ArgMode, config_schema, load_project_config
+from ..config import config_schema, load_project_config
 from ..db import (
     AgentPersona,
-    EngineProfileRow,
     EventRow,
     Project,
     QuarantineEntry,
-    RepoKnowledgeRow,
     Task,
     TaskState,
     VerdictRow,
@@ -30,8 +28,6 @@ from ..db import (
 from ..db import repositories as repo
 from ..db.planning_models import PlanningMessage, PlanningSession, PlanningTaskNode
 from ..events import EventType
-from ..providers import ProfileTestResult, ResolvedProfile, probe_profile
-from ..repo_intel import RepoKnowledge, ai_enrich, onboard
 from ..runtime import Daemon
 from ..verification import quarantine_integrity
 from .deps import get_daemon
@@ -41,10 +37,8 @@ from .schemas import (
     PaginationParams,
     PlanningMessageInput,
     PlanningSessionCreate,
-    ProfileInput,
     ProjectCreate,
     QuarantineInput,
-    SecretInput,
     TaskCreate,
 )
 
@@ -129,12 +123,6 @@ async def create_project(
         daemon.db, name=body.name, path=str(path), default_branch=body.default_branch
     )
     await daemon.start_worker(project.id)
-    # Run onboarding as a tracked background task so the endpoint returns
-    # promptly.  An onboarding failure is logged but never fatal — the project
-    # remains usable.
-    task = asyncio.create_task(daemon._onboard_project(project))
-    daemon._bg_tasks.add(task)
-    task.add_done_callback(daemon._bg_tasks.discard)
     return await _require_project(daemon, project.id)
 
 
@@ -149,44 +137,6 @@ async def detach_project(project_id: str, daemon: Daemon = Depends(get_daemon)) 
     await daemon.cleanup_in_progress_work(project_id)
     await repo.delete_project(daemon.db, project_id)
     return {"detached": project_id}
-
-
-@router.post("/projects/{project_id}/onboard")
-async def reonboard(project_id: str, daemon: Daemon = Depends(get_daemon)) -> RepoKnowledgeRow:
-    project = await _require_project(daemon, project_id)
-    config = load_project_config(project.config)
-    return await onboard(
-        daemon.db, daemon.bus, project, force=True,
-        provider=daemon.provider, config=config,
-    )
-
-
-@router.get("/projects/{project_id}/knowledge")
-async def get_knowledge(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
-    row = await repo.current_repo_knowledge(daemon.db, project_id)
-    if row is None:
-        return {}
-    return {**row.knowledge, "ai_enriched": row.ai_enriched}
-
-
-@router.post("/projects/{project_id}/ai-analyze")
-async def ai_analyze(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
-    """Force re-run the AI repo analysis regardless of staleness."""
-    project = await _require_project(daemon, project_id)
-    config = load_project_config(project.config)
-    current = await repo.current_repo_knowledge(daemon.db, project_id)
-    if current is None:
-        raise HTTPException(status_code=400, detail="run onboarding first (no knowledge exists)")
-    heuristic = RepoKnowledge(**current.knowledge)
-    row = await ai_enrich(
-        daemon.db, daemon.bus, daemon.provider, project, config,
-        heuristic=heuristic,
-        sha=current.sha,
-        fingerprint=current.manifest_fingerprint or "",
-    )
-    if row is None:
-        raise HTTPException(status_code=500, detail="AI analysis failed (see server logs)")
-    return {**row.knowledge, "ai_enriched": row.ai_enriched}
 
 
 @router.get("/projects/{project_id}/config")
@@ -441,89 +391,6 @@ async def list_task_verdicts(
     )
 
 
-# --- engine profiles --------------------------------------------------------
-
-
-@router.get("/profiles")
-async def list_profiles(
-    project_id: str | None = None,
-    pagination: PaginationParams = Depends(_pagination),
-    daemon: Daemon = Depends(get_daemon),
-) -> list[EngineProfileRow]:
-    return await repo.list_engine_profiles(
-        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
-    )
-
-
-@router.post("/profiles")
-async def upsert_profile(
-    body: ProfileInput, daemon: Daemon = Depends(get_daemon)
-) -> EngineProfileRow:
-    _validate_arg_mode(body.arg_mode)
-    existing = await repo.get_engine_profile(daemon.db, body.name, body.project_id)
-    auth_secret_id = existing.auth_secret_id if existing else None
-    if body.auth_token:
-        scope = body.project_id or "global"
-        auth_secret_id = await repo.set_secret(
-            daemon.db, f"engine_profile:{scope}:{body.name}", body.auth_token
-        )
-    return await repo.upsert_engine_profile(
-        daemon.db,
-        name=body.name,
-        project_id=body.project_id,
-        arg_mode=body.arg_mode,
-        base_url=body.base_url,
-        model=body.model,
-        subagent_model=body.subagent_model,
-        effort=body.effort,
-        auth_secret_id=auth_secret_id,
-        extra_env=body.extra_env,
-    )
-
-
-@router.delete("/profiles/{profile_id}")
-async def delete_profile(profile_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, str]:
-    await repo.delete_engine_profile(daemon.db, profile_id)
-    return {"deleted": profile_id}
-
-
-@router.post("/profiles/test")
-async def test_profile(
-    body: ProfileInput, daemon: Daemon = Depends(get_daemon)
-) -> ProfileTestResult:
-    _validate_arg_mode(body.arg_mode)
-    auth = body.auth_token
-    if auth is None:
-        existing = await repo.get_engine_profile(daemon.db, body.name, body.project_id)
-        if existing is not None and existing.auth_secret_id:
-            auth = await repo.get_secret_value(daemon.db, existing.auth_secret_id)
-    profile = ResolvedProfile(
-        name=body.name,
-        arg_mode=ArgMode(body.arg_mode),
-        base_url=body.base_url,
-        auth_token=auth,
-        model=body.model,
-        subagent_model=body.subagent_model,
-        effort=body.effort,
-        extra_env=body.extra_env,
-    )
-    return await probe_profile(daemon.provider, profile, timeout_seconds=120)
-
-
-# --- secrets (write-only) ---------------------------------------------------
-
-
-@router.get("/secrets")
-async def list_secrets(daemon: Daemon = Depends(get_daemon)) -> list[str]:
-    return await repo.list_secret_names(daemon.db)
-
-
-@router.post("/secrets")
-async def set_secret(body: SecretInput, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
-    await repo.set_secret(daemon.db, body.name, body.value)
-    return {"name": body.name, "stored": True}
-
-
 # --- agent personas ---------------------------------------------------------
 
 
@@ -641,10 +508,3 @@ async def cancel_planning_session(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"cancelled": True}
-
-
-def _validate_arg_mode(value: str) -> None:
-    try:
-        ArgMode(value)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"invalid arg_mode: {value}") from exc

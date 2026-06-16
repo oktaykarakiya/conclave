@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from conclave.config import ArgMode
-from conclave.db import EngineProfileRow
-from conclave.providers import ResolvedProfile, build_invocation, resolve_profile
+from conclave.providers import ResolvedProfile, build_invocation
 
 
 def test_inherit_passes_only_base_args() -> None:
@@ -65,25 +64,3 @@ def test_extra_env_overrides_last() -> None:
     )
     assert inv.env["ANTHROPIC_MODEL"] == "override"
     assert inv.env["FOO"] == "bar"
-
-
-def test_resolve_profile_overlays_overrides_and_secret() -> None:
-    row = EngineProfileRow(
-        id="1",
-        name="deepseek",
-        arg_mode="env",
-        base_url="https://u",
-        model="pro",
-        subagent_model="flash",
-        effort="high",
-        extra_env={"A": "b"},
-        created_at="t",
-    )
-    rp = resolve_profile(row, auth_token="sk", model_override="custom", effort_override="max")
-    assert rp.arg_mode is ArgMode.env
-    assert rp.model == "custom"  # override wins
-    assert rp.effort == "max"  # override wins
-    assert rp.auth_token == "sk"  # resolved secret injected
-    assert rp.base_url == "https://u"
-    assert rp.subagent_model == "flash"
-    assert rp.extra_env == {"A": "b"}

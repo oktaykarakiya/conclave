@@ -320,44 +320,18 @@ async def test_quarantine_expiry(db: Database) -> None:
     assert [q.pattern for q in active] == ["tests/a.test.js"]
 
 
-async def test_engine_profile_scope_resolution(db: Database) -> None:
-    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
-    await repo.upsert_engine_profile(db, name="system-default", arg_mode="inherit")
-    await repo.upsert_engine_profile(
-        db, name="deepseek", arg_mode="env", base_url="https://api.deepseek.com/anthropic",
-        model="deepseek-v4-pro",
-    )
-    # project override of the same name shadows the global
-    await repo.upsert_engine_profile(
-        db, name="deepseek", project_id=p.id, arg_mode="env", model="deepseek-v4-flash"
-    )
-    resolved = await repo.get_engine_profile(db, "deepseek", project_id=p.id)
-    assert resolved is not None
-    assert resolved.model == "deepseek-v4-flash"
-    glob = await repo.get_engine_profile(db, "deepseek")
-    assert glob is not None
-    assert glob.model == "deepseek-v4-pro"
+async def test_seed_global_defaults_idempotent_and_preserves_edits(db: Database) -> None:
+    from conclave.bootstrap import seed_global_defaults
 
+    await seed_global_defaults(db)
+    assert await repo.get_agent(db, "developer") is not None
+    assert await repo.get_agent(db, "tester") is not None
 
-async def test_secrets_are_store_only(db: Database) -> None:
-    sid = await repo.set_secret(db, "deepseek_key", "sk-secret")
-    assert await repo.get_secret_value(db, sid) == "sk-secret"
-    # upsert by name returns the same id and updates the value
-    sid2 = await repo.set_secret(db, "deepseek_key", "sk-new")
-    assert sid2 == sid
-    assert await repo.get_secret_value(db, sid) == "sk-new"
-    assert await repo.list_secret_names(db) == ["deepseek_key"]
-
-
-async def test_repo_knowledge_versioning(db: Database) -> None:
-    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
-    v1 = await repo.save_repo_knowledge(db, project_id=p.id, knowledge={"languages": ["py"]})
-    v2 = await repo.save_repo_knowledge(db, project_id=p.id, knowledge={"languages": ["py", "ts"]})
-    assert v1.version == 1
-    assert v2.version == 2
-    current = await repo.current_repo_knowledge(db, p.id)
-    assert current is not None
-    assert current.version == 2
+    # an operator edit must survive re-seeding
+    await repo.upsert_agent(db, name="developer", role="developer", persona_md="EDITED PERSONA")
+    await seed_global_defaults(db)
+    dev = await repo.get_agent(db, "developer")
+    assert dev is not None and dev.persona_md == "EDITED PERSONA"
 
 
 async def test_usage_summary(db: Database) -> None:

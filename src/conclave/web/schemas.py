@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class ProjectCreate(BaseModel):
@@ -23,25 +23,6 @@ class TaskCreate(BaseModel):
     title: str = ""
     use_planner: bool | None = None
     auto_approve: bool = False
-
-
-class ProfileInput(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
-
-    name: str
-    project_id: str | None = None
-    arg_mode: str = "inherit"
-    base_url: str | None = None
-    model: str | None = None
-    subagent_model: str | None = None
-    effort: str | None = None
-    auth_token: str | None = None  # write-only; stored as a secret, never returned
-    extra_env: dict[str, str] = Field(default_factory=dict)
-
-
-class SecretInput(BaseModel):
-    name: str
-    value: str
 
 
 class QuarantineInput(BaseModel):

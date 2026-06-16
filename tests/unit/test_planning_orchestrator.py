@@ -290,19 +290,10 @@ class _OneShotThenBlockProvider:
 class _QuickFakeProvider:
     """Minimal deterministic provider for daemon-level shutdown tests.
 
-    Returns sane responses for planning agents and backfill enrichment,
-    enough to let a daemon start and a planning session complete.
+    Returns sane responses for planning agents, enough to let a daemon start and a
+    planning session complete.
     """
 
-    _AI_KNOWLEDGE = (
-        '```json\n'
-        '{"languages": [], "frameworks": [], '
-        '"commands": {}, '
-        '"architecture_summary": "A minimal git repository with a README.", '
-        '"conventions": [], "protected_globs": [], '
-        '"layout": {"dirs": []}}\n'
-        '```'
-    )
     _PLANNER_INITIAL = """Here is the initial task breakdown.
 
 ```json
@@ -336,11 +327,6 @@ class _QuickFakeProvider:
 
     async def run_agent(self, *, profile, prompt, timeout_seconds, cwd=None, on_chunk=None):
         self.prompts.append(prompt)
-        # Backfill enrichment
-        if "Repository Analysis" in prompt and "AI Enrichment" in prompt:
-            return AgentResult(
-                ok=True, text=self._AI_KNOWLEDGE, model_reported="fake", cost_usd=0.0,
-            )
         # Planning discussion — planner
         if "Planning Facilitator Agent" in prompt:
             if not self._has_initial:
@@ -410,45 +396,29 @@ async def test_planning_orchestrator_shutdown_cleans_bg_tasks(db: Database) -> N
     assert not orchestrator._bg_tasks
 
 
-async def test_daemon_shutdown_cancels_backfill_tasks(db: Database, tmp_path: Path) -> None:
-    """Daemon.shutdown must cancel any in-flight backfill tasks before db.close()."""
+async def test_daemon_shutdown_cancels_background_tasks(db: Database, tmp_path: Path) -> None:
+    """Daemon.shutdown must cancel any in-flight ``_bg_tasks`` before db.close()."""
     home = tmp_path / "conclave-home"
     home.mkdir(parents=True, exist_ok=True)
-
-    project = await repo.create_project(
-        db, name="backfill-test", path=str(home / "backfill-repo"), default_branch="main",
-    )
-    # Save a knowledge row that is NOT ai_enriched so latest_ai_knowledge
-    # returns None (it only returns ai_enriched=1 rows), triggering backfill.
-    knowledge: dict = {
-        "languages": ["python"],
-        "frameworks": [],
-        "commands": {},
-        "architecture_summary": "Test repo for backfill shutdown.",
-        "conventions": [],
-        "protected_globs": [],
-        "layout": {"dirs": []},
-    }
-    await repo.save_repo_knowledge(
-        db,
-        project_id=project.id,
-        knowledge=knowledge,
-        sha="abc123",
-        manifest_fingerprint="fp",
-        ai_enriched=False,
-    )
 
     daemon = Daemon(db, home, _QuickFakeProvider(), workers_enabled=True)
     await daemon.start()
 
-    # Let the backfill task begin execution.
-    await asyncio.sleep(0)
+    # Inject a stuck background task to stand in for any tracked housekeeping task.
+    async def stuck_bg() -> None:
+        await asyncio.Event().wait()
 
-    # Shutdown must clean up without raising.
+    bg = asyncio.create_task(stuck_bg())
+    daemon._bg_tasks.add(bg)
+    bg.add_done_callback(daemon._bg_tasks.discard)
+    await asyncio.sleep(0)  # let the task enter its await
+
+    # Shutdown must cancel the stuck task and clean up without raising.
     await daemon.shutdown()
 
     # Background tasks must be cleared after shutdown.
     assert not daemon._bg_tasks
+    assert bg.cancelled()
     # The orchestrator should have been shut down too.
     assert not daemon.planning_orchestrator._active_sessions
     assert not daemon.planning_orchestrator._bg_tasks

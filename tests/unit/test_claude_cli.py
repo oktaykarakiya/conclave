@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from conclave.config import ArgMode
-from conclave.providers import ClaudeCliProvider, ResolvedProfile, probe_profile
+from conclave.providers import ClaudeCliProvider, ResolvedProfile
 
 # A fake "claude" that echoes the routed model back via the JSON envelope, so we can
 # prove the composed environment actually reaches the child process.
@@ -213,12 +213,3 @@ async def test_parts_concatenation_with_echo_fake(tmp_path: Path) -> None:
     # envelope suffix is intact, and the echoed characters appear in order.
     assert '"result": "echo-ok"' in result.text
     assert result.text.endswith("}\n")
-
-
-async def test_probe_profile_smoke(tmp_path: Path) -> None:
-    cli = _make_cli(tmp_path, _FAKE_CLI)
-    profile = ResolvedProfile(name="ds", arg_mode=ArgMode.env, model="m", cli=cli, cli_flags=())
-    report = await probe_profile(ClaudeCliProvider(), profile, timeout_seconds=30)
-    assert report.ok
-    assert report.model_reported == "m"
-    assert report.latency_ms is not None

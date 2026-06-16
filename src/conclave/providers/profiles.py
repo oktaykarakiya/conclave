@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..config import ArgMode
-from ..db import EngineProfileRow
 
 # Always-on CLI args: headless print mode + JSON envelope (for result/usage/cost parsing).
 _BASE_ARGS: tuple[str, ...] = ("--print", "--output-format", "json")
@@ -75,23 +74,3 @@ def build_invocation(profile: ResolvedProfile) -> Invocation:
     # Advanced escape hatch always applies last (and can override the above).
     env.update(profile.extra_env)
     return Invocation(args=args, env=env)
-
-
-def resolve_profile(
-    row: EngineProfileRow,
-    *,
-    auth_token: str | None = None,
-    model_override: str | None = None,
-    effort_override: str | None = None,
-) -> ResolvedProfile:
-    """Overlay per-agent model/effort overrides and the resolved secret onto a stored row."""
-    return ResolvedProfile(
-        name=row.name,
-        arg_mode=ArgMode(row.arg_mode),
-        base_url=row.base_url,
-        auth_token=auth_token,
-        model=model_override or row.model,
-        subagent_model=row.subagent_model,
-        effort=effort_override or row.effort,
-        extra_env=dict(row.extra_env),
-    )

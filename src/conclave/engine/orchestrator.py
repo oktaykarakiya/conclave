@@ -23,7 +23,6 @@ from ..db import Database, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType
 from ..providers import AgentResult, Provider
-from ..repo_intel.knowledge import render_preamble
 from .baseline import build_baseline_preamble
 from .gate import apply_quarantine, run_tests
 from .gitio import run_git, run_shell
@@ -33,7 +32,9 @@ from .runner import AgentRunner
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
 from .worktree import WorktreeError, WorktreeManager
 
-_PROJECT_RULE_FILES = ("CONCLAVE.md", "CLAUDE.md")
+# opencode reads AGENTS.md natively, so it leads the project-rule fallback list. CLAUDE.md
+# and CONCLAVE.md remain supported for repos that still carry them.
+_PROJECT_RULE_FILES = ("AGENTS.md", "CONCLAVE.md", "CLAUDE.md")
 
 # A single reviewer dispatch can transiently return empty/non-ok (provider hiccup).
 # Retry it a few times before giving up, so one flaky call doesn't discard the
@@ -155,14 +156,12 @@ class Orchestrator:
             if cancel_event is not None and cancel_event.is_set():
                 return await self._finish_cancelled(task, wm, task_branch)
 
-            knowledge_row = await repo.current_repo_knowledge(self._db, project.id)
-            knowledge = render_preamble(knowledge_row.knowledge) if knowledge_row else ""
+            # Repo context now comes from AGENTS.md (read by opencode natively and surfaced
+            # through _read_project_rules), not Conclave's synthesized knowledge preamble.
+            knowledge = ""
             rules = _read_project_rules(worktree)
-            rules += _build_venv_guidance(
-                worktree, config,
-                knowledge_row.knowledge if knowledge_row else None,
-            )
-            test_command = _test_command(config, knowledge_row.knowledge if knowledge_row else None)
+            rules += _build_venv_guidance(worktree, config, None)
+            test_command = _test_command(config, None)
             # Inject active quarantine exclusions so flaky quarantined tests
             # don't fail the baseline snapshot or the green-gate.
             test_command = await apply_quarantine(self._db, project.id, test_command)
