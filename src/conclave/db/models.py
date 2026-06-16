@@ -60,6 +60,54 @@ class BugStatus(StrEnum):
     deferred = "deferred"  # parked for now
 
 
+class IllegalBugTransition(ValueError):
+    """Raised when a bug-candidate status change violates :data:`BUG_STATUS_TRANSITIONS`.
+
+    A ``ValueError`` subclass, so a caller can catch it narrowly or fall back to the broad
+    ``ValueError`` net. The Bug-Fixer controller is the sole writer of ``bug_candidates.status``
+    and must drive it strictly along the pinned table; an illegal edge is a controller bug, not
+    a recoverable runtime condition, so the guard raises rather than silently no-opping the write.
+    """
+
+
+# The pinned 7-state transition table the Bug-Fixer controller drives a candidate along: each
+# source state maps to the set of states it may legally advance to, and an empty frozenset marks
+# a terminal sink. ``repositories.transition_bug_status`` guards every status write against this
+# table, so no caller can shortcut an edge. Reconstructed from the bf-data epic's machine:
+#
+#   discovered → reproduced → fixing → fixed  (the happy path)
+#   fixing → reproduced  (a failed fix attempt falls back to retry)
+#   reproduced → declined_needs_human  (fix attempts exhausted → handed to a human)
+#   discovered, reproduced → dismissed_false_positive | declined_needs_human | deferred  (sinks)
+#   deferred → discovered | reproduced  (un-park back into the actionable pipeline)
+#
+# fixed, dismissed_false_positive and declined_needs_human are terminal for the controller; a
+# human re-opening a declined candidate is a separate operator path, not an automatic edge.
+BUG_STATUS_TRANSITIONS: dict[BugStatus, frozenset[BugStatus]] = {
+    BugStatus.discovered: frozenset(
+        {
+            BugStatus.reproduced,
+            BugStatus.dismissed_false_positive,
+            BugStatus.declined_needs_human,
+            BugStatus.deferred,
+        }
+    ),
+    BugStatus.reproduced: frozenset(
+        {
+            BugStatus.fixing,
+            BugStatus.dismissed_false_positive,
+            BugStatus.declined_needs_human,
+            BugStatus.deferred,
+        }
+    ),
+    BugStatus.fixing: frozenset({BugStatus.fixed, BugStatus.reproduced}),
+    BugStatus.fixed: frozenset(),
+    BugStatus.dismissed_false_positive: frozenset(),
+    BugStatus.declined_needs_human: frozenset(),
+    BugStatus.deferred: frozenset({BugStatus.discovered, BugStatus.reproduced}),
+}
+
+
 def _loads(value: Any, fallback: Any) -> Any:
     """Decode a JSON column, tolerating corruption.
 

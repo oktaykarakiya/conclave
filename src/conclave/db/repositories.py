@@ -15,10 +15,15 @@ import aiosqlite
 from ..util import new_id, now_iso
 from .database import Database
 from .models import (
+    BUG_STATUS_TRANSITIONS,
     AgentPersona,
     Baseline,
+    BugCandidate,
+    BugStatus,
+    CoverageRegion,
     EngineProfileRow,
     EventRow,
+    IllegalBugTransition,
     Project,
     ProjectMode,
     QuarantineEntry,
@@ -1197,3 +1202,251 @@ async def list_planning_task_nodes_by_parent(
             (session_id, parent_id),
         )
     return [PlanningTaskNode.from_row(r) for r in rows]
+
+
+# --- bug candidates (Bug-Fixer ledger) --------------------------------------
+
+
+async def create_bug_candidate(
+    db: Database,
+    *,
+    project_id: str,
+    fingerprint: str,
+    claim: str,
+    file: str | None = None,
+    symbol: str | None = None,
+    region: str | None = None,
+    severity: str | None = None,
+    notes: str | None = None,
+) -> BugCandidate:
+    """Insert a new candidate, or return the existing one on a (project_id, fingerprint) clash.
+
+    Dedupe is structural: ``idx_bug_fingerprint`` makes (project_id, fingerprint) unique and
+    ``ON CONFLICT DO NOTHING`` turns a re-report of the same fingerprint into a true no-op that
+    preserves the original row — its id, status and accumulated history are untouched. The
+    follow-up SELECT runs in the SAME transaction so a concurrent creator can't interleave, and
+    it returns whichever row now owns that fingerprint, so callers get a stable handle without
+    having to inspect rowcount or distinguish insert-from-conflict.
+    """
+    ts = now_iso()
+    async with db.transaction() as conn:
+        await conn.execute(
+            "INSERT INTO bug_candidates (id, project_id, fingerprint, file, symbol, region, "
+            "claim, severity, notes, discovered_at, last_examined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(project_id, fingerprint) DO NOTHING",
+            (new_id(), project_id, fingerprint, file, symbol, region, claim, severity, notes,
+             ts, ts),
+        )
+        cur = await conn.execute(
+            "SELECT * FROM bug_candidates WHERE project_id = ? AND fingerprint = ?",
+            (project_id, fingerprint),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    return BugCandidate.from_row(row)
+
+
+async def get_bug_candidate(db: Database, candidate_id: str) -> BugCandidate | None:
+    row = await db.fetchone("SELECT * FROM bug_candidates WHERE id = ?", (candidate_id,))
+    return BugCandidate.from_row(row) if row else None
+
+
+async def list_bug_candidates(
+    db: Database,
+    project_id: str,
+    status: BugStatus | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[BugCandidate]:
+    """List a project's candidates newest-first, optionally filtered to a single status.
+
+    ``status`` is bound as a parameter (never interpolated) so the permissive TEXT column is
+    queried safely; the enum's ``.value`` is the only thing that reaches SQLite.
+    """
+    clauses = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status.value)
+    sql = f"SELECT * FROM bug_candidates WHERE {' AND '.join(clauses)} ORDER BY discovered_at DESC"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+    rows = await db.fetchall(sql, tuple(params))
+    return [BugCandidate.from_row(r) for r in rows]
+
+
+async def list_needs_human(db: Database, project_id: str) -> list[BugCandidate]:
+    """The human work-queue: candidates parked in ``declined_needs_human`` for this project."""
+    return await list_bug_candidates(db, project_id, status=BugStatus.declined_needs_human)
+
+
+async def set_repro_artifacts(
+    db: Database, candidate_id: str, *, path: str, body: str, hash: str
+) -> None:
+    """Attach the reproduction-test artifact (path, body, content hash) to a candidate.
+
+    Refreshes ``last_examined_at`` too — capturing a repro is itself an examination of the
+    candidate. The status is deliberately NOT touched here: advancing discovered → reproduced is
+    the controller's explicit :func:`transition_bug_status` call, kept separate so the artifact
+    write and the guarded state change remain independently auditable.
+    """
+    await db.execute(
+        "UPDATE bug_candidates SET repro_test_path = ?, repro_test_body = ?, "
+        "repro_test_hash = ?, last_examined_at = ? WHERE id = ?",
+        (path, body, hash, now_iso(), candidate_id),
+    )
+
+
+async def transition_bug_status(
+    db: Database,
+    candidate_id: str,
+    target: BugStatus,
+    *,
+    task_id: str | None = None,
+    decline_reason: str | None = None,
+) -> BugCandidate:
+    """Advance a candidate to ``target``, guarded by :data:`BUG_STATUS_TRANSITIONS`.
+
+    The whole read-check-write runs in one transaction so the guard sees a consistent current
+    status and two coroutines can't both drive the same candidate off one stale observation. The
+    current status is read through :meth:`BugCandidate.from_row`, so a corrupt stored status has
+    already degraded to the terminal ``declined_needs_human`` and every onward edge is rejected —
+    a garbled candidate can never be auto-advanced.
+
+    Side effects stamped atomically with the status flip:
+
+    * ``last_examined_at`` is always refreshed — a transition is activity on the candidate.
+    * entering ``fixing`` bumps ``attempts`` (one in-flight auto-fix == one attempt); this is the
+      counter the controller meters to decide when ``reproduced`` must escalate to a human.
+    * reaching ``fixed`` stamps ``fixed_at``.
+    * ``task_id`` / ``decline_reason`` are linked when supplied — the driving task, and the
+      human-handoff note that rides along the reproduced → declined_needs_human edge.
+
+    Raises :class:`IllegalBugTransition` when the candidate is missing or the edge is not in the
+    table; an illegal edge is a controller bug, surfaced loudly rather than silently dropped.
+    """
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM bug_candidates WHERE id = ?", (candidate_id,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise IllegalBugTransition(f"bug candidate {candidate_id!r} does not exist")
+        current = BugCandidate.from_row(row)
+        if target not in BUG_STATUS_TRANSITIONS[current.status]:
+            raise IllegalBugTransition(
+                f"illegal bug transition {current.status.value} → {target.value}"
+            )
+
+        ts = now_iso()
+        # Only fixed column-assignment fragments are joined into the SQL (no caller value is ever
+        # formatted in); every value travels as a bound parameter, appended in lockstep with its
+        # fragment so the placeholder order stays aligned. ``attempts = attempts + 1`` carries no
+        # placeholder, so it is appended to the fragments WITHOUT a matching param.
+        sets = ["status = ?", "last_examined_at = ?"]
+        params: list[Any] = [target.value, ts]
+        if target is BugStatus.fixed:
+            sets.append("fixed_at = ?")
+            params.append(ts)
+        if target is BugStatus.fixing:
+            sets.append("attempts = attempts + 1")
+        if task_id is not None:
+            sets.append("task_id = ?")
+            params.append(task_id)
+        if decline_reason is not None:
+            sets.append("decline_reason = ?")
+            params.append(decline_reason)
+        params.append(candidate_id)
+        await conn.execute(
+            f"UPDATE bug_candidates SET {', '.join(sets)} WHERE id = ?", tuple(params)
+        )
+
+        cur = await conn.execute(
+            "SELECT * FROM bug_candidates WHERE id = ?", (candidate_id,)
+        )
+        updated = await cur.fetchone()
+    assert updated is not None
+    return BugCandidate.from_row(updated)
+
+
+# --- coverage regions (Bug-Fixer region scheduler) --------------------------
+
+
+async def upsert_coverage_region(
+    db: Database,
+    *,
+    project_id: str,
+    region: str,
+    priority: int | None = None,
+    last_examined_at: str | None = None,
+    examined_count: int | None = None,
+) -> CoverageRegion:
+    """Register a coverage region or update its scheduler fields, keyed on (project_id, region).
+
+    Read-modify-write under one transaction (``idx_coverage_region`` keeps the pair unique). On
+    a fresh region the supplied values seed it, falling back to the column defaults (priority 0,
+    examined_count 0, last_examined_at NULL); on an existing one only the explicitly-supplied
+    (non-``None``) fields are overwritten, so a caller can bump priority without clobbering the
+    examination history, or stamp ``last_examined_at`` without resetting priority.
+    """
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT id FROM coverage WHERE project_id = ? AND region = ?",
+            (project_id, region),
+        )
+        existing = await cur.fetchone()
+        if existing is None:
+            await conn.execute(
+                "INSERT INTO coverage (id, project_id, region, last_examined_at, priority, "
+                "examined_count) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    new_id(),
+                    project_id,
+                    region,
+                    last_examined_at,
+                    priority if priority is not None else 0,
+                    examined_count if examined_count is not None else 0,
+                ),
+            )
+        else:
+            sets: list[str] = []
+            params: list[Any] = []
+            if priority is not None:
+                sets.append("priority = ?")
+                params.append(priority)
+            if last_examined_at is not None:
+                sets.append("last_examined_at = ?")
+                params.append(last_examined_at)
+            if examined_count is not None:
+                sets.append("examined_count = ?")
+                params.append(examined_count)
+            if sets:
+                params.append(existing["id"])
+                await conn.execute(
+                    f"UPDATE coverage SET {', '.join(sets)} WHERE id = ?", tuple(params)
+                )
+        cur = await conn.execute(
+            "SELECT * FROM coverage WHERE project_id = ? AND region = ?",
+            (project_id, region),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    return CoverageRegion.from_row(row)
+
+
+async def select_next_region(db: Database, project_id: str) -> CoverageRegion | None:
+    """Pick the single region to examine next, or ``None`` when the project has no regions.
+
+    Ordering is least-recently-examined first, highest-priority breaking ties. SQLite sorts
+    NULLs first on an ascending key, so never-examined regions (``last_examined_at IS NULL``)
+    naturally lead — the scheduler sweeps unexplored ground before revisiting. ``region`` is the
+    final tiebreak purely to make the choice deterministic when both keys are equal.
+    """
+    row = await db.fetchone(
+        "SELECT * FROM coverage WHERE project_id = ? "
+        "ORDER BY last_examined_at ASC, priority DESC, region ASC LIMIT 1",
+        (project_id,),
+    )
+    return CoverageRegion.from_row(row) if row else None
