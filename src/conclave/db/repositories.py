@@ -1252,6 +1252,23 @@ async def get_bug_candidate(db: Database, candidate_id: str) -> BugCandidate | N
     return BugCandidate.from_row(row) if row else None
 
 
+async def get_bug_candidate_by_fingerprint(
+    db: Database, project_id: str, fingerprint: str
+) -> BugCandidate | None:
+    """Look up a candidate by its (project_id, fingerprint) identity, or ``None``.
+
+    The discovery routine reads this BEFORE a create to decide whether a parsed candidate is
+    genuinely new (worth a ``bug.discovered``) or a re-report of one already in the ledger (a
+    silent no-op). Structural dedupe still lives in :func:`create_bug_candidate`; this is only
+    the event gate, so a found row here means "do not re-announce", not "do not store".
+    """
+    row = await db.fetchone(
+        "SELECT * FROM bug_candidates WHERE project_id = ? AND fingerprint = ?",
+        (project_id, fingerprint),
+    )
+    return BugCandidate.from_row(row) if row else None
+
+
 async def list_bug_candidates(
     db: Database,
     project_id: str,

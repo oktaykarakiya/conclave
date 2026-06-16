@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .baseline import build_baseline_preamble, trim_output
+from .discovery import discover_bug
 from .gate import GateResult, run_tests
 from .gitio import run_git, run_shell
 from .hunter import HunterCandidate, parse_hunter_candidate
@@ -26,6 +27,7 @@ __all__ = [
     "assemble_prompt",
     "build_baseline_preamble",
     "check_grounding",
+    "discover_bug",
     "get_agent_pipeline",
     "parse_hunter_candidate",
     "parse_verdict",
