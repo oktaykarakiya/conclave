@@ -7,11 +7,17 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from ..db import ProjectMode
+
 
 class ProjectCreate(BaseModel):
     name: str
     path: str
     default_branch: str = "main"
+
+
+class ProjectModeUpdate(BaseModel):
+    mode: ProjectMode
 
 
 class ConfigPatch(BaseModel):

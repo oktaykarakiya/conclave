@@ -839,3 +839,36 @@ async def test_create_project_starts_worker_and_is_queryable(
     # Worker must have been started.
     daemon = client_with_workers._transport.app.state.daemon
     assert project_id in daemon._workers, "worker was not started"
+
+
+async def test_bug_fixer_mode_and_ledger_endpoints(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A project can be switched to autonomous_bug_fixer mode; its ledger is queryable."""
+    repo_path = tmp_path / "repo_mode"
+    await _init_repo(repo_path)
+    created = await client.post(
+        "/api/projects",
+        json={"name": "mode-test", "path": str(repo_path), "default_branch": "main"},
+    )
+    assert created.status_code == 200, created.text
+    pid = created.json()["id"]
+    assert created.json()["mode"] == "task_queue"
+
+    switched = await client.post(
+        f"/api/projects/{pid}/mode", json={"mode": "autonomous_bug_fixer"}
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["mode"] == "autonomous_bug_fixer"
+
+    # Fresh project: ledger and needs-human queues are empty.
+    cands = await client.get(f"/api/projects/{pid}/bug-candidates")
+    assert cands.status_code == 200 and cands.json() == []
+    needs = await client.get(f"/api/projects/{pid}/needs-human")
+    assert needs.status_code == 200 and needs.json() == []
+
+    back = await client.post(f"/api/projects/{pid}/mode", json={"mode": "task_queue"})
+    assert back.json()["mode"] == "task_queue"
+
+    bad = await client.post(f"/api/projects/{pid}/mode", json={"mode": "nonsense"})
+    assert bad.status_code == 422

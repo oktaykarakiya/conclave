@@ -18,6 +18,7 @@ from .. import __version__
 from ..config import config_schema, load_project_config
 from ..db import (
     AgentPersona,
+    BugCandidate,
     EventRow,
     Project,
     QuarantineEntry,
@@ -38,6 +39,7 @@ from .schemas import (
     PlanningMessageInput,
     PlanningSessionCreate,
     ProjectCreate,
+    ProjectModeUpdate,
     QuarantineInput,
     TaskCreate,
 )
@@ -166,6 +168,39 @@ async def pause_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -
 @router.post("/projects/{project_id}/resume")
 async def resume_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, bool]:
     return {"running": daemon.set_paused(project_id, False)}
+
+
+@router.post("/projects/{project_id}/mode")
+async def update_project_mode(
+    project_id: str, body: ProjectModeUpdate, daemon: Daemon = Depends(get_daemon)
+) -> Project:
+    """Switch a project between ``task_queue`` and ``autonomous_bug_fixer``. The worker re-reads
+    the project each tick, so the change takes effect on the next loop iteration."""
+    await _require_project(daemon, project_id)
+    await repo.set_project_mode(daemon.db, project_id, body.mode)
+    return await _require_project(daemon, project_id)
+
+
+@router.get("/projects/{project_id}/bug-candidates")
+async def get_bug_candidates(
+    project_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
+) -> list[BugCandidate]:
+    """The Bug-Fixer ledger for a project — every discovered/reproduced/fixed/… candidate."""
+    await _require_project(daemon, project_id)
+    return await repo.list_bug_candidates(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+@router.get("/projects/{project_id}/needs-human")
+async def get_needs_human(
+    project_id: str, daemon: Daemon = Depends(get_daemon)
+) -> list[BugCandidate]:
+    """Candidates parked in ``declined_needs_human`` — the operator's review queue."""
+    await _require_project(daemon, project_id)
+    return await repo.list_needs_human(daemon.db, project_id)
 
 
 @router.get("/projects/{project_id}/usage")
