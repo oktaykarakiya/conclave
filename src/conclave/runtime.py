@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from pathlib import Path
 
-from .db import Database
+from .config import ConclaveConfig, load_project_config, resolve_bug_fixer_session
+from .db import Database, Project, ProjectMode
 from .db import repositories as repo
-from .engine import Orchestrator, WorktreeManager
+from .engine import BugFixerController, Orchestrator, SessionBudget, WorktreeManager
 from .events import EventBus
 from .planning.session import PlanningOrchestrator
 from .providers import Provider
@@ -46,6 +48,12 @@ class ProjectWorker:
         # Current backoff sleep — grows on consecutive idle iterations and resets
         # to ``_idle_sleep`` whenever work is claimed.
         self._current_idle_sleep = idle_sleep
+        # Autonomous bug-fixer mode: the controller that drives one discover→reproduce→fix
+        # cycle per tick, plus the session budget (caps + wall-clock) it runs under. Both are
+        # lazily built on the first autonomous tick so a task_queue project never pays for them.
+        self._bug_fixer = BugFixerController(orchestrator)
+        self._session_budget: SessionBudget | None = None
+        self._session_started: float | None = None
 
     async def start(self) -> None:
         await self._orchestrator.recover(self.project_id)
@@ -57,32 +65,89 @@ class ProjectWorker:
                 if self.paused:
                     await asyncio.sleep(self._idle_sleep)
                     continue
-                task = await repo.claim_next_approved(self._db, self.project_id)
-                if task is None:
+                # Re-read the project each tick so a mode flip (or a config change) is picked up
+                # without bouncing the worker. A vanished project just idles until detached.
+                project = await repo.get_project(self._db, self.project_id)
+                if project is None:
                     await self._idle_backoff()
                     continue
-                # Work claimed — reset backoff so the next idle cycle starts
-                # from the minimum.
-                self._current_idle_sleep = self._idle_sleep
-                # Register a cancellation event so the cancel endpoint can signal
-                # cooperative cancellation for this specific task.
-                cancel_event = asyncio.Event()
-                self._orchestrator._cancel_events[task.id] = cancel_event
-                try:
-                    await self._orchestrator.process_task(
-                        task, cancel_event=cancel_event,
-                    )
-                finally:
-                    # Clean the event entry regardless of outcome — the
-                    # orchestrator's _finish_cancelled also cleans it, but
-                    # this finally is the belt-and-suspenders so the dict
-                    # can never leak entries.
-                    self._orchestrator._cancel_events.pop(task.id, None)
+                if project.mode is ProjectMode.autonomous_bug_fixer:
+                    await self._bug_fixer_tick(project)
+                else:
+                    await self._task_queue_tick()
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep the worker alive on unexpected errors
                 logger.exception("worker error for project %s", self.project_id)
                 await asyncio.sleep(self._idle_sleep)
+
+    # --- Per-mode ticks ------------------------------------------------------
+
+    async def _task_queue_tick(self) -> None:
+        """One task-queue iteration: claim the next approved task and process it, or back off."""
+        task = await repo.claim_next_approved(self._db, self.project_id)
+        if task is None:
+            await self._idle_backoff()
+            return
+        # Work claimed — reset backoff so the next idle cycle starts from the minimum.
+        self._current_idle_sleep = self._idle_sleep
+        # Register a cancellation event so the cancel endpoint can signal cooperative
+        # cancellation for this specific task.
+        cancel_event = asyncio.Event()
+        self._orchestrator._cancel_events[task.id] = cancel_event
+        try:
+            await self._orchestrator.process_task(task, cancel_event=cancel_event)
+        finally:
+            # Clean the event entry regardless of outcome — the orchestrator's
+            # _finish_cancelled also cleans it, but this finally is the belt-and-suspenders
+            # so the dict can never leak entries.
+            self._orchestrator._cancel_events.pop(task.id, None)
+
+    async def _bug_fixer_tick(self, project: Project) -> None:
+        """One autonomous-bug-fixer iteration: run a controller cycle metered by the session budget.
+
+        Resolves the per-session caps + wall-clock budget once (lazily, on the first autonomous
+        tick) from the project's :class:`BugFixerPolicy`, then meters every cycle against them.
+        Once the budget is exhausted the worker stops starting new cycles and idles — any candidate
+        a cycle was mid-flight on is already parked by the controller (a failed/over-budget fix
+        defers it), so there is never a candidate stranded in ``fixing`` between ticks. A cycle that
+        found nothing (idle) backs off; a cycle that did work resets the backoff.
+        """
+        config = load_project_config(project.config)
+        budget = self._ensure_session(config)
+
+        if budget.exhausted(elapsed_seconds=self._session_elapsed()):
+            # Session caps reached — go quiet. (A fresh session begins after a pause/resume or
+            # worker restart, which clears the budget.)
+            await self._idle_backoff()
+            return
+
+        cancel_event = asyncio.Event()
+        # Surface a stop request for whatever fix task this cycle spawns: the controller registers
+        # the task's own id in the same _cancel_events table, but we also honour a worker stop by
+        # signalling between stages through the event threaded into the cycle.
+        result = await self._bug_fixer.run_cycle(project, config, cancel_event=cancel_event)
+        budget.record(result)
+
+        if result.outcome.did_work:
+            # Acted on a candidate — reset backoff so the next sweep starts promptly.
+            self._current_idle_sleep = self._idle_sleep
+        else:
+            # No candidate this turn — nothing to hunt, so back off like an empty task queue.
+            await self._idle_backoff()
+
+    def _ensure_session(self, config: ConclaveConfig) -> SessionBudget:
+        """Lazily build (and remember) this autonomous session's budget + start time."""
+        if self._session_budget is None:
+            self._session_budget = SessionBudget.from_config(resolve_bug_fixer_session(config))
+            self._session_started = time.monotonic()
+        return self._session_budget
+
+    def _session_elapsed(self) -> float:
+        """Seconds since the current autonomous session began (0 before one starts)."""
+        if self._session_started is None:
+            return 0.0
+        return time.monotonic() - self._session_started
 
     # --- Internal helpers ----------------------------------------------------
 

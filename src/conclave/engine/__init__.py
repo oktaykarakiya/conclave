@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from .baseline import build_baseline_preamble, trim_output
+from .bug_fixer import (
+    BugFixerController,
+    CycleOutcome,
+    CycleResult,
+    SessionBudget,
+)
 from .coverage_ingest import ingest_coverage
 from .discovery import discover_bug
 from .gate import GateResult, run_tests
@@ -26,6 +32,9 @@ from .worktree import WorktreeError, WorktreeManager
 __all__ = [
     "AgentRunner",
     "AttemptMemory",
+    "BugFixerController",
+    "CycleOutcome",
+    "CycleResult",
     "GateResult",
     "HunterCandidate",
     "Orchestrator",
@@ -33,6 +42,7 @@ __all__ = [
     "ReproOutcome",
     "ReproResult",
     "ReproTest",
+    "SessionBudget",
     "WorktreeError",
     "WorktreeManager",
     "assemble_prompt",
