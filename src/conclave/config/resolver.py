@@ -14,7 +14,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import AgentSettings, ConclaveConfig
+from .models import (
+    AgentSettings,
+    BugFixerSessionConfig,
+    BugFixerSessionOverride,
+    ConclaveConfig,
+)
 
 # Safety floor: these are always protected regardless of project config. Users may
 # ADD protected paths via config but can never remove these (closes a team-ai footgun).
@@ -54,6 +59,34 @@ def resolve_agent(config: ConclaveConfig, agent: str) -> AgentSettings:
     override = config.agent_overrides.get(agent, {})
     merged = deep_merge(base, dict(override)) if override else base
     return AgentSettings.model_validate(merged)
+
+
+def resolve_bug_fixer_session(
+    config: ConclaveConfig,
+    override: BugFixerSessionOverride | None = None,
+) -> BugFixerSessionConfig:
+    """Resolve the effective limits for one Bug-Fixer session.
+
+    Mirrors :func:`resolve_agent`'s layered shape: a per-session ``override`` wins,
+    falling back to the project's ``bug_fixer`` policy default. ``wall_clock_budget_minutes``
+    adds one final fallback — when neither the override nor the policy pins it, the session
+    reuses ``execution.wall_clock_budget_minutes`` so it shares the per-task retry-loop cap
+    rather than running unbounded.
+    """
+    policy = config.bug_fixer
+    ov = override or BugFixerSessionOverride()
+    budget = ov.wall_clock_budget_minutes
+    if budget is None:
+        budget = policy.wall_clock_budget_minutes
+    if budget is None:
+        budget = config.execution.wall_clock_budget_minutes
+    return BugFixerSessionConfig(
+        max_candidates=(
+            ov.max_candidates if ov.max_candidates is not None else policy.max_candidates
+        ),
+        max_attempts=(ov.max_attempts if ov.max_attempts is not None else policy.max_attempts),
+        wall_clock_budget_minutes=budget,
+    )
 
 
 def effective_protected(config: ConclaveConfig) -> tuple[list[str], list[str]]:

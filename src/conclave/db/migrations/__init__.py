@@ -265,6 +265,54 @@ _SQL_007 = """
 ALTER TABLE planning_sessions ADD COLUMN stabilization_reason TEXT;
 """
 
+# Migration 8 — promote the Phase-2 Bug-Fixer ledger from scaffold to its real shape.
+# bug_candidates and coverage are seeded empty by migration 1 and still have no writers
+# (verified), so there is no data to preserve: we DROP and recreate bug_candidates instead
+# of performing the 12-step ALTER rebuild SQLite would otherwise demand. The runner wraps
+# every migration in one BEGIN/COMMIT, so the DROP + CREATE + index land atomically — a
+# failure rolls the whole thing back and leaves the old scaffold intact.
+#
+# The old two-field status model (status DEFAULT 'candidate' + a separate `reproduced`
+# boolean) collapses into a single permissive `status` TEXT column over the 7-state machine
+# the controller drives (validation lives in the Pydantic/enum layer, like tasks.state):
+#   discovered → reproduced → fixing → fixed
+#                          ↘ dismissed_false_positive | declined_needs_human | deferred
+# The new columns carry the reproduction artifact (region, repro_test_path/body/hash), the
+# fix-retry count (attempts), the human-handoff reason (decline_reason), and the serialized
+# consensus payload (consensus_json). coverage gains priority + examined_count so the region
+# scheduler can rank and age-out what it has already swept.
+_SQL_008 = """
+DROP TABLE bug_candidates;
+
+CREATE TABLE bug_candidates (
+  id                TEXT PRIMARY KEY,
+  project_id        TEXT NOT NULL,
+  fingerprint       TEXT NOT NULL,
+  file              TEXT,
+  symbol            TEXT,
+  region            TEXT,
+  claim             TEXT NOT NULL,
+  severity          TEXT,
+  status            TEXT NOT NULL DEFAULT 'discovered',
+  repro_test_path   TEXT,
+  repro_test_body   TEXT,
+  repro_test_hash   TEXT,
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  decline_reason    TEXT,
+  consensus_json    TEXT NOT NULL DEFAULT '{}',
+  task_id           TEXT,
+  notes             TEXT,
+  discovered_at     TEXT NOT NULL,
+  last_examined_at  TEXT NOT NULL,
+  fixed_at          TEXT,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX idx_bug_fingerprint ON bug_candidates(project_id, fingerprint);
+
+ALTER TABLE coverage ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE coverage ADD COLUMN examined_count INTEGER NOT NULL DEFAULT 0;
+"""
+
 MIGRATIONS: list[Migration] = [
     Migration(version=1, name="initial_schema", sql=_SQL_001),
     Migration(version=2, name="add_ai_enriched_to_repo_knowledge", sql=_SQL_002),
@@ -273,4 +321,5 @@ MIGRATIONS: list[Migration] = [
     Migration(version=5, name="add_tokens_to_usage", sql=_SQL_005),
     Migration(version=6, name="add_task_usage_indexes", sql=_SQL_006),
     Migration(version=7, name="add_stabilization_reason_to_planning_sessions", sql=_SQL_007),
+    Migration(version=8, name="bug_candidate_ledger_7_state_machine", sql=_SQL_008),
 ]

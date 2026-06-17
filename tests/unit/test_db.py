@@ -2,22 +2,95 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+from pathlib import Path
 
 import pytest
 
-from conclave.db import Database, ProjectMode, TaskOrigin, TaskState
+from conclave.db import (
+    BUG_STATUS_TRANSITIONS,
+    BugCandidate,
+    BugStatus,
+    CoverageRegion,
+    Database,
+    IllegalBugTransition,
+    ProjectMode,
+    TaskOrigin,
+    TaskState,
+)
 from conclave.db import repositories as repo
-from conclave.db.migrations import Migration
+from conclave.db.migrations import MIGRATIONS, Migration
 from conclave.db.planning_models import PlanningNodeStatus, PlanningSessionStatus
+
+# The 7-state machine the Bug-Fixer controller drives over bug_candidates.status. The column
+# is permissive TEXT (validation lives in the enum/Pydantic layer, like tasks.state), so this
+# tuple documents the canonical vocabulary and the migration test proves each value persists.
+BUG_CANDIDATE_STATUSES = (
+    "discovered",
+    "reproduced",
+    "fixing",
+    "fixed",
+    "dismissed_false_positive",
+    "declined_needs_human",
+    "deferred",
+)
+
+# An INDEPENDENT restatement of the pinned 7-state machine — deliberately not derived from
+# BUG_STATUS_TRANSITIONS, so an accidental edit to the production table is caught (test and code
+# must agree) rather than silently tracked. Each pair is one legal (from → to) edge.
+_LEGAL_BUG_EDGES = (
+    (BugStatus.discovered, BugStatus.reproduced),
+    (BugStatus.discovered, BugStatus.dismissed_false_positive),
+    (BugStatus.discovered, BugStatus.declined_needs_human),
+    (BugStatus.discovered, BugStatus.deferred),
+    (BugStatus.reproduced, BugStatus.fixing),
+    (BugStatus.reproduced, BugStatus.dismissed_false_positive),
+    (BugStatus.reproduced, BugStatus.declined_needs_human),
+    (BugStatus.reproduced, BugStatus.deferred),
+    (BugStatus.fixing, BugStatus.fixed),
+    (BugStatus.fixing, BugStatus.reproduced),
+    (BugStatus.deferred, BugStatus.discovered),
+    (BugStatus.deferred, BugStatus.reproduced),
+)
+
+# A representative sample of edges that must be REJECTED: skipping reproduction, leaving a
+# terminal sink, and re-entering fixing without going through reproduced.
+_ILLEGAL_BUG_EDGES = (
+    (BugStatus.discovered, BugStatus.fixing),  # cannot fix what isn't reproduced
+    (BugStatus.discovered, BugStatus.fixed),  # cannot skip straight to fixed
+    (BugStatus.reproduced, BugStatus.fixed),  # fixed only via fixing
+    (BugStatus.fixed, BugStatus.reproduced),  # terminal: no way out
+    (BugStatus.dismissed_false_positive, BugStatus.discovered),  # terminal
+    (BugStatus.declined_needs_human, BugStatus.fixing),  # terminal handoff
+    (BugStatus.fixing, BugStatus.deferred),  # fixing only lands fixed or retries
+    (BugStatus.discovered, BugStatus.discovered),  # self-loop is not an advance
+)
+
+
+async def _seed_candidate(
+    db: Database, project_id: str, *, fingerprint: str, status: BugStatus = BugStatus.discovered
+) -> str:
+    """Insert a candidate already parked at ``status`` (raw, bypassing the transition guard).
+
+    Lets the transition tests drop a candidate directly into any source state without having to
+    navigate the whole machine to reach it. Returns the new row id.
+    """
+    cid = f"seed-{fingerprint}"
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, status, "
+        "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (cid, project_id, fingerprint, "seeded claim", status.value, "2020-01-01", "2020-01-01"),
+    )
+    return cid
 
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 7
+    assert version == 8
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 7
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 8
 
 
 async def test_migration_failure_is_atomic(
@@ -28,12 +101,12 @@ async def test_migration_failure_is_atomic(
 
     Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
     replays the same migration and wedges on a duplicate-column error. The fixture DB is
-    already at version 7; we inject a v8 migration whose first statement succeeds (creates
+    already at version 8; we inject a v9 migration whose first statement succeeds (creates
     a probe table) and whose second fails — ``stabilization_reason`` was already added by
     migration 7, so re-adding it raises a duplicate-column error — which is exactly that wedge.
     """
     failing = Migration(
-        version=8,
+        version=9,
         name="injected_failure",
         sql=(
             "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
@@ -46,7 +119,7 @@ async def test_migration_failure_is_atomic(
         await db._apply_migrations()
 
     # Version did not advance past the last good migration...
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 7
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 8
     # ...and the partial DDL (the probe table from the first statement) was rolled back.
     assert (
         await db.fetchval(
@@ -54,6 +127,108 @@ async def test_migration_failure_is_atomic(
         )
         == 0
     )
+
+
+async def test_migration_8_bug_candidate_ledger_schema(db: Database) -> None:
+    """Migration 8 reshapes bug_candidates into the 7-state ledger and extends coverage.
+
+    A fresh DB is at version 8. The old two-field status model (status DEFAULT 'candidate'
+    plus a separate ``reproduced`` boolean) is gone, replaced by a single permissive
+    ``status`` TEXT defaulting to 'discovered', alongside the reproduction/consensus columns;
+    coverage gains priority + examined_count.
+    """
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 8
+
+    cols = {r["name"]: r for r in await db.fetchall("PRAGMA table_info(bug_candidates)")}
+    # New columns are present...
+    for added in (
+        "region", "repro_test_path", "repro_test_body", "repro_test_hash",
+        "attempts", "decline_reason", "consensus_json",
+    ):
+        assert added in cols, f"bug_candidates is missing {added}"
+    # ...the retired boolean is gone, and the reshaped columns carry the documented defaults.
+    assert "reproduced" not in cols
+    assert cols["status"]["notnull"] == 1
+    assert cols["status"]["dflt_value"] == "'discovered'"
+    assert cols["attempts"]["notnull"] == 1
+    assert cols["attempts"]["dflt_value"] == "0"
+    assert cols["consensus_json"]["notnull"] == 1
+    assert cols["consensus_json"]["dflt_value"] == "'{}'"
+    # Preserved columns survive the rebuild.
+    for kept in (
+        "fingerprint", "file", "symbol", "claim", "severity", "task_id",
+        "notes", "discovered_at", "last_examined_at", "fixed_at",
+    ):
+        assert kept in cols
+
+    # The fingerprint unique index is recreated with the table.
+    indexes = {r["name"] for r in await db.fetchall("PRAGMA index_list('bug_candidates')")}
+    assert "idx_bug_fingerprint" in indexes
+
+    # coverage gains its scheduler columns with the documented NOT NULL defaults.
+    cov = {r["name"]: r for r in await db.fetchall("PRAGMA table_info(coverage)")}
+    assert cov["priority"]["notnull"] == 1 and cov["priority"]["dflt_value"] == "0"
+    assert cov["examined_count"]["notnull"] == 1 and cov["examined_count"]["dflt_value"] == "0"
+
+    # Each of the 7 status strings inserts cleanly — the column is permissive TEXT (no CHECK),
+    # so the ledger can hold any state the controller advances a candidate through.
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    for i, status in enumerate(BUG_CANDIDATE_STATUSES):
+        await db.execute(
+            "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, status, "
+            "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (f"bc{i}", p.id, f"fp{i}", "off-by-one in slice", status, "2026-01-01", "2026-01-01"),
+        )
+    persisted = {r["status"] for r in await db.fetchall("SELECT status FROM bug_candidates")}
+    assert persisted == set(BUG_CANDIDATE_STATUSES)
+
+    # Omitting status applies the 'discovered' default.
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, "
+        "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("bc-default", p.id, "fp-default", "claim", "2026-01-01", "2026-01-01"),
+    )
+    assert (
+        await db.fetchval("SELECT status FROM bug_candidates WHERE id = 'bc-default'")
+        == "discovered"
+    )
+
+
+async def test_migration_8_recreates_seeded_bug_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v8 DROP/recreate runs cleanly against a DB where the v1 scaffold physically exists.
+
+    A fresh DB never materializes the old bug_candidates shape, so we seed a DB at version 1
+    only — where the retired ``status DEFAULT 'candidate'`` + ``reproduced`` columns are real —
+    then migrate forward and confirm it reaches version 8 with the new schema. This exercises
+    the DROP against an actual prior table rather than a no-op on a missing one.
+    """
+    # Seed at version 1: expose only the initial-schema migration to the runner.
+    monkeypatch.setattr("conclave.db.database.MIGRATIONS", [MIGRATIONS[0]])
+    database = Database(tmp_path / "seeded.db")
+    await database.connect()
+    try:
+        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 1
+        v1_cols = {
+            r["name"] for r in await database.fetchall("PRAGMA table_info(bug_candidates)")
+        }
+        assert "reproduced" in v1_cols  # the old scaffold is genuinely present
+
+        # Expose the full migration set and roll the seeded DB forward to head.
+        monkeypatch.setattr("conclave.db.database.MIGRATIONS", MIGRATIONS)
+        await database._apply_migrations()
+
+        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 8
+        v8_cols = {
+            r["name"] for r in await database.fetchall("PRAGMA table_info(bug_candidates)")
+        }
+        assert "reproduced" not in v8_cols  # rebuilt without the retired boolean
+        assert {"region", "repro_test_path", "attempts", "consensus_json"} <= v8_cols
+        cov_cols = {r["name"] for r in await database.fetchall("PRAGMA table_info(coverage)")}
+        assert {"priority", "examined_count"} <= cov_cols
+    finally:
+        await database.close()
 
 
 async def test_project_crud_and_config(db: Database) -> None:
@@ -539,6 +714,137 @@ async def test_corrupt_planning_rows_load_with_safe_defaults(db: Database) -> No
     assert nodes[0].status is PlanningNodeStatus.proposed
 
 
+async def test_bug_candidate_from_row_happy_path(db: Database) -> None:
+    """A fully-populated bug_candidates row round-trips through BugCandidate.from_row.
+
+    The enum status parses, consensus_json decodes to a dict, and every reproduction/handoff
+    column maps onto its model field.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO bug_candidates ("
+        "id, project_id, fingerprint, file, symbol, region, claim, severity, status, "
+        "repro_test_path, repro_test_body, repro_test_hash, attempts, decline_reason, "
+        "consensus_json, task_id, notes, discovered_at, last_examined_at, fixed_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "bc-happy", p.id, "fp-1", "src/x.py", "foo", "src/", "off-by-one in slice", "high",
+            "reproduced", "tests/test_x.py", "def test_x(): assert False", "deadbeef", 2, None,
+            '{"reviewers": 3, "agree": true}', "t-1", "a note", "2026-01-01", "2026-01-02", None,
+        ),
+    )
+
+    row = await db.fetchone("SELECT * FROM bug_candidates WHERE id = 'bc-happy'")
+    bc = BugCandidate.from_row(row)
+
+    assert bc.id == "bc-happy"
+    assert bc.project_id == p.id
+    assert bc.fingerprint == "fp-1"
+    assert bc.file == "src/x.py"
+    assert bc.symbol == "foo"
+    assert bc.region == "src/"
+    assert bc.claim == "off-by-one in slice"
+    assert bc.severity == "high"
+    assert bc.status is BugStatus.reproduced
+    assert bc.repro_test_path == "tests/test_x.py"
+    assert bc.repro_test_body == "def test_x(): assert False"
+    assert bc.repro_test_hash == "deadbeef"
+    assert bc.attempts == 2
+    assert bc.decline_reason is None
+    assert bc.consensus == {"reviewers": 3, "agree": True}
+    assert bc.task_id == "t-1"
+    assert bc.notes == "a note"
+    assert bc.discovered_at == "2026-01-01"
+    assert bc.last_examined_at == "2026-01-02"
+    assert bc.fixed_at is None
+
+
+async def test_bug_candidate_from_row_applies_column_defaults(db: Database) -> None:
+    """A minimal insert leans on the schema defaults: status 'discovered', attempts 0,
+    consensus '{}'. The model surfaces them as the natural initial state — distinct from the
+    corrupt-row sink exercised below."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, "
+        "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("bc-min", p.id, "fp-min", "claim", "2026-01-01", "2026-01-01"),
+    )
+    bc = BugCandidate.from_row(
+        await db.fetchone("SELECT * FROM bug_candidates WHERE id = 'bc-min'")
+    )
+    assert bc.status is BugStatus.discovered
+    assert bc.attempts == 0
+    assert bc.consensus == {}
+    assert bc.region is None
+    assert bc.repro_test_path is None
+
+
+async def test_corrupt_bug_candidate_row_loads_with_safe_defaults(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bug_candidates row with an unknown status and corrupt consensus JSON must load —
+    not raise out of from_row and stall the controller's ledger scan.
+
+    The unknown status degrades to ``declined_needs_human`` (non-actionable, human-routed)
+    so a corrupt candidate is never auto-picked for an auto-fix; corrupt consensus_json
+    decodes to ``{}``. Both fallbacks log a warning rather than raising.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, status, "
+        "consensus_json, discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("bc-bad", p.id, "fp-bad", "claim", "totally-bogus", "{not json", "2026-01-01",
+         "2026-01-01"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="conclave.db.models"):
+        bc = BugCandidate.from_row(
+            await db.fetchone("SELECT * FROM bug_candidates WHERE id = 'bc-bad'")
+        )
+
+    # Falls back to the safe, non-actionable sink — never an auto-pickable state.
+    assert bc.status is BugStatus.declined_needs_human
+    assert bc.status not in {BugStatus.discovered, BugStatus.reproduced}
+    assert bc.consensus == {}
+    # Both corruptions were logged (no raise), so the bad row is observable, not silent.
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "unknown BugStatus" in messages
+    assert "corrupt JSON column" in messages
+
+
+async def test_coverage_region_from_row(db: Database) -> None:
+    """A coverage row round-trips through CoverageRegion.from_row, including the scheduler
+    columns added by migration 8; omitting them applies the NOT NULL defaults (priority 0,
+    examined_count 0)."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO coverage (id, project_id, region, last_examined_at, priority, "
+        "examined_count) VALUES (?, ?, ?, ?, ?, ?)",
+        ("cov-1", p.id, "src/conclave/db", "2026-01-03", 5, 7),
+    )
+    cov = CoverageRegion.from_row(
+        await db.fetchone("SELECT * FROM coverage WHERE id = 'cov-1'")
+    )
+    assert cov.id == "cov-1"
+    assert cov.project_id == p.id
+    assert cov.region == "src/conclave/db"
+    assert cov.last_examined_at == "2026-01-03"
+    assert cov.priority == 5
+    assert cov.examined_count == 7
+
+    # A region that has never been examined leans on the defaults.
+    await db.execute(
+        "INSERT INTO coverage (id, project_id, region) VALUES (?, ?, ?)",
+        ("cov-fresh", p.id, "src/conclave/web"),
+    )
+    fresh = CoverageRegion.from_row(
+        await db.fetchone("SELECT * FROM coverage WHERE id = 'cov-fresh'")
+    )
+    assert fresh.last_examined_at is None
+    assert fresh.priority == 0
+    assert fresh.examined_count == 0
+
+
 async def test_block_descendants_cycle_safe(db: Database) -> None:
     """block_descendants terminates on a cyclic parent_task_id (A → B → A)
     and blocks each non-terminal node at most once."""
@@ -656,3 +962,320 @@ async def test_migration_6_indexes_exist(db: Database) -> None:
     )
     usage_names = {r["name"] for r in usage_indexes}
     assert "idx_usage_task" in usage_names
+
+
+# --- Bug-Fixer ledger: create / dedupe / list -------------------------------
+
+
+async def test_create_bug_candidate_dedupes_on_fingerprint(db: Database) -> None:
+    """A second create with the same (project_id, fingerprint) is a no-op that returns row 1.
+
+    Dedupe must preserve the original row wholesale — same id, original claim/status — and never
+    spawn a duplicate; a genuinely new fingerprint still yields a distinct row.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    first = await repo.create_bug_candidate(
+        db, project_id=p.id, fingerprint="fp-1", claim="off-by-one in slice", severity="high"
+    )
+    assert first.status is BugStatus.discovered
+
+    # Re-report the SAME fingerprint with different payload → no-op returning the original row.
+    second = await repo.create_bug_candidate(
+        db, project_id=p.id, fingerprint="fp-1", claim="totally different claim", severity="low"
+    )
+    assert second.id == first.id
+    assert second.claim == "off-by-one in slice"  # row 1 preserved, the re-report ignored
+    assert second.severity == "high"
+
+    # Exactly one row exists for that fingerprint.
+    assert len(await repo.list_bug_candidates(db, p.id)) == 1
+
+    # A new fingerprint is a genuinely distinct candidate.
+    other = await repo.create_bug_candidate(
+        db, project_id=p.id, fingerprint="fp-2", claim="another bug"
+    )
+    assert other.id != first.id
+    assert len(await repo.list_bug_candidates(db, p.id)) == 2
+
+
+async def test_get_and_list_bug_candidates_filter_by_status(db: Database) -> None:
+    """get returns one row (or None); list filters by project and, optionally, status."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    assert await repo.get_bug_candidate(db, "nope") is None
+
+    a = await repo.create_bug_candidate(db, project_id=p.id, fingerprint="fp-a", claim="a")
+    b = await repo.create_bug_candidate(db, project_id=p.id, fingerprint="fp-b", claim="b")
+
+    got = await repo.get_bug_candidate(db, a.id)
+    assert got is not None and got.id == a.id
+
+    # Advance one candidate so the status filter has something to discriminate.
+    await repo.transition_bug_status(db, b.id, BugStatus.reproduced)
+
+    all_ids = {c.id for c in await repo.list_bug_candidates(db, p.id)}
+    assert all_ids == {a.id, b.id}
+
+    discovered = await repo.list_bug_candidates(db, p.id, status=BugStatus.discovered)
+    assert [c.id for c in discovered] == [a.id]
+    reproduced = await repo.list_bug_candidates(db, p.id, status=BugStatus.reproduced)
+    assert [c.id for c in reproduced] == [b.id]
+    assert await repo.list_bug_candidates(db, p.id, status=BugStatus.fixed) == []
+
+
+async def test_set_repro_artifacts(db: Database) -> None:
+    """set_repro_artifacts attaches the repro test columns and refreshes last_examined_at."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    cid = await _seed_candidate(db, p.id, fingerprint="fp-1")  # last_examined_at = 2020-01-01
+
+    await repo.set_repro_artifacts(
+        db, cid, path="tests/test_x.py", body="def test_x(): assert False", hash="deadbeef"
+    )
+
+    bc = await repo.get_bug_candidate(db, cid)
+    assert bc is not None
+    assert bc.repro_test_path == "tests/test_x.py"
+    assert bc.repro_test_body == "def test_x(): assert False"
+    assert bc.repro_test_hash == "deadbeef"
+    assert bc.status is BugStatus.discovered  # status is untouched here
+    assert bc.last_examined_at != "2020-01-01"  # refreshed to now
+
+
+# --- Bug-Fixer ledger: the guarded status machine ---------------------------
+
+
+def test_bug_status_transition_table_matches_independent_spec() -> None:
+    """The production table equals the test's independent restatement — neither drifts silently.
+
+    Folds _LEGAL_BUG_EDGES back into a {state: {targets}} map (terminals → empty sets) and
+    asserts equality with BUG_STATUS_TRANSITIONS, pinning the exact shape of the machine.
+    """
+    expected: dict[BugStatus, set[BugStatus]] = {state: set() for state in BugStatus}
+    for src, dst in _LEGAL_BUG_EDGES:
+        expected[src].add(dst)
+    actual = {state: set(targets) for state, targets in BUG_STATUS_TRANSITIONS.items()}
+    assert actual == expected
+
+
+async def test_bug_status_every_legal_transition_is_accepted(db: Database) -> None:
+    """Every edge in the pinned table is accepted and lands the candidate in the target state."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    for i, (src, dst) in enumerate(_LEGAL_BUG_EDGES):
+        cid = await _seed_candidate(db, p.id, fingerprint=f"legal-{i}", status=src)
+        updated = await repo.transition_bug_status(db, cid, dst)
+        assert updated.status is dst, f"{src.value} → {dst.value} should be legal"
+
+
+async def test_bug_status_illegal_transitions_are_rejected(db: Database) -> None:
+    """Every sampled illegal edge raises IllegalBugTransition and leaves the row unchanged."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    for i, (src, dst) in enumerate(_ILLEGAL_BUG_EDGES):
+        cid = await _seed_candidate(db, p.id, fingerprint=f"illegal-{i}", status=src)
+        with pytest.raises(IllegalBugTransition):
+            await repo.transition_bug_status(db, cid, dst)
+        # The rejected write rolled back: the candidate is still parked at the source state.
+        bc = await repo.get_bug_candidate(db, cid)
+        assert bc is not None and bc.status is src
+
+
+async def test_bug_status_missing_candidate_raises(db: Database) -> None:
+    """Transitioning a non-existent candidate is an illegal transition, not a silent no-op."""
+    with pytest.raises(IllegalBugTransition):
+        await repo.transition_bug_status(db, "ghost", BugStatus.reproduced)
+
+
+async def test_bug_status_fix_retry_loop_and_attempts(db: Database) -> None:
+    """The fixing → reproduced retry edge re-arms a fix; each entry into fixing bumps attempts.
+
+    Walks discovered → reproduced → fixing → reproduced → fixing → fixed, asserting attempts
+    increments only on entering fixing (1, then 2) and that fixed_at is stamped at the end.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    bc = await repo.create_bug_candidate(db, project_id=p.id, fingerprint="fp-1", claim="bug")
+    assert bc.attempts == 0
+
+    reproduced = await repo.transition_bug_status(db, bc.id, BugStatus.reproduced)
+    assert reproduced.status is BugStatus.reproduced
+    assert reproduced.attempts == 0  # reproduction is not a fix attempt
+
+    fixing1 = await repo.transition_bug_status(db, bc.id, BugStatus.fixing)
+    assert fixing1.status is BugStatus.fixing
+    assert fixing1.attempts == 1  # entering fixing bumps attempts
+
+    # The fix attempt failed — fall back along the retry edge. Attempts is NOT bumped here.
+    retried = await repo.transition_bug_status(db, bc.id, BugStatus.reproduced)
+    assert retried.status is BugStatus.reproduced
+    assert retried.attempts == 1
+
+    fixing2 = await repo.transition_bug_status(db, bc.id, BugStatus.fixing)
+    assert fixing2.attempts == 2  # second auto-fix attempt
+
+    assert fixing2.fixed_at is None
+    fixed = await repo.transition_bug_status(db, bc.id, BugStatus.fixed)
+    assert fixed.status is BugStatus.fixed
+    assert fixed.attempts == 2  # reaching fixed does not bump attempts
+    assert fixed.fixed_at is not None
+
+
+async def test_bug_status_exhausted_attempts_escalates_to_human(db: Database) -> None:
+    """reproduced → declined_needs_human is the exhausted-attempts escalation edge.
+
+    After a failed fix returns the candidate to reproduced, the controller escalates to a human;
+    the row records the handoff reason and surfaces in list_needs_human. The sink is terminal —
+    a further transition is rejected.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    bc = await repo.create_bug_candidate(db, project_id=p.id, fingerprint="fp-1", claim="bug")
+    await repo.transition_bug_status(db, bc.id, BugStatus.reproduced)
+    await repo.transition_bug_status(db, bc.id, BugStatus.fixing)
+    await repo.transition_bug_status(db, bc.id, BugStatus.reproduced)  # fix failed, back to repro
+
+    declined = await repo.transition_bug_status(
+        db, bc.id, BugStatus.declined_needs_human, decline_reason="auto-fix exhausted"
+    )
+    assert declined.status is BugStatus.declined_needs_human
+    assert declined.decline_reason == "auto-fix exhausted"
+
+    needs_human = await repo.list_needs_human(db, p.id)
+    assert [c.id for c in needs_human] == [bc.id]
+
+    # The handoff sink is terminal — no onward auto-edge.
+    with pytest.raises(IllegalBugTransition):
+        await repo.transition_bug_status(db, bc.id, BugStatus.fixing)
+
+
+async def test_bug_status_links_task_and_refreshes_last_examined(db: Database) -> None:
+    """A transition links the driving task_id and refreshes the stale last_examined_at stamp."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    cid = await _seed_candidate(db, p.id, fingerprint="fp-1")  # last_examined_at = 2020-01-01
+
+    updated = await repo.transition_bug_status(
+        db, cid, BugStatus.reproduced, task_id="task-42"
+    )
+    assert updated.task_id == "task-42"
+    assert updated.last_examined_at != "2020-01-01"  # any transition is activity → refreshed
+
+
+async def test_corrupt_status_candidate_cannot_be_transitioned(db: Database) -> None:
+    """A candidate whose stored status is garbage degrades to declined_needs_human (terminal),
+    so the guard rejects every onward edge — a corrupt row can never be auto-advanced."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await db.execute(
+        "INSERT INTO bug_candidates (id, project_id, fingerprint, claim, status, "
+        "discovered_at, last_examined_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("bc-bad", p.id, "fp-bad", "claim", "totally-bogus", "2026-01-01", "2026-01-01"),
+    )
+    with pytest.raises(IllegalBugTransition):
+        await repo.transition_bug_status(db, "bc-bad", BugStatus.reproduced)
+
+
+# --- Bug-Fixer scheduler: coverage regions ----------------------------------
+
+
+async def test_upsert_coverage_region_inserts_then_updates(db: Database) -> None:
+    """First upsert inserts with defaults; later upserts patch only the supplied fields."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    created = await repo.upsert_coverage_region(db, project_id=p.id, region="src/a", priority=5)
+    assert created.priority == 5
+    assert created.examined_count == 0
+    assert created.last_examined_at is None
+
+    # Bump priority only — examination history must be left intact (no clobber to defaults).
+    bumped = await repo.upsert_coverage_region(db, project_id=p.id, region="src/a", priority=9)
+    assert bumped.id == created.id  # same row, not a duplicate
+    assert bumped.priority == 9
+    assert bumped.examined_count == 0
+
+    # Record an examination without touching priority.
+    examined = await repo.upsert_coverage_region(
+        db, project_id=p.id, region="src/a", last_examined_at="2026-06-01", examined_count=3
+    )
+    assert examined.priority == 9  # preserved
+    assert examined.last_examined_at == "2026-06-01"
+    assert examined.examined_count == 3
+
+    # Still exactly one row for the (project, region) pair.
+    rows = await db.fetchall("SELECT id FROM coverage WHERE project_id = ?", (p.id,))
+    assert len(rows) == 1
+
+
+async def test_select_next_region_ordering(db: Database) -> None:
+    """select_next_region returns least-recently-examined first, priority breaking ties.
+
+    Never-examined regions (NULL last_examined_at) lead, then oldest examined; among regions
+    examined at the same time, the higher priority wins.
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    assert await repo.select_next_region(db, p.id) is None  # empty project
+
+    # never-examined (NULL); two examined on the same old day (priority tiebreak); one recent.
+    await repo.upsert_coverage_region(db, project_id=p.id, region="never", priority=0)
+    await repo.upsert_coverage_region(
+        db, project_id=p.id, region="old-hi", priority=9, last_examined_at="2026-01-01"
+    )
+    await repo.upsert_coverage_region(
+        db, project_id=p.id, region="old-lo", priority=1, last_examined_at="2026-01-01"
+    )
+    await repo.upsert_coverage_region(
+        db, project_id=p.id, region="recent", priority=9, last_examined_at="2026-06-01"
+    )
+
+    # NULL last_examined_at sorts first → the never-examined region is picked.
+    nxt = await repo.select_next_region(db, p.id)
+    assert nxt is not None and nxt.region == "never"
+
+    # Mark it examined most-recently; now the two old regions lead, priority breaks their tie.
+    await repo.upsert_coverage_region(
+        db, project_id=p.id, region="never", last_examined_at="2026-06-02"
+    )
+    assert (await repo.select_next_region(db, p.id)).region == "old-hi"  # type: ignore[union-attr]
+
+    # Age out old-hi → the equally-old but lower-priority region is next.
+    await repo.upsert_coverage_region(
+        db, project_id=p.id, region="old-hi", last_examined_at="2026-06-03"
+    )
+    assert (await repo.select_next_region(db, p.id)).region == "old-lo"  # type: ignore[union-attr]
+
+    # Age out old-lo → the only remaining stale region (2026-06-01) is next.
+    await repo.upsert_coverage_region(
+        db, project_id=p.id, region="old-lo", last_examined_at="2026-06-04"
+    )
+    assert (await repo.select_next_region(db, p.id)).region == "recent"  # type: ignore[union-attr]
+
+
+async def test_coverage_region_scoped_per_project(db: Database) -> None:
+    """select_next_region never crosses project boundaries."""
+    p1 = await repo.create_project(db, name="p1", path="/tmp/p1", default_branch="main")
+    p2 = await repo.create_project(db, name="p2", path="/tmp/p2", default_branch="main")
+    await repo.upsert_coverage_region(db, project_id=p1.id, region="only-p1")
+
+    assert (await repo.select_next_region(db, p1.id)).region == "only-p1"  # type: ignore[union-attr]
+    assert await repo.select_next_region(db, p2.id) is None
+
+
+async def test_list_coverage_regions_canonical_order_and_scope(db: Database) -> None:
+    """list_coverage_regions returns every region in select_next_region's order, project-scoped."""
+    p1 = await repo.create_project(db, name="p1", path="/tmp/p1", default_branch="main")
+    p2 = await repo.create_project(db, name="p2", path="/tmp/p2", default_branch="main")
+    assert await repo.list_coverage_regions(db, p1.id) == []  # empty project
+
+    # never-examined (NULL); two examined on the same old day (priority tiebreak); one recent.
+    await repo.upsert_coverage_region(db, project_id=p1.id, region="never", priority=0)
+    await repo.upsert_coverage_region(
+        db, project_id=p1.id, region="old-hi", priority=9, last_examined_at="2026-01-01"
+    )
+    await repo.upsert_coverage_region(
+        db, project_id=p1.id, region="old-lo", priority=1, last_examined_at="2026-01-01"
+    )
+    await repo.upsert_coverage_region(
+        db, project_id=p1.id, region="recent", priority=9, last_examined_at="2026-06-01"
+    )
+    # A region in another project must not leak into p1's list.
+    await repo.upsert_coverage_region(db, project_id=p2.id, region="only-p2")
+
+    ordered = [r.region for r in await repo.list_coverage_regions(db, p1.id)]
+    assert ordered == ["never", "old-hi", "old-lo", "recent"]
+    # The first element always equals the single-row picker.
+    head = await repo.select_next_region(db, p1.id)
+    assert head is not None and head.region == ordered[0]

@@ -40,6 +40,74 @@ class TaskOrigin(StrEnum):
     bug_fixer = "bug_fixer"
 
 
+class BugStatus(StrEnum):
+    """The 7-state machine the Bug-Fixer controller drives over a candidate.
+
+    The happy path is ``discovered → reproduced → fixing → fixed``; a candidate can
+    instead branch off to one of three sinks. ``discovered`` and ``reproduced`` are the
+    *actionable* states the controller auto-picks (to reproduce, then to fix); the rest are
+    in-progress or terminal. ``declined_needs_human`` is the safe, non-actionable sink a
+    corrupt row degrades to in :meth:`BugCandidate.from_row` — it is never auto-picked and
+    explicitly routes to a human, mirroring ``TaskState.inbox`` for tasks.
+    """
+
+    discovered = "discovered"  # found, awaiting reproduction
+    reproduced = "reproduced"  # repro test captured, eligible for an auto-fix attempt
+    fixing = "fixing"  # an auto-fix attempt is in flight
+    fixed = "fixed"  # terminal: repaired and merged
+    dismissed_false_positive = "dismissed_false_positive"  # terminal: not a real bug
+    declined_needs_human = "declined_needs_human"  # handed off to a human, never auto-picked
+    deferred = "deferred"  # parked for now
+
+
+class IllegalBugTransition(ValueError):
+    """Raised when a bug-candidate status change violates :data:`BUG_STATUS_TRANSITIONS`.
+
+    A ``ValueError`` subclass, so a caller can catch it narrowly or fall back to the broad
+    ``ValueError`` net. The Bug-Fixer controller is the sole writer of ``bug_candidates.status``
+    and must drive it strictly along the pinned table; an illegal edge is a controller bug, not
+    a recoverable runtime condition, so the guard raises rather than silently no-opping the write.
+    """
+
+
+# The pinned 7-state transition table the Bug-Fixer controller drives a candidate along: each
+# source state maps to the set of states it may legally advance to, and an empty frozenset marks
+# a terminal sink. ``repositories.transition_bug_status`` guards every status write against this
+# table, so no caller can shortcut an edge. Reconstructed from the bf-data epic's machine:
+#
+#   discovered → reproduced → fixing → fixed  (the happy path)
+#   fixing → reproduced  (a failed fix attempt falls back to retry)
+#   reproduced → declined_needs_human  (fix attempts exhausted → handed to a human)
+#   discovered, reproduced → dismissed_false_positive | declined_needs_human | deferred  (sinks)
+#   deferred → discovered | reproduced  (un-park back into the actionable pipeline)
+#
+# fixed, dismissed_false_positive and declined_needs_human are terminal for the controller; a
+# human re-opening a declined candidate is a separate operator path, not an automatic edge.
+BUG_STATUS_TRANSITIONS: dict[BugStatus, frozenset[BugStatus]] = {
+    BugStatus.discovered: frozenset(
+        {
+            BugStatus.reproduced,
+            BugStatus.dismissed_false_positive,
+            BugStatus.declined_needs_human,
+            BugStatus.deferred,
+        }
+    ),
+    BugStatus.reproduced: frozenset(
+        {
+            BugStatus.fixing,
+            BugStatus.dismissed_false_positive,
+            BugStatus.declined_needs_human,
+            BugStatus.deferred,
+        }
+    ),
+    BugStatus.fixing: frozenset({BugStatus.fixed, BugStatus.reproduced}),
+    BugStatus.fixed: frozenset(),
+    BugStatus.dismissed_false_positive: frozenset(),
+    BugStatus.declined_needs_human: frozenset(),
+    BugStatus.deferred: frozenset({BugStatus.discovered, BugStatus.reproduced}),
+}
+
+
 def _loads(value: Any, fallback: Any) -> Any:
     """Decode a JSON column, tolerating corruption.
 
@@ -293,4 +361,94 @@ class QuarantineEntry(BaseModel):
             until=row["until"],
             created_by=row["created_by"],
             created_at=row["created_at"],
+        )
+
+
+class BugCandidate(BaseModel):
+    """A row in the Bug-Fixer ledger — one suspected bug tracked through :class:`BugStatus`.
+
+    The reproduction artifact (``region`` + ``repro_test_*``), the auto-fix retry count
+    (``attempts``), the human-handoff note (``decline_reason``) and the serialized reviewer
+    ``consensus`` ride alongside the state so the controller can resume a candidate without
+    re-deriving its context.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    fingerprint: str
+    file: str | None = None
+    symbol: str | None = None
+    region: str | None = None
+    claim: str
+    severity: str | None = None
+    status: BugStatus = BugStatus.discovered
+    repro_test_path: str | None = None
+    repro_test_body: str | None = None
+    repro_test_hash: str | None = None
+    attempts: int = 0
+    decline_reason: str | None = None
+    consensus: dict[str, Any] = Field(default_factory=dict)
+    task_id: str | None = None
+    notes: str | None = None
+    discovered_at: str
+    last_examined_at: str
+    fixed_at: str | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> BugCandidate:
+        return cls(
+            id=row["id"],
+            project_id=row["project_id"],
+            fingerprint=row["fingerprint"],
+            file=row["file"],
+            symbol=row["symbol"],
+            region=row["region"],
+            claim=row["claim"],
+            severity=row["severity"],
+            # A corrupt/unknown status degrades to declined_needs_human, NOT the 'discovered'
+            # field default: 'discovered' is auto-picked for reproduction (and onward to a fix),
+            # so a corrupt candidate that fell back there would be silently fixed. The safe sink
+            # is the non-actionable, human-routed state — the BugStatus mirror of TaskState.inbox.
+            status=_enum(BugStatus, row["status"], BugStatus.declined_needs_human),
+            repro_test_path=row["repro_test_path"],
+            repro_test_body=row["repro_test_body"],
+            repro_test_hash=row["repro_test_hash"],
+            attempts=row["attempts"],
+            decline_reason=row["decline_reason"],
+            consensus=_loads(row["consensus_json"], {}),
+            task_id=row["task_id"],
+            notes=row["notes"],
+            discovered_at=row["discovered_at"],
+            last_examined_at=row["last_examined_at"],
+            fixed_at=row["fixed_at"],
+        )
+
+
+class CoverageRegion(BaseModel):
+    """A region of the repo the Bug-Fixer has swept, with the scheduler's ranking fields.
+
+    ``priority`` ranks which region to examine next and ``examined_count`` ages out regions
+    already swept many times, so the scheduler can balance breadth against revisiting hot spots.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    region: str
+    last_examined_at: str | None = None
+    priority: int = 0
+    examined_count: int = 0
+
+    @classmethod
+    def from_row(cls, row: Any) -> CoverageRegion:
+        return cls(
+            id=row["id"],
+            project_id=row["project_id"],
+            region=row["region"],
+            last_examined_at=row["last_examined_at"],
+            priority=row["priority"],
+            examined_count=row["examined_count"],
         )

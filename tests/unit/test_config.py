@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from conclave.config import (
+    BugFixerSessionOverride,
     ConclaveConfig,
     Effort,
     config_schema,
@@ -10,6 +11,7 @@ from conclave.config import (
     effective_protected,
     load_project_config,
     resolve_agent,
+    resolve_bug_fixer_session,
 )
 
 
@@ -64,6 +66,44 @@ def test_resolve_agent_layers_defaults_then_overrides() -> None:
     reviewer = resolve_agent(cfg, "reviewer")
     assert reviewer.timeout_minutes == 120
     assert reviewer.engine_profile == "system-default"
+
+
+def test_bug_fixer_policy_defaults() -> None:
+    cfg = ConclaveConfig()
+    assert cfg.bug_fixer.max_candidates == 10
+    assert cfg.bug_fixer.max_attempts == 3
+    # The policy leaves wall-clock unset so resolution reuses the execution cap.
+    assert cfg.bug_fixer.wall_clock_budget_minutes is None
+
+
+def test_resolve_bug_fixer_session_uses_policy_defaults() -> None:
+    cfg = ConclaveConfig()
+    session = resolve_bug_fixer_session(cfg)
+    assert session.max_candidates == 10
+    assert session.max_attempts == 3
+    # Neither override nor policy pins a budget, so it falls back to the execution cap.
+    assert session.wall_clock_budget_minutes == cfg.execution.wall_clock_budget_minutes == 720
+
+
+def test_resolve_bug_fixer_session_override_wins_over_policy() -> None:
+    cfg = load_project_config(
+        {"bug_fixer": {"max_candidates": 5, "max_attempts": 2, "wall_clock_budget_minutes": 90}}
+    )
+    override = BugFixerSessionOverride(max_candidates=1, wall_clock_budget_minutes=15)
+    session = resolve_bug_fixer_session(cfg, override)
+    # Fields present on the start-request payload take precedence...
+    assert session.max_candidates == 1
+    assert session.wall_clock_budget_minutes == 15
+    # ...and omitted fields fall back to the project policy default.
+    assert session.max_attempts == 2
+
+
+def test_resolve_bug_fixer_session_policy_budget_overrides_execution_fallback() -> None:
+    # A policy-pinned budget wins over the execution cap; the execution setting is untouched.
+    cfg = load_project_config({"bug_fixer": {"wall_clock_budget_minutes": 60}})
+    session = resolve_bug_fixer_session(cfg)
+    assert session.wall_clock_budget_minutes == 60
+    assert cfg.execution.wall_clock_budget_minutes == 720
 
 
 def test_protected_floor_cannot_be_removed() -> None:
