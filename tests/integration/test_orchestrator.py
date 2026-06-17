@@ -1082,6 +1082,67 @@ async def test_mid_attempt_timeout(
     )
 
 
+# --- Operator steer ------------------------------------------------------------
+
+
+async def test_steer_injected_into_next_dispatch_then_cleared(
+    db: Database, tmp_path: Path,
+) -> None:
+    """A steer queued for an in-flight task is appended to the NEXT developer dispatch
+    prompt (clearly labelled), emitted as an operator.steer event, then cleared."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    # A task is steerable exactly while it is being processed (it has a live cancel event,
+    # the same in-flight signal the worker registers). Mirror that registration here.
+    cancel_event = asyncio.Event()
+    orchestrator._cancel_events[task.id] = cancel_event
+    assert orchestrator.request_steer(task.id, "focus on edge cases") is True
+
+    assert await orchestrator.process_task(claimed, cancel_event=cancel_event) is True
+
+    # The steer was appended (labelled) to the developer dispatch — not to the planner or
+    # reviewer prompts.
+    dev_prompts = [
+        p for p in provider.prompts
+        if "Review the changes made for this task" not in p
+        and "Produce a structured plan" not in p
+    ]
+    assert any("OPERATOR STEER" in p and "focus on edge cases" in p for p in dev_prompts)
+
+    # It was consumed exactly once — the pending-steer slot is now empty.
+    assert task.id not in orchestrator._pending_steers
+    assert orchestrator._consume_steer(task.id) is None
+
+    # An operator.steer event was emitted carrying the message.
+    events = await repo.list_events(db, task_id=task.id)
+    steer_events = [e for e in events if e.type == "operator.steer"]
+    assert len(steer_events) == 1
+    assert steer_events[0].payload.get("message") == "focus on edge cases"
+
+
+def test_request_steer_returns_false_when_task_not_in_flight(
+    db: Database, tmp_path: Path,
+) -> None:
+    """request_steer must report False (and queue nothing) when no dispatch is in-flight."""
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    # No cancel event registered for this id => the task is not being processed.
+    assert orchestrator.request_steer("ghost-task", "do the thing") is False
+    assert orchestrator._consume_steer("ghost-task") is None
+
+
 # --- Cooperative cancellation --------------------------------------------------
 
 
@@ -1456,5 +1517,151 @@ async def test_cancel_via_api_endpoint(
             events_resp = await client.get(f"/api/tasks/{task_id}/events")
             events = events_resp.json()
             assert any(e["type"] == "task.cancelled" for e in events)
+        finally:
+            await daemon.shutdown()
+
+
+async def test_steer_endpoint_validation(db: Database, tmp_path: Path) -> None:
+    """POST /api/tasks/{id}/steer: 404 unknown task, 409 when not in-flight, 422 empty msg."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await seed_global_defaults(db)
+
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    transport = ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        try:
+            created = await client.post(
+                "/api/projects",
+                json={"name": "t", "path": str(repo_path), "default_branch": "main"},
+            )
+            assert created.status_code == 200
+            project_id = created.json()["id"]
+
+            # Unknown task → 404.
+            r404 = await client.post(
+                "/api/tasks/ghost/steer", json={"message": "do it"}
+            )
+            assert r404.status_code == 404
+
+            # An approved (not yet in-progress) task → 409, it is not in-flight.
+            t = await client.post(
+                f"/api/projects/{project_id}/tasks",
+                json={"request": "x", "auto_approve": True},
+            )
+            t_id = t.json()["id"]
+            r409 = await client.post(
+                f"/api/tasks/{t_id}/steer", json={"message": "focus here"}
+            )
+            assert r409.status_code == 409
+            assert "in-flight" in r409.json()["detail"]
+
+            # Empty message → 422 (schema rejects it before reaching the handler).
+            r422 = await client.post(f"/api/tasks/{t_id}/steer", json={"message": ""})
+            assert r422.status_code == 422
+        finally:
+            await daemon.shutdown()
+
+
+async def test_steer_via_api_endpoint_injects_into_in_flight_task(
+    db: Database, tmp_path: Path,
+) -> None:
+    """POST /api/tasks/{id}/steer on an in_progress task queues the guidance, which is
+    injected into the developer dispatch and surfaced as an operator.steer event."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await seed_global_defaults(db)
+
+    _PASS = (
+        '```json\n{"verdict": "pass", "reason": "looks correct", "evidence": []}\n```'
+    )
+
+    class _BlockingProvider:
+        """Developer dispatch blocks until released so the steer can be queued mid-flight."""
+
+        def __init__(self) -> None:
+            self._release = asyncio.Event()
+            self.dev_prompts: list[str] = []
+
+        def release(self) -> None:
+            self._release.set()
+
+        async def run_agent(
+            self,
+            *,
+            profile: ResolvedProfile,
+            prompt: str,
+            timeout_seconds: int,
+            cwd: Path | None = None,
+            on_chunk: OnChunk | None = None,
+            cancel_event: asyncio.Event | None = None,
+        ) -> AgentResult:
+            if "Produce a structured plan" in prompt:
+                return AgentResult(ok=True, text="{}", model_reported="fake")
+            if "Review the changes" in prompt:
+                return AgentResult(ok=True, text=_PASS, model_reported="fake")
+            # Developer dispatch — block until released so the steer is queued first.
+            self.dev_prompts.append(prompt)
+            await self._release.wait()
+            if cwd is not None:
+                (Path(cwd) / "FEATURE.txt").write_text("done\n", encoding="utf-8")
+            return AgentResult(ok=True, text="Implemented the change.", model_reported="fake")
+
+    blocking = _BlockingProvider()
+    daemon = Daemon(db, tmp_path / "home", blocking, workers_enabled=True)
+    app = create_app(daemon, manage_lifecycle=False)
+    transport = ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        try:
+            created = await client.post(
+                "/api/projects",
+                json={"name": "t", "path": str(repo_path), "default_branch": "main"},
+            )
+            assert created.status_code == 200
+            project_id = created.json()["id"]
+
+            task = await client.post(
+                f"/api/projects/{project_id}/tasks",
+                json={"request": "add a feature file", "auto_approve": True},
+            )
+            task_id = task.json()["id"]
+
+            # Wait for the worker to claim the task and reach the blocking developer dispatch.
+            state = ""
+            for _ in range(150):
+                state = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
+                if state == "in_progress":
+                    break
+                await asyncio.sleep(0.1)
+            assert state == "in_progress", f"expected in_progress, got {state!r}"
+            # Give the orchestrator a moment to actually enter the developer dispatch.
+            for _ in range(150):
+                if blocking.dev_prompts:
+                    break
+                await asyncio.sleep(0.1)
+            assert blocking.dev_prompts, "developer dispatch never started"
+
+            # Steer the in-flight task: the endpoint must accept it (200) and the daemon
+            # must queue the guidance on the orchestrator, pending the next dispatch. (The
+            # consume-into-dispatch + clear behaviour is proven deterministically by
+            # test_steer_injected_into_next_dispatch_then_cleared.)
+            steer_resp = await client.post(
+                f"/api/tasks/{task_id}/steer", json={"message": "handle the empty case"}
+            )
+            assert steer_resp.status_code == 200
+            assert steer_resp.json()["steered"] is True
+            assert daemon.orchestrator._pending_steers.get(task_id) == "handle the empty case"
+
+            # Release the developer so the task completes cleanly.
+            blocking.release()
+            for _ in range(150):
+                state = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
+                if state in ("done", "failed", "cancelled"):
+                    break
+                await asyncio.sleep(0.1)
+            assert state == "done", f"expected done, got {state!r}"
         finally:
             await daemon.shutdown()

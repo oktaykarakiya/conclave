@@ -31,6 +31,12 @@ class TaskCreate(BaseModel):
     auto_approve: bool = False
 
 
+class SteerInput(BaseModel):
+    """Operator guidance injected into an in-progress task's next dispatch."""
+
+    message: str = Field(min_length=1, description="Guidance to inject into the next dispatch")
+
+
 class QuarantineInput(BaseModel):
     pattern: str
     reason: str

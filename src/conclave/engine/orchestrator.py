@@ -81,6 +81,12 @@ class Orchestrator:
         # :meth:`request_cancel` and checked by :meth:`process_task` between
         # every pipeline stage for cooperative cancellation.
         self._cancel_events: dict[str, asyncio.Event] = {}
+        # Per-task pending operator steer — injected by the daemon through
+        # :meth:`request_steer` and consumed by :meth:`process_task` before the
+        # NEXT developer dispatch, then cleared. Mirrors ``_cancel_events`` in
+        # shape: a task is steerable exactly while it is being processed (i.e. it
+        # has a live cancellation event), so guidance lands on its next attempt.
+        self._pending_steers: dict[str, str] = {}
 
     async def recover(self, project_id: str) -> tuple[int, int]:
         """Crash recovery: return orphaned in_progress tasks to approved and re-block
@@ -100,6 +106,30 @@ class Orchestrator:
             return False
         event.set()
         return True
+
+    def request_steer(self, task_id: str, message: str) -> bool:
+        """Queue operator *message* for injection into *task_id*'s next dispatch.
+
+        Returns ``True`` when the task is in-flight (it has a live cancellation event,
+        the same signal :meth:`request_cancel` uses to mean "currently processing"), so
+        the guidance will be consumed before the next developer dispatch and cleared.
+        Returns ``False`` when the task is not being processed — there is no upcoming
+        dispatch to steer, so the caller surfaces a clear "not in-flight" response.
+
+        A second steer before the first is consumed appends to it (newline-joined) so no
+        operator guidance is silently dropped between attempts.
+        """
+        if task_id not in self._cancel_events:
+            return False
+        existing = self._pending_steers.get(task_id)
+        self._pending_steers[task_id] = (
+            f"{existing}\n{message}" if existing else message
+        )
+        return True
+
+    def _consume_steer(self, task_id: str) -> str | None:
+        """Pop any pending operator steer for *task_id* (None when none is queued)."""
+        return self._pending_steers.pop(task_id, None)
 
     async def process_task(self, task: Task, *, cancel_event: asyncio.Event | None = None) -> bool:
         project = await repo.get_project(self._db, task.project_id)
@@ -257,6 +287,22 @@ class Orchestrator:
                 if cancel_event is not None and cancel_event.is_set():
                     return await self._finish_cancelled(task, wm, task_branch)
 
+                # Operator steer — inject any guidance queued for this task into THIS
+                # developer dispatch, then clear it so it lands exactly once. Best-effort:
+                # absent a steer this is a no-op and never alters processing.
+                steer = self._consume_steer(task.id)
+                if steer:
+                    dev_prompt += (
+                        "\n\nOPERATOR STEER (live guidance from the operator — "
+                        "prioritise this):\n" + steer
+                    )
+                    await self._bus.emit(
+                        type=EventType.operator_steer,
+                        project_id=project.id,
+                        task_id=task.id,
+                        payload={"message": steer, "attempt": attempts},
+                    )
+
                 dev = await runner.run(
                     agent="developer",
                     prompt=dev_prompt,
@@ -413,6 +459,9 @@ class Orchestrator:
             # Always clean the cancellation event so the dict doesn't leak memory
             # — harmless no-op when the entry was already removed by _finish_cancelled.
             self._cancel_events.pop(task.id, None)
+            # Drop any uninjected steer too (e.g. queued after the final dispatch) so
+            # _pending_steers stays bounded — harmless no-op when already consumed.
+            self._pending_steers.pop(task.id, None)
             # Prune events/baselines unconditionally — every processed task, regardless of
             # outcome (success/failure/cancel/exception) and crucially even for projects with
             # NO test command (which never run a baseline). Folding GC into _baseline meant

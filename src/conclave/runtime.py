@@ -241,6 +241,16 @@ class Daemon:
         """
         return self.orchestrator.request_cancel(task_id)
 
+    async def request_steer(self, task_id: str, message: str) -> bool:
+        """Queue operator *message* for an in-progress *task_id*'s next dispatch.
+
+        Returns ``True`` when the task is in-flight (the guidance was queued and will be
+        injected before its next developer dispatch). Returns ``False`` when the task is
+        not currently being processed, so the caller can report that there is no in-flight
+        dispatch to steer.
+        """
+        return self.orchestrator.request_steer(task_id, message)
+
     async def cleanup_in_progress_work(self, project_id: str) -> None:
         """Cancel in-progress tasks and clean their worktrees for a stopped worker.
 

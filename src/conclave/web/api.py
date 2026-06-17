@@ -41,6 +41,7 @@ from .schemas import (
     ProjectCreate,
     ProjectModeUpdate,
     QuarantineInput,
+    SteerInput,
     TaskCreate,
 )
 
@@ -327,6 +328,33 @@ async def cancel_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dic
         status_code=409,
         detail=f"cannot cancel a task in state {task.state.value}",
     )
+
+
+@router.post("/tasks/{task_id}/steer")
+async def steer_task(
+    task_id: str, body: SteerInput, daemon: Daemon = Depends(get_daemon)
+) -> dict[str, Any]:
+    """Inject operator guidance into an in-progress task's NEXT developer dispatch.
+
+    Mirrors the in-progress cancel path: the guidance is queued on the orchestrator keyed
+    by task_id and consumed before the next developer dispatch. Returns 404 for an unknown
+    task and 409 when the task is not currently being processed (no upcoming dispatch to
+    steer) — both inbox/approved (not yet started) and terminal states.
+    """
+    task = await _require_task(daemon, task_id)
+    if task.state != TaskState.in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot steer a task in state {task.state.value} — it is not in-flight",
+        )
+    queued = await daemon.request_steer(task_id, body.message)
+    if not queued:
+        # The task left in_progress between the state check and the steer request.
+        raise HTTPException(
+            status_code=409,
+            detail="task is no longer in-flight — refresh and retry if needed",
+        )
+    return {"steered": True}
 
 
 @router.delete("/tasks/{task_id}")
