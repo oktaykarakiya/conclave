@@ -471,9 +471,15 @@ class PlanningOrchestrator:
                 except Exception:
                     logger.debug("could not emit planning error event (db closed?)")
         finally:
-            # Remove the lock entry so the dict doesn't leak entries for
-            # long-gone sessions.  Any in-flight _agent_turn still holds a
-            # reference to the Lock itself, so it can finish safely.
+            # Drop this session's bookkeeping so neither dict leaks entries for long-gone
+            # sessions. The active-task entry in particular was only ever pruned on the
+            # approve/cancel paths — a session that reached stable (or max-rounds, or
+            # crashed) on its own left its finished Task lingering forever. Pruning here in
+            # finally covers every exit. approve_session/cancel_session may have already
+            # popped the entry (then awaited us); pop(..., None) is an idempotent no-op.
+            # Session ids are unique, so we only ever remove our own entry. Any in-flight
+            # _agent_turn still holds its own reference to the Lock, so it finishes safely.
+            self._active_sessions.pop(session.id, None)
             self._session_locks.pop(session.id, None)
 
     # ------------------------------------------------------------------

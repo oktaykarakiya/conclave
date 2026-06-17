@@ -459,6 +459,97 @@ async def test_merge_conflict_marks_task_failed_and_preserves_branch(
     assert fail_events[0].payload.get("reason") == "merge_conflict"
 
 
+async def test_merge_locks_pruned_after_merge(db: Database, tmp_path: Path) -> None:
+    """``_merge`` must not leak a permanent lock per target branch.
+
+    The per-target lock is reference-counted: after the last merge into a target
+    releases, both the lock and its ref-count entry are evicted so the dicts stay
+    bounded on a long-running daemon that merges into many ephemeral targets.
+    """
+    from conclave.engine.orchestrator import MergeResult
+
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    _project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+
+    # A feature branch that fast-forwards main (main is not the checked-out branch, so
+    # _merge takes the guarded update-ref fast-forward path and succeeds).
+    await run_git(repo_path, "checkout", "-b", "feature")
+    (repo_path / "FEATURE.txt").write_text("feature content\n")
+    await run_git(repo_path, "add", "-A")
+    await run_git(repo_path, "commit", "-m", "feature work")
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    result = await orchestrator._merge(repo_path, "main", "feature", "task-1")
+    assert result is MergeResult.success
+
+    # The lock entry for "main" was evicted once the only merge finished.
+    assert orchestrator._merge_locks == {}
+    assert orchestrator._merge_lock_refs == {}
+
+
+async def test_concurrent_merges_share_lock_then_prune(db: Database, tmp_path: Path) -> None:
+    """Two concurrent merges into the same target serialize on ONE shared lock, and
+    the lock is evicted only after BOTH finish — never mid-flight.
+
+    Guards the reference-counted eviction: a naive ``pop`` after the first merge would
+    drop the lock while the second still referenced it, breaking serialization. We stub
+    the inner critical section so the first merge holds the lock until both calls have
+    entered ``_merge`` (ref count == 2), then assert they shared one lock object and that
+    it was pruned only once both completed.
+    """
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    _project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    release_gate = asyncio.Event()
+    seen_locks: list[int] = []
+
+    async def _fake_locked(*_args: object, **_kwargs: object) -> str:
+        # Record the identity of the live "main" lock while holding it, then wait on a gate
+        # the test opens only after both calls have referenced the lock.
+        seen_locks.append(id(orchestrator._merge_locks["main"]))
+        await release_gate.wait()
+        return "success"  # stand-in MergeResult — the test only checks lock bookkeeping
+
+    # _merge still runs its real ref-count bookkeeping around this stubbed body.
+    orchestrator._merge_locked = _fake_locked  # type: ignore[method-assign,assignment]
+
+    async def _open_gate_once_both_referenced() -> None:
+        # Both _merge calls bump the ref count for "main" BEFORE acquiring the lock, so a
+        # count of 2 proves the second is queued on the SAME lock the first holds.
+        for _ in range(500):
+            if orchestrator._merge_lock_refs.get("main", 0) >= 2:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("second merge never queued on the shared lock")
+        release_gate.set()
+
+    gate_opener = asyncio.create_task(_open_gate_once_both_referenced())
+    results = await asyncio.gather(
+        orchestrator._merge(repo_path, "main", "feature-1", "task-1"),
+        orchestrator._merge(repo_path, "main", "feature-2", "task-2"),
+    )
+    await gate_opener
+
+    assert results == ["success", "success"]
+    # Both merges referenced the SAME lock object — serialization preserved.
+    assert len(seen_locks) == 2
+    assert seen_locks[0] == seen_locks[1]
+    # The lock was pruned only after BOTH finished — dicts are clean.
+    assert orchestrator._merge_locks == {}
+    assert orchestrator._merge_lock_refs == {}
+
+
 def test_merge_worktree_path_unique_per_task() -> None:
     """``wm_merge_path`` must produce distinct paths for different task ids so
     concurrent merges into the same target never share a worktree directory."""

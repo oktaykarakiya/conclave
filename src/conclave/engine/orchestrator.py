@@ -73,8 +73,10 @@ class Orchestrator:
         self._home = conclave_home
         # Serialize merges into the same target branch so two tasks merging
         # "main" concurrently can never race on a shared worktree path or
-        # clobber each other's ref update.
+        # clobber each other's ref update. Reference-counted (see _merge) so the
+        # lock dict stays bounded — an entry is evicted once no merge references it.
         self._merge_locks: dict[str, asyncio.Lock] = {}
+        self._merge_lock_refs: dict[str, int] = {}
         # Per-task cancellation events — set by the daemon through
         # :meth:`request_cancel` and checked by :meth:`process_task` between
         # every pipeline stage for cooperative cancellation.
@@ -812,10 +814,28 @@ class Orchestrator:
         * ``conflict`` — a real merge conflict (caller must fail the task, preserve
           the branch).
         * ``error`` — transient infra failure (e.g. concurrent ref advance); retryable.
+
+        The per-target lock is reference-counted so ``_merge_locks`` stays bounded: a
+        long-running daemon merging into many ephemeral targets would otherwise accrue one
+        permanent lock per branch ever seen. The counter is bumped before acquiring and
+        dropped after releasing; the entry is evicted once no merge still references it.
+        All counter/dict mutations below run synchronously (no ``await`` between them), so
+        in the single-threaded event loop a concurrent merge into the same target always
+        observes the same live lock — the serialization guarantee is preserved.
         """
         lock = self._merge_locks.setdefault(target_branch, asyncio.Lock())
-        async with lock:
-            return await self._merge_locked(repo_path, target_branch, task_branch, task_id)
+        self._merge_lock_refs[target_branch] = self._merge_lock_refs.get(target_branch, 0) + 1
+        try:
+            async with lock:
+                return await self._merge_locked(repo_path, target_branch, task_branch, task_id)
+        finally:
+            refs = self._merge_lock_refs[target_branch] - 1
+            if refs <= 0:
+                # Last referer out — drop both entries so the dicts can't grow unbounded.
+                self._merge_lock_refs.pop(target_branch, None)
+                self._merge_locks.pop(target_branch, None)
+            else:
+                self._merge_lock_refs[target_branch] = refs
 
     async def _merge_locked(
         self, repo_path: Path, target_branch: str, task_branch: str, task_id: str

@@ -396,6 +396,43 @@ async def test_planning_orchestrator_shutdown_cleans_bg_tasks(db: Database) -> N
     assert not orchestrator._bg_tasks
 
 
+async def test_active_session_entry_pruned_when_discussion_finishes(db: Database) -> None:
+    """A session that runs to completion on its own must be removed from
+    ``_active_sessions`` — otherwise finished Tasks leak there forever.
+
+    Only the approve/cancel paths used to prune the entry; a session that reached
+    stable (here via max_rounds=0) left its done Task lingering. The prune now lives in
+    ``_run_discussion``'s finally, covering every exit.
+    """
+    project = await repo.create_project(
+        db, name="prune-test", path="/tmp/prune-test", default_branch="main",
+    )
+    orchestrator = PlanningOrchestrator(db, EventBus(db), _QuickFakeProvider())
+
+    # max_rounds=0 sends the loop straight to the max-rounds stable branch and returns,
+    # so the discussion task finishes without any approve/cancel call.
+    session = await orchestrator.create_and_start(
+        project_id=project.id,
+        title="Prune Test",
+        prompt="Test active-session pruning on natural completion.",
+        max_rounds=0,
+    )
+
+    # Grab the live discussion task and await it to completion. Awaiting the actual task
+    # (rather than polling) deterministically guarantees every DB write AND the finally
+    # prune have run before we assert — and that nothing trails into fixture teardown.
+    bg = orchestrator._active_sessions[session.id]
+    await bg
+
+    # The session reached a stable state and left no bookkeeping behind — the finally
+    # pruned both the active-session entry and the per-session lock.
+    refreshed = await repo.get_planning_session(db, session.id)
+    assert refreshed is not None
+    assert refreshed.status == PlanningSessionStatus.stable
+    assert session.id not in orchestrator._active_sessions
+    assert session.id not in orchestrator._session_locks
+
+
 async def test_daemon_shutdown_cancels_background_tasks(db: Database, tmp_path: Path) -> None:
     """Daemon.shutdown must cancel any in-flight ``_bg_tasks`` before db.close()."""
     home = tmp_path / "conclave-home"
