@@ -178,6 +178,11 @@ class FakeProvider:
         # developer fallback
         if self.developer_writes and cwd is not None:
             (Path(cwd) / self.filename).write_text("done\n", encoding="utf-8")
+        # Stream the result in chunks (with a newline) so on_chunk-driven live output is
+        # exercised: this drives the runner's bounded agent_output emission.
+        if on_chunk is not None:
+            await on_chunk("Implemented the change.\n")
+            await on_chunk("VERDICT: PASS")
         return AgentResult(
             ok=True,
             text="Implemented the change. VERDICT: PASS",

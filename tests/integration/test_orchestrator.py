@@ -84,6 +84,41 @@ async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> No
     assert {"task.started", "task.committed", "task.merged", "task.done"} <= types
 
 
+async def test_dispatch_emits_live_agent_output_events(db: Database, tmp_path: Path) -> None:
+    """An agent dispatch whose provider streams via ``on_chunk`` emits at least one
+    ``agent.output_chunk`` event on the bus, carrying the task_id, agent, and a text delta.
+
+    This proves the runner wires a bounded ``on_chunk`` callback through to the provider and
+    re-publishes the deltas as live events for the Live tab (not just coarse dispatch/result).
+    """
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    config = load_project_config(project.config)
+    runner = AgentRunner(db, EventBus(db), FakeProvider(), project.id, config)
+
+    result = await runner.run(
+        agent="developer",
+        prompt="add a feature",
+        task_id="task-stream-1",
+        worktree=repo_path,
+    )
+    assert result.ok
+
+    events = await repo.list_events(db, task_id="task-stream-1")
+    output_events = [e for e in events if e.type == "agent.output_chunk"]
+    assert output_events, "expected at least one agent.output_chunk live event"
+    assert all(e.agent == "developer" for e in output_events)
+    assert all(e.task_id == "task-stream-1" for e in output_events)
+    # The streamed deltas reassemble the developer's output (newline-buffered + trailing flush).
+    streamed = "".join(e.payload["text"] for e in output_events)
+    assert "Implemented the change." in streamed
+    assert "VERDICT: PASS" in streamed
+
+
 async def test_green_gate_passes_after_developer_change(db: Database, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)
