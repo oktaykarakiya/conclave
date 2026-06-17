@@ -391,6 +391,12 @@ class Orchestrator:
                 return await self._finish_cancelled(task, wm, task_branch)
 
             if failed or attempts == 0:
+                # Best-effort post-mortem BEFORE cleanup, while the worktree + agent
+                # context still exist. Never lets a post-mortem failure crash the worker.
+                await self._maybe_post_mortem(
+                    runner, task, worktree, knowledge, rules, config, feedback, attempts,
+                    cancel_event=cancel_event,
+                )
                 return await self._finish_failure(
                     task, wm, task_branch, timed_out, attempts
                 )
@@ -759,6 +765,72 @@ class Orchestrator:
             logger.info("blocked %d descendant tasks after %s failed", blocked, task.id)
         await wm.cleanup(task.id, task_branch)
         return False
+
+    async def _maybe_post_mortem(
+        self,
+        runner: AgentRunner,
+        task: Task,
+        worktree: Path,
+        knowledge: str,
+        rules: str,
+        config: ConclaveConfig,
+        feedback: str,
+        attempts: int,
+        *,
+        cancel_event: asyncio.Event | None = None,
+    ) -> None:
+        """Dispatch the ``postmortem`` persona on a terminal failure (best-effort).
+
+        Gated by ``experimental.post_mortem_enabled``. Runs BEFORE the worktree is cleaned
+        so the agent can inspect the failed work, and feeds it the last reviewer/gate
+        feedback plus the recorded verdicts so it can reason about why the task failed.
+        The analysis is recorded as a ``postmortem_draft`` event.
+
+        Wholly best-effort: ANY failure (provider error, cancelled dispatch, DB hiccup) is
+        swallowed and logged — a post-mortem must never crash the worker or change the
+        task's already-decided failure outcome.
+        """
+        if not config.experimental.post_mortem_enabled:
+            return
+        try:
+            verdicts = await repo.list_verdicts(self._db, task.id)
+            verdict_lines = "\n".join(
+                f"- attempt {v.attempt} · {v.agent}: {v.verdict}"
+                + (f" — {v.reason}" if v.reason else "")
+                for v in verdicts
+            )
+            prompt = (
+                "This task FAILED after exhausting its retries. Analyze why and produce a "
+                "rewritten task specification more likely to succeed, per your system prompt.\n\n"
+                f"ORIGINAL TASK:\n{task.request}\n\n"
+                f"ATTEMPTS MADE: {attempts}\n"
+            )
+            if verdict_lines:
+                prompt += f"\nREVIEWER VERDICTS ACROSS ATTEMPTS:\n{verdict_lines}\n"
+            if feedback:
+                prompt += f"\nLAST FAILURE FEEDBACK:\n{feedback}\n"
+
+            result = await runner.run(
+                agent="postmortem",
+                prompt=prompt,
+                task_id=task.id,
+                worktree=worktree,
+                repo_knowledge=knowledge,
+                project_rules=rules,
+                cancel_event=cancel_event,
+            )
+            if not result.ok or not result.text.strip():
+                logger.info("post-mortem produced no usable output for task %s", task.id)
+                return
+            await self._bus.emit(
+                type=EventType.postmortem_draft,
+                project_id=task.project_id,
+                task_id=task.id,
+                agent="postmortem",
+                payload={"analysis": result.text, "attempts": attempts},
+            )
+        except Exception:
+            logger.warning("post-mortem failed for task %s", task.id, exc_info=True)
 
     async def _fail_early(
         self, task: Task, wm: WorktreeManager, task_branch: str, message: str

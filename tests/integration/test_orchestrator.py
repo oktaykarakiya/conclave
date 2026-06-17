@@ -323,6 +323,125 @@ async def test_crash_recovery_reblocks_descendants(db: Database, tmp_path: Path)
     assert await repo.claim_next_approved(db, project.id) is None
 
 
+# --- Post-mortem on failure ---------------------------------------------------
+
+
+async def test_post_mortem_dispatched_on_failure_when_enabled(
+    db: Database, tmp_path: Path,
+) -> None:
+    """A task that exhausts retries dispatches the postmortem persona (when enabled)
+    and records its analysis as a postmortem.draft event."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await seed_global_defaults(db)  # seed the real postmortem persona
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "baseline_test_command": "test -f FEATURE.txt"},
+            "agent_overrides": {"developer": {"max_retries": 2}},
+            "experimental": {"post_mortem_enabled": True},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add feature", state=TaskState.approved,
+    )
+    # Developer never writes the file => gate stays red => fail after retries.
+    provider = FakeProvider(developer_writes=False)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is False
+
+    failed = await repo.get_task(db, task.id)
+    assert failed is not None and failed.state is TaskState.failed
+
+    # The post-mortem persona was dispatched exactly once.
+    assert provider.post_mortem_calls == 1
+
+    # Its analysis was recorded as a postmortem.draft event on the task.
+    events = await repo.list_events(db, task_id=task.id)
+    pm_events = [e for e in events if e.type == "postmortem.draft"]
+    assert len(pm_events) == 1
+    assert pm_events[0].payload.get("analysis")
+    assert pm_events[0].agent == "postmortem"
+
+
+async def test_post_mortem_skipped_when_disabled(db: Database, tmp_path: Path) -> None:
+    """With post_mortem_enabled=False, a failed task never dispatches the postmortem
+    persona and emits no postmortem.draft event."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await seed_global_defaults(db)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "baseline_test_command": "test -f FEATURE.txt"},
+            "agent_overrides": {"developer": {"max_retries": 2}},
+            "experimental": {"post_mortem_enabled": False},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add feature", state=TaskState.approved,
+    )
+    provider = FakeProvider(developer_writes=False)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is False
+
+    failed = await repo.get_task(db, task.id)
+    assert failed is not None and failed.state is TaskState.failed
+
+    # No post-mortem dispatch, no postmortem.draft event.
+    assert provider.post_mortem_calls == 0
+    events = await repo.list_events(db, task_id=task.id)
+    assert not [e for e in events if e.type == "postmortem.draft"]
+
+
+async def test_post_mortem_failure_does_not_crash_worker(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashing post-mortem dispatch must be swallowed — the task still finalises as
+    failed and process_task returns normally (best-effort contract)."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await seed_global_defaults(db)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "baseline_test_command": "test -f FEATURE.txt"},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+            "experimental": {"post_mortem_enabled": True},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add feature", state=TaskState.approved,
+    )
+    provider = FakeProvider(developer_writes=False)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    # Make the post-mortem's verdict lookup explode mid-dispatch.
+    from conclave.engine import orchestrator as orch_mod
+
+    async def _boom(*_a: object, **_k: object) -> list[object]:
+        raise RuntimeError("post-mortem context lookup blew up")
+
+    monkeypatch.setattr(orch_mod.repo, "list_verdicts", _boom)
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    # Must NOT raise — the post-mortem failure is swallowed.
+    assert await orchestrator.process_task(claimed) is False
+
+    failed = await repo.get_task(db, task.id)
+    assert failed is not None and failed.state is TaskState.failed
+    # No draft event, since the post-mortem crashed before emitting.
+    events = await repo.list_events(db, task_id=task.id)
+    assert not [e for e in events if e.type == "postmortem.draft"]
+
+
 # --- Unconditional GC sweep ---------------------------------------------------
 
 

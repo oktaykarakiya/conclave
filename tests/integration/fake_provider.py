@@ -104,6 +104,8 @@ class FakeProvider:
         self.reviewer_tampers = reviewer_tampers
         self.use_nested_plan = use_nested_plan
         self.prompts: list[str] = []
+        # Count post-mortem dispatches so failure-path tests can assert the wiring.
+        self.post_mortem_calls = 0
 
     async def run_agent(
         self,
@@ -124,6 +126,16 @@ class FakeProvider:
         # persona-name checks below don't intercept it. (Both now return a JSON verdict.)
         if "Produce a structured plan" in prompt:
             return AgentResult(ok=True, text=_PLAN, model_reported="fake", cost_usd=0.0)
+        if "Post-Mortem Agent" in prompt:
+            # The orchestrator dispatches this on a terminal task failure when
+            # post_mortem_enabled. Track it so a test can assert it ran (or didn't).
+            self.post_mortem_calls += 1
+            return AgentResult(
+                ok=True,
+                text="```yaml\nrequest: tighter, retry-friendly rewrite of the task\n```",
+                model_reported="fake",
+                cost_usd=0.0,
+            )
         if "Review the changes made for this task" in prompt:
             if self.reviewer_tampers and cwd is not None:
                 # A reviewer that writes despite only being asked to review: drop a stray
