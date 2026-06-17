@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "./api";
 import {
   AgentCeptionPanel,
+  BugFixerPanel,
   Button,
   ConfigPanel,
   LivePanel,
@@ -17,6 +18,7 @@ import type { Project } from "./types";
 const TABS = [
   "Agent-ception",
   "Tasks",
+  "Bug-Fixer",
   "Live",
   "Config",
   "Quarantine",
@@ -50,6 +52,16 @@ export default function App() {
     reload();
   }, [reload]);
 
+  // Escape closes the mobile project drawer when it's open.
+  useEffect(() => {
+    if (!drawerOpen) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setDrawerOpen(false);
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [drawerOpen]);
+
   const selected = projects.find((p) => p.id === selectedId) ?? null;
 
   // Each page fills exactly the content viewport and scrolls INTERNALLY — the page
@@ -61,6 +73,8 @@ export default function App() {
         return <AgentCeptionPanel projectId={selected.id} />;
       case "Tasks":
         return <TasksPanel projectId={selected.id} />;
+      case "Bug-Fixer":
+        return <BugFixerPanel project={selected} />;
       case "Live":
         return <LivePanel projectId={selected.id} />;
       case "Config":
@@ -71,7 +85,7 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100 md:flex-row">
+    <div className="flex h-dvh flex-col overflow-hidden bg-zinc-950 text-zinc-100 md:flex-row">
       {/* Mobile top bar with hamburger */}
       <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900 px-4 py-3 md:hidden">
         <button
@@ -256,6 +270,18 @@ function AttachModal({ onClose, onDone }: { onClose: () => void; onDone: (id: st
   const [branch, setBranch] = useState("main");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const nameRef = useRef<HTMLInputElement | null>(null);
+
+  // Escape closes the modal; focus the first field on open. The listener is
+  // attached once and reads the latest onClose via the dependency.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    document.addEventListener("keydown", onKey);
+    nameRef.current?.focus();
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   async function submit() {
     setBusy(true);
@@ -275,14 +301,20 @@ function AttachModal({ onClose, onDone }: { onClose: () => void; onDone: (id: st
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="attach-modal-title"
         className="w-full max-w-sm rounded-xl border border-zinc-800 bg-zinc-900 p-5"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="mb-3 text-lg font-semibold">Attach project</h2>
+        <h2 id="attach-modal-title" className="mb-3 text-lg font-semibold">
+          Attach project
+        </h2>
         <div className="space-y-3">
           <label className="block">
             <span className="mb-1 block text-xs text-zinc-400">Name</span>
             <input
+              ref={nameRef}
               className={input}
               placeholder="my-project"
               value={name}

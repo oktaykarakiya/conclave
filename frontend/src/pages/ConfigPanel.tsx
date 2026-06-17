@@ -1,9 +1,117 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import type React from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "../api";
-import { Button, Spinner } from "../ui";
+import { Button, Spinner, input } from "../ui";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
+
+/* --------------------------------------------------------------------------
+ * Schema-driven quick settings
+ *
+ * The backend exposes a full JSON Schema at /api/config/schema. Rather than
+ * build a bespoke form per setting, we render a CURATED allowlist of simple
+ * top-level scalar fields (string / integer / boolean) as typed inputs that
+ * write straight back into the same JSON document the raw editor owns — so the
+ * JSON editor below stays the single source of truth and the fallback for
+ * everything the quick form doesn't cover. Nested objects, unions and arrays
+ * are intentionally out of scope here.
+ * ------------------------------------------------------------------------ */
+
+/** The subset of a JSON-Schema property node the quick form understands. */
+interface SchemaProp {
+  type?: string;
+  title?: string;
+  description?: string;
+  default?: unknown;
+  minimum?: number;
+  maximum?: number;
+}
+
+/** A resolved, renderable field: which `[section, key]` it maps to + its schema. */
+interface QuickField {
+  section: string;
+  key: string;
+  prop: SchemaProp;
+}
+
+/**
+ * Curated fields to surface, in render order. Kept deliberately small and
+ * hand-picked (all simple scalars) so the form never tries to render something
+ * it can't handle cleanly. Each entry is `section.key` into the config object.
+ */
+const QUICK_FIELDS: { section: string; key: string }[] = [
+  { section: "execution", key: "target_branch" },
+  { section: "execution", key: "branch_prefix" },
+  { section: "execution", key: "auto_merge" },
+  { section: "execution", key: "require_full_green" },
+  { section: "execution", key: "parallel_reviewers" },
+  { section: "execution", key: "review_rounds_max" },
+  { section: "execution", key: "wall_clock_budget_minutes" },
+];
+
+const SCALAR_TYPES = new Set(["string", "integer", "number", "boolean"]);
+
+/**
+ * Resolve the schema property for one `section.key`, following the single
+ * `$ref` indirection FastAPI emits for nested models (top-level fields point at
+ * an entry in `$defs`). Returns null if anything about the shape is unexpected
+ * or the field isn't a simple scalar — the form silently skips such fields.
+ */
+function resolveProp(
+  schema: Record<string, unknown> | null,
+  section: string,
+  key: string,
+): SchemaProp | null {
+  if (!schema) return null;
+  const defs = (schema.$defs ?? {}) as Record<string, unknown>;
+  const topProps = (schema.properties ?? {}) as Record<string, unknown>;
+  const sectionNode = topProps[section] as { $ref?: string } | undefined;
+  const ref = sectionNode?.$ref;
+  if (typeof ref !== "string") return null;
+  const defName = ref.split("/").pop();
+  if (!defName) return null;
+  const def = defs[defName] as { properties?: Record<string, unknown> } | undefined;
+  const prop = def?.properties?.[key] as SchemaProp | undefined;
+  if (!prop || typeof prop.type !== "string" || !SCALAR_TYPES.has(prop.type)) {
+    return null;
+  }
+  return prop;
+}
+
+/** Read `obj[section][key]` defensively (the document may be partial). */
+function readValue(
+  obj: Record<string, unknown> | null,
+  section: string,
+  key: string,
+): unknown {
+  if (!obj) return undefined;
+  const sec = obj[section];
+  if (sec && typeof sec === "object" && !Array.isArray(sec)) {
+    return (sec as Record<string, unknown>)[key];
+  }
+  return undefined;
+}
+
+/** Immutably set `obj[section][key] = value`, creating the section if needed. */
+function withValue(
+  obj: Record<string, unknown>,
+  section: string,
+  key: string,
+  value: unknown,
+): Record<string, unknown> {
+  const prevSec = obj[section];
+  const sec =
+    prevSec && typeof prevSec === "object" && !Array.isArray(prevSec)
+      ? (prevSec as Record<string, unknown>)
+      : {};
+  return { ...obj, [section]: { ...sec, [key]: value } };
+}
+
+function prettyLabel(prop: SchemaProp, key: string): string {
+  if (prop.title) return prop.title;
+  return key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 /** A single FastAPI-style validation error entry. */
 interface FieldError {
@@ -89,6 +197,8 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
   const [errorPanel, setErrorPanel] = useState<
     { title: string; fields: { key: string; msg: string }[] } | null
   >(null);
+  // The config JSON Schema (best-effort; the quick form is hidden if it fails).
+  const [schema, setSchema] = useState<Record<string, unknown> | null>(null);
 
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -117,6 +227,24 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Fetch the schema once for the quick-settings form. The schema is global
+  // (not per-project), and a failure simply hides the form — the raw JSON
+  // editor below is the always-available fallback.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .configSchema()
+      .then((s) => {
+        if (!cancelled) setSchema(s);
+      })
+      .catch(() => {
+        if (!cancelled) setSchema(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Auto-clear the transient "saved ✓" badge.
   useEffect(() => {
@@ -183,6 +311,48 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
       setErrorPanel(formatServerError(e));
     }
   }, [loaded, projectId, text]);
+
+  // Best-effort parse of the LIVE editor text into a plain object. While the
+  // JSON is mid-edit / invalid this is null and the quick form hides itself,
+  // deferring to the raw editor (which shows the syntax error on save).
+  const parsedDoc = useMemo<Record<string, unknown> | null>(() => {
+    if (!loaded) return null;
+    try {
+      const v = JSON.parse(text) as unknown;
+      return v && typeof v === "object" && !Array.isArray(v)
+        ? (v as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }, [loaded, text]);
+
+  // Resolve the curated fields against the fetched schema (skips anything the
+  // schema doesn't describe as a simple scalar).
+  const quickFields = useMemo<QuickField[]>(() => {
+    if (!schema) return [];
+    const out: QuickField[] = [];
+    for (const { section, key } of QUICK_FIELDS) {
+      const prop = resolveProp(schema, section, key);
+      if (prop) out.push({ section, key, prop });
+    }
+    return out;
+  }, [schema]);
+
+  // Apply a quick-form edit by rewriting the JSON document, then funnel it
+  // through the same onEdit path the raw editor uses (keeps text authoritative,
+  // dirty-tracking and save behaviour identical).
+  const setQuickField = useCallback(
+    (section: string, key: string, value: unknown) => {
+      if (!parsedDoc) return;
+      const next = withValue(parsedDoc, section, key, value);
+      onEdit(JSON.stringify(next, null, 2));
+    },
+    // onEdit is a stable closure over setState setters; parsedDoc drives this.
+    [parsedDoc],
+  );
+
+  const showQuickForm = loaded && quickFields.length > 0 && parsedDoc !== null;
 
   // Ctrl/Cmd+S saves from within the editor (matches editor muscle memory).
   // Scoped to the textarea so it never hijacks the browser's save elsewhere
@@ -251,20 +421,32 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
             </Button>
           </div>
         ) : (
-          <textarea
-            ref={taRef}
-            className={editorClass}
-            spellCheck={false}
-            autoCorrect="off"
-            autoCapitalize="off"
-            autoComplete="off"
-            wrap="off"
-            value={text}
-            onChange={(e) => onEdit(e.target.value)}
-            onKeyDown={onKeyDown}
-            aria-label="Project configuration JSON editor"
-            aria-describedby={DESC_ID}
-          />
+          <div className="flex h-full min-h-0 flex-col gap-3">
+            {showQuickForm && (
+              <QuickSettings
+                fields={quickFields}
+                doc={parsedDoc}
+                onChange={setQuickField}
+              />
+            )}
+            {/* Raw JSON editor — fills the remaining space and scrolls
+                internally. It stays the source of truth and the fallback for
+                everything the quick form above doesn't cover. */}
+            <textarea
+              ref={taRef}
+              className={`${editorClass} min-h-[160px] flex-1`}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              autoComplete="off"
+              wrap="off"
+              value={text}
+              onChange={(e) => onEdit(e.target.value)}
+              onKeyDown={onKeyDown}
+              aria-label="Project configuration JSON editor"
+              aria-describedby={DESC_ID}
+            />
+          </div>
         )}
       </div>
 
@@ -320,5 +502,156 @@ export function ConfigPanel({ projectId }: { projectId: string }) {
         )}
       </div>
     </div>
+  );
+}
+
+/* --------------------------------------------------------------------------
+ * Quick-settings form (schema-driven, curated scalar fields)
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Collapsible block of typed inputs for the curated config fields. Defaults to
+ * OPEN so the affordance is discoverable, but caps its own height and scrolls
+ * internally so it never crowds out the raw JSON editor below. Every edit flows
+ * back through `onChange`, which rewrites the shared JSON document.
+ */
+function QuickSettings({
+  fields,
+  doc,
+  onChange,
+}: {
+  fields: QuickField[];
+  doc: Record<string, unknown>;
+  onChange: (section: string, key: string, value: unknown) => void;
+}) {
+  const [open, setOpen] = useState(true);
+
+  return (
+    <section className="shrink-0 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-900">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2.5 text-left transition-colors hover:bg-zinc-800/50 focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none"
+      >
+        <svg
+          viewBox="0 0 20 20"
+          fill="currentColor"
+          aria-hidden="true"
+          className={`h-4 w-4 shrink-0 text-zinc-500 transition-transform duration-200 ${
+            open ? "rotate-90" : ""
+          }`}
+        >
+          <path
+            fillRule="evenodd"
+            d="M7.21 14.77a.75.75 0 0 1 .02-1.06L11.168 10 7.23 6.29a.75.75 0 1 1 1.04-1.08l4.5 4.25a.75.75 0 0 1 0 1.08l-4.5 4.25a.75.75 0 0 1-1.06-.02Z"
+            clipRule="evenodd"
+          />
+        </svg>
+        <span className="flex-1 text-sm font-semibold tracking-wide text-zinc-200">
+          Quick settings
+        </span>
+        <span className="shrink-0 text-xs text-zinc-500">common execution options</span>
+      </button>
+      {open && (
+        <div className="max-h-[40vh] space-y-3 overflow-y-auto border-t border-zinc-800 p-3">
+          {fields.map((f) => (
+            <QuickFieldRow
+              key={`${f.section}.${f.key}`}
+              field={f}
+              value={readValue(doc, f.section, f.key)}
+              onChange={(v) => onChange(f.section, f.key, v)}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** One labelled input, rendered by JSON-schema type. */
+function QuickFieldRow({
+  field,
+  value,
+  onChange,
+}: {
+  field: QuickField;
+  value: unknown;
+  onChange: (value: unknown) => void;
+}) {
+  const { prop, key } = field;
+  const label = prettyLabel(prop, key);
+  const id = `cfg-${field.section}-${key}`;
+  const descId = prop.description ? `${id}-desc` : undefined;
+
+  // Booleans render as a single clickable row (checkbox + label).
+  if (prop.type === "boolean") {
+    return (
+      <label
+        htmlFor={id}
+        className="flex cursor-pointer items-start gap-2.5 text-sm text-zinc-200"
+      >
+        <input
+          id={id}
+          type="checkbox"
+          className="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500"
+          checked={value === true}
+          aria-describedby={descId}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        <span className="min-w-0">
+          <span className="font-medium">{label}</span>
+          {prop.description && (
+            <span id={descId} className="mt-0.5 block text-xs text-zinc-500">
+              {prop.description}
+            </span>
+          )}
+        </span>
+      </label>
+    );
+  }
+
+  const isNumber = prop.type === "integer" || prop.type === "number";
+
+  return (
+    <label htmlFor={id} className="block">
+      <span className="mb-1 flex items-baseline justify-between gap-2">
+        <span className="text-xs font-medium text-zinc-300">{label}</span>
+        {isNumber && (prop.minimum !== undefined || prop.maximum !== undefined) && (
+          <span className="text-[11px] tabular-nums text-zinc-600">
+            {prop.minimum ?? "−∞"}–{prop.maximum ?? "∞"}
+          </span>
+        )}
+      </span>
+      <input
+        id={id}
+        className={input}
+        type={isNumber ? "number" : "text"}
+        min={isNumber ? prop.minimum : undefined}
+        max={isNumber ? prop.maximum : undefined}
+        step={prop.type === "integer" ? 1 : undefined}
+        value={value === undefined || value === null ? "" : String(value)}
+        aria-describedby={descId}
+        onChange={(e) => {
+          if (isNumber) {
+            const raw = e.target.value;
+            // Empty clears back to the schema default rather than writing NaN.
+            if (raw === "") {
+              onChange(prop.default ?? undefined);
+              return;
+            }
+            const n = Number(raw);
+            onChange(Number.isFinite(n) ? n : raw);
+          } else {
+            onChange(e.target.value);
+          }
+        }}
+      />
+      {prop.description && (
+        <span id={descId} className="mt-1 block text-xs text-zinc-500">
+          {prop.description}
+        </span>
+      )}
+    </label>
   );
 }

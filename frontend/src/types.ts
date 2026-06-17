@@ -1,3 +1,6 @@
+/** The two project execution modes (mirrors the backend `ProjectMode` enum). */
+export type ProjectMode = "task_queue" | "autonomous_bug_fixer";
+
 export interface Project {
   id: string;
   name: string;
@@ -6,6 +9,39 @@ export interface Project {
   mode: string;
   created_at: string;
   config?: { execution?: { target_branch?: string } };
+}
+
+/**
+ * A row in the Bug-Fixer ledger — one suspected bug tracked through the 7-state
+ * `BugStatus` machine (mirrors the backend `BugCandidate` model). Only the
+ * fields the UI renders are typed here.
+ */
+export type BugStatus =
+  | "discovered"
+  | "reproduced"
+  | "fixing"
+  | "fixed"
+  | "dismissed_false_positive"
+  | "declined_needs_human"
+  | "deferred";
+
+export interface BugCandidate {
+  id: string;
+  project_id: string;
+  fingerprint: string;
+  file: string | null;
+  symbol: string | null;
+  region: string | null;
+  claim: string;
+  severity: string | null;
+  status: BugStatus;
+  attempts: number;
+  decline_reason: string | null;
+  task_id: string | null;
+  notes: string | null;
+  discovered_at: string;
+  last_examined_at: string;
+  fixed_at: string | null;
 }
 
 export interface Task {
