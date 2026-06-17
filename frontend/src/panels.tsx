@@ -8,3 +8,4 @@ export * from "./pages/LivePanel";
 export * from "./pages/ConfigPanel";
 export * from "./pages/QuarantinePanel";
 export * from "./pages/AgentCeptionPanel";
+export * from "./pages/BugFixerPanel";

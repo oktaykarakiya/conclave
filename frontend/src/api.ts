@@ -1,10 +1,12 @@
 import type {
+  BugCandidate,
   EventRow,
   Integrity,
   PlanningMessage,
   PlanningSession,
   PlanningTaskNode,
   Project,
+  ProjectMode,
   Quarantine,
   Task,
   Verdict,
@@ -73,6 +75,14 @@ export const api = {
   getConfig: (id: string) => req<Record<string, unknown>>("GET", `/api/projects/${id}/config`),
   patchConfig: (id: string, config: unknown) =>
     req<unknown>("PATCH", `/api/projects/${id}/config`, { config }),
+  configSchema: () => req<Record<string, unknown>>("GET", "/api/config/schema"),
+  setMode: (id: string, mode: ProjectMode) =>
+    req<Project>("POST", `/api/projects/${id}/mode`, { mode }),
+
+  // Bug-Fixer ledger
+  bugCandidates: (id: string) =>
+    req<BugCandidate[]>("GET", `/api/projects/${id}/bug-candidates`),
+  needsHuman: (id: string) => req<BugCandidate[]>("GET", `/api/projects/${id}/needs-human`),
 
   listTasks: (id: string, opts?: string | ListTasksOptions) => {
     const o: ListTasksOptions = typeof opts === "string" ? { state: opts } : opts ?? {};
