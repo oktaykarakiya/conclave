@@ -169,7 +169,6 @@ class Orchestrator:
 
             baseline_preamble = await self._baseline(
                 project.id, worktree, checkpoint, target_branch, test_command, gate_timeout,
-                events_retention=config.execution.retention_events_max,
             )
             plan_preamble = await self._maybe_plan(
                 runner, task, worktree, knowledge, rules, baseline_preamble, config,
@@ -406,6 +405,19 @@ class Orchestrator:
             # Always clean the cancellation event so the dict doesn't leak memory
             # — harmless no-op when the entry was already removed by _finish_cancelled.
             self._cancel_events.pop(task.id, None)
+            # Prune events/baselines unconditionally — every processed task, regardless of
+            # outcome (success/failure/cancel/exception) and crucially even for projects with
+            # NO test command (which never run a baseline). Folding GC into _baseline meant
+            # those projects' events/baselines grew unbounded. Both DELETEs are cheap when
+            # under the cap (the subquery returns all rows, so none match) and are best-effort:
+            # a sweep failure must never mask the task's real result.
+            try:
+                await repo.gc_events(
+                    self._db, project.id, keep=config.execution.retention_events_max
+                )
+                await repo.gc_baselines(self._db, project.id)
+            except Exception:
+                logger.warning("GC sweep failed for task %s", task.id, exc_info=True)
 
     # --- phases ---------------------------------------------------------------
 
@@ -417,7 +429,6 @@ class Orchestrator:
         target_branch: str,
         test_command: str | None,
         gate_timeout: int,
-        events_retention: int = 10_000,
     ) -> str:
         if not test_command:
             return ""
@@ -437,11 +448,6 @@ class Orchestrator:
         else:
             failures = gate.output
         await repo.save_baseline(self._db, project_id, checkpoint, failures)
-        await repo.gc_baselines(self._db, project_id)
-        # Prune old events per-project so the events table stays bounded under load.
-        # The DELETE is cheap when under the cap (no rows match) and is index-covered
-        # by the existing (project_id, id) index.
-        await repo.gc_events(self._db, project_id, keep=events_retention)
         return build_baseline_preamble(target_branch, failures)
 
     async def _maybe_plan(

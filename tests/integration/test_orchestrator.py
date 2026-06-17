@@ -323,6 +323,53 @@ async def test_crash_recovery_reblocks_descendants(db: Database, tmp_path: Path)
     assert await repo.claim_next_approved(db, project.id) is None
 
 
+# --- Unconditional GC sweep ---------------------------------------------------
+
+
+async def test_gc_runs_without_baseline(db: Database, tmp_path: Path) -> None:
+    """The events/baselines GC sweep runs on every processed task, even when the
+    project has NO test command (so no baseline snapshot ever runs).
+
+    Regression: GC used to live inside ``_baseline``, which returns early without a
+    test command — so test-command-less projects pruned nothing and their events grew
+    unbounded. The sweep now runs unconditionally in ``process_task``'s ``finally``.
+    """
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    # retention_events_max floor is 100; seed well beyond it so the cap visibly bites.
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "retention_events_max": 100},
+        },
+    )
+    # No baseline_test_command => _baseline returns "" without running tests or a snapshot.
+    await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+
+    # Pre-seed 150 events for this project so the table is over the 100 cap.
+    for i in range(150):
+        await repo.append_event(db, type="seed.event", project_id=project.id, payload={"n": i})
+    before = await repo.list_events(db, project_id=project.id, limit=1000)
+    assert len(before) == 150
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    # No baseline ran (no test command), proving GC is independent of the baseline path.
+    types = {e.type for e in await repo.list_events(db, project_id=project.id, limit=1000)}
+    assert "baseline.snapshot" not in types
+
+    # The GC swept the project down to exactly the retention cap. process_task emits its
+    # own lifecycle events too, but the sweep runs LAST (in finally), so the final count
+    # is pinned at the cap rather than 150 + lifecycle.
+    after = await repo.list_events(db, project_id=project.id, limit=1000)
+    assert len(after) == 100
+
+
 # --- ENG-5: merge hardening ---------------------------------------------------
 
 
