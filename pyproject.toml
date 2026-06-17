@@ -56,6 +56,8 @@ packages = ["src/conclave"]
 line-length = 100
 src = ["src", "tests"]
 target-version = "py312"
+# Keep generated caches out of the repo root (one .cache/ dir, gitignored).
+cache-dir = ".cache/ruff"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
@@ -67,6 +69,7 @@ ignore = ["B008", "ASYNC230", "ASYNC240"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+cache_dir = ".cache/mypy"
 mypy_path = "src"
 packages = ["conclave"]
 warn_unused_ignores = true
@@ -81,6 +84,7 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+cache_dir = ".cache/pytest"
 # Strict: every warning is an error, EXCEPT the known-benign asyncio GC race where a
 # subprocess transport from a cancelled/torn-down background task is finalized after its
 # event loop closes ("Exception ignored in BaseSubprocessTransport.__del__"). This only
