@@ -1,82 +1,66 @@
 # Conclave — TODO / Roadmap
 
-Forward-looking roadmap. The autonomous engine, Agent-ception planning, web UI, and the swarm
-hardening pass are complete (**222 tests**, `ruff` + `mypy --strict` clean). See `CHANGELOG.md` for
-what shipped and `docs/AUDIT.md` for the hardening backlog detail.
+Forward-looking roadmap. The autonomous engine, Agent-ception planning, the opencode-native
+engine migration, and the **Autonomous Bug-Fixer mode** are shipped (**367 tests**, `ruff` +
+`mypy --strict` clean). See `CHANGELOG.md` for detail.
 
 ## Current state
-- `master` = MVP + Agent-ception planning + the full AUDIT hardening (CRITICAL + HIGH) + the
-  single-page-per-tab responsive UI. Self-hosting target branch: `conclave-work`.
-- `conclave-selftest` = a **built-but-unmerged** scale-adaptive planning (BMad L0–L4) feature —
-  integrate or retire it (see below).
-- Engine profiles: `system-default` = opus-4-8 @ max; a ready `deepseek` (env) profile to switch.
+- `master` = MVP + Agent-ception planning + full AUDIT/MEDIUM hardening + **opencode-native engine**
+  + **Autonomous Bug-Fixer mode**. Default engine is **opencode** (`CONCLAVE_ENGINE=claude` opts out);
+  model/provider is configured in opencode itself (DeepSeek by default). Repo context comes from
+  `AGENTS.md` (opencode `/init`).
 - Security: single-user, intentionally unauthenticated, binds `0.0.0.0` for LAN use (see README).
+- `archive/scale-adaptive` tag = the retired scale-adaptive (BMad L0–L4) branch (would have regressed
+  the migration; rebuild on master if ever wanted).
 
-## In progress — MEDIUM hardening (dogfooded)
-Smaller robustness/perf items from `docs/AUDIT.md` MEDIUM, being cleared as gate-verified tasks:
-- [ ] WEB input validation & error mapping (no 500s on bad input; planning 404s; date validation)
-- [ ] DATA retention + index coverage (events/usage GC; hot-query indexes)
-- [ ] PLAN task_changes safety (no KeyError; session-scoped update/remove; validated list)
-- [ ] ENG safety (hard wall-clock cap; grounding path-traversal guard; capped prompt diffs)
-- [ ] run_shell child-group kill; event-bus backpressure resync; idle-worker poll backoff
-- [ ] `detach_project` cleanup (no orphaned worktree/worker); robust async onboarding on create
+## Remaining
+### Bug-Fixer follow-ups
+- [ ] **Consensus decline/escalate round** — before trusting an auto-fix, run a `DeclineConsensus`
+      vote (mandatory reviewers) → route risky candidates to `declined_needs_human`
+      (`TODO(bug-fixer-consensus)` in `engine/bug_fixer.py`). The reproduction gate already handles
+      its own `declined` route; this adds a pre-fix safety vote.
+- [ ] **Bug-Fixer UI tab** — mode toggle + ledger/coverage dashboard + needs-human queue. The backend
+      API exists (`/projects/{id}/mode`, `/bug-candidates`, `/needs-human`); the UI does not.
 
-## Phase 2 — Autonomous Bug-Fixer mode (headline feature; only DB/verdict scaffolding exists)
-- [ ] Candidate ledger + coverage data layer + bug-hunter persona
-- [ ] Bug-hunter discovery agent + region selection (one falsifiable `{file,symbol,claim,severity}`)
-- [ ] Reproduction gate — a test that currently FAILS to prove the bug; `dismissed_false_positive`
-      when behaviour is actually correct
-- [ ] Mode controller loop — select → reproduce → fix → green-gate → commit → merge → next;
-      Start/Pause/Stop; per-session caps; `deferred` on wall-clock budget
-- [ ] Consensus decline/escalate — `decline` + consensus round → `declined_needs_human` queue
-- [ ] Bug-Fixer UI tab — controls + ledger/coverage dashboard + needs-human queue
-- [ ] Wire project `mode` (task_queue vs autonomous_bug_fixer) into the worker loop
+### Engine / backend
+- [ ] True token streaming to the Live tab — `on_chunk` is implemented in both providers but the
+      orchestrator never passes a callback; wire it through to the bus/Live tab.
+- [ ] Operator **steer** — inject guidance into the next dispatch of an in-progress task
+      (in-progress **cancel** is done).
 
-## Test-integrity hardening (so the green-gate can't be gamed by editing tests)
-- [ ] Flag test mutations (modified/deleted existing tests) → mandatory extra reviewer scrutiny
-- [ ] "Fails-on-old-code" check for reproduction tests
-- [ ] Spec-as-contract: reviewer/tester reconcile against stated acceptance criteria
+### Frontend
+- [ ] Config UI: schema-driven forms (`/api/config/schema` exists; currently a raw JSON editor).
+- [ ] Nits: `h-screen`→`h-dvh` (mobile chrome); remove the now-unused shared `Section`; modal/drawer
+      Escape + focus-trap; surface errors from fire-and-forget Resume/Pause.
 
-## Scale-adaptive planning (BMad L0–L4)
-Built on `conclave-selftest` (Level router, L2–L4, planning personas) — **decide: merge into `master`
-or retire**. If merging, reconcile with the Agent-ception planning module.
+### Tests
+- [ ] Direct coverage for the WebSocket handlers (`web/ws.py`).
 
-## MVP gaps to close
-- [ ] Post-mortem agent (`experimental.post_mortem_enabled` exists; not wired into the orchestrator)
-- [ ] Notifications — Telegram/webhook `NotificationSink`s (only the WS/UI stream exists today)
-- [ ] True token streaming to the Live tab (`--output-format stream-json`; `on_chunk` plumbing unused)
-- [ ] Steering — in-progress task **cancel** + operator **steer** (inject into the next dispatch)
-- [ ] Quarantine selective exclusion (jest `--testPathIgnorePatterns` / pytest `--deselect`)
-- [ ] Config UI: schema-driven forms (`/api/config/schema` exists; currently a JSON editor)
-- [ ] `DELETE /api/tasks/{id}` — emit a bus event + decide cascade/cleanup for orphaned `events`
+## Phase 3 / later (out of current scope)
+- [ ] Podman container packaging (host process only today).
+- [ ] Cost dashboards in the UI (usage recorded; `/usage` summary exists; dashboards not built).
+- [ ] GitHub PR integration (`gh pr create` as an alternative to direct merge).
+- [ ] Embeddings-based repo index for very large repos.
+- (Superseded: a second `Provider` implementation — opencode now owns provider/model selection.)
+- (Out of scope by design: multi-user auth / RBAC — Conclave is single-user.)
 
-## Post-launch polish (from the deployment-readiness QA swarm; non-blocking)
-- [ ] `run_git` has no timeout — a hung git op (hook/index-lock/slow FS) can stall a worker
-- [ ] `gc_events`/usage GC is only reachable via the test-gated `_baseline()` path (no-test-command
-      projects never prune) — run GC unconditionally / on a sweep
-- [ ] minor leaks: completed planning sessions in `_active_sessions`; unpruned `_merge_locks`
-- [ ] a cancel on the final review attempt is labelled `failed` instead of `cancelled`
-- [ ] frontend nits: `h-screen`→`h-dvh` (mobile chrome); remove the now-unused shared `Section`;
-      surface errors from fire-and-forget Resume/Pause/Re-analyze; modal/drawer Escape + focus-trap;
-      `usePlanningStream` reconnect (5s poll covers it today)
-- [ ] tests: WebSocket handlers (`web/ws.py`) have no direct coverage; tighten planning-API poll timing
-
-## Phase 3 / later
-- [ ] Second provider (OpenAI / Anthropic SDK) behind the `Provider` seam
-- [ ] Podman container packaging (host process only today)
-- [ ] Cost dashboards in the UI (usage recorded; `/usage` summary exists; dashboards not built)
-- [ ] GitHub PR integration (revive `gh pr create` as an alternative to direct merge)
-- [ ] Embeddings-based repo index for very large repos
-- [ ] (Out of scope by design: multi-user auth / RBAC — Conclave is single-user.)
-
-## Done (recent)
-- AUDIT hardening: CON-1 + ENG-1–7 + DATA-1–4 + CON-2–4 + WEB-1–2 + PLAN-1–4 (+ SEC de-scoped).
-- First-self-run findings: per-worktree venv + `setup_command`; `baseline.snapshot` carries `task_id`.
-- UI: dark/zinc+indigo redesign, dedicated viewport-fit pages, mobile, collapsible text.
+## Done (this cycle)
+- **opencode-native migration**: `OpenCodeCliProvider` (NDJSON usage parsing; raw-chunk stdout read so
+  large output can't overflow), `--dir` worktree isolation, `CONCLAVE_ENGINE` selection (opencode
+  default), launcher autodiscovery. Backend teardown of the orphaned engine-profiles/secrets/
+  repo-knowledge/onboarding layers (−1435 LOC); repo context now flows from `AGENTS.md`.
+- **Autonomous Bug-Fixer mode**: candidate ledger + coverage data layer, hunter/repro/test-integrity
+  components, the mode-controller (discover→reproduce→fix→transition), worker-loop wiring on
+  `project.mode`, activation + ledger API. Live-validated end-to-end. Test-integrity hardening
+  (modified/deleted-test detector, fails-on-old-code, spec-as-contract) shipped with it.
+- Developer inner-loop now runs the exact green-gate. Post-mortem agent wired on failure;
+  config-driven `NotificationSink` (webhook); unconditional events/baselines GC; planning-session +
+  merge-lock leak fixes; final-attempt cancel → `cancelled`. All MEDIUM hardening + earlier MVP gaps
+  (DELETE task, in-progress cancel, quarantine selective exclusion, `run_git` timeout).
 
 ## Run / quality reference
 ```bash
-./conclave                                    # bootstraps venv, serves on 0.0.0.0:8700
-ruff check src tests && mypy && pytest -q     # the quality gate (222 tests)
+./conclave                                    # opencode engine by default; serves on 0.0.0.0:8700
+ruff check src tests && mypy && pytest -q     # the quality gate (367 tests)
 cd frontend && npm install && npm run build   # rebuild the SPA into src/conclave/web/static
 ```
