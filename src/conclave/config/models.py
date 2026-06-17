@@ -300,6 +300,14 @@ class BugFixerPolicy(BaseModel):
         le=50,
         description="Auto-fix attempts per candidate before it declines to a human.",
     )
+    require_decline_consensus: bool = Field(
+        default=True,
+        description=(
+            "Before auto-fixing a reproduced candidate, poll the mandatory reviewers and route it "
+            "to a human when the team's decline threshold (agents.decline_consensus) is met. "
+            "Safety-first default; disable to skip the extra reviewer dispatches and fix directly."
+        ),
+    )
     wall_clock_budget_minutes: int | None = Field(
         default=None,
         ge=0,

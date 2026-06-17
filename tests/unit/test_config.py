@@ -74,6 +74,8 @@ def test_bug_fixer_policy_defaults() -> None:
     assert cfg.bug_fixer.max_attempts == 3
     # The policy leaves wall-clock unset so resolution reuses the execution cap.
     assert cfg.bug_fixer.wall_clock_budget_minutes is None
+    # Safety-first: an auto-merging agent polls the reviewers before auto-fixing by default.
+    assert cfg.bug_fixer.require_decline_consensus is True
 
 
 def test_resolve_bug_fixer_session_uses_policy_defaults() -> None:

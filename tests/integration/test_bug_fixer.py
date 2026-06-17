@@ -21,6 +21,7 @@ Covered:
 from __future__ import annotations
 
 import asyncio
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -28,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from conclave.config import ConclaveConfig, load_project_config
+from conclave.config.models import DeclineConsensus
 from conclave.db import BugCandidate, BugStatus, Database, Project
 from conclave.db import repositories as repo
 from conclave.engine import BugFixerController, CycleOutcome, Orchestrator, run_git
@@ -69,21 +71,60 @@ def _pytest_command() -> str:
     return f"{shlex.quote(sys.executable)} -m pytest -p no:cacheprovider -q"
 
 
+def _consensus_agent(prompt: str) -> str:
+    """Recover the mandatory agent a consensus dispatch is for from its assembled system context.
+
+    No persona is seeded for the test project, so :class:`AgentRunner` falls back to the default
+    system line ``You are the <agent> agent of an autonomous software engineering team.`` — we read
+    the agent name back out of it so the fake can return a per-agent verdict.
+    """
+    match = re.search(r"You are the (\S+) agent", prompt)
+    return match.group(1) if match else ""
+
+
 class _BugFixerProvider:
-    """Deterministic provider for the controller cycle: repro synth, developer fix, reviewers.
+    """Deterministic provider for the controller cycle: repro synth, consensus, developer fix.
 
     Keyed on prompt discriminators, mirroring the integration ``FakeProvider``:
 
     * the ``repro`` synthesis dispatch (``Write ONE focused test``) → a fenced repro block;
+    * the decline-consensus dispatch (``Before we AUTO-FIX it autonomously``) → a per-agent verdict
+      from ``consensus_verdicts`` (default: every reviewer ``pass``), and NEVER writes the worktree;
     * the developer dispatch → writes the repro test file AND the source fix into the worktree
       (``fix_succeeds``), or only the (failing) repro test (``fix_succeeds=False``) so the gate
       stays red and the fix task fails;
     * reviewers / planner → a passing verdict / a trivial plan.
+
+    ``consensus_verdicts`` maps an agent name to the verdict its consensus dispatch returns. A value
+    of ``"pass"``/``"decline"`` yields a fenced JSON verdict; ``"abstain"`` yields prose with NO
+    parseable verdict; ``"error"`` yields ``ok=False`` (a failed dispatch). An agent absent from the
+    map defaults to ``"pass"``. ``consensus_calls`` / ``developer_calls`` count those dispatches.
     """
 
-    def __init__(self, *, repro_block: str = _REPRO_BLOCK, fix_succeeds: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        repro_block: str = _REPRO_BLOCK,
+        fix_succeeds: bool = True,
+        consensus_verdicts: dict[str, str] | None = None,
+    ) -> None:
         self._repro_block = repro_block
         self._fix_succeeds = fix_succeeds
+        self._consensus_verdicts = consensus_verdicts or {}
+        self.consensus_calls = 0
+        self.developer_calls = 0
+
+    @staticmethod
+    def _consensus_reply(verdict: str) -> AgentResult:
+        """Render one reviewer's consensus reply for the requested verdict mode."""
+        if verdict == "error":
+            return AgentResult(ok=False, text="", model_reported="fake", cost_usd=0.0, error="boom")
+        if verdict == "abstain":
+            return AgentResult(
+                ok=True, text="I am not sure either way.", model_reported="fake", cost_usd=0.0,
+            )
+        body = f'```json\n{{"verdict": "{verdict}", "reason": "consensus", "evidence": []}}\n```'
+        return AgentResult(ok=True, text=body, model_reported="fake", cost_usd=0.0)
 
     async def run_agent(
         self,
@@ -98,6 +139,11 @@ class _BugFixerProvider:
         # Reproduction-test synthesis (controller-issued, before any worktree write).
         if "Write ONE focused test" in prompt:
             return AgentResult(ok=True, text=self._repro_block, model_reported="fake", cost_usd=0.0)
+        # Decline-consensus round (controller-issued, read-only — must NOT touch the worktree).
+        if "Before we AUTO-FIX it autonomously" in prompt:
+            self.consensus_calls += 1
+            agent = _consensus_agent(prompt)
+            return self._consensus_reply(self._consensus_verdicts.get(agent, "pass"))
         # Planner (orchestrator) — keyed on its unique instruction.
         if "Produce a structured plan" in prompt:
             return AgentResult(
@@ -110,6 +156,7 @@ class _BugFixerProvider:
         if "Review the changes made for this task" in prompt:
             return AgentResult(ok=True, text=_PASS_VERDICT, model_reported="fake", cost_usd=0.0)
         # Developer fallback: add the repro test (+ the fix when the scenario wants a green gate).
+        self.developer_calls += 1
         if cwd is not None:
             repro_target = Path(cwd) / _REPRO_PATH
             repro_target.parent.mkdir(parents=True, exist_ok=True)
@@ -319,3 +366,163 @@ async def test_no_usable_repro_defers(
     assert stored.status is BugStatus.deferred
     assert stored.attempts == 0  # never reached a fix attempt
     assert stored.decline_reason and "no usable repro" in stored.decline_reason
+
+
+# --- decline consensus: reviewers vote before an auto-fix --------------------
+
+
+async def test_decline_consensus_all_mandatory_routes_to_human(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every mandatory reviewer declines → candidate goes to ``declined_needs_human``, no fix task.
+
+    The default threshold is ``all_mandatory``; with all three reviewers declining the candidate is
+    handed to a human along the legal reproduced → declined edge and NO ``bug_fixer`` Task is run
+    (the source stays buggy, the developer is never dispatched, attempts is never bumped).
+    """
+    provider = _BugFixerProvider(
+        consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "decline"},
+    )
+    project, config, controller = await _make(db, tmp_path, provider)
+    candidate = await _seed_candidate(db, project)
+    _patch_discovery(monkeypatch, candidate)
+
+    result = await controller.run_cycle(project, config)
+
+    assert result.outcome is CycleOutcome.declined
+    assert provider.consensus_calls == 3  # all three mandatory reviewers polled
+    assert provider.developer_calls == 0  # the fix path was never entered
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None
+    assert stored.status is BugStatus.declined_needs_human
+    assert stored.task_id is None  # no fix task was created
+    assert stored.attempts == 0  # never entered `fixing`
+    assert stored.decline_reason and "decline-consensus" in stored.decline_reason
+    # On the human work-queue and the source is untouched (no fix attempted).
+    queue = await repo.list_needs_human(db, project.id)
+    assert [c.id for c in queue] == [candidate.id]
+    assert (Path(project.path) / "src" / "app.py").read_text() == _BUGGY_SRC
+
+
+async def test_decline_consensus_all_pass_proceeds_to_fix(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When every reviewer passes the round, the controller proceeds to the existing fix path."""
+    provider = _BugFixerProvider(
+        fix_succeeds=True,
+        consensus_verdicts={"tester": "pass", "security": "pass", "reviewer": "pass"},
+    )
+    project, config, controller = await _make(db, tmp_path, provider)
+    candidate = await _seed_candidate(db, project)
+    _patch_discovery(monkeypatch, candidate)
+
+    result = await controller.run_cycle(project, config)
+
+    assert result.outcome is CycleOutcome.fixed
+    assert provider.consensus_calls == 3
+    assert provider.developer_calls >= 1  # the fix path ran
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None
+    assert stored.status is BugStatus.fixed
+    assert (Path(project.path) / "src" / "app.py").read_text() == _FIXED_SRC
+
+
+async def test_decline_consensus_abstainer_does_not_decline(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reviewer that errors (abstains) under ``all_mandatory`` must NOT force a human handoff.
+
+    Two reviewers decline but one crashes; ``all_mandatory`` requires EVERY agent to cast a usable
+    decline, so the abstain keeps the candidate on the auto-fix path — a flaky reviewer can never
+    manufacture a decline.
+    """
+    provider = _BugFixerProvider(
+        fix_succeeds=True,
+        consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "error"},
+    )
+    project, config, controller = await _make(db, tmp_path, provider)
+    candidate = await _seed_candidate(db, project)
+    _patch_discovery(monkeypatch, candidate)
+
+    result = await controller.run_cycle(project, config)
+
+    assert result.outcome is CycleOutcome.fixed  # abstain did not trip all_mandatory
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None
+    assert stored.status is BugStatus.fixed
+
+
+async def test_decline_consensus_any_two_threshold_declines(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``any_two``, two declines (with one passing) are enough to route to a human."""
+    provider = _BugFixerProvider(
+        consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "pass"},
+    )
+    project, config, controller = await _make(db, tmp_path, provider)
+    config.agents.decline_consensus = DeclineConsensus.any_two
+    candidate = await _seed_candidate(db, project)
+    _patch_discovery(monkeypatch, candidate)
+
+    result = await controller.run_cycle(project, config)
+
+    assert result.outcome is CycleOutcome.declined
+    assert provider.developer_calls == 0
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None
+    assert stored.status is BugStatus.declined_needs_human
+
+
+async def test_decline_consensus_cancel_aborts_round_without_declining(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel set before the round makes every reviewer ABSTAIN — never a manufactured decline.
+
+    Honouring ``cancel_event`` between dispatches must not look like a unanimous decline: with the
+    event already set, no reviewer is polled, the round abstains, and the candidate is NOT routed to
+    a human by the consensus gate (the fix path is reached, where the wired task cancellation owns
+    the stop).
+    """
+    provider = _BugFixerProvider(
+        consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "decline"},
+    )
+    project, config, controller = await _make(db, tmp_path, provider)
+    candidate = await _seed_candidate(db, project)
+    _patch_discovery(monkeypatch, candidate)
+
+    cancel = asyncio.Event()
+    cancel.set()
+    result = await controller.run_cycle(project, config, cancel_event=cancel)
+
+    assert provider.consensus_calls == 0  # no reviewer was dispatched
+    # The consensus gate did NOT route to a human (cancellation is not a decline).
+    assert result.outcome is not CycleOutcome.declined
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None
+    assert stored.status is not BugStatus.declined_needs_human
+
+
+async def test_decline_consensus_skipped_when_disabled(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``require_decline_consensus=False`` the round is skipped — fix-directly behavior.
+
+    Even with every reviewer set to decline, the round never runs (no consensus dispatches) and the
+    candidate is fixed directly.
+    """
+    provider = _BugFixerProvider(
+        fix_succeeds=True,
+        consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "decline"},
+    )
+    project, config, controller = await _make(db, tmp_path, provider)
+    config.bug_fixer.require_decline_consensus = False
+    candidate = await _seed_candidate(db, project)
+    _patch_discovery(monkeypatch, candidate)
+
+    result = await controller.run_cycle(project, config)
+
+    assert result.outcome is CycleOutcome.fixed
+    assert provider.consensus_calls == 0  # the round was skipped entirely
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None
+    assert stored.status is BugStatus.fixed

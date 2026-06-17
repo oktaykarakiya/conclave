@@ -36,11 +36,15 @@ discovered → fixing → {fixed, deferred} side. Every write goes through
 no-opping. The reproduction gate owns its own three transitions (reproduced / dismissed / declined)
 — the controller never re-drives those.
 
-CONSENSUS FOLLOW-UP: a ``declined`` candidate already lands in ``declined_needs_human`` (surfaced
-via :func:`conclave.db.repositories.list_needs_human`), which is the v1 human-handoff. A full
-multi-agent *decline consensus* round (every mandatory reviewer voting before an auto-fix is
-trusted) is a deliberate, documented follow-up — see the ``# TODO(bug-fixer-consensus)`` note on
-:meth:`_fix_reproduced` — and is intentionally NOT built here.
+DECLINE CONSENSUS: before a ``reproduced`` candidate is trusted to an auto-fix, the mandatory
+reviewers (``config.agents.mandatory``) vote in a read-only round — each is shown the candidate and
+the pinned repro test and asked whether the fix is safe to attempt autonomously or edge-case-risky
+enough to need a human. When the team's :class:`~conclave.config.models.DeclineConsensus` threshold
+is met the candidate is routed to ``declined_needs_human`` (surfaced via
+:func:`conclave.db.repositories.list_needs_human`) instead of being fixed. The round is best-effort
+about dispatch failures — a crashed or unparseable reviewer ABSTAINS rather than forcing a handoff —
+and is gated behind ``BugFixerPolicy.require_decline_consensus`` (default on) so an operator can
+disable it to save the extra dispatches and fix directly.
 
 SECRETS HYGIENE: discovery's and the repro gate's local-only-sink discipline carries over. The
 repro-test body is persisted only to this project's SQLite row and written only into the throwaway /
@@ -51,14 +55,16 @@ developer can re-create the test, but a Task row is the same local SQLite sink a
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 from ..config import ConclaveConfig, resolve_agent
-from ..config.models import BugFixerSessionConfig
+from ..config.models import BugFixerSessionConfig, DeclineConsensus
 from ..db import BugCandidate, BugStatus, Database, Project, Task, TaskOrigin, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType
@@ -68,7 +74,10 @@ from .orchestrator import Orchestrator
 from .repro import ReproTest, parse_repro_test
 from .repro_gate import ReproOutcome, reproduce_bug
 from .runner import AgentRunner
+from .verdict import parse_verdict
 from .worktree import WorktreeManager
+
+logger = logging.getLogger("conclave.engine.bug_fixer")
 
 # Match pytest as a standalone word or path component (".venv/bin/pytest", "python -m pytest"),
 # mirroring :func:`conclave.engine.gate.inject_quarantine_exclusions`. When the project test command
@@ -166,7 +175,9 @@ class BugFixerController:
         )
 
         if result.outcome is ReproOutcome.reproduced:
-            return await self._fix_reproduced(project, result.candidate, repro)
+            return await self._fix_reproduced(
+                project, result.candidate, repro, config, cancel_event=cancel_event,
+            )
         if result.outcome is ReproOutcome.dismissed:
             await self._log(project.id, result.candidate, "dismissed false positive (gate)")
             return CycleResult(CycleOutcome.dismissed, result.candidate)
@@ -186,24 +197,34 @@ class BugFixerController:
         project: Project,
         candidate: BugCandidate,
         repro: ReproTest,
+        config: ConclaveConfig,
+        *,
+        cancel_event: asyncio.Event | None = None,
     ) -> CycleResult:
         """Fix a ``reproduced`` candidate as a real ``bug_fixer`` Task; record the outcome.
 
-        Advances the candidate to ``fixing`` (which bumps ``attempts``), builds a task that hands
-        the developer the bug AND the pinned repro test, and runs it through the orchestrator's full
-        pipeline. A merged task → ``fixed``; a failed task → ``deferred`` (parked for a later retry,
-        a legal edge the controller drives itself).
-
-        TODO(bug-fixer-consensus): before trusting an auto-fix, run a decline-consensus round (every
-        mandatory reviewer votes; ``DeclineConsensus`` thresholds in ``AgentsPolicy``) so the team
-        can ABSTAIN on an edge-case-risky candidate and route it to ``declined_needs_human`` instead
-        of fixing it. v1 trusts the reproduction gate's proof and fixes directly; consensus is a
-        documented follow-up, deliberately not built here.
+        First runs the decline-consensus round (when
+        ``BugFixerPolicy.require_decline_consensus`` is on): the mandatory reviewers vote, and if
+        the team's threshold is met the candidate is routed to ``declined_needs_human`` and NO fix
+        Task is created. Otherwise it advances the candidate to ``fixing`` (which bumps
+        ``attempts``), builds a task that hands the developer the bug AND the pinned repro test, and
+        runs it through the orchestrator's full pipeline. A merged task → ``fixed``; a failed task →
+        ``deferred`` (parked for a later retry, a legal edge the controller drives itself).
         """
         # The pinned body/hash live on the row after the gate's set_repro_artifacts; prefer them so
         # the task carries EXACTLY what was proven, falling back to the in-memory ReproTest.
         pinned_path = candidate.repro_test_path or repro.path
         pinned_body = candidate.repro_test_body or repro.body
+
+        # Decline-consensus gate: poll the mandatory reviewers BEFORE trusting an auto-fix. A met
+        # threshold routes the candidate to a human along the legal reproduced → declined edge and
+        # short-circuits the fix entirely.
+        if config.bug_fixer.require_decline_consensus:
+            declined = await self._decline_consensus(
+                project, candidate, config, pinned_path, pinned_body, cancel_event=cancel_event,
+            )
+            if declined is not None:
+                return CycleResult(CycleOutcome.declined, declined)
 
         task = await repo.create_task(
             self._db,
@@ -250,6 +271,139 @@ class BugFixerController:
             return await self._orchestrator.process_task(task, cancel_event=cancel_event)
         finally:
             self._orchestrator._cancel_events.pop(task.id, None)
+
+    # --- decline consensus --------------------------------------------------
+
+    async def _decline_consensus(
+        self,
+        project: Project,
+        candidate: BugCandidate,
+        config: ConclaveConfig,
+        repro_path: str,
+        repro_body: str,
+        *,
+        cancel_event: asyncio.Event | None,
+    ) -> BugCandidate | None:
+        """Poll the mandatory reviewers on a ``reproduced`` candidate before an auto-fix.
+
+        Each mandatory agent is dispatched READ-ONLY over the project tree (the controller never
+        lets a reviewer write — the only writer of the worktree is the fix Task) with the candidate
+        and the pinned repro test, and asked to ``pass`` (safe to auto-fix) or ``decline`` (needs a
+        human). Verdicts feed :func:`_decline_threshold_met` against
+        ``config.agents.decline_consensus``.
+
+        Robust by construction: a dispatch that crashes or returns no parseable verdict counts as an
+        ABSTAIN, never a decline — a flaky reviewer can never force a human handoff, and an
+        all-abstain round never trips the threshold. ``cancel_event`` is honoured between each
+        dispatch.
+
+        Returns the ``declined_needs_human`` candidate when the threshold is met (after emitting the
+        round + decline events), or ``None`` to let the caller proceed to the fix path unchanged.
+        """
+        verdicts = await self._collect_consensus_verdicts(
+            project, candidate, config, repro_path, repro_body, cancel_event=cancel_event,
+        )
+        threshold = config.agents.decline_consensus
+        met = _decline_threshold_met(verdicts, threshold)
+
+        await self._bus.emit(
+            type=EventType.consensus_round,
+            project_id=project.id,
+            payload={
+                "candidate_id": candidate.id,
+                "fingerprint": candidate.fingerprint,
+                "threshold": threshold.value,
+                "verdicts": dict(verdicts),
+                "declined": met,
+            },
+        )
+        if not met:
+            return None
+
+        decliners = sorted(a for a, v in verdicts.items() if v == "decline")
+        reason = (
+            "decline-consensus reached ("
+            f"{threshold.value}: {', '.join(decliners)} declined) — needs human review before "
+            "an autonomous fix"
+        )
+        declined = await repo.transition_bug_status(
+            self._db, candidate.id, BugStatus.declined_needs_human, decline_reason=reason,
+        )
+        await self._bus.emit(
+            type=EventType.bug_declined,
+            project_id=project.id,
+            payload={
+                "candidate_id": declined.id,
+                "fingerprint": declined.fingerprint,
+                "region": declined.region,
+                "file": declined.file,
+                "symbol": declined.symbol,
+                "status": declined.status.value,
+                "reason": reason,
+            },
+        )
+        await self._log(project.id, declined, reason)
+        return declined
+
+    async def _collect_consensus_verdicts(
+        self,
+        project: Project,
+        candidate: BugCandidate,
+        config: ConclaveConfig,
+        repro_path: str,
+        repro_body: str,
+        *,
+        cancel_event: asyncio.Event | None,
+    ) -> dict[str, str | None]:
+        """Dispatch each mandatory reviewer and parse its verdict; map agent → verdict (or abstain).
+
+        A dispatch that is cancelled, errors, returns no text, or whose reply carries no parseable
+        verdict maps to ``None`` (ABSTAIN). A reviewer crash is caught and logged best-effort so a
+        single misbehaving dispatch can never crash the cycle.
+        """
+        runner = AgentRunner(self._db, self._bus, self._provider, project.id, config)
+        prompt = _consensus_prompt(candidate, repro_path, repro_body)
+        worktree = Path(project.path)
+        verdicts: dict[str, str | None] = {}
+        for agent in config.agents.mandatory:
+            if cancel_event is not None and cancel_event.is_set():
+                # Honour a stop request between dispatches: remaining reviewers ABSTAIN, so a
+                # cancellation never manufactures a decline.
+                verdicts[agent] = None
+                continue
+            verdicts[agent] = await self._consensus_verdict(
+                runner, agent, prompt, worktree, cancel_event=cancel_event,
+            )
+        return verdicts
+
+    async def _consensus_verdict(
+        self,
+        runner: AgentRunner,
+        agent: str,
+        prompt: str,
+        worktree: Path,
+        *,
+        cancel_event: asyncio.Event | None,
+    ) -> str | None:
+        """Run one reviewer dispatch and return its verdict value, or ``None`` on abstain.
+
+        Best-effort: any dispatch exception is swallowed (logged) and treated as an abstain, so a
+        crashing reviewer degrades to "no vote" rather than taking down the consensus round.
+        """
+        try:
+            result = await runner.run(
+                agent=agent, prompt=prompt, worktree=worktree, cancel_event=cancel_event,
+            )
+        except Exception:  # best-effort: a reviewer crash must not crash the cycle — it abstains
+            logger.warning(
+                "decline-consensus dispatch for agent %s failed — abstaining", agent, exc_info=True
+            )
+            return None
+        if not result.ok or not result.text:
+            return None
+        verdict = parse_verdict(result.text).verdict
+        # Only a clean pass/decline is a usable vote; unknown/grounding-downgraded → abstain.
+        return verdict if verdict in ("pass", "decline") else None
 
     # --- repro synthesis ----------------------------------------------------
 
@@ -381,7 +535,78 @@ class SessionBudget:
         return False
 
 
+# --- decline-consensus threshold (pure) -------------------------------------
+
+
+def _decline_threshold_met(
+    verdicts: Mapping[str, str | None], threshold: DeclineConsensus,
+) -> bool:
+    """Decide whether the team's DECLINE threshold is met given the per-reviewer verdicts.
+
+    ``verdicts`` maps each polled mandatory agent to its verdict value, where ``"decline"`` and
+    ``"pass"`` are usable votes and anything else (notably ``None``) is an ABSTAIN — a reviewer that
+    crashed, timed out, or returned no parseable verdict. Abstentions never count toward a decline,
+    so a flaky reviewer can't force a human handoff. The three thresholds:
+
+    * ``all_mandatory`` — EVERY polled agent must have returned a usable verdict AND it must be
+      ``decline``. A single abstain (or a single ``pass``) keeps the fix on the auto path. An empty
+      round is never "all declined".
+    * ``majority`` — more than half of the agents that returned a USABLE verdict declined
+      (abstainers drop out of both numerator and denominator); with no usable verdicts, no majority.
+    * ``any_two`` — at least two agents declined.
+
+    An empty round (no agents, or all abstain) is never a decline under any threshold.
+    """
+    declines = sum(1 for v in verdicts.values() if v == "decline")
+    usable = sum(1 for v in verdicts.values() if v in ("pass", "decline"))
+
+    if threshold is DeclineConsensus.any_two:
+        return declines >= 2
+    if threshold is DeclineConsensus.majority:
+        # Strict majority of the agents that actually voted; an all-abstain round has no majority.
+        return usable > 0 and declines * 2 > usable
+    # all_mandatory: every polled agent must have cast a usable DECLINE vote (no abstains, no pass).
+    return len(verdicts) > 0 and declines == len(verdicts)
+
+
 # --- prompt builders --------------------------------------------------------
+
+
+def _consensus_prompt(candidate: BugCandidate, repro_path: str, repro_body: str) -> str:
+    """Build the read-only decline-consensus task body shown to each mandatory reviewer.
+
+    Hands the reviewer the proven bug (file / symbol / region / claim / severity) and the pinned
+    repro test (path + verbatim body), then asks for a single ``pass``/``decline`` verdict on
+    whether the fix is safe to attempt autonomously. The reviewer's persona carries its lens; this
+    supplies the candidate and the strict output contract the round parses with ``parse_verdict``.
+    """
+    where_bits = [b for b in (candidate.file, candidate.symbol) if b]
+    where = " / ".join(where_bits) if where_bits else (candidate.region or "the codebase")
+    lines = [
+        "A bug was PROVEN with a focused failing test. Before we AUTO-FIX it autonomously, assess "
+        "whether the fix is safe to attempt without a human, or edge-case-risky / ambiguous enough "
+        "that a human should own it.",
+        "",
+        f"BUG LOCATION: {where}",
+    ]
+    if candidate.region and candidate.region not in where:
+        lines.append(f"REGION: {candidate.region}")
+    if candidate.severity:
+        lines.append(f"SEVERITY: {candidate.severity}")
+    lines.append(f"CLAIM (the wrong behaviour): {candidate.claim}")
+    lines.append("")
+    lines.append(
+        "REPRODUCTION TEST (already proven to FAIL on the current code) — read-only context; do "
+        f"NOT modify the worktree:\n\nPATH: {repro_path}\n\n```python\n{repro_body}\n```"
+    )
+    lines.append("")
+    lines.append(
+        "Decide: is fixing this safe to attempt AUTONOMOUSLY, or is it risky/ambiguous enough to "
+        "need a human? End your reply with a fenced ```json block containing a single \"verdict\" "
+        "field set to `pass` (safe — proceed with the auto-fix) or `decline` (route to a human). "
+        "Decline only when you genuinely judge an autonomous fix unsafe or under-specified."
+    )
+    return "\n".join(lines)
 
 
 def _repro_prompt(candidate: BugCandidate) -> str:
