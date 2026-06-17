@@ -2,19 +2,19 @@
 
 ## Project
 
-Conclave — a portable, web-driven autonomous AI coding team that drives the `claude` CLI through a plan → develop → multi-agent review → green-gate → commit/merge loop. Attaches to any git repo via isolated worktrees. Controlled entirely from a web UI.
+Conclave — a portable, web-driven autonomous AI coding team that drives the `opencode` CLI through a plan → develop → multi-agent review → green-gate → commit/merge loop. Attaches to any git repo via isolated worktrees. Controlled entirely from a web UI.
 
 ## Stack
 
 - **Backend**: Python 3.12+, FastAPI, SQLite (aiosqlite), async
 - **Frontend**: React 19, TypeScript (strict), Tailwind 4, Vite 6
-- **Engine**: drives the `claude` CLI (or DeepSeek/Anthropic-compatible endpoint)
+- **Engine**: drives `opencode` headless (default); `claude` CLI available as legacy fallback (`CONCLAVE_ENGINE=claude`). Model/provider selection lives in opencode — Conclave inherits it. DeepSeek is the intended default.
 - **Packaging**: hatchling, `pip install -e ".[dev]"`
 
 ## Quality gate (always run before declaring done)
 
 ```bash
-ruff check src tests && mypy && pytest -q         # Python: 229 tests (deterministic, zero LLM cost)
+ruff check src tests && mypy && pytest -q         # Python: 402 tests (deterministic, zero LLM cost)
 cd frontend && npx tsc --noEmit && npm run build  # TypeScript strict + rebuild SPA
 ```
 
@@ -26,13 +26,18 @@ cd frontend && npx tsc --noEmit && npm run build  # TypeScript strict + rebuild 
 
 ```bash
 ./conclave                         # auto-bootstraps venv, serves on 0.0.0.0:8700
+CONCLAVE_ENGINE=opencode ./conclave # explicit (opencode is the default)
+CONCLAVE_ENGINE=claude ./conclave  # legacy claude-CLI fallback
+
 ruff check src tests               # lint only (no fix)
 mypy                               # type-check (reads config from pyproject.toml)
 pytest -q                          # all tests
 pytest tests/unit/test_engine_logic.py -q         # single test file
 pytest -k "test_planning" -q                      # filter by name
-cd frontend && npx tsc --noEmit                   # TS type-check only
-cd frontend && npm run build                      # build SPA into src/conclave/web/static/
+
+cd frontend && npm run dev         # Vite dev server with HMR (connects to a running backend)
+cd frontend && npm run typecheck   # TS type-check only
+cd frontend && npm run build       # build SPA into src/conclave/web/static/
 ```
 
 ## Architecture
@@ -42,7 +47,7 @@ cd frontend && npm run build                      # build SPA into src/conclave/
 | `src/conclave/engine/` | Orchestrator loop (worktree → venv → baseline → plan → develop → review → verdict → gate → commit/merge), gate, reviewers, pipeline |
 | `src/conclave/planning/` | Agent-ception multi-agent planning sessions |
 | `src/conclave/db/` | SQLite layer — single shared async connection + lock + `transaction()`, append-only migrations, repositories |
-| `src/conclave/providers/` | `claude` CLI provider + engine-profile invocation |
+| `src/conclave/providers/` | `claude` CLI provider + `opencode` CLI provider + engine-profile invocation |
 | `src/conclave/web/` | FastAPI app, routes, WebSocket stream, served SPA |
 | `src/conclave/runtime.py` | Per-project worker daemon |
 | `frontend/src/` | React SPA — `ui.tsx` primitives, `pages/*` one per tab |
@@ -54,7 +59,7 @@ cd frontend && npm run build                      # build SPA into src/conclave/
 - **Validate API inputs** — return 4xx, never 500 on bad input. Bound list endpoints.
 - **The built SPA** (`src/conclave/web/static/`) is committed so the daemon serves the UI without Node at runtime. Always rebuild after frontend changes.
 - **Security**: single-user, intentionally unauthenticated. Binds `0.0.0.0` by default for LAN use. Set `CONCLAVE_HOST=127.0.0.1` for loopback-only. Multi-user auth is out of scope.
-- **Env vars**: `CONCLAVE_HOST` (default `0.0.0.0`), `CONCLAVE_PORT` (default `8700`), `CONCLAVE_HOME` (default `~/.local/share/conclave`), `PYTHON` (override interpreter for venv bootstrap).
+- **Env vars**: `CONCLAVE_HOST` (default `0.0.0.0`), `CONCLAVE_PORT` (default `8700`), `CONCLAVE_HOME` (default `~/.local/share/conclave`), `CONCLAVE_ENGINE` (default `opencode`; set `claude` for legacy), `PYTHON` (override interpreter for venv bootstrap).
 - **Branch `conclave-selftest`** exists unmerged — contains BMad scale-adaptive planning. Do not accidentally work on it unless that feature is explicitly requested.
 
 ## Testing
