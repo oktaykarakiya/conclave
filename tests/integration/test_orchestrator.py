@@ -763,6 +763,81 @@ async def test_cancel_event_checked_between_stages(
     assert worktree_path not in wt_list
 
 
+async def test_cancel_on_final_attempt_lands_in_cancelled_not_failed(
+    db: Database, tmp_path: Path,
+) -> None:
+    """Cancelling during the FINAL review attempt must land the task in ``cancelled``,
+    never ``failed``.
+
+    With ``max_retries=1`` the develop→review loop runs exactly once. A developer that
+    sets the cancel event after writing its change forces ``_review``'s per-stage check to
+    fire: it returns ``failed=True`` and the loop exits at the bottom. The orchestrator
+    must recognise the pending cancellation there and finish as cancelled.
+    """
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main"},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+
+    cancel_event = asyncio.Event()
+
+    class _CancelDuringReview:
+        """Developer writes its change then trips the cancel event; review then sees it."""
+
+        async def run_agent(
+            self,
+            *,
+            profile: ResolvedProfile,
+            prompt: str,
+            timeout_seconds: int,
+            cwd: Path | None = None,
+            on_chunk: OnChunk | None = None,
+            cancel_event: asyncio.Event | None = None,
+        ) -> AgentResult:
+            if "Produce a structured plan" in prompt:
+                return AgentResult(ok=True, text="{}", model_reported="fake")
+            if "Review the changes" in prompt:
+                # Should never be reached: the cancel check inside _review fires first.
+                return AgentResult(
+                    ok=True,
+                    text='```json\n{"verdict": "pass", "reason": "ok", "evidence": []}\n```',
+                    model_reported="fake",
+                )
+            # Developer: write the change, then signal cancellation so the post-developer
+            # and in-review checks observe it on this final attempt.
+            if cwd is not None:
+                (Path(cwd) / "FEATURE.txt").write_text("done\n", encoding="utf-8")
+            cancel_event.set()
+            return AgentResult(ok=True, text="done", model_reported="fake")
+
+    orchestrator = Orchestrator(db, EventBus(db), _CancelDuringReview(), tmp_path / "home")
+
+    result = await orchestrator.process_task(claimed, cancel_event=cancel_event)
+    assert result is False
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.cancelled, (
+        f"expected cancelled, got {final.state} (summary: {final.result_summary!r})"
+    )
+
+    # The terminal event must be a cancellation, not a failure.
+    events = await repo.list_events(db, task_id=task.id)
+    types = {e.type for e in events}
+    assert "task.cancelled" in types
+    assert "task.failed" not in types
+
+
 async def test_cancel_non_in_progress_task_via_api(
     db: Database, tmp_path: Path,
 ) -> None:

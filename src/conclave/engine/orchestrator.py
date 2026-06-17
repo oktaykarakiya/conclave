@@ -382,6 +382,13 @@ class Orchestrator:
 
                 break  # success
 
+            # A cancellation can land on the FINAL attempt: a per-stage check inside the
+            # loop (e.g. _review) sets failed=True and the loop exits here rather than
+            # returning _finish_cancelled. Route any pending cancellation to cancelled so
+            # the task is never mislabelled as failed when the operator actually cancelled it.
+            if cancel_event is not None and cancel_event.is_set():
+                return await self._finish_cancelled(task, wm, task_branch)
+
             if failed or attempts == 0:
                 return await self._finish_failure(
                     task, wm, task_branch, timed_out, attempts
