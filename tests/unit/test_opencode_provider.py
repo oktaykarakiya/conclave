@@ -7,7 +7,13 @@ Fixtures mirror real ``opencode run --format json`` output: one JSON event per l
 
 from __future__ import annotations
 
-from conclave.providers.opencode_cli import _parse_events
+from pathlib import Path
+
+import pytest
+
+from conclave.config import ArgMode
+from conclave.providers.opencode_cli import OpenCodeCliProvider, _parse_events
+from conclave.providers.profiles import ResolvedProfile
 
 # A representative single-step stream (captured from a real deepseek run).
 _STREAM = "\n".join(
@@ -85,3 +91,29 @@ def test_parse_events_no_step_finish_leaves_usage_none() -> None:
     assert r.cost_usd is None
     assert r.input_tokens is None
     assert r.num_turns is None
+
+
+async def test_run_agent_reads_ndjson_line_over_64kib(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single NDJSON line larger than asyncio's 64 KiB readline limit must not abort the
+    dispatch (regression: readline() raised LimitOverrunError; we now read raw chunks)."""
+    fake = tmp_path / "fake_opencode.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        "big = 'x' * 100000\n"  # > 64 KiB in one line
+        "sys.stdout.write('{\"type\":\"text\",\"part\":"
+        "{\"type\":\"text\",\"text\":\"' + big + '\"}}\\n')\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(
+        "conclave.providers.opencode_cli._OPENCODE_BIN", str(fake)
+    )
+    profile = ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit)
+    result = await OpenCodeCliProvider().run_agent(
+        profile=profile, prompt="hello", timeout_seconds=30
+    )
+    assert result.ok
+    assert result.text == "x" * 100000  # full line read + parsed, no LimitOverrunError

@@ -84,12 +84,16 @@ class OpenCodeCliProvider:
                 stdin.close()
 
             async def _read_stdout() -> None:
-                # NDJSON: read line-buffered so on_chunk receives whole events.
+                # Read raw chunks, NOT readline(): opencode's NDJSON lines (a big file read or
+                # a long tool result) can exceed asyncio's default 64 KiB StreamReader line
+                # limit, which raises LimitOverrunError and aborts the whole dispatch.
+                # _parse_events splits the accumulated output on newlines, so chunk boundaries
+                # are harmless (mirrors the claude provider's raw-chunk read).
                 while True:
-                    line = await stdout.readline()
-                    if not line:
+                    chunk = await stdout.read(65536)
+                    if not chunk:
                         break
-                    text = line.decode("utf-8", errors="replace")
+                    text = chunk.decode("utf-8", errors="replace")
                     parts.append(text)
                     if on_chunk is not None:
                         await on_chunk(text)
