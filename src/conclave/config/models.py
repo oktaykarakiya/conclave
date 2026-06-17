@@ -343,6 +343,31 @@ class BugFixerSessionConfig(BaseModel):
     wall_clock_budget_minutes: int = Field(ge=0)
 
 
+class NotificationSettings(BaseModel):
+    """Outbound notifications for terminal task events (done/failed).
+
+    Inert by default: with no ``webhook_url`` set, no sink is built and nothing fires.
+    When a URL is configured, a small JSON payload is POSTed best-effort on each terminal
+    task — a delivery failure never affects task processing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    webhook_url: str | None = Field(
+        default=None,
+        description=(
+            "If set, POST a small JSON payload to this URL when a task reaches a terminal "
+            "state (done/failed). None disables notifications entirely."
+        ),
+    )
+    timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=120,
+        description="Per-request timeout for the webhook POST.",
+    )
+
+
 class ProtectedSettings(BaseModel):
     """Paths agents must never modify. ``.env*`` and ``.git`` are an enforced floor
     (see :func:`conclave.config.resolver.effective_protected`); users may add, not remove."""
@@ -375,6 +400,7 @@ class ConclaveConfig(BaseModel):
     planning: PlanningSettings = Field(default_factory=PlanningSettings)
     agents: AgentsPolicy = Field(default_factory=AgentsPolicy)
     bug_fixer: BugFixerPolicy = Field(default_factory=BugFixerPolicy)
+    notifications: NotificationSettings = Field(default_factory=NotificationSettings)
     protected: ProtectedSettings = Field(default_factory=ProtectedSettings)
     agent_defaults: AgentSettings = Field(default_factory=AgentSettings)
     agent_overrides: dict[str, dict[str, object]] = Field(default_factory=dict)

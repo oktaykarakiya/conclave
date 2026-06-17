@@ -21,7 +21,7 @@ from typing import Any
 from ..config import ConclaveConfig, load_project_config, resolve_agent
 from ..db import Database, Task, TaskState
 from ..db import repositories as repo
-from ..events import EventBus, EventType
+from ..events import EventBus, EventType, build_notification_sink
 from ..providers import AgentResult, Provider
 from .baseline import build_baseline_preamble
 from .gate import apply_quarantine, run_tests
@@ -426,6 +426,39 @@ class Orchestrator:
                 await repo.gc_baselines(self._db, project.id)
             except Exception:
                 logger.warning("GC sweep failed for task %s", task.id, exc_info=True)
+            # Fire the terminal-task notification last, after the outcome is durably written.
+            # Reads the freshly-persisted task so the payload reflects the final state +
+            # summary; inert unless a webhook is configured, and fully best-effort.
+            await self._notify_terminal(project.id, task.id, config)
+
+    async def _notify_terminal(
+        self, project_id: str, task_id: str, config: ConclaveConfig
+    ) -> None:
+        """POST a compact notification for a task that finished done/failed (best-effort).
+
+        Inert unless ``notifications.webhook_url`` is configured. Re-reads the task to get
+        its durably-written terminal state/summary, fires only for ``done``/``failed``, and
+        swallows every error so a notification can never affect task processing.
+        """
+        sink = build_notification_sink(config)
+        if sink is None:
+            return
+        try:
+            task = await repo.get_task(self._db, task_id)
+            if task is None or task.state not in (TaskState.done, TaskState.failed):
+                return
+            await sink.notify(
+                {
+                    "event": f"task.{task.state.value}",
+                    "task_id": task.id,
+                    "project_id": project_id,
+                    "state": task.state.value,
+                    "title": task.title,
+                    "result_summary": task.result_summary,
+                }
+            )
+        except Exception:
+            logger.warning("terminal notification failed for task %s", task_id, exc_info=True)
 
     # --- phases ---------------------------------------------------------------
 

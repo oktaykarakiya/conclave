@@ -323,6 +323,154 @@ async def test_crash_recovery_reblocks_descendants(db: Database, tmp_path: Path)
     assert await repo.claim_next_approved(db, project.id) is None
 
 
+# --- Terminal-task notifications ----------------------------------------------
+
+
+class _RecordingSink:
+    """A NotificationSink test double that records every payload it receives."""
+
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, object]] = []
+
+    async def notify(self, payload: dict[str, object]) -> None:
+        self.payloads.append(payload)
+
+
+async def test_notification_fires_on_task_done(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful task fires the configured notification sink with a done payload."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main"},
+            "notifications": {"webhook_url": "http://example.test/hook"},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+
+    sink = _RecordingSink()
+    from conclave.engine import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "build_notification_sink", lambda _cfg: sink)
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    assert len(sink.payloads) == 1
+    payload = sink.payloads[0]
+    assert payload["event"] == "task.done"
+    assert payload["state"] == "done"
+    assert payload["task_id"] == task.id
+    assert payload["project_id"] == project.id
+
+
+async def test_notification_fires_on_task_failed(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed task fires the notification sink with a failed payload + summary."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "baseline_test_command": "test -f FEATURE.txt"},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+            "notifications": {"webhook_url": "http://example.test/hook"},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add feature", state=TaskState.approved,
+    )
+
+    sink = _RecordingSink()
+    from conclave.engine import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "build_notification_sink", lambda _cfg: sink)
+
+    # Developer never writes the file => gate stays red => fail.
+    orchestrator = Orchestrator(
+        db, EventBus(db), FakeProvider(developer_writes=False), tmp_path / "home"
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is False
+
+    assert len(sink.payloads) == 1
+    payload = sink.payloads[0]
+    assert payload["event"] == "task.failed"
+    assert payload["state"] == "failed"
+    assert payload["task_id"] == task.id
+    assert "failed" in str(payload["result_summary"])
+
+
+async def test_no_notification_when_unconfigured(
+    db: Database, tmp_path: Path,
+) -> None:
+    """With no webhook_url, no sink is built and a completed task fires nothing.
+
+    Uses the REAL build_notification_sink (not a fake), so this proves the default-off
+    behaviour end-to-end: build_notification_sink returns None and _notify_terminal is a
+    no-op. A successful run with no notifications config must not raise.
+    """
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    # Real sink factory returns None for this config — the run completes cleanly.
+    assert await orchestrator.process_task(claimed) is True
+
+
+async def test_notification_failure_does_not_affect_task(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sink that raises must not change the task outcome — notifications are best-effort."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main"},
+            "notifications": {"webhook_url": "http://example.test/hook"},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+
+    class _ExplodingSink:
+        async def notify(self, payload: dict[str, object]) -> None:
+            raise RuntimeError("webhook delivery exploded")
+
+    from conclave.engine import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "build_notification_sink", lambda _cfg: _ExplodingSink())
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    # The exploding sink is swallowed — the task still completes successfully.
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None and done.state is TaskState.done
+
+
 # --- Post-mortem on failure ---------------------------------------------------
 
 
