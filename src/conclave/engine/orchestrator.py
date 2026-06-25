@@ -197,6 +197,7 @@ class Orchestrator:
             # Inject active quarantine exclusions so flaky quarantined tests
             # don't fail the baseline snapshot or the green-gate.
             test_command = await apply_quarantine(self._db, project.id, test_command)
+            check_commands = _check_commands(None)
             gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
 
             baseline_preamble = await self._baseline(
@@ -251,16 +252,21 @@ class Orchestrator:
                     await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
                 dev_prompt = task.request + plan_preamble + baseline_preamble
+                all_cmds: list[str] = []
                 if test_command:
-                    # Hand the developer the EXACT authoritative gate so its own
+                    all_cmds.append(test_command)
+                all_cmds.extend(check_commands)
+                if all_cmds:
+                    # Hand the developer EVERY authoritative gate command so its own
                     # write→run→fix loop converges on what the orchestrator actually
                     # enforces — not a partial self-check that passes here but fails the gate.
                     dev_prompt += (
                         "\n\nGREEN-GATE (authoritative — exactly what the orchestrator runs "
-                        "to accept your work). Before you finish, run this EXACT command in "
+                        "to accept your work). Before you finish, run EVERY command below in "
                         "the worktree and iterate (write → run → read failures → fix → re-run) "
-                        "until it passes with NO NEW failures vs. the pre-existing baseline:\n"
-                        f"```\n{test_command}\n```\n"
+                        "until ALL commands pass with NO NEW failures vs. the pre-existing "
+                        "baseline:\n"
+                        + "\n".join(f"```\n{cmd}\n```" for cmd in all_cmds) + "\n"
                     )
                 if use_memory:
                     dev_prompt += memory.build_preamble()
@@ -375,57 +381,79 @@ class Orchestrator:
                 await run_git(worktree, "checkout-index", "-a", "-f")
                 await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
-                if test_command and config.execution.require_full_green:
-                    # Cooperative cancellation — check before the gate (which may be slow).
-                    if cancel_event is not None and cancel_event.is_set():
-                        return await self._finish_cancelled(task, wm, task_branch)
+                if config.execution.require_full_green:
+                    gate_commands: list[tuple[str, str]] = []
+                    if test_command:
+                        gate_commands.append(("test", test_command))
+                    for cmd in check_commands:
+                        gate_commands.append(("check/lint", cmd))
 
-                    # HARD cap: abort before running the test gate if the wall-clock
-                    # budget has been exhausted. The gate itself may be slow; checking
-                    # here prevents a very long test run from blowing past the cap.
-                    if _check_budget(started, budget):
-                        timed_out = True
-                        failed = True
-                        break
+                    if gate_commands:
+                        # Cooperative cancellation — check before the gate (which may be slow).
+                        if cancel_event is not None and cancel_event.is_set():
+                            return await self._finish_cancelled(task, wm, task_branch)
 
-                    gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
-                    if not gate.passed:
-                        # ENG-7: distinguish infra failures (timeout / missing command)
-                        # from real test failures.  Infra problems get one retry; if they
-                        # persist the attempt is aborted — do NOT feed toolchain noise to
-                        # the developer as code feedback.
-                        if gate.outcome in ("timed_out", "missing_command"):
+                        # HARD cap: abort before running the gate if the wall-clock
+                        # budget has been exhausted.
+                        if _check_budget(started, budget):
+                            timed_out = True
+                            failed = True
+                            break
+
+                        gate_mark: str | None = None  # {"infra", "real", None}
+                        for label, cmd in gate_commands:
                             gate = await run_tests(
-                                worktree, test_command, timeout_seconds=gate_timeout
+                                worktree, cmd, timeout_seconds=gate_timeout
                             )
                             if not gate.passed:
-                                reason = f"infra_{gate.outcome}"
-                                await self._bus.emit(
-                                    type=EventType.attempt_failed,
-                                    project_id=project.id,
-                                    task_id=task.id,
-                                    payload={
-                                        "n": attempts, "stage": "gate", "reason": reason,
-                                        "exit_code": gate.exit_code,
-                                    },
-                                )
-                                failed = True
-                                break  # infra failure — don't feed to developer
-                        else:
-                            feedback = (
-                                f"TEST GATE is not green (exit {gate.exit_code}). "
-                                f"Fix the failing tests:\n{gate.output[-2000:]}"
-                            )
-                            await self._bus.emit(
-                                type=EventType.attempt_failed,
-                                project_id=project.id,
-                                task_id=task.id,
-                                payload={
-                                    "n": attempts, "stage": "gate", "exit_code": gate.exit_code,
-                                },
-                            )
-                            failed = True
-                            continue
+                                # Distinguish infra failures (timeout / missing command)
+                                # from real test/check failures. Infra problems get one
+                                # retry; if they persist the attempt is aborted — do NOT
+                                # feed toolchain noise to the developer as code feedback.
+                                if gate.outcome in ("timed_out", "missing_command"):
+                                    gate = await run_tests(
+                                        worktree, cmd, timeout_seconds=gate_timeout
+                                    )
+                                    if not gate.passed:
+                                        reason = f"infra_{gate.outcome}"
+                                        await self._bus.emit(
+                                            type=EventType.attempt_failed,
+                                            project_id=project.id,
+                                            task_id=task.id,
+                                            payload={
+                                                "n": attempts,
+                                                "stage": "gate",
+                                                "reason": reason,
+                                                "exit_code": gate.exit_code,
+                                            },
+                                        )
+                                        failed = True
+                                        gate_mark = "infra"
+                                        break
+                                else:
+                                    feedback = (
+                                        f"{label.upper()} GATE is not green "
+                                        f"(exit {gate.exit_code}). "
+                                        f"Fix the failing {label}:\n{gate.output[-2000:]}"
+                                    )
+                                    await self._bus.emit(
+                                        type=EventType.attempt_failed,
+                                        project_id=project.id,
+                                        task_id=task.id,
+                                        payload={
+                                            "n": attempts,
+                                            "stage": "gate",
+                                            "exit_code": gate.exit_code,
+                                        },
+                                    )
+                                    failed = True
+                                    gate_mark = "real"
+                                    break
+
+                        if gate_mark == "infra":
+                            break  # infra failure — abort the attempt
+                        elif gate_mark == "real":
+                            continue  # real failure — feed back and retry
 
                 break  # success
 
@@ -1123,6 +1151,20 @@ def _test_command(config: ConclaveConfig, knowledge: dict[str, Any] | None) -> s
     return None
 
 
+def _check_commands(knowledge: dict[str, Any] | None) -> list[str]:
+    if not knowledge:
+        return []
+    cmds = knowledge.get("commands")
+    if not isinstance(cmds, dict):
+        return []
+    result = []
+    for key in ("check", "lint"):
+        val = cmds.get(key)
+        if isinstance(val, str) and val.strip():
+            result.append(val.strip())
+    return result
+
+
 def _build_venv_guidance(
     worktree: Path, config: ConclaveConfig, knowledge: dict[str, Any] | None,
 ) -> str:
@@ -1130,10 +1172,12 @@ def _build_venv_guidance(
 
     Only injects guidance when ``.venv/`` actually exists in the worktree — i.e. the
     ``setup_command`` ran and provisioned it.  Derives the test command via
-    :func:`_test_command` and also picks up ``lint`` / ``check`` commands from repo
-    knowledge.  Produces ``.venv/bin/``-prefixed lines for each command so the guidance
-    reflects the real toolchain instead of hard-coded pytest/mypy/ruff.  When no commands
-    are known, emits a generic ``.venv/bin/`` hint.
+    :func:`_test_command` and picks up ``lint`` / ``check`` commands via
+    :func:`_check_commands` from repo knowledge.  The green-gate enforces ALL of these
+    commands (test + check + lint), not just the test command.  Produces
+    ``.venv/bin/``-prefixed lines for each command so the guidance reflects the real
+    toolchain instead of hard-coded pytest/mypy/ruff.  When no commands are known, emits
+    a generic ``.venv/bin/`` hint.
     """
     venv_path = worktree / ".venv"
     if not venv_path.is_dir():
@@ -1146,14 +1190,8 @@ def _build_venv_guidance(
     if test_cmd:
         commands.append(test_cmd.strip())
 
-    # Lint / check commands from repo knowledge (forward-compatible: keys may not exist).
-    if knowledge:
-        cmds = knowledge.get("commands")
-        if isinstance(cmds, dict):
-            for key in ("lint", "check"):
-                val = cmds.get(key)
-                if isinstance(val, str) and val.strip():
-                    commands.append(val.strip())
+    # Lint / check commands from repo knowledge.
+    commands.extend(_check_commands(knowledge))
 
     if not commands:
         return (

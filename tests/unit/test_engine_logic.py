@@ -174,6 +174,48 @@ def test_test_command_returns_none_when_neither() -> None:
     assert _test_command(config, {"commands": {}}) is None
 
 
+# --- _check_commands ---------------------------------------------------------
+
+
+def test_check_commands_returns_empty_when_no_knowledge() -> None:
+    from conclave.engine.orchestrator import _check_commands
+
+    assert _check_commands(None) == []
+    assert _check_commands({}) == []
+    assert _check_commands({"commands": {}}) == []
+
+
+def test_check_commands_extracts_check_and_lint() -> None:
+    from conclave.engine.orchestrator import _check_commands
+
+    knowledge = {"commands": {"check": "npx tsc --noEmit", "lint": "ruff check src tests"}}
+    result = _check_commands(knowledge)
+    assert result == ["npx tsc --noEmit", "ruff check src tests"]
+
+
+def test_check_commands_skips_test_key() -> None:
+    from conclave.engine.orchestrator import _check_commands
+
+    knowledge = {"commands": {"check": "npx tsc --noEmit", "test": "npm test"}}
+    result = _check_commands(knowledge)
+    assert result == ["npx tsc --noEmit"]
+
+
+def test_check_commands_ignores_empty_and_whitespace_strings() -> None:
+    from conclave.engine.orchestrator import _check_commands
+
+    knowledge = {"commands": {"check": "   ", "lint": "ruff check", "test": ""}}
+    result = _check_commands(knowledge)
+    assert result == ["ruff check"]
+
+
+def test_check_commands_returns_empty_when_commands_is_not_dict() -> None:
+    from conclave.engine.orchestrator import _check_commands
+
+    assert _check_commands({"commands": "not a dict"}) == []
+    assert _check_commands({"commands": 123}) == []
+
+
 # --- _build_venv_guidance ---------------------------------------------------
 
 
