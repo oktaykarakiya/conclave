@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import sys
 from pathlib import Path
+from typing import IO
 
 import uvicorn
 
@@ -20,6 +23,37 @@ def conclave_home() -> Path:
     return Path.home() / ".local" / "share" / "conclave"
 
 
+def acquire_daemon_lock(home: Path) -> IO[str]:
+    """Take an exclusive advisory lock on ``<home>/daemon.lock`` — or die loudly.
+
+    Exactly ONE daemon may run per data dir. Two daemons sharing one SQLite DB
+    means two ProjectWorkers claiming from the same queue: observed live as a
+    half-shut-down daemon (SIGTERM received, socket released, worker still
+    draining) racing a fresh daemon — crash recovery re-approved a task the old
+    worker was still running, both processed it, and the late finalizer
+    clobbered the winner's state. flock is released by the kernel on ANY
+    process exit (including SIGKILL), so a stale lockfile can never brick a
+    restart. The returned handle must stay referenced for the daemon's lifetime.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    lock_path = home / "daemon.lock"
+    handle = lock_path.open("w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        print(
+            f"[conclave] another daemon already holds {lock_path} — refusing to start.\n"
+            "[conclave] stop it first (or wait for its graceful shutdown to finish); "
+            "a second daemon on the same data dir would double-claim tasks.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 def make_provider() -> Provider:
     """Select the agent engine. opencode is the default; ``CONCLAVE_ENGINE=claude`` opts
     back into the legacy ``claude`` CLI."""
@@ -31,6 +65,8 @@ def make_provider() -> Provider:
 
 def cli() -> None:
     home = conclave_home()
+    # Held (referenced) for the whole process lifetime; kernel releases it on exit.
+    _lock = acquire_daemon_lock(home)
     db = Database(home / "conclave.db")
     daemon = Daemon(db, home, make_provider())
     app = create_app(daemon)
