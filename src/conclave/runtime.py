@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from .config import ConclaveConfig, load_project_config, resolve_bug_fixer_session
-from .db import Database, Project, ProjectMode
+from .db import Database, Project, ProjectMode, TaskState
 from .db import repositories as repo
 from .engine import BugFixerController, Orchestrator, SessionBudget, WorktreeManager
 from .events import EventBus
@@ -97,6 +97,26 @@ class ProjectWorker:
         self._orchestrator._cancel_events[task.id] = cancel_event
         try:
             await self._orchestrator.process_task(task, cancel_event=cancel_event)
+        except Exception:
+            # Backstop for the one-task-at-a-time invariant: process_task itself fails
+            # tasks on every known error path, but if an exception ever escapes it, the
+            # claimed task must NOT stay in_progress — a stranded in_progress row used to
+            # be silently left behind while the loop moved on and claimed the next task
+            # (two tasks "running" at once, one a zombie). Mark it failed (best-effort,
+            # idempotent when process_task already finalized) and keep the worker alive.
+            logger.exception("process_task escaped for task %s; marking failed", task.id)
+            with contextlib.suppress(Exception):
+                # Only finalize when the row is still in_progress — if process_task already
+                # reached a terminal state (e.g. done, then raised in a late best-effort
+                # step), overwriting it with failed would lie about the real outcome.
+                current = await repo.get_task(self._db, task.id)
+                if current is not None and current.state is TaskState.in_progress:
+                    await repo.finalize_task(
+                        self._db, task.id, state=TaskState.failed,
+                        result_summary="worker backstop: unhandled exception during "
+                        "processing (see daemon logs)",
+                        block_children=True,
+                    )
         finally:
             # Clean the event entry regardless of outcome — the orchestrator's
             # _finish_cancelled also cleans it, but this finally is the belt-and-suspenders

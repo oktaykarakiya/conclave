@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from conclave.config import ConclaveConfig
-from conclave.db import ProjectMode
+from conclave.db import ProjectMode, TaskState
 from conclave.engine import CycleOutcome, CycleResult
 from conclave.runtime import ProjectWorker
 
@@ -170,6 +170,63 @@ async def test_task_queue_tick_claims_and_processes() -> None:
     worker._orchestrator.process_task.assert_awaited_once()  # type: ignore[attr-defined]
     # The per-task cancel entry is registered and then cleaned (no leak).
     assert "task-9" not in worker._orchestrator._cancel_events
+
+
+async def test_task_queue_tick_fails_task_when_process_task_escapes() -> None:
+    """An exception escaping ``process_task`` must FAIL the claimed task, not strand it.
+
+    A stranded ``in_progress`` row used to sit there while the loop claimed the next
+    task — two tasks apparently running at once, one a zombie. The backstop finalizes
+    the claimed task as failed (only when it is still in_progress) and keeps the
+    worker alive.
+    """
+    worker = _make_worker()
+    task = SimpleNamespace(id="task-9")
+    worker._orchestrator.process_task = AsyncMock(side_effect=RuntimeError("boom"))
+    stranded = SimpleNamespace(id="task-9", state=TaskState.in_progress)
+
+    finalized: dict[str, object] = {}
+
+    async def fake_finalize(
+        _db: object, task_id: str, *, state: object, result_summary: str,
+        block_children: bool = False,
+    ) -> int:
+        finalized.update(task_id=task_id, state=state, block_children=block_children)
+        return 0
+
+    with (
+        patch("conclave.runtime.repo.claim_next_approved", new=AsyncMock(return_value=task)),
+        patch("conclave.runtime.repo.get_task", new=AsyncMock(return_value=stranded)),
+        patch("conclave.runtime.repo.finalize_task", new=fake_finalize),
+    ):
+        await worker._task_queue_tick()  # must not raise
+
+    assert finalized == {
+        "task_id": "task-9", "state": TaskState.failed, "block_children": True,
+    }
+    assert "task-9" not in worker._orchestrator._cancel_events
+
+
+async def test_task_queue_tick_backstop_respects_terminal_state() -> None:
+    """The backstop must NOT overwrite a task that already reached a terminal state.
+
+    If ``process_task`` finalized the task (e.g. done) and then raised in a late
+    best-effort step, re-finalizing as failed would lie about the real outcome.
+    """
+    worker = _make_worker()
+    task = SimpleNamespace(id="task-9")
+    worker._orchestrator.process_task = AsyncMock(side_effect=RuntimeError("boom"))
+    already_done = SimpleNamespace(id="task-9", state=TaskState.done)
+    finalize = AsyncMock(return_value=0)
+
+    with (
+        patch("conclave.runtime.repo.claim_next_approved", new=AsyncMock(return_value=task)),
+        patch("conclave.runtime.repo.get_task", new=AsyncMock(return_value=already_done)),
+        patch("conclave.runtime.repo.finalize_task", new=finalize),
+    ):
+        await worker._task_queue_tick()
+
+    finalize.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ from .memory import AttemptMemory
 from .pipeline import get_agent_pipeline
 from .runner import AgentRunner
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
-from .worktree import WorktreeError, WorktreeManager
+from .worktree import WorktreeManager
 
 # opencode reads AGENTS.md natively, so it leads the project-rule fallback list. CLAUDE.md
 # and CONCLAVE.md remain supported for repos that still carry them.
@@ -151,8 +151,14 @@ class Orchestrator:
 
         try:
             worktree = await wm.create(task.id, target_branch, task_branch)
-        except WorktreeError as exc:
-            return await self._fail_early(task, wm, task_branch, f"worktree setup failed: {exc}")
+        except Exception as exc:
+            # Broad on purpose: wm.create can surface more than WorktreeError (e.g. an
+            # OSError spawning git). Anything escaping here used to propagate past the
+            # worker's claim, stranding the task in_progress with no worktree and no
+            # failure event — the worker then claimed the NEXT task, breaking the
+            # one-task-at-a-time invariant. Fail the task properly instead.
+            logger.exception("worktree creation failed for task %s", task.id)
+            return await self._fail_early(task, wm, task_branch, f"worktree setup failed: {exc!r}")
 
         # Wrap the entire body after worktree creation so ANY unexpected exception
         # transitions the task to failed, cleans the worktree, and lets the worker

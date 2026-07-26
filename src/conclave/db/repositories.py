@@ -270,15 +270,27 @@ async def claim_next_approved(db: Database, project_id: str) -> Task | None:
     is never executed. The ``parent_task_id IS NULL`` branch is load-bearing: when no 'done'
     rows exist the inner subquery is empty and ``IN (<empty>)`` is false, which would otherwise
     stop parentless tasks from ever being claimed.
+
+    Single-flight invariant: at most ONE task per project may be ``in_progress``. The claim
+    refuses (returns None) while any in_progress row exists for the project — tasks in one
+    repo share files, so concurrent execution means merge conflicts and interleaved gates.
+    This also fails safe when a crash strands a row in_progress: the queue HALTS (until
+    recovery flips it back) instead of silently running two tasks at once.
     """
     # Still a single atomic UPDATE...RETURNING — the write lock only serializes its commit
     # against other writers so it cannot flush an open transaction() on the shared connection.
+    # The NOT EXISTS guard lives inside the same atomic statement, so two racing claimers
+    # can never both pass the check and claim.
     async with db._write() as conn:
         cur = await conn.execute(
             "UPDATE tasks SET state = 'in_progress', updated_at = ? "
             "WHERE id = ("
             "  SELECT t.id FROM tasks t "
             "  WHERE t.project_id = ? AND t.state = 'approved' "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM tasks r "
+            "    WHERE r.project_id = t.project_id AND r.state = 'in_progress'"
+            "  ) "
             "  AND ("
             "    t.parent_task_id IS NULL OR t.parent_task_id IN ("
             "      SELECT id FROM tasks WHERE state = 'done'"

@@ -275,6 +275,34 @@ async def test_task_lifecycle_claim_and_recover(db: Database) -> None:
     assert updated.plan == {"approach": "a"}
 
 
+async def test_claim_is_single_flight_per_project(db: Database) -> None:
+    """At most ONE task per project may be in_progress at a time.
+
+    Claims refuse while a task is in flight (including a crash-stranded row — failing
+    safe by halting beats silently running two tasks in one repo), resume once the
+    in-flight task reaches a terminal state, and never affect other projects.
+    """
+    p = await repo.create_project(db, name="sf", path="/tmp/sf", default_branch="main")
+    other = await repo.create_project(db, name="sf2", path="/tmp/sf2", default_branch="main")
+    t1 = await repo.create_task(db, project_id=p.id, request="one", state=TaskState.approved)
+    t2 = await repo.create_task(db, project_id=p.id, request="two", state=TaskState.approved)
+    ot = await repo.create_task(
+        db, project_id=other.id, request="other", state=TaskState.approved
+    )
+
+    claimed = await repo.claim_next_approved(db, p.id)
+    assert claimed is not None and claimed.id == t1.id
+    # Same project: refused while t1 is in flight.
+    assert await repo.claim_next_approved(db, p.id) is None
+    # A different project is unaffected by this project's in-flight task.
+    oc = await repo.claim_next_approved(db, other.id)
+    assert oc is not None and oc.id == ot.id
+    # A terminal state releases the slot and the next task claims in FIFO order.
+    await repo.set_task_state(db, t1.id, TaskState.done)
+    nxt = await repo.claim_next_approved(db, p.id)
+    assert nxt is not None and nxt.id == t2.id
+
+
 async def test_recover_reblocks_failed_parent_children(db: Database) -> None:
     """After recovery, a child of a failed parent must be blocked — not claimable.
 
@@ -323,13 +351,17 @@ async def test_recover_reblocks_failed_parent_children(db: Database) -> None:
     o = await repo.get_task(db, orphan.id)
     assert o is not None and o.state is TaskState.approved
 
-    # Verify claimability: only the healthy and orphan should be claimable.
+    # Verify claimability: only the healthy and orphan should be claimable — one at a
+    # time (single-flight: the second claim must wait until the first task finishes).
     claimed1 = await repo.claim_next_approved(db, p.id)
     assert claimed1 is not None and claimed1.id in (healthy.id, orphan.id)
+    assert await repo.claim_next_approved(db, p.id) is None  # first still in_progress
+    await repo.set_task_state(db, claimed1.id, TaskState.done)
     claimed2 = await repo.claim_next_approved(db, p.id)
     assert claimed2 is not None and claimed2.id in (healthy.id, orphan.id)
     assert claimed1.id != claimed2.id
-    # The blocked child is NOT claimable.
+    await repo.set_task_state(db, claimed2.id, TaskState.done)
+    # The blocked child is NOT claimable even with nothing in flight.
     assert await repo.claim_next_approved(db, p.id) is None
 
 
@@ -440,18 +472,26 @@ async def test_claim_enforces_parent_done_dependency(db: Database) -> None:
         db, project_id=p.id, request="sibling", state=TaskState.approved
     )
 
-    # Dependency ordering beats FIFO: the parent is still in_progress (not 'done'), so the older
-    # child is skipped and the younger parentless sibling is claimed instead.
+    # Single-flight: while the parent is in_progress NOTHING else is claimable — not even
+    # the parentless sibling. The parent must finish before the next claim goes through.
+    assert await repo.claim_next_approved(db, p.id) is None
+
+    # Parent fails (terminal, non-success): the slot frees up, but dependency ordering
+    # still beats FIFO — the older child of a non-'done' parent is skipped and the
+    # younger parentless sibling is claimed instead.
+    await repo.set_task_state(db, parent.id, TaskState.failed)
     nxt = await repo.claim_next_approved(db, p.id)
     assert nxt is not None
     assert nxt.id == sibling.id
     assert nxt.id != child.id
 
-    # Sibling is now in_progress too; the child is the only approved task left but stays
-    # unclaimable while the parent is not done → claim returns None.
+    # Sibling is in_progress; the child stays unclaimable (parent not 'done') and the
+    # single-flight guard holds → claim returns None.
     assert await repo.claim_next_approved(db, p.id) is None
 
-    # Parent reaches terminal success → the previously-skipped child is finally claimable.
+    # Sibling finishes and the parent reaches terminal success → the previously-skipped
+    # child is finally claimable.
+    await repo.set_task_state(db, sibling.id, TaskState.done)
     await repo.set_task_state(db, parent.id, TaskState.done)
     claimed_child = await repo.claim_next_approved(db, p.id)
     assert claimed_child is not None
