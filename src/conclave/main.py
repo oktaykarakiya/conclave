@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import sys
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import uvicorn
 
@@ -14,6 +13,14 @@ from .db import Database
 from .providers import ClaudeCliProvider, OpenCodeCliProvider, Provider
 from .runtime import Daemon
 from .web import create_app
+
+fcntl: Any = None
+try:
+    import fcntl as _fcntl
+
+    fcntl = _fcntl
+except ImportError:
+    pass
 
 
 def conclave_home() -> Path:
@@ -39,7 +46,15 @@ def acquire_daemon_lock(home: Path) -> IO[str]:
     lock_path = home / "daemon.lock"
     handle = lock_path.open("w")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise BlockingIOError from exc
     except BlockingIOError:
         handle.close()
         print(

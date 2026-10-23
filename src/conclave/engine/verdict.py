@@ -33,27 +33,44 @@ class ParsedVerdict(BaseModel):
     raw: str = ""
 
 
+def _build_parsed_verdict(data: dict[str, Any], raw_str: str) -> ParsedVerdict:
+    verdict = str(data.get("verdict", "unknown")).strip().lower()
+    if verdict not in _VALID:
+        verdict = "unknown"
+    evidence = data.get("evidence") or []
+    if not isinstance(evidence, list):
+        evidence = []
+    return ParsedVerdict(
+        verdict=verdict,
+        reason=str(data.get("reason", "")).strip(),
+        evidence=evidence,
+        source="json",
+        raw=raw_str,
+    )
+
+
 def parse_verdict(log_text: str) -> ParsedVerdict:
     """Extract a structured verdict from agent log output."""
     match = _JSON_BLOCK.search(log_text)
     if match:
         try:
             data = json.loads(match.group(1))
-            verdict = str(data.get("verdict", "unknown")).strip().lower()
-            if verdict not in _VALID:
-                verdict = "unknown"
-            evidence = data.get("evidence") or []
-            if not isinstance(evidence, list):
-                evidence = []
-            return ParsedVerdict(
-                verdict=verdict,
-                reason=str(data.get("reason", "")).strip(),
-                evidence=evidence,
-                source="json",
-                raw=match.group(0),
-            )
+            if isinstance(data, dict):
+                return _build_parsed_verdict(data, match.group(0))
         except (json.JSONDecodeError, ValueError):
             pass
+
+    if '"verdict"' in log_text.lower():
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(log_text):
+            if ch != "{":
+                continue
+            try:
+                obj, end = decoder.raw_decode(log_text[idx:])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(obj, dict) and "verdict" in obj:
+                return _build_parsed_verdict(obj, log_text[idx : idx + end])
 
     upper = log_text.upper()
     if "VERDICT: PASS" in upper:

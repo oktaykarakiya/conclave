@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -15,8 +16,10 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
 from ..bootstrap import seed_global_defaults
+from ..db import repositories as repo
 from ..runtime import Daemon
 from .api import router as api_router
+from .mcp_routes import router as mcp_router
 from .ws import router as ws_router
 
 # Maximum request body size (2 MiB) — DoS hardening (WEB-1).
@@ -199,6 +202,118 @@ async def _send_403_origin(send: _Send) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+async def _send_json(
+    send: _Send,
+    status: int,
+    payload: Any,
+    *,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    headers: list[tuple[bytes, bytes]] = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    if extra_headers:
+        headers.extend(extra_headers)
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": headers,
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+class _IdempotencyMiddleware:
+    """Persist and replay 2xx JSON responses for mutating requests carrying ``Idempotency-Key``."""
+
+    _METHODS = frozenset({"POST", "PUT", "PATCH"})
+    _MAX_KEY_LEN = 128
+
+    def __init__(self, app: _ASGIApp, daemon: Daemon) -> None:
+        self._app = app
+        self._daemon = daemon
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        method = str(scope.get("method", "GET")).upper()
+        if method not in self._METHODS:
+            await self._app(scope, receive, send)
+            return
+
+        key: str | None = None
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"idempotency-key":
+                key = value.decode("latin-1").strip()
+                break
+
+        if not key:
+            await self._app(scope, receive, send)
+            return
+
+        if len(key) > self._MAX_KEY_LEN:
+            await _send_json(
+                send,
+                400,
+                {"detail": "Idempotency-Key exceeds 128 characters"},
+            )
+            return
+
+        path = str(scope.get("path", ""))
+        existing = await repo.get_idempotency_record(self._daemon.db, key)
+        if existing is not None:
+            if existing.method != method or existing.path != path:
+                await _send_json(
+                    send,
+                    409,
+                    {
+                        "detail": (
+                            "Idempotency-Key already used with a different request method or path"
+                        )
+                    },
+                )
+                return
+            await _send_json(
+                send,
+                existing.status_code,
+                existing.response,
+                extra_headers=[(b"x-idempotency-replayed", b"true")],
+            )
+            return
+
+        status_code = 200
+        body_chunks = bytearray()
+
+        async def _capturing_send(message: dict[str, Any]) -> None:
+            nonlocal status_code
+            msg_type = message.get("type")
+            if msg_type == "http.response.start":
+                status_code = int(message.get("status", 200))
+                await send(message)
+                return
+            if msg_type == "http.response.body":
+                body_chunks.extend(message.get("body", b""))
+                if not message.get("more_body", False) and 200 <= status_code < 300 and body_chunks:
+                    with contextlib.suppress(Exception):
+                        parsed_body = json.loads(bytes(body_chunks).decode("utf-8"))
+                        await repo.save_idempotency_record(
+                            self._daemon.db,
+                            key=key,
+                            method=method,
+                            path=path,
+                            status_code=status_code,
+                            response=parsed_body,
+                        )
+                await send(message)
+                return
+            await send(message)
+
+        await self._app(scope, receive, _capturing_send)
+
+
 def create_app(daemon: Daemon, *, manage_lifecycle: bool = True) -> FastAPI:
     """Build the app. When ``manage_lifecycle`` is set, the app connects the DB, seeds
     defaults, and starts workers on startup (and tears down on shutdown). Tests that
@@ -218,7 +333,9 @@ def create_app(daemon: Daemon, *, manage_lifecycle: bool = True) -> FastAPI:
     app = FastAPI(title="Conclave", version=__version__, lifespan=lifespan)
     app.state.daemon = daemon
     app.include_router(api_router)
+    app.include_router(mcp_router)
     app.include_router(ws_router)
+    app.add_middleware(_IdempotencyMiddleware, daemon=daemon)
     app.add_middleware(_BodySizeLimitMiddleware, max_bytes=_MAX_BODY_BYTES)
     app.add_middleware(_OriginGuardMiddleware)
 

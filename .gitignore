@@ -19,6 +19,7 @@ build/
 *.db
 *.db-wal
 *.db-shm
+INTERACTION_LOGS.parquet
 
 # Node / frontend
 node_modules/

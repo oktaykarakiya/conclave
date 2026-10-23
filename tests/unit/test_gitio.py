@@ -27,7 +27,7 @@ async def test_run_shell_kills_process_group_on_timeout(
     pid_file = tmp_path / "child.pid"
     # Write the background child's pid to a file so we can check it after
     # the timeout (stdout is lost when communicate() is interrupted).
-    script = f"sleep 300 & echo $! > {pid_file}; wait"
+    script = f"sleep 300 & echo $! > {pid_file.as_posix()}; wait"
     exit_code, output = await run_shell(tmp_path, script, timeout_seconds=1)
     assert exit_code == 124, f"expected exit 124, got {exit_code}; output={output!r}"
     assert "timed out" in output
@@ -94,23 +94,28 @@ async def test_kill_process_group_sigterm_then_sigkill() -> None:
             if self._wait_count == 1:
                 await hang.wait()
 
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+
     # Patch os.killpg and os.kill so we can record which signals are sent
     # without actually killing anything.
     def _fake_killpg(pgid: int, sig: int) -> None:
         signals_sent.append(sig)
-        if sig == signal.SIGKILL:
+        if sig == sigkill and len(signals_sent) >= 2:
             hang.set()
 
     def _fake_kill(pid: int, sig: int) -> None:
         signals_sent.append(sig)
-        if sig == signal.SIGKILL:
+        if sig == sigkill and len(signals_sent) >= 2:
             hang.set()
 
-    with patch.object(os, "killpg", _fake_killpg), patch.object(os, "kill", _fake_kill):
+    with (
+        patch.object(os, "killpg", _fake_killpg, create=True),
+        patch.object(os, "kill", _fake_kill),
+    ):
         await _kill_process_group(_StubbornProc(), 10)  # type: ignore[arg-type]
 
     assert signal.SIGTERM in signals_sent, "SIGTERM must be sent first"
-    assert signal.SIGKILL in signals_sent, "SIGKILL must follow if process survives SIGTERM"
+    assert sigkill in signals_sent, "SIGKILL must follow if process survives SIGTERM"
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +129,7 @@ async def _wait_for_process_gone(pid: int, deadline_seconds: float = 3.0) -> Non
     while asyncio.get_event_loop().time() < deadline:
         try:
             os.kill(pid, 0)
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError, OSError, SystemError):
             return
         await asyncio.sleep(0.05)
     raise AssertionError(f"pid {pid} still alive after {deadline_seconds}s")

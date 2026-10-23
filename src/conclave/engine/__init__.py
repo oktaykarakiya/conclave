@@ -13,6 +13,12 @@ from .coverage_ingest import ingest_coverage
 from .discovery import discover_bug
 from .gate import GateResult, run_tests
 from .gitio import run_git, run_shell
+from .graph_executor import (
+    derive_planner_nodes,
+    derive_review_nodes,
+    is_parallel_review,
+    resolve_workflow,
+)
 from .hunter import HunterCandidate, parse_hunter_candidate
 from .memory import AttemptMemory
 from .orchestrator import Orchestrator
@@ -49,9 +55,12 @@ __all__ = [
     "build_baseline_preamble",
     "check_grounding",
     "collect_modified_or_deleted_tests",
+    "derive_planner_nodes",
+    "derive_review_nodes",
     "discover_bug",
     "get_agent_pipeline",
     "ingest_coverage",
+    "is_parallel_review",
     "is_test_path",
     "modified_or_deleted_tests",
     "parse_hunter_candidate",
@@ -60,6 +69,7 @@ __all__ = [
     "repro_pathguard",
     "reproduce_bug",
     "resolve_repro_test_path",
+    "resolve_workflow",
     "run_git",
     "run_shell",
     "run_tests",

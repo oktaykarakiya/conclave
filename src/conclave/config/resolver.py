@@ -27,14 +27,45 @@ PROTECTED_FLOOR_FILES = ("*.env", "*.env.*", ".env")
 PROTECTED_FLOOR_DIRS = (".git",)
 
 
+def _unquote_key(k: str) -> str:
+    cleaned = k.strip()
+    while len(cleaned) >= 2:
+        if (cleaned.startswith('"') and cleaned.endswith('"')) or (
+            cleaned.startswith("'") and cleaned.endswith("'")
+        ):
+            cleaned = cleaned[1:-1].strip()
+        elif (cleaned.startswith('\\"') and cleaned.endswith('\\"') and len(cleaned) >= 4) or (
+            cleaned.startswith("\\'") and cleaned.endswith("\\'") and len(cleaned) >= 4
+        ):
+            cleaned = cleaned[2:-2].strip()
+        else:
+            break
+    return cleaned or k
+
+
+def normalize_config_keys(value: Any) -> Any:
+    """Recursively strip accidental surrounding quotes from dictionary keys (e.g.
+    ``'"architect-as-planner"'`` -> ``'architect-as-planner'``)."""
+    if isinstance(value, dict):
+        return {
+            (_unquote_key(k) if isinstance(k, str) else k): normalize_config_keys(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [normalize_config_keys(item) for item in value]
+    return value
+
+
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge ``override`` onto ``base`` without mutating either.
 
     Dict values are merged key-by-key; every other type (including lists) is replaced
     wholesale by the override value.
     """
-    result: dict[str, Any] = dict(base)
-    for key, value in override.items():
+    norm_base = normalize_config_keys(base)
+    norm_override = normalize_config_keys(override)
+    result: dict[str, Any] = dict(norm_base)
+    for key, value in norm_override.items():
         existing = result.get(key)
         if isinstance(existing, dict) and isinstance(value, dict):
             result[key] = deep_merge(existing, value)
@@ -46,7 +77,8 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 def load_project_config(overrides: dict[str, Any] | None = None) -> ConclaveConfig:
     """Build a validated :class:`ConclaveConfig` from built-in defaults + project overrides."""
     base = ConclaveConfig().model_dump(mode="python")
-    merged = deep_merge(base, overrides) if overrides else base
+    norm_overrides = normalize_config_keys(overrides) if overrides else None
+    merged = deep_merge(base, norm_overrides) if norm_overrides else base
     return ConclaveConfig.model_validate(merged)
 
 
@@ -56,7 +88,9 @@ def resolve_agent(config: ConclaveConfig, agent: str) -> AgentSettings:
     ``agent_defaults`` provides the base; any ``agent_overrides[agent]`` keys win.
     """
     base = config.agent_defaults.model_dump(mode="python")
-    override = config.agent_overrides.get(agent, {})
+    clean_agent = _unquote_key(agent)
+    norm_overrides = normalize_config_keys(config.agent_overrides)
+    override = norm_overrides.get(clean_agent) or config.agent_overrides.get(agent, {})
     merged = deep_merge(base, dict(override)) if override else base
     return AgentSettings.model_validate(merged)
 

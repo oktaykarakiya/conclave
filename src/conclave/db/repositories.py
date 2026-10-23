@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import sqlite3
+import time
 from typing import Any
 
 import aiosqlite
@@ -20,16 +23,23 @@ from .models import (
     Baseline,
     BugCandidate,
     BugStatus,
+    CheckpointStatus,
     CoverageRegion,
     EventRow,
+    IdempotencyRecord,
     IllegalBugTransition,
+    InteractionLog,
     Project,
     ProjectMode,
     QuarantineEntry,
+    StoreItem,
+    StoreItemKind,
     Task,
+    TaskCheckpoint,
     TaskOrigin,
     TaskState,
     VerdictRow,
+    normalize_dict_keys,
 )
 from .planning_models import (
     PlanningMessage,
@@ -49,6 +59,7 @@ async def create_project(
 ) -> Project:
     pid = new_id()
     ts = now_iso()
+    norm_cfg = normalize_dict_keys(config or {})
     await db.execute(
         "INSERT INTO projects(id, name, path, default_branch, mode, config_json, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -58,7 +69,7 @@ async def create_project(
             path,
             default_branch,
             ProjectMode.task_queue.value,
-            json.dumps(config or {}),
+            json.dumps(norm_cfg),
             ts,
         ),
     )
@@ -70,6 +81,38 @@ async def create_project(
 async def get_project(db: Database, project_id: str) -> Project | None:
     row = await db.fetchone("SELECT * FROM projects WHERE id = ?", (project_id,))
     return Project.from_row(row) if row else None
+
+
+async def get_project_by_path(db: Database, path: str) -> Project | None:
+    row = await db.fetchone(
+        "SELECT * FROM projects WHERE path = ? ORDER BY created_at LIMIT 1", (path,)
+    )
+    return Project.from_row(row) if row else None
+
+
+async def update_project(
+    db: Database,
+    project_id: str,
+    *,
+    name: str | None = None,
+    default_branch: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> Project | None:
+    sets: list[str] = []
+    params: list[Any] = []
+    if name is not None:
+        sets.append("name = ?")
+        params.append(name)
+    if default_branch is not None:
+        sets.append("default_branch = ?")
+        params.append(default_branch)
+    if config is not None:
+        sets.append("config_json = ?")
+        params.append(json.dumps(normalize_dict_keys(config)))
+    if sets:
+        params.append(project_id)
+        await db.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", tuple(params))
+    return await get_project(db, project_id)
 
 
 async def list_projects(
@@ -86,7 +129,8 @@ async def list_projects(
 
 async def update_project_config(db: Database, project_id: str, config: dict[str, Any]) -> None:
     await db.execute(
-        "UPDATE projects SET config_json = ? WHERE id = ?", (json.dumps(config), project_id)
+        "UPDATE projects SET config_json = ? WHERE id = ?",
+        (json.dumps(normalize_dict_keys(config)), project_id),
     )
 
 
@@ -112,21 +156,33 @@ async def create_task(
     state: TaskState = TaskState.inbox,
     origin: TaskOrigin = TaskOrigin.operator,
     parent_task_id: str | None = None,
+    swarm_id: str | None = None,
+    source_branch: str | None = None,
 ) -> Task:
     tid = new_id()
     ts = now_iso()
     up = None if use_planner is None else int(use_planner)
+    norm_source = source_branch.strip() if source_branch and source_branch.strip() else None
     await db.execute(
         "INSERT INTO tasks(id, project_id, title, request, level, state, use_planner, origin, "
-        "parent_task_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "parent_task_id, swarm_id, source_branch, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             tid, project_id, title, request, level, state.value, up, origin.value,
-            parent_task_id, ts, ts,
+            parent_task_id, swarm_id, norm_source, ts, ts,
         ),
     )
     task = await get_task(db, tid)
     assert task is not None
     return task
+
+
+async def list_swarm_tasks(db: Database, project_id: str, swarm_id: str) -> list[Task]:
+    rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE project_id = ? AND swarm_id = ? ORDER BY created_at ASC",
+        (project_id, swarm_id),
+    )
+    return [Task.from_row(r) for r in rows]
 
 
 async def get_task(db: Database, task_id: str) -> Task | None:
@@ -183,9 +239,9 @@ async def set_task_state(db: Database, task_id: str, state: TaskState) -> None:
 async def delete_task(db: Database, task_id: str) -> bool:
     """Atomically delete a task and its orphaned child rows.
 
-    ``attempts`` and ``verdicts`` auto-cascade via ``ON DELETE CASCADE`` FK.
-    ``events`` and ``usage`` have no FK — they are deleted explicitly inside
-    the same transaction so nothing is left dangling.
+    ``attempts``, ``verdicts``, and ``task_checkpoints`` auto-cascade via
+    ``ON DELETE CASCADE`` FK. ``events`` and ``usage`` have no FK — they are
+    deleted explicitly inside the same transaction so nothing is left dangling.
 
     The ``WHERE state != 'in_progress'`` guard is defense-in-depth against a
     TOCTOU between the API-layer check and this delete: if the task was claimed
@@ -198,7 +254,7 @@ async def delete_task(db: Database, task_id: str) -> bool:
         # Remove orphan-prone child rows first — events and usage lack FK cascades.
         await conn.execute("DELETE FROM events WHERE task_id = ?", (task_id,))
         await conn.execute("DELETE FROM usage WHERE task_id = ?", (task_id,))
-        # Delete the task; attempts + verdicts cascade via FK.
+        # Delete the task; attempts, verdicts, and task_checkpoints cascade via FK.
         cur = await conn.execute(
             "DELETE FROM tasks WHERE id = ? AND state != 'in_progress'",
             (task_id,),
@@ -219,7 +275,7 @@ async def approve_task(db: Database, task_id: str) -> bool:
     async with db._write() as conn:
         cur = await conn.execute(
             "UPDATE tasks SET state = ?, updated_at = ? "
-            "WHERE id = ? AND state IN ('inbox', 'failed')",
+            "WHERE id = ? AND state IN ('inbox', 'failed', 'waiting_for_approval')",
             (TaskState.approved.value, now_iso(), task_id),
         )
         return cur.rowcount > 0
@@ -233,6 +289,7 @@ async def update_task_fields(
     level: int | None = None,
     plan: dict[str, Any] | None = None,
     branch: str | None = None,
+    source_branch: str | None = None,
     result_summary: str | None = None,
 ) -> None:
     sets: list[str] = []
@@ -249,6 +306,9 @@ async def update_task_fields(
     if branch is not None:
         sets.append("branch = ?")
         params.append(branch)
+    if source_branch is not None:
+        sets.append("source_branch = ?")
+        params.append(source_branch)
     if result_summary is not None:
         sets.append("result_summary = ?")
         params.append(result_summary)
@@ -260,7 +320,9 @@ async def update_task_fields(
     await db.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", tuple(params))
 
 
-async def claim_next_approved(db: Database, project_id: str) -> Task | None:
+async def claim_next_approved(
+    db: Database, project_id: str, *, max_parallel: int = 1
+) -> Task | None:
     """Atomically pick the oldest claimable ``approved`` task and mark it ``in_progress``.
 
     Claimability model: a task is claimable iff it has no parent OR its parent has completed
@@ -271,26 +333,21 @@ async def claim_next_approved(db: Database, project_id: str) -> Task | None:
     rows exist the inner subquery is empty and ``IN (<empty>)`` is false, which would otherwise
     stop parentless tasks from ever being claimed.
 
-    Single-flight invariant: at most ONE task per project may be ``in_progress``. The claim
-    refuses (returns None) while any in_progress row exists for the project — tasks in one
-    repo share files, so concurrent execution means merge conflicts and interleaved gates.
-    This also fails safe when a crash strands a row in_progress: the queue HALTS (until
-    recovery flips it back) instead of silently running two tasks at once.
+    Concurrency invariant: at most ``max_parallel`` tasks per project may be ``in_progress``
+    simultaneously (default ``1`` enforces single-flight execution; ``> 1`` enables Swarm
+    parallelism across dedicated isolated worktrees).
     """
-    # Still a single atomic UPDATE...RETURNING — the write lock only serializes its commit
-    # against other writers so it cannot flush an open transaction() on the shared connection.
-    # The NOT EXISTS guard lives inside the same atomic statement, so two racing claimers
-    # can never both pass the check and claim.
+    cap = max(1, int(max_parallel))
     async with db._write() as conn:
         cur = await conn.execute(
             "UPDATE tasks SET state = 'in_progress', updated_at = ? "
             "WHERE id = ("
             "  SELECT t.id FROM tasks t "
             "  WHERE t.project_id = ? AND t.state = 'approved' "
-            "  AND NOT EXISTS ("
-            "    SELECT 1 FROM tasks r "
+            "  AND ("
+            "    SELECT COUNT(*) FROM tasks r "
             "    WHERE r.project_id = t.project_id AND r.state = 'in_progress'"
-            "  ) "
+            "  ) < ? "
             "  AND ("
             "    t.parent_task_id IS NULL OR t.parent_task_id IN ("
             "      SELECT id FROM tasks WHERE state = 'done'"
@@ -298,7 +355,7 @@ async def claim_next_approved(db: Database, project_id: str) -> Task | None:
             "  )"
             "  ORDER BY t.created_at LIMIT 1"
             ") RETURNING *",
-            (now_iso(), project_id),
+            (now_iso(), project_id, cap),
         )
         row = await cur.fetchone()
     return Task.from_row(row) if row else None
@@ -402,8 +459,9 @@ async def get_in_progress_tasks(db: Database, project_id: str) -> list[Task]:
 
 
 async def recover_in_progress(db: Database, project_id: str) -> tuple[int, int]:
-    """Reset orphaned ``in_progress`` tasks to ``approved`` and re-block descendants
-    of ``failed``/``blocked`` parents (crash recovery).
+    """Reset orphaned ``in_progress`` tasks to ``approved``, reset ``fixing`` bug
+    candidates back to ``reproduced``, and re-block descendants of ``failed``/``blocked``
+    parents (crash recovery).
 
     Returns ``(recovered, reblocked)`` where *recovered* is the count of ``in_progress``
     tasks reset to ``approved`` and *reblocked* is the count of descendant tasks that
@@ -415,12 +473,19 @@ async def recover_in_progress(db: Database, project_id: str) -> tuple[int, int]:
     recovered = 0
     reblocked = 0
     async with db.transaction() as conn:
+        ts = now_iso()
         cur = await conn.execute(
             "UPDATE tasks SET state = 'approved', updated_at = ? "
             "WHERE project_id = ? AND state = 'in_progress'",
-            (now_iso(), project_id),
+            (ts, project_id),
         )
         recovered = cur.rowcount
+
+        await conn.execute(
+            "UPDATE bug_candidates SET status = 'reproduced', last_examined_at = ? "
+            "WHERE project_id = ? AND status = 'fixing'",
+            (ts, project_id),
+        )
 
         # Re-block descendants of every task currently in failed/blocked state so a
         # crash that strands a parent in failed/blocked with children in approved can
@@ -781,6 +846,18 @@ async def list_agents(
             (project_id,),
         )
     return [AgentPersona.from_row(r) for r in rows]
+
+
+async def delete_agent(
+    db: Database, name: str, project_id: str | None = None
+) -> bool:
+    scope = project_id or ""
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "DELETE FROM agents WHERE IFNULL(project_id, '') = ? AND name = ?",
+            (scope, name),
+        )
+        return cur.rowcount > 0
 
 
 # --- planning sessions --------------------------------------------------------
@@ -1335,4 +1412,484 @@ async def list_coverage_regions(db: Database, project_id: str) -> list[CoverageR
         "ORDER BY last_examined_at ASC, priority DESC, region ASC",
         (project_id,),
     )
-    return [CoverageRegion.from_row(row) for row in rows]
+    return [CoverageRegion.from_row(r) for r in rows]
+
+
+# --- task checkpoints -------------------------------------------------------
+
+
+async def save_task_checkpoint(
+    db: Database,
+    *,
+    task_id: str,
+    node_id: str,
+    attempt: int = 1,
+    status: CheckpointStatus = CheckpointStatus.completed,
+    git_tree_sha: str | None = None,
+    artifact: dict[str, Any] | None = None,
+) -> TaskCheckpoint:
+    ts = now_iso()
+    payload = artifact or {}
+    await db.execute(
+        "INSERT OR REPLACE INTO task_checkpoints("
+        "task_id, node_id, attempt, status, git_tree_sha, artifact_json, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, node_id, attempt, status.value, git_tree_sha, json.dumps(payload), ts),
+    )
+    return TaskCheckpoint(
+        task_id=task_id,
+        node_id=node_id,
+        attempt=attempt,
+        status=status,
+        git_tree_sha=git_tree_sha,
+        artifact=payload,
+        updated_at=ts,
+    )
+
+
+async def list_task_checkpoints(
+    db: Database, task_id: str, attempt: int | None = None
+) -> list[TaskCheckpoint]:
+    if attempt is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM task_checkpoints WHERE task_id = ? AND attempt = ? "
+            "ORDER BY attempt ASC, updated_at ASC",
+            (task_id, attempt),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM task_checkpoints WHERE task_id = ? "
+            "ORDER BY attempt ASC, updated_at ASC",
+            (task_id,),
+        )
+    return [TaskCheckpoint.from_row(r) for r in rows]
+
+
+async def get_task_checkpoint(
+    db: Database, task_id: str, node_id: str, attempt: int = 1
+) -> TaskCheckpoint | None:
+    row = await db.fetchone(
+        "SELECT * FROM task_checkpoints WHERE task_id = ? AND node_id = ? AND attempt = ?",
+        (task_id, node_id, attempt),
+    )
+    return TaskCheckpoint.from_row(row) if row else None
+
+
+async def clear_task_checkpoints(
+    db: Database, task_id: str, *, after_attempt: int | None = None
+) -> None:
+    if after_attempt is None:
+        await db.execute("DELETE FROM task_checkpoints WHERE task_id = ?", (task_id,))
+    else:
+        await db.execute(
+            "DELETE FROM task_checkpoints WHERE task_id = ? AND attempt >= ?",
+            (task_id, after_attempt),
+        )
+
+
+# --- idempotency keys -------------------------------------------------------
+
+
+async def get_idempotency_record(db: Database, key: str) -> IdempotencyRecord | None:
+    row = await db.fetchone("SELECT * FROM idempotency_keys WHERE key = ?", (key,))
+    return IdempotencyRecord.from_row(row) if row else None
+
+
+async def save_idempotency_record(
+    db: Database,
+    *,
+    key: str,
+    method: str,
+    path: str,
+    status_code: int,
+    response: Any,
+) -> IdempotencyRecord:
+    ts = now_iso()
+    async with db.transaction() as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO idempotency_keys("
+            "key, method, path, status_code, response_json, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (key, method, path, status_code, json.dumps(response), ts),
+        )
+        await conn.execute(
+            "DELETE FROM idempotency_keys WHERE key NOT IN ("
+            "SELECT key FROM idempotency_keys ORDER BY created_at DESC LIMIT 1000"
+            ")"
+        )
+    return IdempotencyRecord(
+        key=key,
+        method=method,
+        path=path,
+        status_code=status_code,
+        response=response,
+        created_at=ts,
+    )
+
+
+# --- global store items (Workflows, Agents, Config Presets) -----------------
+
+
+async def upsert_store_item(
+    db: Database,
+    *,
+    kind: StoreItemKind,
+    name: str,
+    description: str = "",
+    tags: list[str] | None = None,
+    payload: dict[str, Any],
+    built_in: bool = False,
+) -> StoreItem:
+    ts = now_iso()
+    norm_payload = normalize_dict_keys(payload)
+    existing = await db.fetchone(
+        "SELECT id, created_at FROM store_items WHERE kind = ? AND name = ?",
+        (kind.value, name),
+    )
+    if existing is not None:
+        sid = str(existing["id"])
+        await db.execute(
+            "UPDATE store_items SET description = ?, tags_json = ?, payload_json = ?, "
+            "built_in = ?, updated_at = ? WHERE id = ?",
+            (
+                description,
+                json.dumps(tags or []),
+                json.dumps(norm_payload),
+                int(built_in),
+                ts,
+                sid,
+            ),
+        )
+    else:
+        sid = new_id()
+        await db.execute(
+            "INSERT INTO store_items("
+            "id, kind, name, description, tags_json, payload_json, built_in, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sid,
+                kind.value,
+                name,
+                description,
+                json.dumps(tags or []),
+                json.dumps(norm_payload),
+                int(built_in),
+                ts,
+                ts,
+            ),
+        )
+    row = await db.fetchone("SELECT * FROM store_items WHERE id = ?", (sid,))
+    assert row is not None
+    return StoreItem.from_row(row)
+
+
+async def get_store_item(db: Database, item_id: str) -> StoreItem | None:
+    row = await db.fetchone("SELECT * FROM store_items WHERE id = ?", (item_id,))
+    return StoreItem.from_row(row) if row else None
+
+
+async def get_store_item_by_name(
+    db: Database, kind: StoreItemKind, name: str
+) -> StoreItem | None:
+    row = await db.fetchone(
+        "SELECT * FROM store_items WHERE kind = ? AND name = ?",
+        (kind.value, name),
+    )
+    return StoreItem.from_row(row) if row else None
+
+
+async def list_store_items(
+    db: Database,
+    *,
+    kind: StoreItemKind | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[StoreItem]:
+    if kind is not None:
+        rows = await db.fetchall(
+            "SELECT * FROM store_items WHERE kind = ? "
+            "ORDER BY built_in DESC, name ASC LIMIT ? OFFSET ?",
+            (kind.value, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM store_items "
+            "ORDER BY kind ASC, built_in DESC, name ASC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+    return [StoreItem.from_row(r) for r in rows]
+
+
+async def delete_store_item(db: Database, item_id: str) -> bool:
+    async with db._write() as conn:
+        cur = await conn.execute("DELETE FROM store_items WHERE id = ?", (item_id,))
+        return bool(cur.rowcount > 0)
+
+
+# --- interaction logs (agent / opencode session ledger) ---------------------
+
+_FORBIDDEN_SQL_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|PRAGMA|VACUUM|REPLACE)\b",
+    re.IGNORECASE,
+)
+_ALLOWED_START_RE = re.compile(r"^(SELECT|WITH)\b", re.IGNORECASE)
+
+
+async def record_interaction_log(
+    db: Database,
+    *,
+    session_id: str | None = None,
+    title: str = "",
+    directory: str = "",
+    path: str = "",
+    slug: str = "",
+    model: str = "",
+    agent: str = "",
+    cost: float = 0.0,
+    tokens_input: int = 0,
+    tokens_output: int = 0,
+    tokens_reasoning: int = 0,
+    tokens_cache_read: int = 0,
+    tokens_cache_write: int = 0,
+    time_created: int | None = None,
+    time_updated: int | None = None,
+    created_at_str: str | None = None,
+    updated_at_str: str | None = None,
+    duration: float = 0.0,
+    tool_calls_count: int = 0,
+    message_count: int = 0,
+    user_prompt: str = "",
+    tool_breakdown: dict[str, int] | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    project_id: str | None = None,
+    task_id: str | None = None,
+    node_id: str | None = None,
+    source: str = "conclave",
+) -> InteractionLog:
+    sid = session_id or new_id()
+    now_ms = int(time.time() * 1000)
+    ts_created = time_created if time_created is not None else now_ms
+    ts_updated = time_updated if time_updated is not None else ts_created
+    iso = now_iso()
+    c_str = created_at_str if created_at_str is not None else iso
+    u_str = updated_at_str if updated_at_str is not None else c_str
+    breakdown_payload = tool_breakdown or {}
+    messages_payload = messages or []
+    await db.execute(
+        "INSERT OR REPLACE INTO interaction_logs("
+        "session_id, title, directory, path, slug, model, agent, cost, "
+        "tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, "
+        "time_created, time_updated, created_at_str, updated_at_str, duration, "
+        "tool_calls_count, message_count, user_prompt, tool_breakdown, messages, "
+        "project_id, task_id, node_id, source"
+        ") VALUES ("
+        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        ")",
+        (
+            sid,
+            title,
+            directory,
+            path,
+            slug,
+            model,
+            agent,
+            cost,
+            tokens_input,
+            tokens_output,
+            tokens_reasoning,
+            tokens_cache_read,
+            tokens_cache_write,
+            ts_created,
+            ts_updated,
+            c_str,
+            u_str,
+            duration,
+            tool_calls_count,
+            message_count,
+            user_prompt,
+            json.dumps(breakdown_payload),
+            json.dumps(messages_payload),
+            project_id,
+            task_id,
+            node_id,
+            source,
+        ),
+    )
+    row = await get_interaction_log(db, sid)
+    assert row is not None
+    return row
+
+
+async def get_interaction_log(db: Database, session_id: str) -> InteractionLog | None:
+    row = await db.fetchone(
+        "SELECT * FROM interaction_logs WHERE session_id = ?", (session_id,)
+    )
+    return InteractionLog.from_row(row) if row else None
+
+
+async def list_interaction_logs(
+    db: Database,
+    *,
+    project_id: str | None = None,
+    task_id: str | None = None,
+    agent: str | None = None,
+    model: str | None = None,
+    search: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[InteractionLog]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project_id is not None:
+        clauses.append("project_id = ?")
+        params.append(project_id)
+    if task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if agent is not None:
+        clauses.append("agent = ?")
+        params.append(agent)
+    if model is not None:
+        clauses.append("model = ?")
+        params.append(model)
+    if search is not None and search.strip():
+        pattern = f"%{search.strip()}%"
+        clauses.append(
+            "(title LIKE ? OR user_prompt LIKE ? OR session_id LIKE ? "
+            "OR slug LIKE ? OR agent LIKE ? OR model LIKE ? OR messages LIKE ?)"
+        )
+        params.extend([pattern] * 7)
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+    params.extend([limit, offset])
+    rows = await db.fetchall(
+        f"SELECT * FROM interaction_logs {where}"
+        "ORDER BY time_updated DESC, session_id DESC LIMIT ? OFFSET ?",
+        tuple(params),
+    )
+    return [InteractionLog.from_row(r) for r in rows]
+
+
+async def interaction_stats(
+    db: Database, *, project_id: str | None = None
+) -> dict[str, Any]:
+    where = "WHERE project_id = ?" if project_id is not None else ""
+    params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
+    row = await db.fetchone(
+        "SELECT "
+        "COUNT(*) AS total_sessions, "
+        "COALESCE(SUM(cost), 0.0) AS total_cost, "
+        "COALESCE(SUM(tokens_input), 0) AS total_input_tokens, "
+        "COALESCE(SUM(tokens_output), 0) AS total_output_tokens, "
+        "COALESCE(SUM(tokens_reasoning), 0) AS total_reasoning_tokens, "
+        "COALESCE(SUM(tokens_cache_read), 0) AS total_cache_read_tokens, "
+        "COALESCE(SUM(tokens_cache_write), 0) AS total_cache_write_tokens, "
+        "COALESCE(SUM(tool_calls_count), 0) AS total_tool_calls, "
+        "COALESCE(SUM(message_count), 0) AS total_messages, "
+        "COALESCE(AVG(duration), 0.0) AS avg_duration "
+        f"FROM interaction_logs {where}",
+        params,
+    )
+    assert row is not None
+
+    model_where = (
+        "WHERE project_id = ? AND model != ''"
+        if project_id is not None
+        else "WHERE model != ''"
+    )
+    model_rows = await db.fetchall(
+        "SELECT model, COUNT(*) AS count, COALESCE(SUM(cost), 0.0) AS cost, "
+        "COALESCE(SUM(tokens_input), 0) AS tokens_input, "
+        "COALESCE(SUM(tokens_output), 0) AS tokens_output "
+        f"FROM interaction_logs {model_where} "
+        "GROUP BY model ORDER BY count DESC, model ASC",
+        params,
+    )
+    models: list[dict[str, Any]] = [
+        {
+            "model": str(r["model"]),
+            "count": int(r["count"]),
+            "sessions": int(r["count"]),
+            "cost": float(r["cost"]),
+            "tokens_input": int(r["tokens_input"]),
+            "tokens_output": int(r["tokens_output"]),
+        }
+        for r in model_rows
+    ]
+
+    agent_where = (
+        "WHERE project_id = ? AND agent != ''"
+        if project_id is not None
+        else "WHERE agent != ''"
+    )
+    agent_rows = await db.fetchall(
+        "SELECT agent, COUNT(*) AS count, COALESCE(SUM(cost), 0.0) AS cost, "
+        "COALESCE(SUM(tokens_input), 0) AS tokens_input, "
+        "COALESCE(SUM(tokens_output), 0) AS tokens_output, "
+        "COALESCE(SUM(tool_calls_count), 0) AS tool_calls "
+        f"FROM interaction_logs {agent_where} "
+        "GROUP BY agent ORDER BY count DESC, agent ASC",
+        params,
+    )
+    agents: list[dict[str, Any]] = [
+        {
+            "agent": str(r["agent"]),
+            "count": int(r["count"]),
+            "sessions": int(r["count"]),
+            "cost": float(r["cost"]),
+            "tokens_input": int(r["tokens_input"]),
+            "tokens_output": int(r["tokens_output"]),
+            "tool_calls": int(r["tool_calls"]),
+        }
+        for r in agent_rows
+    ]
+
+    return {
+        "total_sessions": int(row["total_sessions"]),
+        "total_cost": float(row["total_cost"]),
+        "total_input_tokens": int(row["total_input_tokens"]),
+        "total_output_tokens": int(row["total_output_tokens"]),
+        "total_reasoning_tokens": int(row["total_reasoning_tokens"]),
+        "total_cache_read_tokens": int(row["total_cache_read_tokens"]),
+        "total_cache_write_tokens": int(row["total_cache_write_tokens"]),
+        "total_tool_calls": int(row["total_tool_calls"]),
+        "total_messages": int(row["total_messages"]),
+        "avg_duration": float(row["avg_duration"]),
+        "models": models,
+        "agents": agents,
+    }
+
+
+async def query_interaction_logs_readonly(
+    db: Database, sql: str, limit: int = 200
+) -> dict[str, Any]:
+    cleaned = sql.strip()
+    if not cleaned:
+        raise ValueError("SQL query must not be empty")
+    if ";" in cleaned:
+        raise ValueError("Multiple statements (';') are not allowed in read-only queries")
+    if not _ALLOWED_START_RE.match(cleaned):
+        raise ValueError("Read-only query must start with SELECT or WITH")
+    forbidden = _FORBIDDEN_SQL_RE.search(cleaned)
+    if forbidden is not None:
+        raise ValueError(
+            f"Forbidden SQL keyword in read-only query: {forbidden.group(1).upper()}"
+        )
+
+    effective_limit = max(1, int(limit))
+    try:
+        cur = await db.conn.execute(cleaned)
+        try:
+            columns = [str(col[0]) for col in (cur.description or [])]
+            raw_rows = await cur.fetchmany(effective_limit)
+        finally:
+            await cur.close()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Invalid SQL query: {exc}") from exc
+
+    rows = [dict(zip(columns, tuple(r), strict=False)) for r in raw_rows]
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+    }
+

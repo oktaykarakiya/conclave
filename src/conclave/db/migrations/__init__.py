@@ -313,6 +313,88 @@ ALTER TABLE coverage ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE coverage ADD COLUMN examined_count INTEGER NOT NULL DEFAULT 0;
 """
 
+_SQL_009 = """
+CREATE TABLE task_checkpoints (
+  task_id       TEXT NOT NULL,
+  node_id       TEXT NOT NULL,
+  attempt       INTEGER NOT NULL DEFAULT 1,
+  status        TEXT NOT NULL DEFAULT 'completed',
+  git_tree_sha  TEXT,
+  artifact_json TEXT NOT NULL DEFAULT '{}',
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY(task_id, node_id, attempt),
+  FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_task_checkpoints_task ON task_checkpoints(task_id, attempt);
+
+CREATE TABLE idempotency_keys (
+  key           TEXT PRIMARY KEY,
+  method        TEXT NOT NULL,
+  path          TEXT NOT NULL,
+  status_code   INTEGER NOT NULL,
+  response_json TEXT NOT NULL DEFAULT '{}',
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
+"""
+
+_SQL_010 = """
+CREATE TABLE store_items (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  description  TEXT NOT NULL DEFAULT '',
+  tags_json    TEXT NOT NULL DEFAULT '[]',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  built_in     INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_store_items_kind_name ON store_items(kind, name);
+
+ALTER TABLE tasks ADD COLUMN swarm_id TEXT;
+CREATE INDEX idx_tasks_swarm ON tasks(project_id, swarm_id);
+"""
+
+_SQL_011 = """
+CREATE TABLE interaction_logs (
+  session_id         TEXT PRIMARY KEY,
+  title              TEXT NOT NULL DEFAULT '',
+  directory          TEXT NOT NULL DEFAULT '',
+  path               TEXT NOT NULL DEFAULT '',
+  slug               TEXT NOT NULL DEFAULT '',
+  model              TEXT NOT NULL DEFAULT '',
+  agent              TEXT NOT NULL DEFAULT '',
+  cost               REAL NOT NULL DEFAULT 0.0,
+  tokens_input       INTEGER NOT NULL DEFAULT 0,
+  tokens_output      INTEGER NOT NULL DEFAULT 0,
+  tokens_reasoning   INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+  time_created       INTEGER NOT NULL DEFAULT 0,
+  time_updated       INTEGER NOT NULL DEFAULT 0,
+  created_at_str     TEXT NOT NULL DEFAULT '',
+  updated_at_str     TEXT NOT NULL DEFAULT '',
+  duration           REAL NOT NULL DEFAULT 0.0,
+  tool_calls_count   INTEGER NOT NULL DEFAULT 0,
+  message_count      INTEGER NOT NULL DEFAULT 0,
+  user_prompt        TEXT NOT NULL DEFAULT '',
+  tool_breakdown     TEXT NOT NULL DEFAULT '{}',
+  messages           TEXT NOT NULL DEFAULT '[]',
+  project_id         TEXT,
+  task_id            TEXT,
+  node_id            TEXT,
+  source             TEXT NOT NULL DEFAULT 'conclave'
+);
+CREATE INDEX idx_interaction_logs_time ON interaction_logs(time_updated DESC);
+CREATE INDEX idx_interaction_logs_project ON interaction_logs(project_id, time_updated DESC);
+CREATE INDEX idx_interaction_logs_agent ON interaction_logs(agent, time_updated DESC);
+"""
+
+_SQL_012 = """
+ALTER TABLE tasks ADD COLUMN source_branch TEXT;
+"""
+
 MIGRATIONS: list[Migration] = [
     Migration(version=1, name="initial_schema", sql=_SQL_001),
     Migration(version=2, name="add_ai_enriched_to_repo_knowledge", sql=_SQL_002),
@@ -322,4 +404,8 @@ MIGRATIONS: list[Migration] = [
     Migration(version=6, name="add_task_usage_indexes", sql=_SQL_006),
     Migration(version=7, name="add_stabilization_reason_to_planning_sessions", sql=_SQL_007),
     Migration(version=8, name="bug_candidate_ledger_7_state_machine", sql=_SQL_008),
+    Migration(version=9, name="workflow_checkpoints_and_idempotency", sql=_SQL_009),
+    Migration(version=10, name="store_and_swarms", sql=_SQL_010),
+    Migration(version=11, name="interaction_logs_ledger", sql=_SQL_011),
+    Migration(version=12, name="add_source_branch_to_tasks", sql=_SQL_012),
 ]

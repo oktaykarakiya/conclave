@@ -12,6 +12,7 @@ from conclave.db import (
     BUG_STATUS_TRANSITIONS,
     BugCandidate,
     BugStatus,
+    CheckpointStatus,
     CoverageRegion,
     Database,
     IllegalBugTransition,
@@ -87,10 +88,10 @@ async def _seed_candidate(
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 8
+    assert version == 12
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 8
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 12
 
 
 async def test_migration_failure_is_atomic(
@@ -101,12 +102,12 @@ async def test_migration_failure_is_atomic(
 
     Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
     replays the same migration and wedges on a duplicate-column error. The fixture DB is
-    already at version 8; we inject a v9 migration whose first statement succeeds (creates
+    already at version 12; we inject a v13 migration whose first statement succeeds (creates
     a probe table) and whose second fails — ``stabilization_reason`` was already added by
     migration 7, so re-adding it raises a duplicate-column error — which is exactly that wedge.
     """
     failing = Migration(
-        version=9,
+        version=13,
         name="injected_failure",
         sql=(
             "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
@@ -119,7 +120,7 @@ async def test_migration_failure_is_atomic(
         await db._apply_migrations()
 
     # Version did not advance past the last good migration...
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 8
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 12
     # ...and the partial DDL (the probe table from the first statement) was rolled back.
     assert (
         await db.fetchval(
@@ -132,12 +133,12 @@ async def test_migration_failure_is_atomic(
 async def test_migration_8_bug_candidate_ledger_schema(db: Database) -> None:
     """Migration 8 reshapes bug_candidates into the 7-state ledger and extends coverage.
 
-    A fresh DB is at version 8. The old two-field status model (status DEFAULT 'candidate'
+    A fresh DB is at version 12. The old two-field status model (status DEFAULT 'candidate'
     plus a separate ``reproduced`` boolean) is gone, replaced by a single permissive
     ``status`` TEXT defaulting to 'discovered', alongside the reproduction/consensus columns;
     coverage gains priority + examined_count.
     """
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 8
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 12
 
     cols = {r["name"]: r for r in await db.fetchall("PRAGMA table_info(bug_candidates)")}
     # New columns are present...
@@ -219,7 +220,7 @@ async def test_migration_8_recreates_seeded_bug_candidates(
         monkeypatch.setattr("conclave.db.database.MIGRATIONS", MIGRATIONS)
         await database._apply_migrations()
 
-        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 8
+        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 12
         v8_cols = {
             r["name"] for r in await database.fetchall("PRAGMA table_info(bug_candidates)")
         }
@@ -1319,3 +1320,89 @@ async def test_list_coverage_regions_canonical_order_and_scope(db: Database) -> 
     # The first element always equals the single-row picker.
     head = await repo.select_next_region(db, p1.id)
     assert head is not None and head.region == ordered[0]
+
+
+# --- Migration 9: task checkpoints, idempotency, delete_agent, bug recovery ---
+
+
+async def test_task_checkpoints_crud_and_cascade(db: Database) -> None:
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    t = await repo.create_task(db, project_id=p.id, request="checkpointed")
+
+    cp1 = await repo.save_task_checkpoint(
+        db,
+        task_id=t.id,
+        node_id="plan",
+        attempt=1,
+        status=CheckpointStatus.completed,
+        git_tree_sha="aaa111",
+        artifact={"summary": "planned"},
+    )
+    assert cp1.task_id == t.id
+    assert cp1.node_id == "plan"
+    assert cp1.attempt == 1
+    assert cp1.status is CheckpointStatus.completed
+    assert cp1.git_tree_sha == "aaa111"
+    assert cp1.artifact == {"summary": "planned"}
+
+    await repo.save_task_checkpoint(
+        db,
+        task_id=t.id,
+        node_id="develop",
+        attempt=2,
+        status=CheckpointStatus.failed,
+    )
+
+    fetched = await repo.get_task_checkpoint(db, t.id, "plan", attempt=1)
+    assert fetched is not None and fetched.git_tree_sha == "aaa111"
+    assert await repo.get_task_checkpoint(db, t.id, "missing", attempt=1) is None
+
+    all_cps = await repo.list_task_checkpoints(db, t.id)
+    assert [c.node_id for c in all_cps] == ["plan", "develop"]
+    attempt2 = await repo.list_task_checkpoints(db, t.id, attempt=2)
+    assert [c.node_id for c in attempt2] == ["develop"]
+
+    await repo.clear_task_checkpoints(db, t.id, after_attempt=2)
+    assert [c.node_id for c in await repo.list_task_checkpoints(db, t.id)] == ["plan"]
+
+    # Deleting the task cascades to task_checkpoints.
+    assert await repo.delete_task(db, t.id) is True
+    assert await repo.list_task_checkpoints(db, t.id) == []
+
+
+async def test_idempotency_keys_roundtrip(db: Database) -> None:
+    assert await repo.get_idempotency_record(db, "k1") is None
+    rec = await repo.save_idempotency_record(
+        db,
+        key="k1",
+        method="POST",
+        path="/api/projects/p1/tasks",
+        status_code=200,
+        response={"id": "t1"},
+    )
+    assert rec.key == "k1"
+    assert rec.status_code == 200
+    assert rec.response == {"id": "t1"}
+
+    loaded = await repo.get_idempotency_record(db, "k1")
+    assert loaded is not None
+    assert loaded.method == "POST"
+    assert loaded.path == "/api/projects/p1/tasks"
+    assert loaded.response == {"id": "t1"}
+
+
+async def test_delete_agent_and_recover_fixing_bug_candidates(db: Database) -> None:
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    await repo.upsert_agent(
+        db, name="custom", role="reviewer", persona_md="md", project_id=p.id
+    )
+    assert await repo.get_agent(db, "custom", project_id=p.id) is not None
+    assert await repo.delete_agent(db, "custom", project_id=p.id) is True
+    assert await repo.delete_agent(db, "custom", project_id=p.id) is False
+    assert await repo.get_agent(db, "custom", project_id=p.id) is None
+
+    # Bug candidate stuck in fixing is recovered back to reproduced.
+    cid = await _seed_candidate(db, p.id, fingerprint="stuck", status=BugStatus.fixing)
+    await repo.recover_in_progress(db, p.id)
+    bc = await repo.get_bug_candidate(db, cid)
+    assert bc is not None and bc.status is BugStatus.reproduced

@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 from ..config import ArgMode, ConclaveConfig, Effort, resolve_agent
 from ..db import Database
 from ..db import repositories as repo
 from ..events import EventBus, EventType
+from ..observability.parquet_sync import log_agent_interaction
 from ..providers import AgentResult, Provider, ResolvedProfile
+from .compactor import compact_prompt_section
 
 logger = logging.getLogger("conclave.engine.runner")
 
@@ -28,8 +31,18 @@ logger = logging.getLogger("conclave.engine.runner")
 _STREAM_FLUSH_BYTES = 1024
 
 
-def assemble_prompt(system: str, knowledge: str, rules: str, task_prompt: str) -> str:
+def assemble_prompt(
+    system: str,
+    knowledge: str,
+    rules: str,
+    task_prompt: str,
+    skills: list[str] | None = None,
+) -> str:
     parts = [f"SYSTEM CONTEXT:\n{system}"]
+    if skills:
+        skill_lines = "\n".join(f"- {s.strip()}" for s in skills if s and s.strip())
+        if skill_lines:
+            parts.append(f"SKILLS & CAPABILITIES:\n{skill_lines}")
     if knowledge:
         parts.append(f"REPO KNOWLEDGE:\n{knowledge}")
     if rules:
@@ -52,12 +65,18 @@ class _OutputStreamer:
     """
 
     def __init__(
-        self, bus: EventBus, project_id: str, task_id: str | None, agent: str
+        self,
+        bus: EventBus,
+        project_id: str,
+        task_id: str | None,
+        agent: str,
+        node_id: str | None = None,
     ) -> None:
         self._bus = bus
         self._project_id = project_id
         self._task_id = task_id
         self._agent = agent
+        self._node_id = node_id
         self._buffer = ""
 
     async def feed(self, text: str) -> None:
@@ -79,12 +98,15 @@ class _OutputStreamer:
 
     async def _emit(self, text: str) -> None:
         try:
+            payload: dict[str, object] = {"text": text}
+            if self._node_id:
+                payload["node_id"] = self._node_id
             await self._bus.emit(
                 type=EventType.agent_output,
                 project_id=self._project_id,
                 task_id=self._task_id,
                 agent=self._agent,
-                payload={"text": text},
+                payload=payload,
             )
         except Exception:  # best-effort: never let a live-output emit break the dispatch
             logger.warning(
@@ -117,6 +139,13 @@ class AgentRunner:
         repo_knowledge: str = "",
         project_rules: str = "",
         cancel_event: asyncio.Event | None = None,
+        node_id: str | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
+        cli_agent_override: str | None = None,
+        skills_override: list[str] | None = None,
+        thinking_override: bool | None = None,
+        compact_override: bool | None = None,
     ) -> AgentResult:
         persona = await repo.get_agent(self._db, agent, self._project_id)
         system = (
@@ -125,17 +154,53 @@ class AgentRunner:
             else f"You are the {agent} agent of an autonomous software engineering team."
         )
         settings = resolve_agent(self._config, agent)
-        profile = self._resolve_profile(settings.model, settings.effort)
-        full_prompt = assemble_prompt(system, repo_knowledge, project_rules, prompt)
+        model = model_override if model_override is not None else settings.model
+        effort: Effort | str | None = (
+            effort_override if effort_override is not None else settings.effort
+        )
+        cli_agent = cli_agent_override if cli_agent_override is not None else settings.cli_agent
+        skills = (
+            list(dict.fromkeys([*settings.skills, *skills_override]))
+            if skills_override
+            else list(settings.skills)
+        )
+        thinking = thinking_override if thinking_override is not None else settings.thinking
+        compact_before_start = (
+            compact_override if compact_override is not None else settings.compact_before_start
+        )
+
+        effective_prompt = (
+            compact_prompt_section("TASK CONTEXT", prompt, max_chars=6000)
+            if compact_before_start and len(prompt) > 6000
+            else prompt
+        )
+        profile = self._resolve_profile(
+            model,
+            effort,
+            cli_agent=cli_agent,
+            thinking=thinking,
+            pure=settings.pure,
+        )
+        full_prompt = assemble_prompt(
+            system, repo_knowledge, project_rules, effective_prompt, skills=skills
+        )
 
         await self._bus.emit(
             type=EventType.agent_dispatched,
             project_id=self._project_id,
             task_id=task_id,
             agent=agent,
-            payload={"profile": profile.name, "model": profile.model, "cwd": str(worktree)},
+            payload={
+                "profile": profile.name,
+                "model": profile.model,
+                "cwd": str(worktree),
+                "node_id": node_id or agent,
+            },
         )
-        stream = _OutputStreamer(self._bus, self._project_id, task_id, agent)
+        stream = _OutputStreamer(
+            self._bus, self._project_id, task_id, agent, node_id=node_id or agent
+        )
+        started_at = time.monotonic()
         result = await self._provider.run_agent(
             profile=profile,
             prompt=full_prompt,
@@ -144,6 +209,7 @@ class AgentRunner:
             on_chunk=stream.feed,
             cancel_event=cancel_event,
         )
+        duration_seconds = max(0.0, time.monotonic() - started_at)
         await stream.flush()
         await repo.add_usage(
             self._db,
@@ -158,6 +224,38 @@ class AgentRunner:
             cache_read_tokens=result.cache_read_tokens,
             cache_creation_tokens=result.cache_creation_tokens,
         )
+        try:
+            first_line = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), agent)
+            log_entry = await log_agent_interaction(
+                self._db,
+                session_id=result.session_id,
+                title=f"[{agent}] {first_line[:72]}",
+                directory=str(worktree),
+                model=profile.model or "opencode/default",
+                agent=agent,
+                prompt=effective_prompt,
+                result=result,
+                duration_seconds=duration_seconds,
+                project_id=self._project_id,
+                task_id=task_id,
+                node_id=node_id or agent,
+                source="conclave",
+            )
+            await self._bus.emit(
+                type="interaction.logged",
+                project_id=self._project_id,
+                task_id=task_id,
+                agent=agent,
+                payload={
+                    "session_id": log_entry.session_id,
+                    "agent": agent,
+                    "model": log_entry.model,
+                    "cost": log_entry.cost,
+                },
+            )
+        except Exception:
+            logger.warning("interaction logging failed for agent %s", agent, exc_info=True)
+
         await self._bus.emit(
             type=EventType.agent_result,
             project_id=self._project_id,
@@ -168,12 +266,19 @@ class AgentRunner:
                 "cost_usd": result.cost_usd,
                 "model_reported": result.model_reported,
                 "error": result.error,
+                "node_id": node_id or agent,
             },
         )
         return result
 
     def _resolve_profile(
-        self, model: str | None, effort: Effort | None
+        self,
+        model: str | None,
+        effort: Effort | str | None,
+        *,
+        cli_agent: str | None = None,
+        thinking: bool = False,
+        pure: bool = False,
     ) -> ResolvedProfile:
         """Build the fixed ``opencode`` dispatch profile for this agent.
 
@@ -187,4 +292,7 @@ class AgentRunner:
             arg_mode=ArgMode.inherit,
             model=model,
             effort=str(effort) if effort is not None else None,
+            cli_agent=cli_agent,
+            thinking=thinking,
+            pure=pure,
         )

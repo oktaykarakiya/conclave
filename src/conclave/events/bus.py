@@ -31,7 +31,11 @@ class EventFilter:
     types: frozenset[str] | None = None
 
     def matches(self, event: EventRow) -> bool:
-        if self.project_id is not None and event.project_id != self.project_id:
+        if (
+            self.project_id is not None
+            and event.project_id is not None
+            and event.project_id != self.project_id
+        ):
             return False
         if self.task_id is not None and event.task_id != self.task_id:
             return False

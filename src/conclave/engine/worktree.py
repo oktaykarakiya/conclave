@@ -33,6 +33,18 @@ class WorktreeManager:
         code, out = await run_git(
             self.repo_path, "worktree", "add", "-b", task_branch, str(path), base_branch
         )
+        if code != 0 and not base_branch.startswith("origin/"):
+            alt_code, _ = await run_git(
+                self.repo_path,
+                "worktree",
+                "add",
+                "-b",
+                task_branch,
+                str(path),
+                f"origin/{base_branch}",
+            )
+            if alt_code == 0:
+                return path
         if code != 0:
             raise WorktreeError(f"git worktree add failed: {out.strip()}")
         return path

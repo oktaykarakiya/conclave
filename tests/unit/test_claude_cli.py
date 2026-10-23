@@ -33,7 +33,7 @@ print("late")
 
 def _make_cli(tmp_path: Path, body: str, name: str = "fake_claude.py") -> str:
     script = tmp_path / name
-    script.write_text(body)
+    script.write_text(body, encoding="utf-8")
     script.chmod(0o755)
     return str(script)
 
@@ -115,7 +115,7 @@ time.sleep(300)
     while time.monotonic() < deadline:
         try:
             os.kill(child_pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError, SystemError):
             break  # process is dead — success
         except PermissionError:
             # Process exists but we cannot signal it — unexpected in a test
@@ -212,4 +212,4 @@ async def test_parts_concatenation_with_echo_fake(tmp_path: Path) -> None:
     # stderr prefix makes the whole raw invalid JSON.  We verify the JSON
     # envelope suffix is intact, and the echoed characters appear in order.
     assert '"result": "echo-ok"' in result.text
-    assert result.text.endswith("}\n")
+    assert result.text.replace("\r\n", "\n").endswith("}\n")

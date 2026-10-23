@@ -35,10 +35,43 @@ def test_parse_events_extracts_text_cost_tokens() -> None:
     assert r.cost_usd == 0.00103628
     assert r.input_tokens == 7372
     assert r.output_tokens == 3
+    assert r.reasoning_tokens == 12
     assert r.cache_read_tokens == 0
     assert r.cache_creation_tokens == 0
     assert r.num_turns == 1
     assert r.exit_code == 0
+
+
+def test_parse_events_extracts_session_id_and_reasoning() -> None:
+    stream = "\n".join(
+        [
+            '{"type":"step_start","sessionID":"ses_abc123","part":{"type":"step-start"}}',
+            '{"type":"text","sessionID":"ses_abc123","part":{"type":"text","text":"done"}}',
+            '{"type":"step_finish","sessionID":"ses_abc123","part":{"tokens":'
+            '{"input":10,"output":5,"reasoning":42},"cost":0.001}}',
+        ]
+    )
+    r = _parse_events(stream, exit_code=0, model_hint="deepseek/deepseek-reasoner")
+    assert r.session_id == "ses_abc123"
+    assert r.reasoning_tokens == 42
+    assert r.model_reported == "deepseek/deepseek-reasoner"
+
+
+def test_parse_events_extracts_tool_calls_and_breakdown() -> None:
+    stream = "\n".join(
+        [
+            '{"type":"tool_use","sessionID":"ses_t1","part":{"type":"tool","tool":"bash"}}',
+            '{"type":"tool","part":{"type":"tool-invocation","name":"read"}}',
+            '{"type":"tool_use","part":{"type":"tool","tool":"bash"}}',
+            '{"type":"text","part":{"type":"text","text":"Checked files"}}',
+        ]
+    )
+    r = _parse_events(stream, exit_code=0)
+    assert r.tool_calls_count == 3
+    assert r.tool_breakdown == {"bash": 2, "read": 1}
+    assert len(r.messages) == 1
+    assert r.messages[0]["role"] == "assistant"
+    assert r.messages[0]["text"] == "Checked files"
 
 
 def test_parse_events_sums_multiple_steps() -> None:
@@ -117,3 +150,92 @@ async def test_run_agent_reads_ndjson_line_over_64kib(
     )
     assert result.ok
     assert result.text == "x" * 100000  # full line read + parsed, no LimitOverrunError
+
+
+async def test_run_agent_passes_profile_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_opencode_flags.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "sys.stdin.buffer.read()\n"
+        "joined = ' '.join(sys.argv[1:])\n"
+        "ev = {'type': 'text', 'part': {'type': 'text', 'text': joined}}\n"
+        "sys.stdout.write(json.dumps(ev) + '\\n')\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(
+        "conclave.providers.opencode_cli._OPENCODE_BIN", str(fake)
+    )
+    profile = ResolvedProfile(
+        name="opencode",
+        arg_mode=ArgMode.inherit,
+        model="deepseek/deepseek-reasoner",
+        effort="high",
+        cli_agent="build",
+        thinking=True,
+        pure=True,
+    )
+    result = await OpenCodeCliProvider().run_agent(
+        profile=profile, prompt="hello", timeout_seconds=30
+    )
+    assert result.ok
+    args = result.text.split()
+    assert "--auto" in args
+    assert "--dangerously-skip-permissions" not in args
+    assert "--model" in args
+    assert "deepseek/deepseek-reasoner" in args
+    assert "--variant" in args
+    assert "high" in args
+    assert "--agent" in args
+    assert "build" in args
+    assert "--thinking" in args
+    assert "--pure" in args
+    assert result.model_reported == "deepseek/deepseek-reasoner"
+
+
+async def test_run_agent_retries_transient_connection_error_and_resumes_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "attempt_count.txt"
+    fake = tmp_path / "fake_opencode_transient.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "sys.stdin.buffer.read()\n"
+        f"p = pathlib.Path({str(state_file)!r})\n"
+        "n = int(p.read_text()) if p.exists() else 0\n"
+        "p.write_text(str(n + 1))\n"
+        "if n == 0:\n"
+        "    err = {\n"
+        "        'type': 'error',\n"
+        "        'sessionID': 'ses_resume_99',\n"
+        "        'error': {'data': {'message': 'Cannot connect to API: Unable to connect'}},\n"
+        "    }\n"
+        "    sys.stdout.write(json.dumps(err) + '\\n')\n"
+        "    sys.exit(1)\n"
+        "joined = ' '.join(sys.argv[1:])\n"
+        "ev = {\n"
+        "    'type': 'text',\n"
+        "    'sessionID': 'ses_resume_99',\n"
+        "    'part': {'type': 'text', 'text': 'VERDICT: pass | args=' + joined},\n"
+        "}\n"
+        "sys.stdout.write(json.dumps(ev) + '\\n')\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr("conclave.providers.opencode_cli._OPENCODE_BIN", str(fake))
+    monkeypatch.setattr("conclave.providers.opencode_cli._TRANSIENT_RETRY_DELAY_S", 0.05)
+
+    profile = ResolvedProfile(
+        name="opencode",
+        arg_mode=ArgMode.inherit,
+        model="google/gemini-2.5-flash-lite",
+    )
+    result = await OpenCodeCliProvider().run_agent(
+        profile=profile, prompt="review gate", timeout_seconds=30
+    )
+    assert result.ok is True
+    assert "VERDICT: pass" in result.text
+    assert "--session ses_resume_99" in result.text
+    assert state_file.read_text() == "2"

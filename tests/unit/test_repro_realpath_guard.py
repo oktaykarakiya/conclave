@@ -9,9 +9,23 @@ out of the tests tree (or out of the worktree entirely). All deterministic and L
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from conclave.engine import resolve_repro_test_path
+
+
+def _dir_symlink(link: Path, target: Path) -> None:
+    """Create a directory symlink (or Windows directory junction when unprivileged)."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        if os.name == "nt":
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            raise
 
 
 def _worktree_with_tests(tmp_path: Path) -> Path:
@@ -61,7 +75,7 @@ def test_rejects_symlink_escape_out_of_worktree(tmp_path: Path) -> None:
     worktree = _worktree_with_tests(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (worktree / "tests" / "evil").symlink_to(outside)
+    _dir_symlink(worktree / "tests" / "evil", outside)
     assert resolve_repro_test_path(worktree, "tests/evil/test_x.py") is None
 
 
@@ -74,7 +88,7 @@ def test_rejects_symlink_redirect_out_of_tests_but_inside_worktree(tmp_path: Pat
     """
     worktree = _worktree_with_tests(tmp_path)
     (worktree / "src").mkdir()
-    (worktree / "tests" / "sneak").symlink_to(worktree / "src")
+    _dir_symlink(worktree / "tests" / "sneak", worktree / "src")
     assert resolve_repro_test_path(worktree, "tests/sneak/test_x.py") is None
 
 
@@ -85,7 +99,7 @@ def test_accepts_symlink_that_stays_within_tests(tmp_path: Path) -> None:
     """
     worktree = _worktree_with_tests(tmp_path)
     (worktree / "tests" / "real").mkdir()
-    (worktree / "tests" / "link").symlink_to(worktree / "tests" / "real")
+    _dir_symlink(worktree / "tests" / "link", worktree / "tests" / "real")
     result = resolve_repro_test_path(worktree, "tests/link/test_x.py")
     assert result == (worktree / "tests" / "real" / "test_x.py").resolve()
 

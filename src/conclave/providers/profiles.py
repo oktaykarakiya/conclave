@@ -37,6 +37,9 @@ class ResolvedProfile:
     extra_env: dict[str, str] = field(default_factory=dict)
     cli: str = "claude"
     cli_flags: tuple[str, ...] = _DEFAULT_CLI_FLAGS
+    cli_agent: str | None = None
+    thinking: bool = False
+    pure: bool = False
 
 
 @dataclass(frozen=True)

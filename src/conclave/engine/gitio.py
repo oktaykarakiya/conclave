@@ -6,10 +6,27 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import signal
+import subprocess
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("conclave.engine.gitio")
+
+def _build_win_subprocess_kw() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+    si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        "startupinfo": si,
+    }
+
+
+_WIN_SUBPROCESS_KW: dict[str, Any] = _build_win_subprocess_kw()
 
 GIT_ENV = {
     # Deterministic, non-interactive git for unattended operation.
@@ -21,6 +38,25 @@ GIT_ENV = {
 }
 
 
+def _find_windows_posix_sh() -> tuple[str | None, str | None]:
+    """Locate Git for Windows' POSIX ``sh.exe`` and its ``usr/bin`` directory."""
+    if os.name != "nt":
+        return None, None
+    git_bin = shutil.which("git")
+    if git_bin:
+        git_root = Path(git_bin).resolve().parent.parent
+        usr_bin = git_root / "usr" / "bin"
+        usr_sh = usr_bin / "sh.exe"
+        if usr_sh.is_file():
+            return str(usr_sh), str(usr_bin)
+        sh_candidate = git_root / "bin" / "sh.exe"
+        if sh_candidate.is_file():
+            extra_path = str(usr_bin) if usr_bin.is_dir() else str(sh_candidate.parent)
+            return str(sh_candidate), extra_path
+    sh_bin = shutil.which("sh")
+    return (sh_bin, None) if sh_bin else (None, None)
+
+
 async def run_git(cwd: Path, *args: str) -> tuple[int, str]:
     """Run a git command in ``cwd``; return (exit_code, combined_output)."""
     proc = await asyncio.create_subprocess_exec(
@@ -30,6 +66,7 @@ async def run_git(cwd: Path, *args: str) -> tuple[int, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env={**os.environ, **GIT_ENV},
+        **_WIN_SUBPROCESS_KW,
     )
     stdout, _ = await proc.communicate()
     return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
@@ -50,14 +87,32 @@ async def run_shell(
     # start_new_session=True gives the shell its own process group (pgid == pid).
     # When the timeout fires we can killpg the entire group rather than just the
     # shell leader, which prevents orphaned grandchildren from outliving the parent.
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, **env} if env else None,
-        start_new_session=True,
-    )
+    merged_env = {**os.environ, **env} if env else dict(os.environ)
+    win_sh, extra_path = _find_windows_posix_sh()
+    if win_sh is not None:
+        if extra_path:
+            merged_env["PATH"] = f"{extra_path}{os.pathsep}{merged_env.get('PATH', '')}"
+        proc = await asyncio.create_subprocess_exec(
+            win_sh,
+            "-c",
+            command,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=merged_env,
+            start_new_session=True,
+            **_WIN_SUBPROCESS_KW,
+        )
+    else:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=merged_env if env else None,
+            start_new_session=True,
+            **_WIN_SUBPROCESS_KW,
+        )
     if timeout_seconds is None:
         stdout, _ = await proc.communicate()
         return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
@@ -71,7 +126,9 @@ async def run_shell(
     except TimeoutError:
         await _kill_process_group(proc, timeout_seconds)
         with contextlib.suppress(Exception):
-            await comm  # completes now the process is dead; closes the pipe transport
+            await asyncio.wait_for(comm, timeout=1.0)
+        if not comm.done():
+            comm.cancel()
         return 124, f"(command timed out after {timeout_seconds}s)"
     return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
 
@@ -92,11 +149,26 @@ async def _kill_process_group(
     if pid is None:
         return  # already reaped — nothing to do
 
+    if os.name == "nt" and isinstance(proc, asyncio.subprocess.Process):
+        with contextlib.suppress(Exception):
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/F",
+                "/T",
+                "/PID",
+                str(pid),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **_WIN_SUBPROCESS_KW,
+            )
+            await killer.wait()
+
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
     _signal_group(pid, signal.SIGTERM)
     try:
         await asyncio.wait_for(proc.wait(), timeout=2.0)
     except TimeoutError:
-        _signal_group(pid, signal.SIGKILL)
+        _signal_group(pid, sigkill)
         await proc.wait()
 
 
@@ -107,7 +179,7 @@ def _signal_group(pgid: int, sig: int) -> None:
             os.killpg(pgid, sig)
         else:
             os.kill(pgid, sig)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError, OSError, SystemError):
         # The group (or its leader) already exited between our check and the
         # signal — nothing left to kill.
         logger.debug("process group %d already exited", pgid)

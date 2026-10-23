@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .profiles import ResolvedProfile
 
@@ -33,6 +33,11 @@ class AgentResult(BaseModel):
     cache_creation_tokens: int | None = None
     exit_code: int | None = None
     error: str | None = None
+    session_id: str | None = None
+    reasoning_tokens: int | None = None
+    tool_calls_count: int = 0
+    tool_breakdown: dict[str, int] = Field(default_factory=dict)
+    messages: list[dict[str, object]] = Field(default_factory=list)
 
 
 class Provider(Protocol):

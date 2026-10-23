@@ -10,8 +10,11 @@ web UI's config forms, so the UI is the sole editor — no hand-edited YAML.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .graph import WorkflowGraph
 
 
 class Effort(StrEnum):
@@ -78,10 +81,32 @@ class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     model: str | None = Field(
-        default=None,
-        description="Free-text model name. None defers to the engine profile / system default.",
+        default="google/gemini-2.5-flash-lite",
+        description="Model identifier (provider/model). Defaults to google/gemini-2.5-flash-lite.",
     )
-    effort: Effort | None = Field(default=None, description="Reasoning effort tier, or unset.")
+    effort: Effort | None = Field(
+        default=None, description="Reasoning effort/variant tier, or unset."
+    )
+    cli_agent: str | None = Field(
+        default=None,
+        description="Optional CLI agent name passed via --agent (e.g. build, general, explore).",
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description="Skills or capability instructions injected into the agent system prompt.",
+    )
+    thinking: bool = Field(
+        default=False,
+        description="Enable reasoning/thinking output (--thinking) during dispatch.",
+    )
+    pure: bool = Field(
+        default=False,
+        description="Run opencode in --pure mode without external plugins.",
+    )
+    compact_before_start: bool = Field(
+        default=True,
+        description="Automatically compact long planning and retry context before starting agent.",
+    )
     timeout_minutes: int = Field(default=120, ge=1, le=600)
     max_retries: int = Field(default=3, ge=1, le=50)
     engine_profile: str = Field(
@@ -100,6 +125,16 @@ class ExecutionSettings(BaseModel):
     )
     review_rounds_max: int = Field(default=20, ge=1, le=50)
     parallel_reviewers: bool = Field(default=False)
+    max_parallel_tasks: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description=(
+            "Maximum number of concurrent tasks (isolated worktree sessions) a project worker "
+            "may execute in parallel. 1 enforces single-flight execution; >1 enables Swarm "
+            "parallelism across dedicated worktrees."
+        ),
+    )
     stop_on_failure: bool = Field(default=False)
     auto_merge: bool = Field(default=True, description="Fast-forward/merge into target on success.")
     setup_command: str | None = Field(
@@ -412,3 +447,29 @@ class ConclaveConfig(BaseModel):
     protected: ProtectedSettings = Field(default_factory=ProtectedSettings)
     agent_defaults: AgentSettings = Field(default_factory=AgentSettings)
     agent_overrides: dict[str, dict[str, object]] = Field(default_factory=dict)
+    workflow: WorkflowGraph | None = Field(
+        default=None,
+        description="Custom node-edge workflow graph. None derives the graph from agents policy.",
+    )
+
+    @field_validator("agent_overrides", mode="before")
+    @classmethod
+    def _clean_override_keys(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return v
+        cleaned: dict[str, Any] = {}
+        for raw_k, raw_val in v.items():
+            k = str(raw_k).strip()
+            while len(k) >= 2:
+                if (k.startswith('"') and k.endswith('"')) or (
+                    k.startswith("'") and k.endswith("'")
+                ):
+                    k = k[1:-1].strip()
+                elif (k.startswith('\\"') and k.endswith('\\"') and len(k) >= 4) or (
+                    k.startswith("\\'") and k.endswith("\\'") and len(k) >= 4
+                ):
+                    k = k[2:-2].strip()
+                else:
+                    break
+            cleaned[k or str(raw_k)] = raw_val
+        return cleaned

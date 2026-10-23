@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+from .graph import (
+    EdgeCondition,
+    NodeKind,
+    OutputContract,
+    WorkflowEdge,
+    WorkflowGraph,
+    WorkflowNode,
+    build_default_workflow,
+    workflow_templates,
+)
 from .models import (
     AgentRole,
     AgentSettings,
@@ -25,6 +35,7 @@ from .resolver import (
     deep_merge,
     effective_protected,
     load_project_config,
+    normalize_config_keys,
     resolve_agent,
     resolve_bug_fixer_session,
 )
@@ -41,19 +52,28 @@ __all__ = [
     "ConclaveConfig",
     "ConditionalAgent",
     "DeclineConsensus",
+    "EdgeCondition",
     "Effort",
     "ExecutionSettings",
     "ExperimentalSettings",
+    "NodeKind",
     "NotificationSettings",
+    "OutputContract",
     "PlanningSettings",
     "ProtectedSettings",
     "Verdict",
+    "WorkflowEdge",
+    "WorkflowGraph",
+    "WorkflowNode",
     "agent_schema",
+    "build_default_workflow",
     "config_schema",
     "deep_merge",
     "default_config_dict",
     "effective_protected",
     "load_project_config",
+    "normalize_config_keys",
     "resolve_agent",
     "resolve_bug_fixer_session",
+    "workflow_templates",
 ]

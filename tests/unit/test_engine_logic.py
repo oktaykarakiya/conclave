@@ -399,17 +399,31 @@ def test_grounding_rejects_path_traversal_with_symlink(tmp_path: Path) -> None:
     (workdir / "src").mkdir()
     (workdir / "src" / "a.py").write_text("x = 1\n")
     # File OUTSIDE the worktree.
-    outside = tmp_path / "secret.txt"
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    outside = outside_dir / "secret.txt"
     outside.write_text("secret\n")
     # Create a symlink that resolves outside the worktree.
-    (workdir / "src" / "escape").symlink_to(outside)
+    try:
+        (workdir / "src" / "escape").symlink_to(outside)
+        cited = "src/escape"
+    except OSError:
+        import os
+
+        if os.name == "nt":
+            import _winapi
+
+            _winapi.CreateJunction(str(outside_dir), str(workdir / "src" / "escape_dir"))
+            cited = "src/escape_dir/secret.txt"
+        else:
+            raise
     diff = (
         "diff --git a/src/a.py b/src/a.py\n@@ -0,0 +1 @@\n+x = 1\n"
-        "diff --git a/src/escape b/src/escape\n@@ -0,0 +1 @@\n+secret"
+        f"diff --git a/{cited} b/{cited}\n@@ -0,0 +1 @@\n+secret"
     )
     v = parse_verdict(
         '```json\n{"verdict": "fail", "reason": "bad", '
-        '"evidence": [{"file": "src/escape", "line": 1}]}\n```'
+        f'"evidence": [{{"file": "{cited}", "line": 1}}]}}\n```'
     )
     out, warnings = check_grounding(v, diff, workdir)
     assert out.verdict == "unknown"

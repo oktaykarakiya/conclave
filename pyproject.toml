@@ -48,6 +48,7 @@ Issues = "https://github.com/oktaykarakiya/conclave/issues"
 
 [project.scripts]
 conclave = "conclave.main:cli"
+conclave-mcp = "conclave.mcp.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/conclave"]

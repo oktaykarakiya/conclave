@@ -1,0 +1,643 @@
+import { useCallback, useEffect, useState } from "react";
+
+import { api } from "../api";
+import type { Integrity, Quarantine } from "../types";
+import { Badge, Button, Card, Spinner, input } from "../ui";
+
+function asRecord(v: unknown): Record<string, unknown> {
+  if (typeof v === "object" && v !== null && !Array.isArray(v)) {
+    return v as Record<string, unknown>;
+  }
+  return {};
+}
+
+export function SettingsView({
+  projectId,
+  onProjectDeleted,
+}: {
+  projectId: string;
+  onProjectDeleted?: () => void;
+}) {
+  const [config, setConfig] = useState<Record<string, unknown>>({});
+  const [rawJson, setRawJson] = useState("");
+  const [quarantine, setQuarantine] = useState<Quarantine[]>([]);
+  const [integrity, setIntegrity] = useState<Integrity | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  // Quarantine form state
+  const [qPattern, setQPattern] = useState("");
+  const [qReason, setQReason] = useState("");
+  const [qUntil, setQUntil] = useState(() => {
+    const d = new Date(Date.now() + 7 * 86400 * 1000);
+    return d.toISOString().slice(0, 10);
+  });
+  const [addingQ, setAddingQ] = useState(false);
+
+  // Raw JSON, MCP & Danger zone state
+  const [showRawJson, setShowRawJson] = useState(false);
+  const [confirmDetach, setConfirmDetach] = useState(false);
+  const [detaching, setDetaching] = useState(false);
+  const [mcpInfo, setMcpInfo] = useState<{
+    mcp_url: string;
+    tool_count: number;
+    opencode_remote_json: Record<string, unknown>;
+    opencode_stdio_json: Record<string, unknown>;
+    claude_code_http_cli: string;
+    claude_code_stdio_cli: string;
+  } | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const loadAll = useCallback(async () => {
+    setLoading(true);
+    setNotice(null);
+    try {
+      const [cfg, qList, qHealth, mcp] = await Promise.all([
+        api.getConfig(projectId),
+        api.listQuarantine(projectId),
+        api.quarantineIntegrity(projectId),
+        api.mcpInfo().catch(() => null),
+      ]);
+      setConfig(cfg);
+      setRawJson(JSON.stringify(cfg, null, 2));
+      setQuarantine(qList);
+      setIntegrity(qHealth);
+      setMcpInfo(mcp);
+    } catch (e) {
+      setNotice({ kind: "err", text: String(e) });
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    loadAll();
+  }, [loadAll]);
+
+  const execution = asRecord(config.execution);
+  const experimental = asRecord(config.experimental);
+  const notifications = asRecord(config.notifications);
+
+  function updateSection(section: string, key: string, value: unknown) {
+    setConfig((prev) => {
+      const curSec = asRecord(prev[section]);
+      const next = {
+        ...prev,
+        [section]: {
+          ...curSec,
+          [key]: value,
+        },
+      };
+      setRawJson(JSON.stringify(next, null, 2));
+      return next;
+    });
+  }
+
+  async function saveStructured() {
+    setSaving(true);
+    setNotice(null);
+    try {
+      await api.patchConfig(projectId, config, `cfg-${projectId}-${Date.now()}`);
+      const fresh = await api.getConfig(projectId);
+      setConfig(fresh);
+      setRawJson(JSON.stringify(fresh, null, 2));
+      setNotice({ kind: "ok", text: "Settings saved." });
+    } catch (e) {
+      setNotice({ kind: "err", text: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveRaw() {
+    setSaving(true);
+    setNotice(null);
+    try {
+      const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+      await api.patchConfig(projectId, parsed, `rawcfg-${projectId}-${Date.now()}`);
+      const fresh = await api.getConfig(projectId);
+      setConfig(fresh);
+      setRawJson(JSON.stringify(fresh, null, 2));
+      setNotice({ kind: "ok", text: "Raw configuration applied." });
+    } catch (e) {
+      setNotice({ kind: "err", text: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleAddQuarantine(e: React.FormEvent) {
+    e.preventDefault();
+    if (!qPattern.trim() || !qReason.trim() || !qUntil.trim()) return;
+    setAddingQ(true);
+    setNotice(null);
+    try {
+      await api.addQuarantine(projectId, {
+        pattern: qPattern.trim(),
+        reason: qReason.trim(),
+        until: qUntil.trim(),
+      });
+      setQPattern("");
+      setQReason("");
+      const [qList, qHealth] = await Promise.all([
+        api.listQuarantine(projectId),
+        api.quarantineIntegrity(projectId),
+      ]);
+      setQuarantine(qList);
+      setIntegrity(qHealth);
+    } catch (err) {
+      setNotice({ kind: "err", text: String(err) });
+    } finally {
+      setAddingQ(false);
+    }
+  }
+
+  async function handleRemoveQuarantine(qid: string) {
+    try {
+      await api.delQuarantine(qid);
+      const [qList, qHealth] = await Promise.all([
+        api.listQuarantine(projectId),
+        api.quarantineIntegrity(projectId),
+      ]);
+      setQuarantine(qList);
+      setIntegrity(qHealth);
+    } catch (err) {
+      setNotice({ kind: "err", text: String(err) });
+    }
+  }
+
+  async function handleDetachProject() {
+    setDetaching(true);
+    try {
+      await api.detachProject(projectId);
+      onProjectDeleted?.();
+    } catch (err) {
+      setNotice({ kind: "err", text: String(err) });
+      setDetaching(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center gap-2 text-xs text-zinc-500">
+        <Spinner size={16} /> Loading project settings…
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto h-full max-w-4xl space-y-6 overflow-y-auto pr-1 pb-10">
+      {notice && (
+        <div
+          className={`flex items-center justify-between rounded-lg border px-3.5 py-2 text-xs ${
+            notice.kind === "ok"
+              ? "border-emerald-800/70 bg-emerald-950/50 text-emerald-300"
+              : "border-rose-800/70 bg-rose-950/50 text-rose-300"
+          }`}
+        >
+          <span>{notice.text}</span>
+          <button
+            type="button"
+            onClick={() => setNotice(null)}
+            className="ml-4 text-zinc-400 hover:text-zinc-200"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Section 1: Execution & Green-Gate */}
+      <Card className="space-y-4">
+        <div className="flex items-center justify-between border-b border-zinc-800/80 pb-3">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-100">Execution & Green-Gate</h2>
+            <p className="text-xs text-zinc-500">
+              Worktree provisioning, authoritative test gate commands, and retry bounds.
+            </p>
+          </div>
+          <Button variant="primary" onClick={saveStructured} disabled={saving}>
+            {saving ? "Saving…" : "Save Settings"}
+          </Button>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">Target Branch</span>
+            <input
+              className={input}
+              value={String(execution.target_branch ?? "main")}
+              onChange={(e) => updateSection("execution", "target_branch", e.target.value)}
+              placeholder="main"
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">Task Branch Prefix</span>
+            <input
+              className={input}
+              value={String(execution.branch_prefix ?? "conclave/")}
+              onChange={(e) => updateSection("execution", "branch_prefix", e.target.value)}
+              placeholder="conclave/"
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">
+              Worktree Setup Command (runs once per worktree)
+            </span>
+            <input
+              className={input}
+              value={String(execution.setup_command ?? "")}
+              onChange={(e) =>
+                updateSection(
+                  "execution",
+                  "setup_command",
+                  e.target.value.trim() ? e.target.value : null,
+                )
+              }
+              placeholder="e.g. uv sync or npm ci"
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">
+              Authoritative Green-Gate Test Command
+            </span>
+            <input
+              className={input}
+              value={String(execution.baseline_test_command ?? "")}
+              onChange={(e) =>
+                updateSection(
+                  "execution",
+                  "baseline_test_command",
+                  e.target.value.trim() ? e.target.value : null,
+                )
+              }
+              placeholder="e.g. pytest -q"
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">
+              Parallel Swarm Sessions (1 = single-flight, up to 16)
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={16}
+              className={input}
+              value={Number(execution.max_parallel_tasks ?? 1)}
+              onChange={(e) =>
+                updateSection(
+                  "execution",
+                  "max_parallel_tasks",
+                  Math.max(1, Math.min(16, Number(e.target.value) || 1)),
+                )
+              }
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">
+              Wall-Clock Budget (minutes, 0 = unlimited)
+            </span>
+            <input
+              type="number"
+              min={0}
+              className={input}
+              value={Number(execution.wall_clock_budget_minutes ?? 720)}
+              onChange={(e) =>
+                updateSection(
+                  "execution",
+                  "wall_clock_budget_minutes",
+                  Math.max(0, Number(e.target.value) || 0),
+                )
+              }
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">Webhook Notification URL</span>
+            <input
+              className={input}
+              value={String(notifications.webhook_url ?? "")}
+              onChange={(e) =>
+                updateSection(
+                  "notifications",
+                  "webhook_url",
+                  e.target.value.trim() ? e.target.value : null,
+                )
+              }
+              placeholder="https://example.com/webhook (optional)"
+            />
+          </label>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2.5 border-t border-zinc-800/70 pt-3 sm:grid-cols-4">
+          {[
+            {
+              section: "execution",
+              key: "auto_merge",
+              label: "Auto-merge on green",
+              val: Boolean(execution.auto_merge ?? true),
+            },
+            {
+              section: "execution",
+              key: "require_full_green",
+              label: "Require green gate",
+              val: Boolean(execution.require_full_green ?? true),
+            },
+            {
+              section: "execution",
+              key: "parallel_reviewers",
+              label: "Parallel reviewers",
+              val: Boolean(execution.parallel_reviewers ?? false),
+            },
+            {
+              section: "experimental",
+              key: "grounding_checks",
+              label: "Evidence grounding",
+              val: Boolean(experimental.grounding_checks ?? true),
+            },
+            {
+              section: "experimental",
+              key: "planner_enabled",
+              label: "Auto planner",
+              val: Boolean(experimental.planner_enabled ?? true),
+            },
+            {
+              section: "experimental",
+              key: "cross_attempt_memory",
+              label: "Attempt memory",
+              val: Boolean(experimental.cross_attempt_memory ?? true),
+            },
+            {
+              section: "experimental",
+              key: "post_mortem_enabled",
+              label: "Failure post-mortem",
+              val: Boolean(experimental.post_mortem_enabled ?? true),
+            },
+          ].map((item) => (
+            <label
+              key={`${item.section}.${item.key}`}
+              className="flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2 text-xs text-zinc-300 hover:border-zinc-700"
+            >
+              <input
+                type="checkbox"
+                checked={item.val}
+                onChange={(e) => updateSection(item.section, item.key, e.target.checked)}
+                className="rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-indigo-500"
+              />
+              <span>{item.label}</span>
+            </label>
+          ))}
+        </div>
+      </Card>
+
+      {/* Section 2: Test Quarantine */}
+      <Card className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-3">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-100">Test Quarantine</h2>
+            <p className="text-xs text-zinc-500">
+              Time-bounded test exclusions injected into pytest/jest during baseline and gate runs.
+            </p>
+          </div>
+          {integrity && (
+            <Badge
+              text={
+                integrity.healthy
+                  ? `Gate Healthy · ${integrity.active} active`
+                  : `${integrity.expired} expired · ${integrity.active} active`
+              }
+              color={
+                integrity.healthy
+                  ? "bg-emerald-950/80 text-emerald-300 border border-emerald-800/70"
+                  : "bg-amber-950/80 text-amber-300 border border-amber-800/70"
+              }
+            />
+          )}
+        </div>
+
+        <form
+          onSubmit={handleAddQuarantine}
+          className="grid grid-cols-1 gap-2.5 sm:grid-cols-12"
+        >
+          <input
+            className={`${input} sm:col-span-4`}
+            placeholder="tests/test_flaky.py::test_race"
+            value={qPattern}
+            onChange={(e) => setQPattern(e.target.value)}
+          />
+          <input
+            className={`${input} sm:col-span-4`}
+            placeholder="Reason for quarantine"
+            value={qReason}
+            onChange={(e) => setQReason(e.target.value)}
+          />
+          <input
+            type="date"
+            className={`${input} sm:col-span-2`}
+            value={qUntil}
+            onChange={(e) => setQUntil(e.target.value)}
+          />
+          <Button
+            type="submit"
+            variant="default"
+            disabled={addingQ || !qPattern.trim() || !qReason.trim()}
+            className="sm:col-span-2"
+          >
+            {addingQ ? "Adding…" : "+ Quarantine"}
+          </Button>
+        </form>
+
+        {quarantine.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-zinc-800/80 py-4 text-center text-xs text-zinc-500">
+            No quarantined test patterns. Full test suite is enforced.
+          </div>
+        ) : (
+          <div className="divide-y divide-zinc-800/60 rounded-lg border border-zinc-800/80 bg-zinc-950/40">
+            {quarantine.map((q) => (
+              <div
+                key={q.id}
+                className="flex items-center justify-between gap-3 px-3 py-2 text-xs"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-mono text-zinc-200">{q.pattern}</div>
+                  <div className="truncate text-[11px] text-zinc-500">
+                    {q.reason} · until {q.until}
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => handleRemoveQuarantine(q.id)}
+                >
+                  Remove
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {/* Section 3: MCP Connect (OpenCode & Claude Code) */}
+      {mcpInfo && (
+        <Card className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-3">
+            <div>
+              <h2 className="text-sm font-semibold text-zinc-100">
+                MCP Server · Connect OpenCode or Claude Code
+              </h2>
+              <p className="text-xs text-zinc-500">
+                Control projects, tasks, live steer, workflow diagrams, and personas directly from your CLI LLM.
+              </p>
+            </div>
+            <Badge
+              text={`${mcpInfo.tool_count} MCP Tools · ${mcpInfo.mcp_url}`}
+              color="bg-indigo-950/80 text-indigo-300 border border-indigo-800/70"
+            />
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5 rounded-lg border border-zinc-800/80 bg-zinc-950/60 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-zinc-300">
+                  OpenCode (`opencode.json` Remote HTTP)
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(
+                      JSON.stringify(mcpInfo.opencode_remote_json, null, 2),
+                    );
+                    setCopiedKey("opencode_http");
+                    setTimeout(() => setCopiedKey(null), 1800);
+                  }}
+                >
+                  {copiedKey === "opencode_http" ? "Copied ✓" : "Copy"}
+                </Button>
+              </div>
+              <pre className="overflow-x-auto font-mono text-[11px] text-zinc-400">
+                {JSON.stringify(mcpInfo.opencode_remote_json, null, 2)}
+              </pre>
+            </div>
+
+            <div className="space-y-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-zinc-300">
+                  Claude Code CLI (HTTP & Stdio)
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(mcpInfo.claude_code_http_cli);
+                    setCopiedKey("claude_http");
+                    setTimeout(() => setCopiedKey(null), 1800);
+                  }}
+                >
+                  {copiedKey === "claude_http" ? "Copied ✓" : "Copy HTTP CLI"}
+                </Button>
+              </div>
+              <pre className="overflow-x-auto rounded bg-zinc-900/90 p-2 font-mono text-[11px] text-indigo-300">
+                {mcpInfo.claude_code_http_cli}
+              </pre>
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-[11px] text-zinc-500">Or via stdio bridge:</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(mcpInfo.claude_code_stdio_cli);
+                    setCopiedKey("claude_stdio");
+                    setTimeout(() => setCopiedKey(null), 1800);
+                  }}
+                >
+                  {copiedKey === "claude_stdio" ? "Copied ✓" : "Copy Stdio CLI"}
+                </Button>
+              </div>
+              <pre className="overflow-x-auto rounded bg-zinc-900/90 p-2 font-mono text-[11px] text-zinc-400">
+                {mcpInfo.claude_code_stdio_cli}
+              </pre>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Section 4: Advanced Raw JSON & Danger Zone */}
+      <Card className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-100">Advanced Configuration JSON</h2>
+            <p className="text-xs text-zinc-500">
+              Inspect or edit the full resolved project configuration document directly.
+            </p>
+          </div>
+          <Button variant="ghost" size="sm" onClick={() => setShowRawJson((v) => !v)}>
+            {showRawJson ? "Hide JSON" : "Edit Raw JSON"}
+          </Button>
+        </div>
+
+        {showRawJson && (
+          <div className="space-y-2 pt-2">
+            <textarea
+              rows={14}
+              value={rawJson}
+              onChange={(e) => setRawJson(e.target.value)}
+              className="w-full rounded-lg border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200 outline-none focus:border-indigo-500"
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  try {
+                    setRawJson(JSON.stringify(JSON.parse(rawJson), null, 2));
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+              >
+                Format JSON
+              </Button>
+              <Button variant="primary" size="sm" onClick={saveRaw} disabled={saving}>
+                Apply Raw JSON
+              </Button>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card className="flex items-center justify-between border-rose-900/40 bg-rose-950/10">
+        <div>
+          <h2 className="text-sm font-semibold text-rose-200">Detach Repository</h2>
+          <p className="text-xs text-zinc-500">
+            Stops the project worker, cleans active worktrees, and removes this project from Conclave.
+          </p>
+        </div>
+        {!confirmDetach ? (
+          <Button variant="danger" size="sm" onClick={() => setConfirmDetach(true)}>
+            Detach Project
+          </Button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => setConfirmDetach(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              onClick={handleDetachProject}
+              disabled={detaching}
+            >
+              {detaching ? "Detaching…" : "Confirm Detach"}
+            </Button>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}

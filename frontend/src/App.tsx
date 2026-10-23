@@ -1,38 +1,73 @@
+import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "./api";
+import { HistoryView } from "./pages/HistoryView";
 import {
-  AgentCeptionPanel,
-  BugFixerPanel,
+  AgentStudioView as AgentStudioViewBase,
   Button,
-  ConfigPanel,
-  LivePanel,
-  QuarantinePanel,
+  SettingsView,
   Spinner,
-  TasksPanel,
+  WorkspaceView,
   input,
 } from "./panels";
-import type { Project } from "./types";
+import type {
+  EventRow,
+  Project,
+  ProjectMode,
+  StoreItem,
+  TaskCheckpoint,
+} from "./types";
+import { useStream } from "./useStream";
 
-// Dedicated page per menu item, in order. Agent-ception is first + the default.
-const TABS = [
-  "Agent-ception",
-  "Tasks",
-  "Bug-Fixer",
-  "Live",
-  "Config",
-  "Quarantine",
-] as const;
-type Tab = (typeof TABS)[number];
+export type MainView = "workspace" | "studio" | "history" | "settings";
+
+const MAIN_VIEWS: { id: MainView; label: string }[] = [
+  { id: "workspace", label: "Workspace" },
+  { id: "studio", label: "Agent Studio" },
+  { id: "history", label: "History & Logs" },
+  { id: "settings", label: "Settings" },
+];
+
+const AgentStudioView = AgentStudioViewBase as React.ComponentType<{
+  projectId?: string | null;
+  project?: Project | null;
+  lastEvent?: EventRow | null;
+  liveNodeStatuses?: Record<string, TaskCheckpoint["status"]>;
+  nodeStatuses?: Record<string, TaskCheckpoint["status"]>;
+}>;
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("Agent-ception");
+  const [mainView, setMainView] = useState<MainView>("workspace");
+  const [globalStudioOpen, setGlobalStudioOpen] = useState(false);
+  const [paused, setPaused] = useState(false);
   const [showAttach, setShowAttach] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastMcpCall, setLastMcpCall] = useState<{ tool: string; ts: number } | null>(
+    null,
+  );
+  const [liveNodeStatuses, setLiveNodeStatuses] = useState<
+    Record<string, TaskCheckpoint["status"]>
+  >({});
+
+  const stream = useStream(selectedId);
+
+  const refreshProjects = useCallback(async () => {
+    try {
+      const ps = await api.listProjects();
+      setProjects(ps);
+      setSelectedId((cur) => {
+        if (cur && ps.some((p) => p.id === cur)) return cur;
+        return ps[0]?.id ?? null;
+      });
+    } catch {
+      /* ignore background refresh errors */
+    }
+  }, []);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -40,7 +75,10 @@ export default function App() {
     try {
       const ps = await api.listProjects();
       setProjects(ps);
-      setSelectedId((cur) => cur ?? ps[0]?.id ?? null);
+      setSelectedId((cur) => {
+        if (cur && ps.some((p) => p.id === cur)) return cur;
+        return ps[0]?.id ?? null;
+      });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -49,10 +87,169 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    reload();
+    void reload();
   }, [reload]);
 
-  // Escape closes the mobile project drawer when it's open.
+  useEffect(() => {
+    setLiveNodeStatuses({});
+  }, [selectedId]);
+
+  useEffect(() => {
+    const lastEvent = stream.lastEvent;
+    if (!lastEvent) return;
+
+    if (lastEvent.type === "project.created" && lastEvent.payload?.project) {
+      const newProject = lastEvent.payload.project as unknown as Project;
+      if (newProject && typeof newProject.id === "string") {
+        setProjects((prev) => {
+          const exists = prev.some((p) => p.id === newProject.id);
+          return exists
+            ? prev.map((p) => (p.id === newProject.id ? newProject : p))
+            : [...prev, newProject];
+        });
+        setSelectedId((cur) => (cur === null ? newProject.id : cur));
+      }
+    } else if (
+      lastEvent.type === "project.deleted" &&
+      typeof lastEvent.payload?.project_id === "string"
+    ) {
+      const deletedId = lastEvent.payload.project_id;
+      setProjects((prev) => {
+        const next = prev.filter((p) => p.id !== deletedId);
+        setSelectedId((cur) =>
+          cur === deletedId ? (next[0]?.id ?? null) : cur,
+        );
+        return next;
+      });
+    } else if (lastEvent.type === "project.updated") {
+      if (lastEvent.payload?.project) {
+        const updated = lastEvent.payload.project as unknown as Project;
+        if (updated && typeof updated.id === "string") {
+          setProjects((prev) =>
+            prev.map((p) => (p.id === updated.id ? updated : p)),
+          );
+        }
+      }
+      void refreshProjects();
+    } else if (lastEvent.type === "mcp.tool_called") {
+      const toolName =
+        typeof lastEvent.payload?.tool === "string"
+          ? lastEvent.payload.tool
+          : "tool";
+      setLastMcpCall({ tool: toolName, ts: Date.now() });
+    } else if (lastEvent.type === "node.started") {
+      const nodeId =
+        typeof lastEvent.payload?.workflow_node_id === "string"
+          ? lastEvent.payload.workflow_node_id
+          : typeof lastEvent.payload?.node_id === "string"
+            ? lastEvent.payload.node_id
+            : null;
+      if (nodeId) {
+        setLiveNodeStatuses((prev) => ({
+          ...prev,
+          [nodeId]: "running",
+        }));
+      }
+    } else if (
+      lastEvent.type === "node.waiting_for_approval" ||
+      lastEvent.type === "hitl.waiting"
+    ) {
+      const nodeId =
+        typeof lastEvent.payload?.node_id === "string"
+          ? lastEvent.payload.node_id
+          : null;
+      if (nodeId) {
+        setLiveNodeStatuses((prev) => ({
+          ...prev,
+          [nodeId]: "waiting_for_approval",
+        }));
+      }
+    } else if (
+      lastEvent.type === "node.completed" ||
+      lastEvent.type === "hitl.resolved"
+    ) {
+      const nodeId =
+        typeof lastEvent.payload?.workflow_node_id === "string"
+          ? lastEvent.payload.workflow_node_id
+          : typeof lastEvent.payload?.node_id === "string"
+            ? lastEvent.payload.node_id
+            : null;
+      const rawStatus = lastEvent.payload?.status;
+      const status: TaskCheckpoint["status"] =
+        rawStatus === "failed" ||
+        rawStatus === "skipped" ||
+        rawStatus === "running" ||
+        rawStatus === "waiting_for_approval"
+          ? rawStatus
+          : "completed";
+      if (nodeId) {
+        setLiveNodeStatuses((prev) => ({
+          ...prev,
+          [nodeId]: status,
+        }));
+      }
+    }
+    if (Array.isArray(stream.events) && stream.events.length > 0) {
+      setLiveNodeStatuses((prev) => {
+        const next: Record<string, TaskCheckpoint["status"]> = { ...prev };
+        for (const ev of stream.events) {
+          const nid =
+            typeof ev.payload?.workflow_node_id === "string"
+              ? ev.payload.workflow_node_id
+              : typeof ev.payload?.node_id === "string"
+                ? ev.payload.node_id
+                : null;
+          if (!nid) continue;
+          if (ev.type === "node.started") {
+            next[nid] = "running";
+          } else if (
+            ev.type === "node.waiting_for_approval" ||
+            ev.type === "hitl.waiting"
+          ) {
+            next[nid] = "waiting_for_approval";
+          } else if (
+            ev.type === "node.completed" ||
+            ev.type === "hitl.resolved"
+          ) {
+            const rs = ev.payload?.status;
+            next[nid] =
+              rs === "failed" ||
+              rs === "skipped" ||
+              rs === "running" ||
+              rs === "waiting_for_approval"
+                ? rs
+                : "completed";
+          }
+        }
+        return next;
+      });
+    }
+  }, [stream.lastEvent, stream.events, refreshProjects]);
+
+  useEffect(() => {
+    if (!lastMcpCall) return;
+    const timer = setTimeout(() => {
+      setLastMcpCall(null);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [lastMcpCall]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    let active = true;
+    api
+      .projectStatus(selectedId)
+      .then((s) => {
+        if (active) setPaused(s.paused);
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedId]);
+
   useEffect(() => {
     if (!drawerOpen) return;
     function onKey(e: KeyboardEvent) {
@@ -62,37 +259,77 @@ export default function App() {
     return () => document.removeEventListener("keydown", onKey);
   }, [drawerOpen]);
 
-  const selected = projects.find((p) => p.id === selectedId) ?? null;
+  const selectedProject = projects.find((p) => p.id === selectedId) ?? null;
+  const selected = selectedProject;
 
-  // Each page fills exactly the content viewport and scrolls INTERNALLY — the page
-  // itself never exceeds the screen (the section below is overflow-hidden).
-  function renderPage() {
-    if (!selected) return null;
-    switch (tab) {
-      case "Agent-ception":
-        return <AgentCeptionPanel projectId={selected.id} />;
-      case "Tasks":
-        return <TasksPanel projectId={selected.id} />;
-      case "Bug-Fixer":
-        return <BugFixerPanel project={selected} />;
-      case "Live":
-        return <LivePanel projectId={selected.id} />;
-      case "Config":
-        return <ConfigPanel projectId={selected.id} />;
-      case "Quarantine":
-        return <QuarantinePanel projectId={selected.id} />;
+  async function togglePause() {
+    if (!selectedProject) return;
+    try {
+      if (paused) {
+        await api.resume(selectedProject.id);
+        setPaused(false);
+      } else {
+        await api.pause(selectedProject.id);
+        setPaused(true);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function toggleMode() {
+    if (!selectedProject) return;
+    const nextMode: ProjectMode =
+      selectedProject.mode === "autonomous_bug_fixer"
+        ? "task_queue"
+        : "autonomous_bug_fixer";
+    try {
+      const updated = await api.setMode(selectedProject.id, nextMode);
+      setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function renderView() {
+    if (!selectedProject) return null;
+    switch (mainView) {
+      case "workspace":
+        return (
+          <WorkspaceView
+            project={selectedProject}
+            lastEvent={stream.lastEvent}
+            liveNodeStatuses={liveNodeStatuses}
+          />
+        );
+      case "studio":
+        return (
+          <AgentStudioView
+            projectId={selectedProject.id}
+            project={selectedProject}
+            lastEvent={stream.lastEvent}
+            liveNodeStatuses={liveNodeStatuses}
+            nodeStatuses={liveNodeStatuses}
+          />
+        );
+      case "history":
+        return <HistoryView project={selectedProject} lastEvent={stream.lastEvent} />;
+      case "settings":
+        return (
+          <SettingsView projectId={selectedProject.id} onProjectDeleted={reload} />
+        );
     }
   }
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-zinc-950 text-zinc-100 md:flex-row">
-      {/* Mobile top bar with hamburger */}
-      <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900 px-4 py-3 md:hidden">
+      {/* Mobile top bar */}
+      <div className="flex items-center justify-between border-b border-zinc-800/80 bg-zinc-900/90 px-4 py-2.5 md:hidden">
         <button
           type="button"
           onClick={() => setDrawerOpen(true)}
           aria-label="Open project menu"
-          className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-300 transition-colors hover:bg-zinc-800 focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none"
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-300 hover:bg-zinc-800"
         >
           <svg viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5" aria-hidden="true">
             <path
@@ -102,12 +339,10 @@ export default function App() {
             />
           </svg>
         </button>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-base font-bold tracking-tight">Conclave</div>
-        </div>
+        <div className="truncate text-sm font-semibold tracking-tight">Conclave</div>
+        <div className="w-8" />
       </div>
 
-      {/* Mobile drawer overlay */}
       {drawerOpen && (
         <div
           className="fixed inset-0 z-40 bg-black/60 md:hidden"
@@ -116,42 +351,48 @@ export default function App() {
         />
       )}
 
-      {/* Sidebar — drawer on mobile, fixed rail on md+ */}
+      {/* Minimalist Left Sidebar */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-zinc-800 bg-zinc-900 transition-transform duration-200 md:static md:z-auto md:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-50 flex w-56 flex-col border-r border-zinc-800/80 bg-zinc-950 transition-transform duration-200 md:static md:z-auto md:translate-x-0 ${
           drawerOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
-        <div className="flex items-center justify-between border-b border-zinc-800 p-4">
-          <div>
-            <div className="text-lg font-bold tracking-tight">Conclave</div>
-            <div className="text-xs text-zinc-500">autonomous coding team</div>
+        <div className="flex items-center justify-between border-b border-zinc-800/80 px-4 py-3.5">
+          <div className="flex items-center gap-2.5">
+            <span className="flex h-6 w-6 items-center justify-center rounded-md bg-indigo-600/20 text-xs font-bold text-indigo-400 ring-1 ring-indigo-500/40">
+              ◈
+            </span>
+            <div>
+              <div className="text-sm font-semibold tracking-tight text-zinc-100">Conclave</div>
+              <div className="text-[10px] tracking-wide text-zinc-500 uppercase">Agent Studio</div>
+            </div>
           </div>
           <button
             type="button"
             onClick={() => setDrawerOpen(false)}
-            aria-label="Close project menu"
-            className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-800 focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:outline-none md:hidden"
+            aria-label="Close menu"
+            className="flex h-7 w-7 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 md:hidden"
           >
-            <svg viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5" aria-hidden="true">
-              <path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z" />
-            </svg>
+            ✕
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-2">
+        <div className="flex-1 space-y-1 overflow-y-auto p-2">
+          <div className="px-2 py-1 text-[10px] font-semibold tracking-wider text-zinc-500 uppercase">
+            Repositories
+          </div>
           {loading && (
-            <div className="space-y-2 p-1">
-              {[0, 1, 2].map((i) => (
-                <div key={i} className="h-11 animate-pulse rounded-lg bg-zinc-800" />
+            <div className="space-y-1.5 p-1">
+              {[0, 1].map((i) => (
+                <div key={i} className="h-10 animate-pulse rounded-lg bg-zinc-900" />
               ))}
             </div>
           )}
 
           {!loading && error && (
-            <div className="m-1 rounded-lg bg-rose-950/40 p-3 text-sm text-rose-300">
-              <div className="mb-2">Failed to load projects.</div>
-              <Button variant="ghost" onClick={reload}>
+            <div className="m-1 rounded-lg border border-rose-900/60 bg-rose-950/30 p-2.5 text-xs text-rose-300">
+              <div className="mb-2">Failed to load repositories.</div>
+              <Button variant="ghost" size="sm" onClick={reload}>
                 Retry
               </Button>
             </div>
@@ -159,91 +400,210 @@ export default function App() {
 
           {!loading &&
             !error &&
-            projects.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => {
-                  setSelectedId(p.id);
-                  setDrawerOpen(false);
-                }}
-                className={`mb-1 min-h-[44px] w-full rounded-lg px-3 py-2.5 text-left text-sm transition-colors ${
-                  selectedId === p.id ? "bg-indigo-700 text-white" : "text-zinc-200 hover:bg-zinc-800"
-                }`}
-              >
-                <div className="font-medium">{p.name}</div>
-                <div className="truncate text-xs opacity-70">{p.path}</div>
-              </button>
-            ))}
+            projects.map((p) => {
+              const active = selectedId === p.id;
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedId(p.id);
+                    setDrawerOpen(false);
+                  }}
+                  className={`group flex w-full flex-col rounded-lg px-2.5 py-2 text-left transition-colors ${
+                    active
+                      ? "bg-zinc-800/90 text-white ring-1 ring-zinc-700"
+                      : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5">
+                    <span className="truncate text-xs font-medium">{p.name}</span>
+                    {p.mode === "autonomous_bug_fixer" && (
+                      <span className="rounded bg-amber-950/80 px-1.5 py-0.5 text-[9px] font-medium text-amber-300">
+                        Sweep
+                      </span>
+                    )}
+                  </div>
+                  <div className="truncate text-[11px] text-zinc-500">{p.path}</div>
+                </button>
+              );
+            })}
 
           {!loading && !error && projects.length === 0 && (
-            <div className="px-3 py-2 text-sm text-zinc-500">No projects attached.</div>
+            <div className="px-2.5 py-4 text-xs text-zinc-500">No repositories attached.</div>
           )}
         </div>
 
-        <div className="border-t border-zinc-800 p-3">
-          <Button variant="primary" onClick={() => setShowAttach(true)}>
-            + Attach project
+        <div className="space-y-1.5 border-t border-zinc-800/80 p-2.5">
+          {!selected && (
+            <Button
+              variant={globalStudioOpen ? "primary" : "ghost"}
+              className="w-full"
+              onClick={() => setGlobalStudioOpen((o) => !o)}
+            >
+              {globalStudioOpen ? "Close Global Studio" : "◈ Global Agent Store"}
+            </Button>
+          )}
+          <Button
+            variant="default"
+            className="w-full"
+            onClick={() => setShowAttach(true)}
+          >
+            + Attach Repository
           </Button>
         </div>
       </aside>
 
+      {/* Main Content Area */}
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {loading && !selected ? (
-          <div className="flex flex-1 items-center justify-center gap-3 text-zinc-500">
-            <Spinner size={18} />
-            Loading projects…
+          <div className="flex flex-1 items-center justify-center gap-2.5 text-xs text-zinc-500">
+            <Spinner size={16} />
+            Loading workspace…
           </div>
         ) : selected ? (
           <>
-            <header className="flex flex-col gap-3 border-b border-zinc-800 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
-              <div className="min-w-0">
-                <div className="truncate text-base font-semibold">{selected.name}</div>
-                <div className="truncate text-xs text-zinc-500">
-                  {selected.path} · target:{" "}
-                  {selected.config?.execution?.target_branch ?? selected.default_branch}
+            {/* Unified Minimalist Top Bar: Project Context + 3 View Switcher + Worker Controls */}
+            <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-zinc-800/80 bg-zinc-950/90 px-4 py-2.5">
+              <div className="flex min-w-0 items-center gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-semibold text-zinc-100">
+                      {selected.name}
+                    </span>
+                    <span className="rounded bg-zinc-900 px-1.5 py-0.5 font-mono text-[11px] text-zinc-400 ring-1 ring-zinc-800">
+                      {selected.config?.execution?.target_branch ?? selected.default_branch}
+                    </span>
+                  </div>
+                  <div className="truncate text-[11px] text-zinc-500">{selected.path}</div>
                 </div>
               </div>
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={() => api.resume(selected.id)}>Resume</Button>
-                <Button variant="ghost" onClick={() => api.pause(selected.id)}>
-                  Pause
-                </Button>
+
+              {/* Center 4-View Segmented Navigation */}
+              <nav className="flex items-center rounded-lg border border-zinc-800/90 bg-zinc-900/70 p-0.5">
+                {MAIN_VIEWS.map((v) => {
+                  const active = mainView === v.id;
+                  return (
+                    <button
+                      key={v.id}
+                      type="button"
+                      onClick={() => setMainView(v.id)}
+                      className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+                        active
+                          ? "bg-indigo-600 text-white shadow-xs"
+                          : "text-zinc-400 hover:text-zinc-200"
+                      }`}
+                    >
+                      {v.label}
+                    </button>
+                  );
+                })}
+              </nav>
+
+              {/* Right Worker & Mode Status Pills */}
+              <div className="flex items-center gap-2">
+                {lastMcpCall && (
+                  <span
+                    role="status"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/50 bg-indigo-950/80 px-2.5 py-1 font-mono text-xs font-medium text-emerald-300 shadow-xs"
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />
+                    MCP: {lastMcpCall.tool}
+                  </span>
+                )}
+
+                <button
+                  type="button"
+                  onClick={toggleMode}
+                  title="Switch execution mode between Task Queue and Autonomous Bug Sweep"
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition ${
+                    selected.mode === "autonomous_bug_fixer"
+                      ? "border-amber-800/70 bg-amber-950/60 text-amber-300 hover:bg-amber-950"
+                      : "border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-zinc-700"
+                  }`}
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      selected.mode === "autonomous_bug_fixer" ? "bg-amber-400" : "bg-indigo-400"
+                    }`}
+                  />
+                  {selected.mode === "autonomous_bug_fixer" ? "Mode: Bug Sweep" : "Mode: Task Queue"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={togglePause}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition ${
+                    paused
+                      ? "border-amber-800/70 bg-amber-950/50 text-amber-300 hover:bg-amber-900/50"
+                      : "border-emerald-800/70 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/40"
+                  }`}
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      paused ? "bg-amber-400" : "bg-emerald-400 animate-pulse"
+                    }`}
+                  />
+                  {paused ? "Paused · Resume" : "Active · Pause"}
+                </button>
               </div>
             </header>
 
-            {/* Tab nav — one dedicated page per item */}
-            <nav className="flex shrink-0 gap-1 overflow-x-auto border-b border-zinc-800 px-2 sm:px-4">
-              {TABS.map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setTab(t)}
-                  className={`shrink-0 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors focus-visible:outline-none ${
-                    tab === t
-                      ? "border-indigo-500 text-white"
-                      : "border-transparent text-zinc-400 hover:text-zinc-200"
-                  }`}
-                >
-                  {t}
-                </button>
-              ))}
-            </nav>
-
-            {/* Content viewport — fixed height; the active page scrolls internally
-                so no page is ever taller than the screen. */}
-            <section className="min-h-0 flex-1 overflow-hidden p-4 sm:p-6">{renderPage()}</section>
+            <section className="min-h-0 flex-1 overflow-hidden p-3 sm:p-4">
+              {renderView()}
+            </section>
+          </>
+        ) : globalStudioOpen ? (
+          <>
+            <header className="flex shrink-0 items-center justify-between gap-3 border-b border-zinc-800/80 bg-zinc-950/90 px-4 py-2.5">
+              <div>
+                <div className="text-sm font-semibold text-zinc-100">
+                  Global Agent & Workflow Store
+                </div>
+                <div className="text-[11px] text-zinc-500">
+                  Design reusable workflows, agent personas, and config presets ready for any repository or MCP client.
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {lastMcpCall && (
+                  <span
+                    role="status"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/50 bg-indigo-950/80 px-2.5 py-1 font-mono text-xs font-medium text-emerald-300 shadow-xs"
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />
+                    MCP: {lastMcpCall.tool}
+                  </span>
+                )}
+                <Button variant="primary" onClick={() => setShowAttach(true)}>
+                  + Attach Repository
+                </Button>
+              </div>
+            </header>
+            <section className="min-h-0 flex-1 overflow-hidden p-3 sm:p-4">
+              <AgentStudioView
+                projectId={null}
+                project={null}
+                lastEvent={stream.lastEvent}
+                liveNodeStatuses={liveNodeStatuses}
+                nodeStatuses={liveNodeStatuses}
+              />
+            </section>
           </>
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-            <div className="mb-3 text-4xl text-zinc-700" aria-hidden="true">
-              ◇
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl border border-zinc-800 bg-zinc-900 text-xl text-indigo-400">
+              ◈
             </div>
-            <div className="text-base font-semibold text-zinc-300">No project selected</div>
-            <div className="mt-1 max-w-sm text-sm text-zinc-500">
-              Attach a git repo to start an autonomous coding session.
+            <div className="text-sm font-semibold text-zinc-200">No repository attached</div>
+            <div className="mt-1 max-w-xs text-xs text-zinc-500">
+              Attach a local git repository via the UI or MCP (`conclave_attach_project`), or open the Global Store to pre-configure agents and workflows.
             </div>
-            <div className="mt-4">
+            <div className="mt-4 flex items-center gap-2">
+              <Button variant="default" onClick={() => setGlobalStudioOpen(true)}>
+                Open Global Agent & Workflow Store
+              </Button>
               <Button variant="primary" onClick={() => setShowAttach(true)}>
-                + Attach project
+                + Attach Repository
               </Button>
             </div>
           </div>
@@ -268,12 +628,22 @@ function AttachModal({ onClose, onDone }: { onClose: () => void; onDone: (id: st
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const [branch, setBranch] = useState("main");
+  const [workflowTemplate, setWorkflowTemplate] = useState("standard");
+  const [configPreset, setConfigPreset] = useState("default-balanced");
+  const [storeItems, setStoreItems] = useState<StoreItem[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const nameRef = useRef<HTMLInputElement | null>(null);
 
-  // Escape closes the modal; focus the first field on open. The listener is
-  // attached once and reads the latest onClose via the dependency.
+  useEffect(() => {
+    api
+      .listStore()
+      .then(setStoreItems)
+      .catch(() => {
+        /* ignore */
+      });
+  }, []);
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") onClose();
@@ -283,32 +653,47 @@ function AttachModal({ onClose, onDone }: { onClose: () => void; onDone: (id: st
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  async function submit() {
+  const workflowChoices = storeItems.filter((i) => i.kind === "workflow");
+  const presetChoices = storeItems.filter((i) => i.kind === "config_preset");
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name.trim() || !path.trim()) return;
     setBusy(true);
     setError("");
     try {
-      const project = await api.createProject({ name, path, default_branch: branch });
+      const project = await api.createProject(
+        {
+          name: name.trim(),
+          path: path.trim(),
+          default_branch: branch.trim() || "main",
+          workflow_template: workflowTemplate || undefined,
+          config_preset: configPreset || undefined,
+        },
+        `proj-${name.trim()}-${Date.now()}`,
+      );
       onDone(project.id);
-    } catch (e) {
-      setError(String(e));
+    } catch (err) {
+      setError(String(err));
       setBusy(false);
     }
   }
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs"
       onClick={onClose}
     >
-      <div
+      <form
         role="dialog"
         aria-modal="true"
         aria-labelledby="attach-modal-title"
-        className="w-full max-w-sm rounded-xl border border-zinc-800 bg-zinc-900 p-5"
+        onSubmit={submit}
+        className="w-full max-w-sm rounded-xl border border-zinc-800 bg-zinc-900 p-5 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 id="attach-modal-title" className="mb-3 text-lg font-semibold">
-          Attach project
+        <h2 id="attach-modal-title" className="mb-3 text-sm font-semibold text-zinc-100">
+          Attach Git Repository
         </h2>
         <div className="space-y-3">
           <label className="block">
@@ -316,22 +701,22 @@ function AttachModal({ onClose, onDone }: { onClose: () => void; onDone: (id: st
             <input
               ref={nameRef}
               className={input}
-              placeholder="my-project"
+              placeholder="my-service"
               value={name}
               onChange={(e) => setName(e.target.value)}
             />
           </label>
           <label className="block">
-            <span className="mb-1 block text-xs text-zinc-400">Repo path</span>
+            <span className="mb-1 block text-xs text-zinc-400">Local Repository Path</span>
             <input
               className={input}
-              placeholder="absolute path to a git repo"
+              placeholder="/path/to/repo"
               value={path}
               onChange={(e) => setPath(e.target.value)}
             />
           </label>
           <label className="block">
-            <span className="mb-1 block text-xs text-zinc-400">Target branch</span>
+            <span className="mb-1 block text-xs text-zinc-400">Target Branch</span>
             <input
               className={input}
               placeholder="main"
@@ -339,19 +724,59 @@ function AttachModal({ onClose, onDone }: { onClose: () => void; onDone: (id: st
               onChange={(e) => setBranch(e.target.value)}
             />
           </label>
+          <div className="grid grid-cols-2 gap-2.5">
+            <label className="block">
+              <span className="mb-1 block text-xs text-zinc-400">Workflow Blueprint</span>
+              <select
+                className={input}
+                value={workflowTemplate}
+                onChange={(e) => setWorkflowTemplate(e.target.value)}
+              >
+                {workflowChoices.length > 0 ? (
+                  workflowChoices.map((w) => (
+                    <option key={w.id} value={w.name}>
+                      {w.name}
+                    </option>
+                  ))
+                ) : (
+                  <option value="standard">standard</option>
+                )}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs text-zinc-400">Config Preset</span>
+              <select
+                className={input}
+                value={configPreset}
+                onChange={(e) => setConfigPreset(e.target.value)}
+              >
+                {presetChoices.length > 0 ? (
+                  presetChoices.map((c) => (
+                    <option key={c.id} value={c.name}>
+                      {c.name}
+                    </option>
+                  ))
+                ) : (
+                  <option value="default-balanced">default-balanced</option>
+                )}
+              </select>
+            </label>
+          </div>
         </div>
         {error && (
-          <div className="mt-2 rounded-lg bg-rose-950/40 p-2 text-sm text-rose-300">{error}</div>
+          <div className="mt-3 rounded-lg border border-rose-800/60 bg-rose-950/40 p-2 text-xs text-rose-300">
+            {error}
+          </div>
         )}
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" onClick={submit} disabled={busy || !name || !path}>
+          <Button type="submit" variant="primary" disabled={busy || !name.trim() || !path.trim()}>
             {busy ? "Attaching…" : "Attach"}
           </Button>
         </div>
-      </div>
+      </form>
     </div>
   );
 }

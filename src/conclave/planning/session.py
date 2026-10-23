@@ -10,9 +10,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
+from pathlib import Path
 from typing import Any
 
-from ..config import ArgMode
+from ..config import ArgMode, load_project_config, resolve_agent
 from ..db import Database, TaskOrigin, TaskState
 from ..db import repositories as repo
 from ..db.planning_models import (
@@ -22,9 +24,11 @@ from ..db.planning_models import (
     PlanningSessionStatus,
     PlanningTaskNode,
 )
+from ..engine.orchestrator import _read_project_rules
 from ..engine.verdict import parse_verdict
 from ..events import EventBus, EventType
-from ..providers import Provider, ResolvedProfile
+from ..observability.parquet_sync import log_agent_interaction
+from ..providers import AgentResult, Provider, ResolvedProfile
 from .prompts import (
     APPROVAL_AGENTS,
     DISCUSSION_AGENTS,
@@ -525,21 +529,85 @@ class PlanningOrchestrator:
 
             turn = await repo.increment_planning_turn(self._db, session_id)
 
-            full_prompt = f"{system_prompt}\n\n{user_message}"
+            project = await repo.get_project(self._db, session.project_id)
+            project_cwd: Path | None = None
+            context_parts: list[str] = [system_prompt]
+            persona = await repo.get_agent(self._db, agent_name, session.project_id)
+            if persona is not None and persona.persona_md.strip():
+                context_parts.append(f"AGENT PERSONA:\n{persona.persona_md.strip()}")
+            if project is not None and project.path:
+                project_cwd = Path(project.path)
+                rules = _read_project_rules(project_cwd, repo_path=project_cwd)
+                if rules:
+                    context_parts.append(f"PROJECT RULES:\n{rules}")
+            recent_tasks = await repo.list_tasks(self._db, session.project_id)
+            memory_lines = [
+                f"- [{t.state.value}] {t.title or t.request[:60]}: {t.result_summary}"
+                for t in recent_tasks[:5]
+                if t.result_summary
+            ]
+            if memory_lines:
+                context_parts.append(
+                    "RECENT PROJECT MEMORIES:\n" + "\n".join(memory_lines)
+                )
+            context_parts.append(user_message)
+            full_prompt = "\n\n".join(context_parts)
 
-            # Use a simple inherited profile (uses the host's logged-in Claude default).
-            profile = ResolvedProfile(name="system-default", arg_mode=ArgMode.inherit)
+            cfg = load_project_config(project.config if project else None)
+            settings = resolve_agent(cfg, agent_name)
+            profile = ResolvedProfile(
+                name="opencode",
+                arg_mode=ArgMode.inherit,
+                model=settings.model,
+                effort=str(settings.effort) if settings.effort else None,
+                cli_agent=settings.cli_agent,
+                thinking=settings.thinking,
+                pure=settings.pure,
+            )
+            started_at = time.monotonic()
+            dispatch_result: AgentResult | None = None
             try:
                 result = await self._provider.run_agent(
                     profile=profile,
                     prompt=full_prompt,
                     timeout_seconds=900,  # 15 min/turn — opus-max does deep repo analysis here
+                    cwd=project_cwd,
                 )
             except Exception as exc:
                 logger.exception("agent %s failed for session %s", agent_name, session_id)
                 result_text = f"[Error dispatching {agent_name}: {exc}]"
+                dispatch_result = AgentResult(ok=False, error=str(exc))
             else:
                 result_text = result.text if result.ok else f"[Error: {result.error}]"
+                dispatch_result = result
+            duration_seconds = max(0.0, time.monotonic() - started_at)
+
+            if dispatch_result is not None:
+                try:
+                    await log_agent_interaction(
+                        self._db,
+                        session_id=dispatch_result.session_id,
+                        title=(
+                            f"[planning:{agent_name}] "
+                            f"{(session.title or session.prompt)[:60]}"
+                        ),
+                        directory=project.path if project else "",
+                        model=profile.model or "opencode/default",
+                        agent=agent_name,
+                        prompt=user_message,
+                        result=dispatch_result,
+                        duration_seconds=duration_seconds,
+                        project_id=session.project_id,
+                        task_id=None,
+                        node_id=f"planning_{agent_name}",
+                        source="conclave",
+                    )
+                except Exception:
+                    logger.warning(
+                        "interaction logging failed for planning agent %s",
+                        agent_name,
+                        exc_info=True,
+                    )
 
             # Parse task tree changes from planner output
             tasks_changed = False

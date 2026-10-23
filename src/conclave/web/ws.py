@@ -20,7 +20,9 @@ async def stream(
 ) -> None:
     await websocket.accept()
     daemon: Daemon = websocket.app.state.daemon
-    subscriber = daemon.bus.subscribe(project_id=project_id, task_id=task_id)
+    norm_pid = project_id.strip() if project_id and project_id.strip() else None
+    norm_tid = task_id.strip() if task_id and task_id.strip() else None
+    subscriber = daemon.bus.subscribe(project_id=norm_pid, task_id=norm_tid)
     try:
         with subscriber:
             async for event in subscriber:

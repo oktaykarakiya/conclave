@@ -1,8 +1,9 @@
-// Barrel re-export. The panels were split into `ui.tsx` (shared primitives) and
-// `pages/<Name>.tsx` (one file per page). This keeps existing imports such as
-// `import { Button, ConfigPanel, ... } from "./panels"` working unchanged.
+// Barrel re-export for UI primitives and views.
 
 export * from "./ui";
+export * from "./pages/WorkspaceView";
+export * from "./pages/AgentStudioView";
+export * from "./pages/SettingsView";
 export * from "./pages/TasksPanel";
 export * from "./pages/LivePanel";
 export * from "./pages/ConfigPanel";

@@ -6,25 +6,22 @@ export type StreamStatus = "connecting" | "live" | "reconnecting";
 
 export interface StreamState {
   events: EventRow[];
+  lastEvent: EventRow | null;
   status: StreamStatus;
 }
 
 /**
- * Subscribe to the live event stream for a project, keeping the last `max`
- * events. Reconnects automatically with exponential backoff + jitter (capped at
- * ~10s, reset on a successful open) and guards against setState-after-unmount.
+ * Subscribe to the live event stream for a project (or the global stream when
+ * `projectId` is null), keeping the last `max` events. Reconnects automatically
+ * with exponential backoff + jitter (capped at ~10s, reset on a successful open)
+ * and guards against setState-after-unmount.
  */
 export function useStream(projectId: string | null, max = 400): StreamState {
   const [events, setEvents] = useState<EventRow[]>([]);
+  const [lastEvent, setLastEvent] = useState<EventRow | null>(null);
   const [status, setStatus] = useState<StreamStatus>("connecting");
 
   useEffect(() => {
-    setEvents([]);
-    if (!projectId) {
-      setStatus("connecting");
-      return;
-    }
-
     let alive = true;
     let ws: WebSocket | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -34,7 +31,8 @@ export function useStream(projectId: string | null, max = 400): StreamState {
     const connect = () => {
       if (!alive) return;
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/ws/stream?project_id=${projectId}`);
+      const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+      ws = new WebSocket(`${proto}://${location.host}/ws/stream${query}`);
 
       ws.onopen = () => {
         if (!alive) return;
@@ -46,6 +44,7 @@ export function useStream(projectId: string | null, max = 400): StreamState {
         if (!alive) return;
         try {
           const event = JSON.parse(msg.data) as EventRow;
+          setLastEvent(event);
           setEvents((prev) => [...prev.slice(-(max - 1)), event]);
         } catch {
           /* ignore malformed frame */
@@ -81,5 +80,5 @@ export function useStream(projectId: string | null, max = 400): StreamState {
     };
   }, [projectId, max]);
 
-  return { events, status };
+  return { events, lastEvent, status };
 }

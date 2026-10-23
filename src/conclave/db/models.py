@@ -29,6 +29,7 @@ class TaskState(StrEnum):
     inbox = "inbox"  # created, awaiting approval
     approved = "approved"  # ready to run
     in_progress = "in_progress"  # claimed by a worker
+    waiting_for_approval = "waiting_for_approval"  # paused at node/connector awaiting human
     done = "done"
     failed = "failed"
     cancelled = "cancelled"
@@ -38,6 +39,14 @@ class TaskState(StrEnum):
 class TaskOrigin(StrEnum):
     operator = "operator"
     bug_fixer = "bug_fixer"
+
+
+class CheckpointStatus(StrEnum):
+    running = "running"
+    waiting_for_approval = "waiting_for_approval"
+    completed = "completed"
+    failed = "failed"
+    skipped = "skipped"
 
 
 class BugStatus(StrEnum):
@@ -108,6 +117,34 @@ BUG_STATUS_TRANSITIONS: dict[BugStatus, frozenset[BugStatus]] = {
 }
 
 
+def _unquote_key(k: str) -> str:
+    cleaned = k.strip()
+    while len(cleaned) >= 2:
+        if (cleaned.startswith('"') and cleaned.endswith('"')) or (
+            cleaned.startswith("'") and cleaned.endswith("'")
+        ):
+            cleaned = cleaned[1:-1].strip()
+        elif (cleaned.startswith('\\"') and cleaned.endswith('\\"') and len(cleaned) >= 4) or (
+            cleaned.startswith("\\'") and cleaned.endswith("\\'") and len(cleaned) >= 4
+        ):
+            cleaned = cleaned[2:-2].strip()
+        else:
+            break
+    return cleaned or k
+
+
+def normalize_dict_keys(value: Any) -> Any:
+    """Recursively strip accidental surrounding quotes from dictionary keys."""
+    if isinstance(value, dict):
+        return {
+            (_unquote_key(k) if isinstance(k, str) else k): normalize_dict_keys(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [normalize_dict_keys(item) for item in value]
+    return value
+
+
 def _loads(value: Any, fallback: Any) -> Any:
     """Decode a JSON column, tolerating corruption.
 
@@ -118,7 +155,7 @@ def _loads(value: Any, fallback: Any) -> Any:
     if value is None:
         return fallback
     try:
-        return json.loads(value)
+        return normalize_dict_keys(json.loads(value))
     except (json.JSONDecodeError, TypeError):
         logger.warning("corrupt JSON column, falling back to %r (raw=%r)", fallback, value)
         return fallback
@@ -177,16 +214,21 @@ class Task(BaseModel):
     use_planner: bool | None = None
     plan: dict[str, Any] | None = None
     branch: str | None = None
+    source_branch: str | None = None
     result_summary: str | None = None
     origin: TaskOrigin = TaskOrigin.operator
     parent_task_id: str | None = None
+    swarm_id: str | None = None
     created_at: str
     updated_at: str
 
     @classmethod
     def from_row(cls, row: Any) -> Task:
         up = row["use_planner"]
-        ptid = row["parent_task_id"] if "parent_task_id" in row.keys() else None
+        keys = row.keys()
+        ptid = row["parent_task_id"] if "parent_task_id" in keys else None
+        sid = row["swarm_id"] if "swarm_id" in keys else None
+        sbranch = row["source_branch"] if "source_branch" in keys else None
         return cls(
             id=row["id"],
             project_id=row["project_id"],
@@ -197,9 +239,11 @@ class Task(BaseModel):
             use_planner=None if up is None else bool(up),
             plan=_loads(row["plan_json"], None),
             branch=row["branch"],
+            source_branch=sbranch,
             result_summary=row["result_summary"],
             origin=_enum(TaskOrigin, row["origin"], TaskOrigin.operator),
             parent_task_id=ptid,
+            swarm_id=sid,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -452,3 +496,172 @@ class CoverageRegion(BaseModel):
             priority=row["priority"],
             examined_count=row["examined_count"],
         )
+
+
+class TaskCheckpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    node_id: str
+    attempt: int = 1
+    status: CheckpointStatus = CheckpointStatus.completed
+    git_tree_sha: str | None = None
+    artifact: dict[str, Any] = Field(default_factory=dict)
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: Any) -> TaskCheckpoint:
+        return cls(
+            task_id=row["task_id"],
+            node_id=row["node_id"],
+            attempt=row["attempt"],
+            status=_enum(CheckpointStatus, row["status"], CheckpointStatus.completed),
+            git_tree_sha=row["git_tree_sha"],
+            artifact=_loads(row["artifact_json"], {}),
+            updated_at=row["updated_at"],
+        )
+
+
+class IdempotencyRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    method: str
+    path: str
+    status_code: int
+    response: Any = None
+    created_at: str
+
+    @classmethod
+    def from_row(cls, row: Any) -> IdempotencyRecord:
+        return cls(
+            key=row["key"],
+            method=row["method"],
+            path=row["path"],
+            status_code=row["status_code"],
+            response=_loads(row["response_json"], {}),
+            created_at=row["created_at"],
+        )
+
+
+class StoreItemKind(StrEnum):
+    """Kinds of reusable items stored in the Global Store."""
+
+    workflow = "workflow"
+    agent = "agent"
+    config_preset = "config_preset"
+
+
+class StoreItem(BaseModel):
+    """A reusable workflow diagram, agent persona, or config preset in the Global Store."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: StoreItemKind
+    name: str
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    built_in: bool = False
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: Any) -> StoreItem:
+        raw_tags = _loads(row["tags_json"], [])
+        tags = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else []
+        raw_payload = _loads(row["payload_json"], {})
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
+        return cls(
+            id=row["id"],
+            kind=_enum(StoreItemKind, row["kind"], StoreItemKind.workflow),
+            name=row["name"],
+            description=row["description"],
+            tags=tags,
+            payload=payload,
+            built_in=bool(row["built_in"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+class InteractionLog(BaseModel):
+    """A recorded agent/CLI interaction session in the interaction_logs ledger."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    title: str = ""
+    directory: str = ""
+    path: str = ""
+    slug: str = ""
+    model: str = ""
+    agent: str = ""
+    cost: float = 0.0
+    tokens_input: int = 0
+    tokens_output: int = 0
+    tokens_reasoning: int = 0
+    tokens_cache_read: int = 0
+    tokens_cache_write: int = 0
+    time_created: int = 0
+    time_updated: int = 0
+    created_at_str: str = ""
+    updated_at_str: str = ""
+    duration: float = 0.0
+    tool_calls_count: int = 0
+    message_count: int = 0
+    user_prompt: str = ""
+    tool_breakdown: dict[str, int] = Field(default_factory=dict)
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    project_id: str | None = None
+    task_id: str | None = None
+    node_id: str | None = None
+    source: str = "conclave"
+
+    @classmethod
+    def from_row(cls, row: Any) -> InteractionLog:
+        raw_breakdown = _loads(row["tool_breakdown"], {})
+        tool_breakdown: dict[str, int] = {}
+        if isinstance(raw_breakdown, dict):
+            for k, v in raw_breakdown.items():
+                try:
+                    tool_breakdown[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    tool_breakdown[str(k)] = 0
+        raw_messages = _loads(row["messages"], [])
+        messages: list[dict[str, Any]] = (
+            [m for m in raw_messages if isinstance(m, dict)]
+            if isinstance(raw_messages, list)
+            else []
+        )
+        return cls(
+            session_id=row["session_id"],
+            title=row["title"] or "",
+            directory=row["directory"] or "",
+            path=row["path"] or "",
+            slug=row["slug"] or "",
+            model=row["model"] or "",
+            agent=row["agent"] or "",
+            cost=float(row["cost"] or 0.0),
+            tokens_input=int(row["tokens_input"] or 0),
+            tokens_output=int(row["tokens_output"] or 0),
+            tokens_reasoning=int(row["tokens_reasoning"] or 0),
+            tokens_cache_read=int(row["tokens_cache_read"] or 0),
+            tokens_cache_write=int(row["tokens_cache_write"] or 0),
+            time_created=int(row["time_created"] or 0),
+            time_updated=int(row["time_updated"] or 0),
+            created_at_str=row["created_at_str"] or "",
+            updated_at_str=row["updated_at_str"] or "",
+            duration=float(row["duration"] or 0.0),
+            tool_calls_count=int(row["tool_calls_count"] or 0),
+            message_count=int(row["message_count"] or 0),
+            user_prompt=row["user_prompt"] or "",
+            tool_breakdown=tool_breakdown,
+            messages=messages,
+            project_id=row["project_id"],
+            task_id=row["task_id"],
+            node_id=row["node_id"],
+            source=row["source"] or "conclave",
+        )
+

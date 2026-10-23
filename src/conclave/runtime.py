@@ -12,17 +12,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import re
 import time
 from pathlib import Path
+from typing import Any
 
 from .config import ConclaveConfig, load_project_config, resolve_bug_fixer_session
-from .db import Database, Project, ProjectMode, TaskState
+from .db import Database, Project, ProjectMode, Task, TaskState
 from .db import repositories as repo
-from .engine import BugFixerController, Orchestrator, SessionBudget, WorktreeManager
-from .events import EventBus
+from .engine import AgentRunner, BugFixerController, Orchestrator, SessionBudget, WorktreeManager
+from .events import EventBus, EventType
 from .planning.session import PlanningOrchestrator
 from .providers import Provider
+from .util import new_id
 
 logger = logging.getLogger("conclave.runtime")
 
@@ -54,6 +58,7 @@ class ProjectWorker:
         self._bug_fixer = BugFixerController(orchestrator)
         self._session_budget: SessionBudget | None = None
         self._session_started: float | None = None
+        self._active_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         await self._orchestrator.recover(self.project_id)
@@ -74,7 +79,15 @@ class ProjectWorker:
                 if project.mode is ProjectMode.autonomous_bug_fixer:
                     await self._bug_fixer_tick(project)
                 else:
-                    await self._task_queue_tick()
+                    max_parallel = (
+                        load_project_config(project.config).execution.max_parallel_tasks
+                        if project.config
+                        else 1
+                    )
+                    if max_parallel > 1:
+                        await self._swarm_queue_tick(max_parallel)
+                    else:
+                        await self._task_queue_tick()
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep the worker alive on unexpected errors
@@ -83,45 +96,60 @@ class ProjectWorker:
 
     # --- Per-mode ticks ------------------------------------------------------
 
+    async def _run_claimed_task(self, task: Task) -> None:
+        """Run a single claimed task with full cancellation and backstop finalization."""
+        cancel_event = asyncio.Event()
+        self._orchestrator._cancel_events[task.id] = cancel_event
+        try:
+            await self._orchestrator.process_task(task, cancel_event=cancel_event)
+        except Exception:
+            logger.exception("process_task escaped for task %s; marking failed", task.id)
+            with contextlib.suppress(Exception):
+                current = await repo.get_task(self._db, task.id)
+                if current is not None and current.state is TaskState.in_progress:
+                    await repo.finalize_task(
+                        self._db,
+                        task.id,
+                        state=TaskState.failed,
+                        result_summary="worker backstop: unhandled exception during "
+                        "processing (see daemon logs)",
+                        block_children=True,
+                    )
+        finally:
+            self._orchestrator._cancel_events.pop(task.id, None)
+
     async def _task_queue_tick(self) -> None:
         """One task-queue iteration: claim the next approved task and process it, or back off."""
         task = await repo.claim_next_approved(self._db, self.project_id)
         if task is None:
             await self._idle_backoff()
             return
-        # Work claimed — reset backoff so the next idle cycle starts from the minimum.
         self._current_idle_sleep = self._idle_sleep
-        # Register a cancellation event so the cancel endpoint can signal cooperative
-        # cancellation for this specific task.
-        cancel_event = asyncio.Event()
-        self._orchestrator._cancel_events[task.id] = cancel_event
-        try:
-            await self._orchestrator.process_task(task, cancel_event=cancel_event)
-        except Exception:
-            # Backstop for the one-task-at-a-time invariant: process_task itself fails
-            # tasks on every known error path, but if an exception ever escapes it, the
-            # claimed task must NOT stay in_progress — a stranded in_progress row used to
-            # be silently left behind while the loop moved on and claimed the next task
-            # (two tasks "running" at once, one a zombie). Mark it failed (best-effort,
-            # idempotent when process_task already finalized) and keep the worker alive.
-            logger.exception("process_task escaped for task %s; marking failed", task.id)
-            with contextlib.suppress(Exception):
-                # Only finalize when the row is still in_progress — if process_task already
-                # reached a terminal state (e.g. done, then raised in a late best-effort
-                # step), overwriting it with failed would lie about the real outcome.
-                current = await repo.get_task(self._db, task.id)
-                if current is not None and current.state is TaskState.in_progress:
-                    await repo.finalize_task(
-                        self._db, task.id, state=TaskState.failed,
-                        result_summary="worker backstop: unhandled exception during "
-                        "processing (see daemon logs)",
-                        block_children=True,
-                    )
-        finally:
-            # Clean the event entry regardless of outcome — the orchestrator's
-            # _finish_cancelled also cleans it, but this finally is the belt-and-suspenders
-            # so the dict can never leak entries.
-            self._orchestrator._cancel_events.pop(task.id, None)
+        await self._run_claimed_task(task)
+
+    async def _swarm_queue_tick(self, max_parallel: int) -> None:
+        """Parallel Swarm iteration: claim up to *max_parallel* tasks into isolated worktrees."""
+        claimed_any = False
+        while len(self._active_tasks) < max_parallel and not self._stop.is_set():
+            task = await repo.claim_next_approved(
+                self._db, self.project_id, max_parallel=max_parallel
+            )
+            if task is None:
+                break
+            claimed_any = True
+            self._current_idle_sleep = self._idle_sleep
+            bg = asyncio.create_task(self._run_claimed_task(task))
+            self._active_tasks.add(bg)
+            bg.add_done_callback(self._active_tasks.discard)
+
+        if self._active_tasks:
+            await asyncio.wait(
+                self._active_tasks,
+                timeout=0.25,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        elif not claimed_any:
+            await self._idle_backoff()
 
     async def _bug_fixer_tick(self, project: Project) -> None:
         """One autonomous-bug-fixer iteration: run a controller cycle metered by the session budget.
@@ -185,6 +213,11 @@ class ProjectWorker:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        for active in list(self._active_tasks):
+            active.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await active
+        self._active_tasks.clear()
 
 
 class Daemon:
@@ -251,6 +284,10 @@ class Daemon:
         worker.paused = paused
         return True
 
+    def is_paused(self, project_id: str) -> bool:
+        worker = self._workers.get(project_id)
+        return worker.paused if worker is not None else False
+
     async def request_cancel(self, task_id: str) -> bool:
         """Request cooperative cancellation for an in-progress *task_id*.
 
@@ -261,15 +298,173 @@ class Daemon:
         """
         return self.orchestrator.request_cancel(task_id)
 
-    async def request_steer(self, task_id: str, message: str) -> bool:
-        """Queue operator *message* for an in-progress *task_id*'s next dispatch.
+    async def request_steer(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        node_id: str | None = None,
+        edge_id: str | None = None,
+    ) -> bool:
+        """Queue operator *message* for an in-progress *task_id*'s next dispatch."""
+        return self.orchestrator.request_steer(
+            task_id, message, node_id=node_id, edge_id=edge_id
+        )
 
-        Returns ``True`` when the task is in-flight (the guidance was queued and will be
-        injected before its next developer dispatch). Returns ``False`` when the task is
-        not currently being processed, so the caller can report that there is no in-flight
-        dispatch to steer.
+    def resolve_node(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        status: str = "completed",
+        message: str | None = None,
+        verdict: str | None = None,
+        output: str | None = None,
+        edge_id: str | None = None,
+    ) -> bool:
+        """Approve/complete or override a node or HITL connector on *task_id*."""
+        return self.orchestrator.resolve_node(
+            task_id,
+            node_id,
+            status=status,
+            message=message,
+            verdict=verdict,
+            output=output,
+            edge_id=edge_id,
+        )
+
+    def set_hitl_checkpoint(self, task_id: str, target_id: str, enabled: bool) -> list[str]:
+        """Dynamically arm or disarm a HITL pause on *target_id* (node_id or edge_id)."""
+        return self.orchestrator.set_hitl_checkpoint(task_id, target_id, enabled)
+
+    def get_hitl_state(self, task_id: str) -> dict[str, list[str]]:
+        """Return currently armed HITL ids and actively waiting node/edge ids for *task_id*."""
+        return self.orchestrator.get_hitl_state(task_id)
+
+    async def launch_swarm(
+        self,
+        project_id: str,
+        *,
+        units: list[dict[str, Any]] | None = None,
+        prompt: str | None = None,
+        concurrency: int = 4,
+        auto_approve: bool = True,
+    ) -> dict[str, Any]:
+        """Launch a dedicated parallel Swarm of worktree sessions for mass changes.
+
+        Supports either an explicit list of work *units* (each with ``title`` and ``request``)
+        or a high-level mass-change *prompt* that the planner decomposes into independent work
+        units. Configures ``execution.max_parallel_tasks`` to at least *concurrency* and stamps
+        all created tasks with a shared ``swarm_id``.
         """
-        return self.orchestrator.request_steer(task_id, message)
+        project = await repo.get_project(self.db, project_id)
+        if project is None:
+            raise ValueError(f"project not found: {project_id}")
+
+        effective_concurrency = max(1, min(int(concurrency), 16))
+        raw_cfg = dict(project.config)
+        exec_cfg = dict(raw_cfg.get("execution") or {})
+        cur_parallel = int(exec_cfg.get("max_parallel_tasks") or 1)
+        if effective_concurrency > cur_parallel:
+            exec_cfg["max_parallel_tasks"] = effective_concurrency
+            raw_cfg["execution"] = exec_cfg
+            await repo.update_project_config(self.db, project_id, raw_cfg)
+
+        resolved_units: list[dict[str, Any]] = list(units or [])
+        if not resolved_units and prompt and prompt.strip():
+            config = load_project_config(raw_cfg)
+            runner = AgentRunner(self.db, self.bus, self.provider, project_id, config)
+            decompose_prompt = (
+                f"Break this mass-change objective into {effective_concurrency} independent, "
+                "non-overlapping work units so a swarm of dedicated agents can execute them in "
+                "parallel worktrees without file conflicts.\n\n"
+                f"OBJECTIVE:\n{prompt.strip()}\n\n"
+                'Respond with a fenced ```json block containing {"units": [{"title": "...", '
+                '"request": "..."}]}'
+            )
+            res = await runner.run(
+                agent="planner",
+                prompt=decompose_prompt,
+                worktree=Path(project.path),
+            )
+            if res.ok and res.text:
+                m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", res.text, re.DOTALL)
+                if m:
+                    with contextlib.suppress(Exception):
+                        parsed = json.loads(m.group(1))
+                        if isinstance(parsed, dict) and isinstance(parsed.get("units"), list):
+                            resolved_units = [
+                                u for u in parsed["units"] if isinstance(u, dict)
+                            ]
+                        elif (
+                            isinstance(parsed, dict)
+                            and isinstance(parsed.get("files_to_touch"), list)
+                        ):
+                            resolved_units = [
+                                {
+                                    "title": f"Swarm unit: {f}",
+                                    "request": f"{prompt.strip()}\nFocus exclusively on `{f}`.",
+                                }
+                                for f in parsed["files_to_touch"]
+                                if isinstance(f, str)
+                            ]
+            if not resolved_units:
+                # Fallback: split multiline bullet/numbered items or create dedicated units
+                lines = [
+                    ln.lstrip("-*0123456789.) ").strip()
+                    for ln in prompt.splitlines()
+                    if ln.strip()
+                ]
+                if len(lines) > 1:
+                    resolved_units = [
+                        {"title": ln[:80], "request": ln} for ln in lines
+                    ]
+                else:
+                    resolved_units = [
+                        {"title": prompt.strip()[:80], "request": prompt.strip()}
+                    ]
+
+        if not resolved_units:
+            raise ValueError("either non-empty units or prompt is required to launch a swarm")
+
+        swarm_id = f"swarm-{new_id()[:12]}"
+        task_state = TaskState.approved if auto_approve else TaskState.inbox
+        created: list[Task] = []
+        for idx, unit in enumerate(resolved_units, start=1):
+            req_text = str(unit.get("request") or unit.get("title") or "").strip()
+            if not req_text:
+                continue
+            title = str(unit.get("title") or f"Swarm #{idx}: {req_text[:50]}").strip()
+            use_planner_raw = unit.get("use_planner")
+            use_planner = bool(use_planner_raw) if isinstance(use_planner_raw, bool) else False
+            task = await repo.create_task(
+                self.db,
+                project_id=project_id,
+                title=title,
+                request=req_text,
+                use_planner=use_planner,
+                state=task_state,
+                swarm_id=swarm_id,
+            )
+            await self.bus.emit(
+                type=EventType.task_created,
+                project_id=project_id,
+                task_id=task.id,
+                payload={
+                    "title": task.title,
+                    "auto_approve": auto_approve,
+                    "swarm_id": swarm_id,
+                },
+            )
+            created.append(task)
+
+        return {
+            "swarm_id": swarm_id,
+            "project_id": project_id,
+            "concurrency": effective_concurrency,
+            "count": len(created),
+            "tasks": [t.model_dump(mode="json") for t in created],
+        }
 
     async def cleanup_in_progress_work(self, project_id: str) -> None:
         """Cancel in-progress tasks and clean their worktrees for a stopped worker.
