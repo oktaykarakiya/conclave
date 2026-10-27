@@ -57,6 +57,12 @@ _REVIEWER_RETRY_BACKOFF_S = 3.0
 # the agent can still reason about scope.
 _MAX_DIFF_CHARS = 40_000
 
+_NECESSITY_YAGNI_RULE = (
+    "NECESSITY & YAGNI CHECK: Verify that every change is strictly necessary to fix a "
+    "real bug, close a parity gap, or satisfy an explicit requirement before adding files "
+    "or abstractions. Reject redundant or speculative code."
+)
+
 logger = logging.getLogger("conclave.engine.orchestrator")
 
 
@@ -105,8 +111,60 @@ class Orchestrator:
         self._approval_resolutions: dict[tuple[str, str], dict[str, Any]] = {}
         # Dynamically armed HITL nodes/edges — keyed by task_id -> set of node/edge ids.
         self._dynamic_hitl: dict[str, set[str]] = {}
+        self._repo_path: Path | None = None
         self._reloader: Any = None
         self._daemon: Any = None
+
+    async def _refresh_task_config(
+        self, project_id: str, runner: AgentRunner, current_config: ConclaveConfig
+    ) -> ConclaveConfig:
+        """Re-fetch ``project.config`` from SQLite and hot-plug it into *runner*."""
+        project = await repo.get_project(self._db, project_id)
+        if project is None:
+            runner._config = current_config
+            return current_config
+        config = load_project_config(project.config)
+        runner._config = config
+        return config
+
+    def _build_venv_guidance(
+        self,
+        worktree: Path,
+        config: ConclaveConfig,
+        knowledge: dict[str, Any] | None = None,
+        repo_path: Path | None = None,
+    ) -> str:
+        return _build_venv_guidance(
+            worktree,
+            config,
+            knowledge,
+            repo_path=repo_path if repo_path is not None else self._repo_path,
+        )
+
+    @staticmethod
+    def _build_developer_prompt(
+        task_or_request: Task | str,
+        plan_preamble: str = "",
+        baseline_preamble: str = "",
+        test_command: str | None = None,
+        check_commands: list[str] | None = None,
+        *,
+        use_memory: bool = False,
+        memory: AttemptMemory | None = None,
+        feedback: str = "",
+        previous_diff: str = "",
+    ) -> str:
+        return _build_developer_prompt(
+            task_or_request,
+            plan_preamble,
+            baseline_preamble,
+            test_command,
+            check_commands,
+            use_memory=use_memory,
+            memory=memory,
+            feedback=feedback,
+            previous_diff=previous_diff,
+        )
 
     async def recover(self, project_id: str) -> tuple[int, int]:
         """Crash recovery: return orphaned in_progress tasks to approved and re-block
@@ -417,6 +475,7 @@ class Orchestrator:
             return False
         config = load_project_config(project.config)
         repo_path = Path(project.path)
+        self._repo_path = repo_path
         raw_exec = project.config.get("execution") if isinstance(project.config, dict) else None
         explicit_target = (
             raw_exec.get("target_branch")
@@ -510,7 +569,7 @@ class Orchestrator:
             # through _read_project_rules), not Conclave's synthesized knowledge preamble.
             knowledge = ""
             rules = _read_project_rules(worktree, repo_path=repo_path)
-            rules += _build_venv_guidance(worktree, config, None)
+            rules += self._build_venv_guidance(worktree, config, None)
             test_command = _test_command(config, None)
             # Inject active quarantine exclusions so flaky quarantined tests
             # don't fail the baseline snapshot or the green-gate.
@@ -562,6 +621,7 @@ class Orchestrator:
             )
             if cancel_event is not None and cancel_event.is_set():
                 return await self._finish_cancelled(task, wm, task_branch)
+            config = await self._refresh_task_config(project.id, runner, config)
             plan_preamble = await self._maybe_plan(
                 runner, task, worktree, knowledge, rules, baseline_preamble, config,
                 cancel_event=cancel_event, checkpoint=checkpoint,
@@ -621,6 +681,26 @@ class Orchestrator:
             gate_failed_after_review = False
 
             while attempts < max_retries:
+                config = await self._refresh_task_config(project.id, runner, config)
+                use_memory = config.experimental.cross_attempt_memory
+                test_command = _test_command(config, None)
+                test_command = await apply_quarantine(self._db, project.id, test_command)
+                gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
+                dev_node_cfg = _find_workflow_node(config, "developer", "developer")
+                if dev_node_cfg is None and config.workflow is not None:
+                    dev_node_cfg = next(
+                        (
+                            n
+                            for n in config.workflow.nodes
+                            if n.enabled and n.kind.value == "developer"
+                        ),
+                        None,
+                    )
+                has_enabled_developer = config.workflow is None or dev_node_cfg is not None
+                max_retries = (
+                    resolve_agent(config, "developer").max_retries if has_enabled_developer else 1
+                )
+                budget = config.execution.wall_clock_budget_minutes
                 if _check_budget(started, budget):
                     timed_out = True
                     failed = True
@@ -709,34 +789,17 @@ class Orchestrator:
                         # is absent or doesn't cover the venv.
                         await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
-                    dev_prompt = task.request + plan_preamble + baseline_preamble
-                    all_cmds: list[str] = []
-                    if test_command:
-                        all_cmds.append(test_command)
-                    all_cmds.extend(check_commands)
-                    if all_cmds:
-                        # Hand the developer EVERY authoritative gate command so its own
-                        # write→run→fix loop converges on what the orchestrator actually
-                        # enforces — not a partial self-check that passes here but fails the gate.
-                        dev_prompt += (
-                            "\n\nGREEN-GATE (authoritative — exactly what the orchestrator runs "
-                            "to accept your work). Before you finish, run EVERY command below in "
-                            "the worktree and iterate (write → run → read failures → fix → re-run) "
-                            "until ALL commands pass with NO NEW failures vs. the pre-existing "
-                            "baseline:\n"
-                            + "\n".join(f"```\n{cmd}\n```" for cmd in all_cmds) + "\n"
-                        )
-                    if use_memory:
-                        dev_prompt += memory.build_preamble()
-                    if feedback:
-                        dev_prompt += (
-                            "\n\nLATEST REVIEWER FEEDBACK (must fix these issues):\n" + feedback
-                        )
-                        if previous_diff:
-                            dev_prompt += (
-                                "\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n"
-                                + _truncate_diff(previous_diff) + "\n```"
-                            )
+                    dev_prompt = self._build_developer_prompt(
+                        task.request,
+                        plan_preamble,
+                        baseline_preamble,
+                        test_command,
+                        check_commands,
+                        use_memory=use_memory,
+                        memory=memory,
+                        feedback=feedback,
+                        previous_diff=previous_diff,
+                    )
 
                     # HARD cap: abort the task if the wall-clock budget has been exceeded
                     # before launching the developer agent. The top-of-loop check catches
@@ -892,6 +955,8 @@ class Orchestrator:
                 if cancel_event is not None and cancel_event.is_set():
                     return await self._finish_cancelled(task, wm, task_branch)
 
+                config = await self._refresh_task_config(project.id, runner, config)
+                budget = config.execution.wall_clock_budget_minutes
                 failed, feedback, review_timed_out = await self._review(
                     runner, task, project.id, worktree, current_diff, attempts, config, knowledge,
                     rules, started, budget, cancel_event=cancel_event, grounding_diff=full_diff,
@@ -901,6 +966,23 @@ class Orchestrator:
                     failed = True
                     break
                 if failed:
+                    config = await self._refresh_task_config(project.id, runner, config)
+                    dev_node_cfg = _find_workflow_node(config, "developer", "developer")
+                    if dev_node_cfg is None and config.workflow is not None:
+                        dev_node_cfg = next(
+                            (
+                                n
+                                for n in config.workflow.nodes
+                                if n.enabled and n.kind.value == "developer"
+                            ),
+                            None,
+                        )
+                    has_enabled_developer = config.workflow is None or dev_node_cfg is not None
+                    max_retries = (
+                        resolve_agent(config, "developer").max_retries
+                        if has_enabled_developer
+                        else 1
+                    )
                     await self._bus.emit(
                         type=EventType.attempt_failed,
                         project_id=project.id,
@@ -923,6 +1005,25 @@ class Orchestrator:
                 await run_git(worktree, "checkout-index", "-a", "-f")
                 await run_git(worktree, "clean", "-fd", "-e", ".venv/")
 
+                config = await self._refresh_task_config(project.id, runner, config)
+                test_command = _test_command(config, None)
+                test_command = await apply_quarantine(self._db, project.id, test_command)
+                gate_timeout = resolve_agent(config, "tester").timeout_minutes * 60
+                dev_node_cfg = _find_workflow_node(config, "developer", "developer")
+                if dev_node_cfg is None and config.workflow is not None:
+                    dev_node_cfg = next(
+                        (
+                            n
+                            for n in config.workflow.nodes
+                            if n.enabled and n.kind.value == "developer"
+                        ),
+                        None,
+                    )
+                has_enabled_developer = config.workflow is None or dev_node_cfg is not None
+                max_retries = (
+                    resolve_agent(config, "developer").max_retries if has_enabled_developer else 1
+                )
+                budget = config.execution.wall_clock_budget_minutes
                 await repo.save_task_checkpoint(
                     self._db,
                     task_id=task.id,
@@ -1406,7 +1507,8 @@ class Orchestrator:
         planner_agent = planner_node.agent or "planner"
         prompt = (
             f"{task.request}{baseline_preamble}\n\n"
-            "Produce a structured plan per your system prompt."
+            "Produce a structured plan per your system prompt.\n\n"
+            f"{_NECESSITY_YAGNI_RULE}"
         )
         if planner_node.prompt_template:
             prompt += f"\n\n{planner_node.prompt_template}"
@@ -2580,23 +2682,79 @@ def _check_commands(knowledge: dict[str, Any] | None) -> list[str]:
     return result
 
 
+def _build_developer_prompt(
+    task_or_request: Task | str,
+    plan_preamble: str = "",
+    baseline_preamble: str = "",
+    test_command: str | None = None,
+    check_commands: list[str] | None = None,
+    *,
+    use_memory: bool = False,
+    memory: AttemptMemory | None = None,
+    feedback: str = "",
+    previous_diff: str = "",
+) -> str:
+    """Assemble the developer agent prompt including the mandatory Necessity & YAGNI check."""
+    request = task_or_request.request if isinstance(task_or_request, Task) else task_or_request
+    dev_prompt = f"{request}{plan_preamble}{baseline_preamble}\n\n{_NECESSITY_YAGNI_RULE}"
+    all_cmds: list[str] = []
+    if test_command:
+        all_cmds.append(test_command)
+    if check_commands:
+        all_cmds.extend(check_commands)
+    if all_cmds:
+        # Hand the developer EVERY authoritative gate command so its own
+        # write→run→fix loop converges on what the orchestrator actually
+        # enforces — not a partial self-check that passes here but fails the gate.
+        dev_prompt += (
+            "\n\nGREEN-GATE (authoritative — exactly what the orchestrator runs "
+            "to accept your work). Before you finish, run EVERY command below in "
+            "the worktree and iterate (write → run → read failures → fix → re-run) "
+            "until ALL commands pass with NO NEW failures vs. the pre-existing "
+            "baseline:\n"
+            + "\n".join(f"```\n{cmd}\n```" for cmd in all_cmds) + "\n"
+        )
+    if use_memory and memory is not None:
+        dev_prompt += memory.build_preamble()
+    if feedback:
+        dev_prompt += (
+            "\n\nLATEST REVIEWER FEEDBACK (must fix these issues):\n" + feedback
+        )
+        if previous_diff:
+            dev_prompt += (
+                "\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n"
+                + _truncate_diff(previous_diff) + "\n```"
+            )
+    return dev_prompt
+
+
 def _build_venv_guidance(
-    worktree: Path, config: ConclaveConfig, knowledge: dict[str, Any] | None,
+    worktree: Path,
+    config: ConclaveConfig,
+    knowledge: dict[str, Any] | None = None,
+    repo_path: Path | None = None,
 ) -> str:
     """Build tool/venv guidance lines derived from the project's actual configured commands.
 
-    Only injects guidance when ``.venv/`` actually exists in the worktree — i.e. the
-    ``setup_command`` ran and provisioned it.  Derives the test command via
-    :func:`_test_command` and picks up ``lint`` / ``check`` commands via
-    :func:`_check_commands` from repo knowledge.  The green-gate enforces ALL of these
-    commands (test + check + lint), not just the test command.  Produces
-    ``.venv/bin/``-prefixed lines for each command so the guidance reflects the real
-    toolchain instead of hard-coded pytest/mypy/ruff.  When no commands are known, emits
-    a generic ``.venv/bin/`` hint.
+    Checks both ``worktree / ".venv"`` and ``repo_path / ".venv"`` (when provided).
+    When ``.venv/Scripts`` exists (Windows), formats commands using ``.venv/Scripts/``
+    instead of POSIX ``.venv/bin/``.
     """
-    venv_path = worktree / ".venv"
-    if not venv_path.is_dir():
+    venv_path: Path | None = None
+    for candidate in (
+        worktree / ".venv",
+        (repo_path / ".venv") if repo_path is not None else None,
+    ):
+        if candidate is not None and candidate.is_dir():
+            venv_path = candidate
+            break
+    if venv_path is None:
         return ""
+
+    has_scripts = (venv_path / "Scripts").is_dir() or (
+        repo_path is not None and (repo_path / ".venv" / "Scripts").is_dir()
+    )
+    bin_prefix = ".venv/Scripts/" if has_scripts else ".venv/bin/"
 
     commands: list[str] = []
 
@@ -2612,12 +2770,12 @@ def _build_venv_guidance(
         return (
             "\n\n## Worktree environment (MANDATORY)\n"
             "A provisioned virtualenv exists at `.venv/` in the worktree root with all "
-            "dependencies installed.  Run tooling through `.venv/bin/` so your checks "
+            f"dependencies installed.  Run tooling through `{bin_prefix}` so your checks "
             "match the green-gate exactly.  Do NOT use system-wide tools — they are a "
             "different toolchain and will disagree with the gate."
         )
 
-    lines = [f"- `.venv/bin/{cmd}`" for cmd in commands]
+    lines = [f"- `{bin_prefix}{cmd}`" for cmd in commands]
     unique_tools = sorted({cmd.split()[0] for cmd in commands})
     tool_refs = "/".join(f"`{t}`" for t in unique_tools)
 
