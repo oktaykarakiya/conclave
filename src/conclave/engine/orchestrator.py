@@ -39,6 +39,7 @@ from .graph_executor import (
 from .memory import AttemptMemory
 from .runner import AgentRunner
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
+from .workflow_evolver import evolve_project_workflow
 from .worktree import WorktreeManager
 
 # opencode reads AGENTS.md natively, so it leads the project-rule fallback list. CLAUDE.md
@@ -104,6 +105,8 @@ class Orchestrator:
         self._approval_resolutions: dict[tuple[str, str], dict[str, Any]] = {}
         # Dynamically armed HITL nodes/edges — keyed by task_id -> set of node/edge ids.
         self._dynamic_hitl: dict[str, set[str]] = {}
+        self._reloader: Any = None
+        self._daemon: Any = None
 
     async def recover(self, project_id: str) -> tuple[int, int]:
         """Crash recovery: return orphaned in_progress tasks to approved and re-block
@@ -454,6 +457,7 @@ class Orchestrator:
         # transitions the task to failed, cleans the worktree, and lets the worker
         # continue with the next task — never stranding a task in_progress or leaking
         # a worktree.
+        gate_failed_after_review = False
         try:
             _, sha = await run_git(worktree, "rev-parse", "HEAD")
             base_head_sha = sha.strip()
@@ -614,6 +618,7 @@ class Orchestrator:
             attempts = max(0, resumed_attempt - 1) if resumed_attempt is not None else 0
             failed = False
             timed_out = False
+            gate_failed_after_review = False
 
             while attempts < max_retries:
                 if _check_budget(started, budget):
@@ -1032,6 +1037,7 @@ class Orchestrator:
                             )
                             break  # infra failure — abort the attempt
                         elif gate_mark == "real":
+                            gate_failed_after_review = True
                             await repo.save_task_checkpoint(
                                 self._db,
                                 task_id=task.id,
@@ -1219,6 +1225,14 @@ class Orchestrator:
                 self._node_steers.pop(k, None)
             for k in [k for k in self._approval_resolutions if k[0] == task.id]:
                 self._approval_resolutions.pop(k, None)
+            with contextlib.suppress(Exception):
+                await evolve_project_workflow(
+                    self._db,
+                    self._bus,
+                    project.id,
+                    task_id=task.id,
+                    gate_failed_after_review=gate_failed_after_review,
+                )
             # Prune events/baselines unconditionally — every processed task, regardless of
             # outcome (success/failure/cancel/exception) and crucially even for projects with
             # NO test command (which never run a baseline). Folding GC into _baseline meant
@@ -1236,6 +1250,13 @@ class Orchestrator:
             # Reads the freshly-persisted task so the payload reflects the final state +
             # summary; inert unless a webhook is configured, and fully best-effort.
             await self._notify_terminal(project.id, task.id, config)
+            if (
+                self._reloader is not None
+                and self._daemon is not None
+                and getattr(self._reloader, "reload_pending", False)
+            ):
+                with contextlib.suppress(Exception):
+                    await self._reloader.on_task_complete(self._daemon)
 
     async def _notify_terminal(
         self, project_id: str, task_id: str, config: ConclaveConfig
@@ -2368,7 +2389,16 @@ class Orchestrator:
         self._merge_lock_refs[target_branch] = self._merge_lock_refs.get(target_branch, 0) + 1
         try:
             async with lock:
-                return await self._merge_locked(repo_path, target_branch, task_branch, task_id)
+                res = await self._merge_locked(repo_path, target_branch, task_branch, task_id)
+                if (
+                    res is MergeResult.success
+                    and self._reloader is not None
+                    and (repo_path / "src" / "conclave").is_dir()
+                ):
+                    self._reloader.request_reload(
+                        self._daemon, reason=f"self_merge:{task_id}"
+                    )
+                return res
         finally:
             refs = self._merge_lock_refs[target_branch] - 1
             if refs <= 0:

@@ -121,7 +121,7 @@ export default function App() {
         );
         return next;
       });
-    } else if (lastEvent.type === "project.updated") {
+    } else if (lastEvent.type === "project.updated" || lastEvent.type === "workflow.evolved") {
       if (lastEvent.payload?.project) {
         const updated = lastEvent.payload.project as unknown as Project;
         if (updated && typeof updated.id === "string") {
@@ -129,6 +129,12 @@ export default function App() {
             prev.map((p) => (p.id === updated.id ? updated : p)),
           );
         }
+      }
+      void refreshProjects();
+    } else if (lastEvent.type === "system.reloaded") {
+      if (lastEvent.payload?.frontend_rebuilt === true) {
+        window.location.reload();
+        return;
       }
       void refreshProjects();
     } else if (lastEvent.type === "mcp.tool_called") {

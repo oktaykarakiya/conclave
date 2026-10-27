@@ -47,6 +47,7 @@ from ..db import (
 from ..db import repositories as repo
 from ..db.planning_models import PlanningMessage, PlanningSession, PlanningTaskNode
 from ..engine.compactor import compact_planning_session_context, compact_task_context
+from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..runtime import Daemon
@@ -143,9 +144,36 @@ class ObservabilityQueryInput(BaseModel):
     limit: int = Field(default=200, ge=1, le=5000)
 
 
+class SystemReloadInput(BaseModel):
+    force: bool = False
+
+
+class WorkflowEvolveInput(BaseModel):
+    task_id: str | None = None
+    gate_failed_after_review: bool = False
+    task_failed: bool = False
+
+
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
+
+
+@router.get("/system/reload-status")
+async def get_system_reload_status(
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    return daemon.reload_status()
+
+
+@router.post("/system/reload")
+async def trigger_system_reload(
+    body: SystemReloadInput | None = None,
+    force: bool = Query(False),
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    effective_force = bool(force or (body.force if body is not None else False))
+    return await daemon.reload_now(force=effective_force)
 
 
 @router.get("/config/schema")
@@ -524,6 +552,25 @@ async def update_project_workflow(
         payload={"project": updated_proj.model_dump(mode="json")},
     )
     return wf_payload
+
+
+@router.post("/projects/{project_id}/workflow/evolve")
+async def evolve_project_workflow_endpoint(
+    project_id: str,
+    body: WorkflowEvolveInput | None = None,
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    await _require_project(daemon, project_id)
+    return await evolve_project_workflow(
+        daemon.db,
+        daemon.bus,
+        project_id,
+        task_id=body.task_id if body is not None else None,
+        gate_failed_after_review=(
+            body.gate_failed_after_review if body is not None else False
+        ),
+        task_failed=body.task_failed if body is not None else False,
+    )
 
 
 @router.post("/projects/{project_id}/mode")

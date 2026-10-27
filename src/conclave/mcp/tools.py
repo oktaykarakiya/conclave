@@ -31,6 +31,7 @@ from ..db import (
 )
 from ..db import repositories as repo
 from ..engine.compactor import compact_planning_session_context, compact_task_context
+from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..runtime import Daemon
 from ..verification import quarantine_integrity
@@ -782,6 +783,40 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "limit": _prop("integer", "Max rows to return (default 200).", default=200),
         },
         required=["sql"],
+    ),
+    _tool(
+        "conclave_reload_system",
+        "Hot-reload all Conclave Python modules, DB migrations, global defaults, runtime "
+        "orchestrators/workers, and FastAPI/MCP routes in-place (defers until quiescent "
+        "if a task is in-flight unless force=true).",
+        {
+            "force": _prop(
+                "boolean",
+                "If true, reload immediately even if a task is currently in-flight.",
+                default=False,
+            ),
+        },
+    ),
+    _tool(
+        "conclave_evolve_workflow",
+        "Longitudinally evolve a project's workflow graph based on historical verdicts, "
+        "gate outcomes, and clean task streaks (growing on failures/catches, shrinking "
+        "zero-catch non-core reviewers after >= 3 clean done tasks).",
+        {
+            "project_id": _prop("string", "Project ID."),
+            "task_id": _prop("string", "Optional task ID to evaluate."),
+            "gate_failed_after_review": _prop(
+                "boolean",
+                "Whether the green-gate failed after reviewers passed.",
+                default=False,
+            ),
+            "task_failed": _prop(
+                "boolean",
+                "Whether the task failed.",
+                default=False,
+            ),
+        },
+        required=["project_id"],
     ),
 ]
 
@@ -2242,6 +2277,25 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         limit = max(1, min(int(args.get("limit", 200)), 5000))
         return await repo.query_interaction_logs_readonly(
             daemon.db, sql_query, limit=limit
+        )
+
+    if name == "conclave_reload_system":
+        force = bool(args.get("force", False))
+        return await daemon.reload_now(force=force)
+
+    if name == "conclave_evolve_workflow":
+        project = await _require_project(daemon, str(args.get("project_id", "")))
+        raw_tid = args.get("task_id")
+        tid_val = str(raw_tid).strip() if raw_tid and str(raw_tid).strip() else None
+        gate_failed = bool(args.get("gate_failed_after_review", False))
+        task_failed = bool(args.get("task_failed", False))
+        return await evolve_project_workflow(
+            daemon.db,
+            daemon.bus,
+            project.id,
+            task_id=tid_val,
+            gate_failed_after_review=gate_failed,
+            task_failed=task_failed,
         )
 
     raise McpToolError(f"unknown MCP tool: {name!r}")

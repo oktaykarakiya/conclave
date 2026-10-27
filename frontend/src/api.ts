@@ -388,4 +388,30 @@ export const api = {
       "POST",
       "/api/observability/export-parquet",
     ),
+  reloadStatus: () =>
+    req<{
+      reload_count: number;
+      reload_pending: boolean;
+      quiescent: boolean;
+      changed_files: string[];
+      frontend_stale: boolean;
+      discoverable_modules: number;
+      version: string;
+    }>("GET", "/api/system/reload-status"),
+  reloadSystem: (force = false) =>
+    req<{
+      reloaded: boolean;
+      deferred: boolean;
+      reload_pending: boolean;
+      quiescent: boolean;
+      reload_count: number;
+      modules_reloaded: number;
+      frontend_rebuilt: boolean;
+      version: string;
+    }>("POST", "/api/system/reload", { force }),
+  evolveWorkflow: (projectId: string) =>
+    req<Record<string, unknown>>(
+      "POST",
+      `/api/projects/${encodeURIComponent(projectId)}/workflow/evolve`,
+    ),
 };

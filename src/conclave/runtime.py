@@ -24,6 +24,7 @@ from .db import Database, Project, ProjectMode, Task, TaskState
 from .db import repositories as repo
 from .engine import AgentRunner, BugFixerController, Orchestrator, SessionBudget, WorktreeManager
 from .events import EventBus, EventType
+from .hot_reload import HotReloader
 from .planning.session import PlanningOrchestrator
 from .providers import Provider
 from .util import new_id
@@ -59,6 +60,8 @@ class ProjectWorker:
         self._session_budget: SessionBudget | None = None
         self._session_started: float | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
+        self._reloader: HotReloader | None = getattr(orchestrator, "_reloader", None)
+        self._daemon: Daemon | None = getattr(orchestrator, "_daemon", None)
 
     async def start(self) -> None:
         await self._orchestrator.recover(self.project_id)
@@ -117,6 +120,11 @@ class ProjectWorker:
                     )
         finally:
             self._orchestrator._cancel_events.pop(task.id, None)
+            reloader = self._reloader or getattr(self._orchestrator, "_reloader", None)
+            daemon_ref = self._daemon or getattr(self._orchestrator, "_daemon", None)
+            if reloader is not None and daemon_ref is not None and reloader.reload_pending:
+                with contextlib.suppress(Exception):
+                    await reloader.on_task_complete(daemon_ref)
 
     async def _task_queue_tick(self) -> None:
         """One task-queue iteration: claim the next approved task and process it, or back off."""
@@ -233,11 +241,31 @@ class Daemon:
         self.home = home
         self.provider = provider
         self.bus = EventBus(db)
+        self.reloader = HotReloader()
+        self.app: Any = None
         self.orchestrator = Orchestrator(db, self.bus, provider, home)
+        self.orchestrator._reloader = self.reloader
+        self.orchestrator._daemon = self
         self.planning_orchestrator = PlanningOrchestrator(db, self.bus, provider)
         self._workers: dict[str, ProjectWorker] = {}
         self._bg_tasks: set[asyncio.Task[None]] = set()
         self._workers_enabled = workers_enabled
+
+    def is_quiescent(self) -> bool:
+        """Return ``True`` when no task or planning turn is in-flight."""
+        return self.reloader.is_quiescent(self)
+
+    def request_reload(self, *, reason: str = "requested") -> dict[str, Any]:
+        """Mark a system hot-reload as pending until the daemon is quiescent."""
+        return self.reloader.request_reload(self, reason=reason)
+
+    def reload_status(self) -> dict[str, Any]:
+        """Return current hot-reload status and module coverage."""
+        return self.reloader.status(self)
+
+    async def reload_now(self, *, force: bool = False) -> dict[str, Any]:
+        """Execute or defer a quiescent hot-reload across all Conclave modules."""
+        return await self.reloader.reload_now(self, app=self.app, force=force)
 
     async def start(self) -> None:
         if not self._workers_enabled:

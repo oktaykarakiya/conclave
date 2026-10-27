@@ -18,6 +18,7 @@ from .graph_executor import (
     derive_review_nodes,
     is_parallel_review,
     resolve_workflow,
+    scale_workflow_for_task,
 )
 from .hunter import HunterCandidate, parse_hunter_candidate
 from .memory import AttemptMemory
@@ -33,6 +34,7 @@ from .test_integrity import (
     modified_or_deleted_tests,
 )
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
+from .workflow_evolver import evolve_project_workflow
 from .worktree import WorktreeError, WorktreeManager
 
 __all__ = [
@@ -58,6 +60,7 @@ __all__ = [
     "derive_planner_nodes",
     "derive_review_nodes",
     "discover_bug",
+    "evolve_project_workflow",
     "get_agent_pipeline",
     "ingest_coverage",
     "is_parallel_review",
@@ -73,6 +76,7 @@ __all__ = [
     "run_git",
     "run_shell",
     "run_tests",
+    "scale_workflow_for_task",
     "select_hunt_region",
     "trim_output",
 ]

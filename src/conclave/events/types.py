@@ -73,6 +73,7 @@ class EventType(StrEnum):
     project_updated = "project.updated"
     project_deleted = "project.deleted"
     workflow_updated = "workflow.updated"
+    workflow_evolved = "workflow.evolved"
     agent_upserted = "agent.upserted"
     agent_deleted = "agent.deleted"
     store_upserted = "store.upserted"
@@ -80,3 +81,5 @@ class EventType(StrEnum):
     mcp_tool_called = "mcp.tool_called"
     interaction_logged = "interaction.logged"
     context_compacted = "context.compacted"
+    system_reloaded = "system.reloaded"
+

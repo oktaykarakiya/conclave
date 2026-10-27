@@ -11,12 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
 from ..bootstrap import seed_global_defaults
 from ..db import repositories as repo
+from ..hot_reload import mount_spa_routes
 from ..runtime import Daemon
 from .api import router as api_router
 from .mcp_routes import router as mcp_router
@@ -332,6 +331,7 @@ def create_app(daemon: Daemon, *, manage_lifecycle: bool = True) -> FastAPI:
 
     app = FastAPI(title="Conclave", version=__version__, lifespan=lifespan)
     app.state.daemon = daemon
+    daemon.app = app
     app.include_router(api_router)
     app.include_router(mcp_router)
     app.include_router(ws_router)
@@ -340,12 +340,6 @@ def create_app(daemon: Daemon, *, manage_lifecycle: bool = True) -> FastAPI:
     app.add_middleware(_OriginGuardMiddleware)
 
     static_dir = Path(__file__).parent / "static"
-    if (static_dir / "index.html").is_file():
-        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="spa")
-    else:
-
-        @app.get("/", response_class=HTMLResponse)
-        async def root() -> str:
-            return _PLACEHOLDER
+    mount_spa_routes(app, static_dir, _PLACEHOLDER)
 
     return app
