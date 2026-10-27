@@ -19,6 +19,16 @@ logger = logging.getLogger("conclave.mcp")
 
 _DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 
+_OBSERVABILITY_READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "conclave_list_interactions",
+        "conclave_get_interaction",
+        "conclave_query_interactions",
+        "conclave_get_observability_stats",
+        "conclave_get_reload_status",
+    }
+)
+
 
 def mcp_connect_snippets(base_url: str = "http://127.0.0.1:8700") -> dict[str, Any]:
     """Return ready-to-copy MCP configuration snippets for OpenCode and Claude Code."""
@@ -83,7 +93,7 @@ async def handle_mcp_message(
     params = params_raw if isinstance(params_raw, dict) else {}
 
     # Notifications carry no id and expect no response object.
-    if msg_id is None and method.startswith("notifications/"):
+    if "id" not in payload or (msg_id is None and method.startswith("notifications/")):
         return None
 
     if method == "initialize":
@@ -116,45 +126,53 @@ async def handle_mcp_message(
         t0 = time.monotonic()
         raw_pid = tool_args.get("project_id")
         pid = str(raw_pid).strip() if isinstance(raw_pid, str) and raw_pid.strip() else None
+        if pid is not None and pid.lower() == "global":
+            pid = None
         raw_tid = tool_args.get("task_id")
         tid = str(raw_tid).strip() if isinstance(raw_tid, str) and raw_tid.strip() else None
+        if pid is None and tid is not None:
+            task_obj = await repo.get_task(daemon.db, tid)
+            if task_obj is not None:
+                pid = task_obj.project_id
         user_prompt_str = json.dumps(tool_args)
+        should_log = tool_name not in _OBSERVABILITY_READ_TOOLS
         try:
             output = await call_mcp_tool(daemon, tool_name, tool_args)
             duration = round(max(0.0, time.monotonic() - t0), 4)
-            assistant_text = json.dumps(output)[:4000]
-            log_row = await repo.record_interaction_log(
-                daemon.db,
-                source="mcp",
-                agent="mcp",
-                model="mcp/jsonrpc",
-                title=f"MCP: {tool_name}",
-                user_prompt=user_prompt_str,
-                messages=[
-                    {"role": "user", "text": user_prompt_str},
-                    {"role": "assistant", "text": assistant_text},
-                ],
-                tool_calls_count=1,
-                message_count=2,
-                tool_breakdown={tool_name: 1},
-                duration=duration,
-                project_id=pid,
-                task_id=tid,
-            )
             await daemon.bus.emit(
                 type=EventType.mcp_tool_called,
                 payload={"tool": tool_name, "ok": True, "project_id": pid, "task_id": tid},
             )
-            await daemon.bus.emit(
-                type=EventType.interaction_logged,
-                payload={
-                    "session_id": log_row.session_id,
-                    "source": "mcp",
-                    "tool": tool_name,
-                    "agent": "mcp",
-                    "project_id": pid,
-                },
-            )
+            if should_log:
+                assistant_text = json.dumps(output)[:4000]
+                log_row = await repo.record_interaction_log(
+                    daemon.db,
+                    source="mcp",
+                    agent="mcp",
+                    model="mcp/jsonrpc",
+                    title=f"MCP: {tool_name}",
+                    user_prompt=user_prompt_str,
+                    messages=[
+                        {"role": "user", "text": user_prompt_str},
+                        {"role": "assistant", "text": assistant_text},
+                    ],
+                    tool_calls_count=1,
+                    message_count=2,
+                    tool_breakdown={tool_name: 1},
+                    duration=duration,
+                    project_id=pid,
+                    task_id=tid,
+                )
+                await daemon.bus.emit(
+                    type=EventType.interaction_logged,
+                    payload={
+                        "session_id": log_row.session_id,
+                        "source": "mcp",
+                        "tool": tool_name,
+                        "agent": "mcp",
+                        "project_id": pid,
+                    },
+                )
             return _jsonrpc_result(
                 msg_id,
                 {
@@ -167,27 +185,28 @@ async def handle_mcp_message(
                     "isError": False,
                 },
             )
-        except (McpToolError, ValidationError, ValueError) as exc:
+        except (McpToolError, ValidationError, ValueError, TypeError) as exc:
             duration = round(max(0.0, time.monotonic() - t0), 4)
             err_text = f"Error: {exc}"
-            await repo.record_interaction_log(
-                daemon.db,
-                source="mcp",
-                agent="mcp",
-                model="mcp/jsonrpc",
-                title=f"MCP: {tool_name}",
-                user_prompt=user_prompt_str,
-                messages=[
-                    {"role": "user", "text": user_prompt_str},
-                    {"role": "assistant", "text": err_text[:4000]},
-                ],
-                tool_calls_count=1,
-                message_count=2,
-                tool_breakdown={tool_name: 1},
-                duration=duration,
-                project_id=pid,
-                task_id=tid,
-            )
+            if should_log:
+                await repo.record_interaction_log(
+                    daemon.db,
+                    source="mcp",
+                    agent="mcp",
+                    model="mcp/jsonrpc",
+                    title=f"MCP: {tool_name}",
+                    user_prompt=user_prompt_str,
+                    messages=[
+                        {"role": "user", "text": user_prompt_str},
+                        {"role": "assistant", "text": err_text[:4000]},
+                    ],
+                    tool_calls_count=1,
+                    message_count=2,
+                    tool_breakdown={tool_name: 1},
+                    duration=duration,
+                    project_id=pid,
+                    task_id=tid,
+                )
             await daemon.bus.emit(
                 type=EventType.mcp_tool_called,
                 payload={"tool": tool_name, "ok": False, "error": str(exc)},
@@ -226,6 +245,25 @@ async def handle_mcp_message(
         ]
         return _jsonrpc_result(msg_id, {"resources": resources})
 
+    if method == "resources/templates/list":
+        return _jsonrpc_result(
+            msg_id,
+            {
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": "conclave://projects/{project_id}",
+                        "name": "Conclave Project",
+                        "mimeType": "application/json",
+                    },
+                    {
+                        "uriTemplate": "conclave://tasks/{task_id}",
+                        "name": "Conclave Task",
+                        "mimeType": "application/json",
+                    },
+                ]
+            },
+        )
+
     if method == "resources/read":
         uri = str(params.get("uri", ""))
         if uri.startswith("conclave://projects/"):
@@ -238,6 +276,29 @@ async def handle_mcp_message(
                 {
                     "project": proj.model_dump(mode="json"),
                     "tasks": [t.model_dump(mode="json") for t in tasks],
+                },
+                indent=2,
+            )
+            return _jsonrpc_result(
+                msg_id,
+                {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": body}
+                    ]
+                },
+            )
+        if uri.startswith("conclave://tasks/"):
+            tid = uri.removeprefix("conclave://tasks/").strip("/")
+            task = await repo.get_task(daemon.db, tid)
+            if task is None:
+                return _jsonrpc_error(msg_id, -32602, f"Resource not found: {uri}")
+            checkpoints = await repo.list_task_checkpoints(daemon.db, task.id)
+            verdicts = await repo.list_verdicts(daemon.db, task.id, limit=100)
+            body = json.dumps(
+                {
+                    "task": task.model_dump(mode="json"),
+                    "checkpoints": [cp.model_dump(mode="json") for cp in checkpoints],
+                    "verdicts": [v.model_dump(mode="json") for v in verdicts],
                 },
                 indent=2,
             )

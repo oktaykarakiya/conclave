@@ -22,22 +22,90 @@ from ..runtime import Daemon
 from .server import handle_mcp_message
 
 
-def _forward_http(mcp_url: str, message: dict[str, Any]) -> dict[str, Any] | None:
-    data = json.dumps(message).encode("utf-8")
+def _forward_http(
+    mcp_url_or_payload: str | dict[str, Any] | list[Any],
+    message: dict[str, Any] | list[Any] | None = None,
+) -> dict[str, Any] | list[Any] | None:
+    if isinstance(mcp_url_or_payload, str):
+        mcp_url = mcp_url_or_payload
+        payload: dict[str, Any] | list[Any] = message if message is not None else {}
+    else:
+        base_url = os.environ.get("CONCLAVE_URL", "http://127.0.0.1:8700").rstrip("/")
+        mcp_url = f"{base_url}/mcp"
+        payload = mcp_url_or_payload
+
+    msg_id = payload.get("id") if isinstance(payload, dict) else None
+    try:
+        timeout = float(os.environ.get("CONCLAVE_MCP_TIMEOUT", "300.0"))
+    except ValueError:
+        timeout = 300.0
+
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         mcp_url,
         data=data,
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30.0) as resp:
-        if resp.status == 202 or resp.status == 204:
-            return None
-        raw = resp.read().decode("utf-8").strip()
-        if not raw:
-            return None
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 202 or resp.status == 204:
+                return None
+            raw = resp.read().decode("utf-8").strip()
+            if not raw:
+                return None
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, (dict, list)) else None
+    except urllib.error.HTTPError as exc:
+        try:
+            raw_err = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            raw_err = ""
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                pass
+        if raw_err:
+            try:
+                parsed_err = json.loads(raw_err)
+                if isinstance(parsed_err, list):
+                    return parsed_err
+                if isinstance(parsed_err, dict) and (
+                    "jsonrpc" in parsed_err or "result" in parsed_err or "error" in parsed_err
+                ):
+                    return parsed_err
+            except json.JSONDecodeError:
+                pass
+        detail = f": {raw_err}" if raw_err else ""
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {
+                "code": -32603,
+                "message": f"HTTP {exc.code} {exc.reason}{detail}",
+            },
+        }
+    except TimeoutError as exc:
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {
+                "code": -32603,
+                "message": f"MCP HTTP request timed out after {timeout}s: {exc}",
+            },
+        }
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32603,
+                    "message": f"MCP HTTP request timed out after {timeout}s: {exc.reason}",
+                },
+            }
+        raise
 
 
 async def _run_stdio() -> None:
@@ -62,17 +130,69 @@ async def _run_stdio() -> None:
                 continue
             try:
                 msg = json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                parse_err = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": f"Parse error: {exc.msg}"},
+                }
+                sys.stdout.write(json.dumps(parse_err) + "\n")
+                sys.stdout.flush()
                 continue
-            if not isinstance(msg, dict):
+            if not isinstance(msg, (dict, list)):
+                inv_err = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                }
+                sys.stdout.write(json.dumps(inv_err) + "\n")
+                sys.stdout.flush()
                 continue
 
-            response: dict[str, Any] | None = None
+            response: dict[str, Any] | list[Any] | None = None
             try:
                 response = await asyncio.to_thread(_forward_http, mcp_url, msg)
-            except (urllib.error.URLError, TimeoutError, OSError):
-                daemon = await _get_fallback_daemon()
-                response = await handle_mcp_message(daemon, msg)
+            except urllib.error.HTTPError as exc:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+                msg_id = msg.get("id") if isinstance(msg, dict) else None
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32603, "message": f"HTTP {exc.code} {exc.reason}"},
+                }
+            except TimeoutError as exc:
+                msg_id = msg.get("id") if isinstance(msg, dict) else None
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32603, "message": f"MCP HTTP request timed out: {exc}"},
+                }
+            except (urllib.error.URLError, ConnectionError, OSError) as exc:
+                if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError):
+                    msg_id = msg.get("id") if isinstance(msg, dict) else None
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {
+                            "code": -32603,
+                            "message": f"MCP HTTP request timed out: {exc.reason}",
+                        },
+                    }
+                else:
+                    daemon = await _get_fallback_daemon()
+                    if isinstance(msg, list):
+                        batch_responses: list[dict[str, Any]] = []
+                        for item in msg:
+                            if isinstance(item, dict):
+                                item_res = await handle_mcp_message(daemon, item)
+                                if item_res is not None:
+                                    batch_responses.append(item_res)
+                        response = batch_responses if batch_responses else None
+                    else:
+                        response = await handle_mcp_message(daemon, msg)
 
             if response is not None:
                 sys.stdout.write(json.dumps(response) + "\n")
