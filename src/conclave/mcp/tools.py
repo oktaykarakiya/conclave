@@ -33,12 +33,41 @@ from ..db import repositories as repo
 from ..engine.compactor import compact_planning_session_context, compact_task_context
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
+from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..runtime import Daemon
 from ..verification import quarantine_integrity
 
 
 class McpToolError(ValueError):
     """Raised when an MCP tool call has invalid arguments or preconditions."""
+
+
+def _opt_str(args: dict[str, Any], key: str, default: str = "") -> str:
+    val = args.get(key)
+    if val is None:
+        return default
+    s = str(val).strip()
+    return s if s else default
+
+
+def _opt_int(args: dict[str, Any], key: str, default: int) -> int:
+    val = args.get(key)
+    if val is None or isinstance(val, bool):
+        return default
+    return int(val)
+
+
+def _opt_bool(args: dict[str, Any], key: str, default: bool) -> bool:
+    val = args.get(key)
+    if val is None:
+        return default
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no", ""):
+            return False
+    return bool(val)
 
 
 def _prop(
@@ -159,6 +188,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "string",
                 "Project ID to update, or omit / pass 'global' to update global settings.",
             ),
+            "name": _prop(
+                "string",
+                "Optional new display name for the project (when project_id is specified).",
+            ),
             "config": {
                 "type": "object",
                 "description": "Partial ConclaveConfig overrides object.",
@@ -181,11 +214,63 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "wall_clock_budget_minutes": _prop(
                 "integer", "Optional task timeout budget in minutes."
             ),
+            "review_rounds_max": _prop("integer", "Optional max review rounds per task (1-50)."),
+            "stop_on_failure": _prop("boolean", "Optional stop-on-failure toggle."),
+            "setup_timeout_seconds": _prop(
+                "integer", "Optional setup_command timeout in seconds."
+            ),
+            "retention_events_max": _prop(
+                "integer", "Optional max retained events per project (>=100)."
+            ),
             "grounding_checks": _prop("boolean", "Optional evidence grounding checks toggle."),
             "planner_enabled": _prop("boolean", "Optional auto-planner toggle."),
             "cross_attempt_memory": _prop("boolean", "Optional cross-attempt memory toggle."),
             "post_mortem_enabled": _prop("boolean", "Optional failure post-mortem toggle."),
+            "structured_verdicts": _prop(
+                "boolean", "Optional structured reviewer verdicts toggle."
+            ),
+            "persistent_baseline_cache": _prop(
+                "boolean", "Optional persistent baseline cache toggle."
+            ),
+            "auto_planner_char_threshold": _prop(
+                "integer", "Optional character threshold for auto-planner."
+            ),
+            "cross_attempt_memory_entries": _prop(
+                "integer", "Optional max cross-attempt memory entries (0-50)."
+            ),
             "webhook_url": _prop("string", "Optional terminal notification webhook URL."),
+            "planning": {
+                "type": "object",
+                "description": "Optional PlanningSettings overrides.",
+            },
+            "agents": {
+                "type": "object",
+                "description": "Optional AgentsPolicy overrides.",
+            },
+            "bug_fixer": {
+                "type": "object",
+                "description": "Optional BugFixerPolicy overrides.",
+            },
+            "notifications": {
+                "type": "object",
+                "description": "Optional NotificationSettings overrides.",
+            },
+            "protected": {
+                "type": "object",
+                "description": "Optional ProtectedPaths overrides.",
+            },
+            "agent_defaults": {
+                "type": "object",
+                "description": "Optional default AgentSettings overrides.",
+            },
+            "agent_overrides": {
+                "type": "object",
+                "description": "Optional per-agent AgentSettings overrides map.",
+            },
+            "workflow": {
+                "type": "object",
+                "description": "Optional WorkflowGraph JSON object.",
+            },
             "apply_to_all_projects": _prop(
                 "boolean",
                 "When updating global config, also apply the patch to all attached projects.",
@@ -226,6 +311,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "title": _prop("string", "Short task title.", default=""),
             "auto_approve": _prop("boolean", "Approve immediately for execution.", default=True),
             "use_planner": _prop("boolean", "Force or skip the pre-developer planner."),
+            "parent_task_id": _prop(
+                "string",
+                "Optional parent task ID to create a child/subtask in a dependency tree.",
+            ),
             "source_branch": _prop(
                 "string",
                 "Optional source branch for PR reviews (e.g. 'origin/feature-login-fix'); "
@@ -242,9 +331,28 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_approve_task",
-        "Approve an inbox, failed, or waiting_for_approval task so the worker executes/resumes it.",
+        "Approve an inbox, failed, blocked, cancelled, or waiting_for_approval task so the "
+        "worker executes/resumes it.",
         {"task_id": _prop("string", "Task ID.")},
         required=["task_id"],
+    ),
+    _tool(
+        "conclave_set_hitl_checkpoint",
+        "Dynamically arm or disarm a Human-in-the-Loop (HITL) pause on a workflow node or "
+        "connector edge for a task.",
+        {
+            "task_id": _prop("string", "Task ID."),
+            "target_id": _prop(
+                "string",
+                "Workflow node ID (e.g. 'developer', 'gate') or connector edge ID to arm/disarm.",
+            ),
+            "enabled": _prop(
+                "boolean",
+                "True to arm the HITL pause, False to disarm/release it.",
+                default=True,
+            ),
+        },
+        required=["task_id", "target_id"],
     ),
     _tool(
         "conclave_complete_node",
@@ -785,6 +893,25 @@ MCP_TOOLS: list[dict[str, Any]] = [
         required=["sql"],
     ),
     _tool(
+        "conclave_get_observability_stats",
+        "Get aggregated observability statistics (sessions, cost, token totals, per-model and "
+        "per-agent breakdowns) from interaction_logs, optionally exporting to Parquet.",
+        {
+            "project_id": _prop("string", "Optional project ID filter."),
+            "export_parquet": _prop(
+                "boolean",
+                "If true, also synchronize/export interaction_logs to INTERACTION_LOGS.parquet.",
+                default=False,
+            ),
+        },
+    ),
+    _tool(
+        "conclave_get_reload_status",
+        "Get current quiescent hot-reload status, pending state, and module coverage without "
+        "triggering a reload.",
+        {},
+    ),
+    _tool(
         "conclave_reload_system",
         "Hot-reload all Conclave Python modules, DB migrations, global defaults, runtime "
         "orchestrators/workers, and FastAPI/MCP routes in-place (defers until quiescent "
@@ -875,14 +1002,14 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     """Execute a named Conclave MCP tool against *daemon* and return a JSON-serializable result."""
     # --- Projects ---
     if name == "conclave_list_projects":
-        limit = max(1, min(int(args.get("limit", 50)), 500))
+        limit = max(1, min(_opt_int(args, "limit", 50), 500))
         projects = await repo.list_projects(daemon.db, limit=limit)
         return [p.model_dump(mode="json") for p in projects]
 
     if name == "conclave_attach_project":
-        proj_name = str(args.get("name", "")).strip()
-        raw_path = str(args.get("path", "")).strip()
-        default_branch = str(args.get("default_branch", "main")).strip() or "main"
+        proj_name = _opt_str(args, "name")
+        raw_path = _opt_str(args, "path")
+        default_branch = _opt_str(args, "default_branch", "main") or "main"
         if not proj_name or not raw_path:
             raise McpToolError("name and path are required")
         path = Path(raw_path).expanduser()
@@ -897,14 +1024,14 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         )
         if global_preset is not None:
             initial_cfg = deep_merge(initial_cfg, global_preset.payload)
-        preset_name = str(args.get("config_preset") or "").strip()
+        preset_name = _opt_str(args, "config_preset")
         if preset_name:
             preset = await repo.get_store_item_by_name(
                 daemon.db, StoreItemKind.config_preset, preset_name
             )
             if preset is not None:
                 initial_cfg = deep_merge(initial_cfg, preset.payload)
-        wf_tpl = str(args.get("workflow_template") or "").strip()
+        wf_tpl = _opt_str(args, "workflow_template")
         if wf_tpl:
             wf_item = await repo.get_store_item_by_name(
                 daemon.db, StoreItemKind.workflow, wf_tpl
@@ -918,7 +1045,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         if args.get("max_parallel_tasks") is not None:
             exec_sec = dict(initial_cfg.get("execution") or {})
             exec_sec["max_parallel_tasks"] = max(
-                1, min(int(args["max_parallel_tasks"]), 16)
+                1, min(_opt_int(args, "max_parallel_tasks", 1), 16)
             )
             initial_cfg["execution"] = exec_sec
 
@@ -966,7 +1093,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return proj_json
 
     if name in ("conclave_detach_project", "conclave_delete_project"):
-        pid = str(args.get("project_id", ""))
+        pid = _opt_str(args, "project_id")
         await _require_project(daemon, pid)
         await daemon.stop_worker(pid)
         await daemon.cleanup_in_progress_work(pid)
@@ -978,7 +1105,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return {"detached": pid}
 
     if name == "conclave_get_project_status":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         usage = await repo.usage_summary(daemon.db, project.id)
         return {
             "project": project.model_dump(mode="json"),
@@ -988,16 +1115,16 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_pause_project":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         return {"project_id": project.id, "paused": daemon.set_paused(project.id, True)}
 
     if name == "conclave_resume_project":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         return {"project_id": project.id, "running": daemon.set_paused(project.id, False)}
 
     if name == "conclave_set_project_mode":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        mode = ProjectMode(str(args.get("mode", "task_queue")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        mode = ProjectMode(_opt_str(args, "mode", "task_queue"))
         await repo.set_project_mode(daemon.db, project.id, mode)
         updated = await _require_project(daemon, project.id)
         updated_json = updated.model_dump(mode="json")
@@ -1009,7 +1136,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return updated_json
 
     if name == "conclave_get_config":
-        raw_pid = str(args.get("project_id") or "").strip()
+        raw_pid = _opt_str(args, "project_id")
         if not raw_pid or raw_pid in ("global", "default", "defaults", "*"):
             global_item = await repo.get_store_item_by_name(
                 daemon.db, StoreItemKind.config_preset, "global-defaults"
@@ -1020,15 +1147,16 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return load_project_config(project.config).model_dump(mode="json")
 
     if name in ("conclave_patch_config", "conclave_update_config", "conclave_update_settings"):
-        raw_pid = str(args.get("project_id") or "").strip()
+        raw_pid = _opt_str(args, "project_id")
+        new_name = _opt_str(args, "name") or None
         raw_patch = args.get("config")
         patch: dict[str, Any] = (
             normalize_config_keys(dict(raw_patch)) if isinstance(raw_patch, dict) else {}
         )
         # Support top-level convenience settings (target_branch, default_branch, execution.*, etc.)
         new_branch_raw = (
-            args.get("default_branch")
-            or args.get("target_branch")
+            _opt_str(args, "default_branch")
+            or _opt_str(args, "target_branch")
             or patch.pop("default_branch", None)
         )
         new_branch = str(new_branch_raw).strip() if new_branch_raw else None
@@ -1074,7 +1202,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
         if args.get("webhook_url") is not None:
             notif_patch = dict(patch.get("notifications") or {})
-            notif_patch["webhook_url"] = args["webhook_url"]
+            notif_patch["webhook_url"] = _opt_str(args, "webhook_url")
             patch["notifications"] = notif_patch
 
         for sec_name in (
@@ -1092,7 +1220,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                     dict(patch.get(sec_name) or {}), normalize_config_keys(args[sec_name])
                 )
 
-        if not patch and not new_branch:
+        if not patch and not new_branch and not new_name:
             raise McpToolError("config object or setting fields are required")
 
         if not raw_pid or raw_pid in ("global", "default", "defaults", "*"):
@@ -1111,24 +1239,35 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 payload=merged_global,
                 built_in=False,
             )
-            apply_all = bool(args.get("apply_to_all_projects", True))
+            apply_all = _opt_bool(args, "apply_to_all_projects", True)
             if apply_all:
                 for proj in await repo.list_projects(daemon.db):
                     proj_merged = deep_merge(proj.config, patch)
-                    await repo.update_project(
+                    proj_resolved = load_project_config(proj_merged)
+                    updated_p = await repo.update_project(
                         daemon.db,
                         proj.id,
                         default_branch=new_branch or proj.default_branch,
                         config=proj_merged,
                     )
+                    if updated_p is not None:
+                        await daemon.bus.emit(
+                            type=EventType.project_updated,
+                            project_id=proj.id,
+                            payload={
+                                "project": updated_p.model_dump(mode="json"),
+                                "config": proj_resolved.model_dump(mode="json"),
+                            },
+                        )
             return resolved_global.model_dump(mode="json")
 
         project = await _require_project(daemon, raw_pid)
-        merged = deep_merge(project.config, patch)
+        merged = deep_merge(project.config, patch) if patch else dict(project.config)
         resolved = load_project_config(merged)
         await repo.update_project(
             daemon.db,
             project.id,
+            name=new_name or project.name,
             default_branch=new_branch or project.default_branch,
             config=merged,
         )
@@ -1156,28 +1295,24 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     # --- Tasks ---
     if name == "conclave_list_tasks":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        raw_state = args.get("state")
-        state = TaskState(str(raw_state)) if raw_state else None
-        limit = max(1, min(int(args.get("limit", 50)), 500))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        raw_state = _opt_str(args, "state")
+        state = TaskState(raw_state) if raw_state else None
+        limit = max(1, min(_opt_int(args, "limit", 50), 500))
         tasks = await repo.list_tasks(daemon.db, project.id, state, limit=limit)
         return [t.model_dump(mode="json") for t in tasks]
 
     if name == "conclave_create_task":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        request_text = str(args.get("request", "")).strip()
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        request_text = _opt_str(args, "request")
         if not request_text:
             raise McpToolError("request is required")
-        title = str(args.get("title", "")).strip()
-        auto_approve = bool(args.get("auto_approve", True))
+        title = _opt_str(args, "title")
+        auto_approve = _opt_bool(args, "auto_approve", True)
         use_planner_raw = args.get("use_planner")
         use_planner = bool(use_planner_raw) if isinstance(use_planner_raw, bool) else None
-        raw_source_branch = args.get("source_branch")
-        source_branch = (
-            str(raw_source_branch).strip()
-            if raw_source_branch and str(raw_source_branch).strip()
-            else None
-        )
+        parent_task_id = _opt_str(args, "parent_task_id") or None
+        source_branch = _opt_str(args, "source_branch") or None
         state = TaskState.approved if auto_approve else TaskState.inbox
         task = await repo.create_task(
             daemon.db,
@@ -1186,6 +1321,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             title=title,
             use_planner=use_planner,
             state=state,
+            parent_task_id=parent_task_id,
             source_branch=source_branch,
         )
         await daemon.bus.emit(
@@ -1195,13 +1331,14 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             payload={
                 "title": task.title,
                 "auto_approve": auto_approve,
+                "parent_task_id": task.parent_task_id,
                 "source_branch": task.source_branch,
             },
         )
         return task.model_dump(mode="json")
 
     if name == "conclave_get_task":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
         checkpoints = await repo.list_task_checkpoints(daemon.db, task.id)
         verdicts = await repo.list_verdicts(daemon.db, task.id, limit=100)
         usage = await repo.get_task_usage(daemon.db, task.id)
@@ -1214,50 +1351,76 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_approve_task":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
         if task.state == TaskState.waiting_for_approval:
             signaled = daemon.resolve_node(task.id, "*", status="completed")
             if not signaled:
                 await repo.approve_task(daemon.db, task.id)
-            await daemon.bus.emit(type=EventType.task_approved, task_id=task.id)
+            await daemon.bus.emit(
+                type=EventType.task_approved,
+                project_id=task.project_id,
+                task_id=task.id,
+            )
             return {"approved": task.id}
         ok = await repo.approve_task(daemon.db, task.id)
         if not ok:
             raise McpToolError(
                 f"task {task.id} is in state {task.state.value}; "
-                "only inbox, failed, or waiting_for_approval can be approved"
+                "only inbox, failed, blocked, cancelled, or waiting_for_approval can be approved"
             )
-        await daemon.bus.emit(type=EventType.task_approved, task_id=task.id)
+        await daemon.bus.emit(
+            type=EventType.task_approved,
+            project_id=task.project_id,
+            task_id=task.id,
+        )
         return {"approved": task.id}
 
+    if name in ("conclave_set_hitl_checkpoint", "conclave_toggle_hitl"):
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        target_id = (
+            _opt_str(args, "target_id")
+            or _opt_str(args, "node_id")
+            or _opt_str(args, "edge_id")
+        )
+        if not target_id:
+            raise McpToolError("target_id is required")
+        enabled = _opt_bool(args, "enabled", True)
+        armed = daemon.set_hitl_checkpoint(task.id, target_id, enabled)
+        hitl_event_type = getattr(
+            EventType,
+            "hitl_updated",
+            EventType.hitl_waiting if enabled else EventType.hitl_resolved,
+        )
+        await daemon.bus.emit(
+            type=hitl_event_type,
+            project_id=task.project_id,
+            task_id=task.id,
+            payload={
+                "target_id": target_id,
+                "enabled": enabled,
+                "armed": armed,
+            },
+        )
+        return {
+            "task_id": task.id,
+            "target_id": target_id,
+            "enabled": enabled,
+            **daemon.get_hitl_state(task.id),
+        }
+
     if name in ("conclave_complete_node", "conclave_approve_node"):
-        task = await _require_task(daemon, str(args.get("task_id", "")))
-        node_id = str(args.get("node_id") or "*").strip() or "*"
-        raw_status = str(args.get("status") or "completed").strip().lower()
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        node_id = _opt_str(args, "node_id", "*") or "*"
+        raw_status = _opt_str(args, "status", "completed").lower()
         if raw_status not in ("completed", "failed", "skipped"):
             raise McpToolError("status must be one of: completed, failed, skipped")
-        verdict = (
-            str(args["verdict"]).strip().lower()
-            if args.get("verdict") and str(args["verdict"]).strip()
-            else None
-        )
-        message = (
-            str(args["message"]).strip()
-            if args.get("message") and str(args["message"]).strip()
-            else None
-        )
-        output = (
-            str(args["output"]).strip()
-            if args.get("output") and str(args["output"]).strip()
-            else None
-        )
-        edge_id = (
-            str(args["edge_id"]).strip()
-            if args.get("edge_id") and str(args["edge_id"]).strip()
-            else None
-        )
+        verdict = _opt_str(args, "verdict").lower() or None
+        message = _opt_str(args, "message") or None
+        output = _opt_str(args, "output") or None
+        edge_id = _opt_str(args, "edge_id") or None
         cp_status = CheckpointStatus(raw_status)
         existing_cps = await repo.list_task_checkpoints(daemon.db, task.id)
+        waiting_hitl = daemon.get_hitl_state(task.id).get("waiting", [])
         target_node = (
             node_id
             if node_id not in ("*", "all")
@@ -1268,7 +1431,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                         for cp in reversed(existing_cps)
                         if cp.status == CheckpointStatus.waiting_for_approval
                     ),
-                    "developer",
+                    waiting_hitl[0] if waiting_hitl else "developer",
                 )
             )
         )
@@ -1311,7 +1474,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             )
         signaled = daemon.resolve_node(
             task.id,
-            node_id,
+            target_node,
             status=raw_status,
             message=message,
             verdict=verdict,
@@ -1355,16 +1518,22 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_cascade_approve_task":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
         approved_ids: list[str] = []
         visited: set[str] = {task.id}
         queue = [task]
         while queue and len(visited) <= 1000:
             cur = queue.pop(0)
-            if cur.state in (TaskState.inbox, TaskState.failed):
+            if cur.state in (
+                TaskState.inbox,
+                TaskState.failed,
+                TaskState.blocked,
+                TaskState.cancelled,
+            ):
                 await repo.set_task_state(daemon.db, cur.id, TaskState.approved)
                 await daemon.bus.emit(
                     type=EventType.task_approved,
+                    project_id=cur.project_id,
                     task_id=cur.id,
                     payload={"cascade": True, "root": task.id},
                 )
@@ -1376,35 +1545,35 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return {"approved": True, "task_ids": approved_ids, "count": len(approved_ids)}
 
     if name == "conclave_cancel_task":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
         if task.state in (TaskState.inbox, TaskState.approved):
             await repo.set_task_state(daemon.db, task.id, TaskState.cancelled)
-            await daemon.bus.emit(type=EventType.task_cancelled, task_id=task.id)
+            await daemon.bus.emit(
+                type=EventType.task_cancelled,
+                project_id=task.project_id,
+                task_id=task.id,
+            )
             return {"cancelled": True, "task_id": task.id}
         if task.state in (TaskState.in_progress, TaskState.waiting_for_approval):
             cancelled = await daemon.request_cancel(task.id)
             if not cancelled and task.state == TaskState.waiting_for_approval:
                 await repo.set_task_state(daemon.db, task.id, TaskState.cancelled)
-                await daemon.bus.emit(type=EventType.task_cancelled, task_id=task.id)
+                await daemon.bus.emit(
+                    type=EventType.task_cancelled,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                )
                 cancelled = True
             return {"cancelled": cancelled, "task_id": task.id}
         raise McpToolError(f"cannot cancel task in state {task.state.value}")
 
     if name == "conclave_steer_task":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
-        message = str(args.get("message", "")).strip()
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        message = _opt_str(args, "message")
         if not message:
             raise McpToolError("message is required")
-        node_id_arg = (
-            str(args["node_id"]).strip()
-            if args.get("node_id") and str(args["node_id"]).strip()
-            else None
-        )
-        edge_id_arg = (
-            str(args["edge_id"]).strip()
-            if args.get("edge_id") and str(args["edge_id"]).strip()
-            else None
-        )
+        node_id_arg = _opt_str(args, "node_id") or None
+        edge_id_arg = _opt_str(args, "edge_id") or None
         if node_id_arg or edge_id_arg:
             if task.state in (TaskState.done, TaskState.cancelled):
                 raise McpToolError(f"cannot steer task in state {task.state.value}")
@@ -1440,7 +1609,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return {"steered": True, "task_id": task.id}
 
     if name == "conclave_delete_task":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
         if task.state is TaskState.in_progress:
             raise McpToolError("cannot delete an in_progress task — cancel it first")
         deleted = await repo.delete_task(daemon.db, task.id)
@@ -1452,24 +1621,24 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return {"deleted": task.id}
 
     if name == "conclave_get_task_events":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
-        after_id = int(args.get("after_id", 0))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        after_id = _opt_int(args, "after_id", 0)
         events = await repo.list_events(daemon.db, task_id=task.id, after_id=after_id)
         return [e.model_dump(mode="json") for e in events]
 
     if name == "conclave_get_task_verdicts":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
         verdicts = await repo.list_verdicts(daemon.db, task.id, limit=200)
         return [v.model_dump(mode="json") for v in verdicts]
 
     if name == "conclave_get_task_checkpoints":
-        task = await _require_task(daemon, str(args.get("task_id", "")))
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
         checkpoints = await repo.list_task_checkpoints(daemon.db, task.id)
         return [cp.model_dump(mode="json") for cp in checkpoints]
 
     # --- Dynamic Agent Diagram (Workflow Graph) ---
     if name == "conclave_get_workflow":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         config = load_project_config(project.config)
         active = config.workflow or build_default_workflow(
             config.agents,
@@ -1485,8 +1654,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_apply_workflow_template":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        template_id = str(args.get("template_id", "")).strip()
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        template_id = _opt_str(args, "template_id")
         config = load_project_config(project.config)
         templates = workflow_templates(config.agents)
         if template_id not in templates:
@@ -1519,7 +1688,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_set_workflow":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         wf_raw = args.get("workflow")
         if not isinstance(wf_raw, dict):
             raise McpToolError("workflow must be a JSON object")
@@ -1527,42 +1696,41 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return await _save_workflow(daemon, project, graph)
 
     if name in ("conclave_workflow_upsert_node", "conclave_upsert_workflow_node"):
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         current = _resolve_active_workflow(project)
-        node_id = str(args.get("id", "")).strip()
+        node_id = _opt_str(args, "id")
         existing_node = next((n for n in current.nodes if n.id == node_id), None)
         kind = NodeKind(
-            str(
-                args.get(
-                    "kind",
-                    existing_node.kind.value if existing_node else "reviewer",
-                )
+            _opt_str(
+                args,
+                "kind",
+                existing_node.kind.value if existing_node else "reviewer",
             )
         )
         raw_triggers = args.get("triggers")
         triggers = (
-            [str(t) for t in raw_triggers]
+            [str(t) for t in raw_triggers if t is not None]
             if isinstance(raw_triggers, list)
             else (list(existing_node.triggers) if existing_node else [])
         )
         raw_skills = args.get("skills")
         skills = (
-            [str(s) for s in raw_skills]
+            [str(s) for s in raw_skills if s is not None]
             if isinstance(raw_skills, list)
             else (list(existing_node.skills) if existing_node else [])
         )
         model_val = (
-            str(args["model"])
+            _opt_str(args, "model") or None
             if args.get("model") is not None
             else (existing_node.model if existing_node else None)
         )
         effort_val = (
-            str(args["effort"])
+            _opt_str(args, "effort") or None
             if args.get("effort") is not None
             else (existing_node.effort if existing_node else None)
         )
         cli_agent_val = (
-            str(args["cli_agent"])
+            _opt_str(args, "cli_agent") or None
             if args.get("cli_agent") is not None
             else (existing_node.cli_agent if existing_node else None)
         )
@@ -1576,31 +1744,49 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             if isinstance(args.get("compact_before_start"), bool)
             else (existing_node.compact_before_start if existing_node else None)
         )
+        has_pause_arg = (
+            args.get("pause_after") is not None
+            or args.get("await_human_approval") is not None
+        )
         pause_val = (
-            bool(args.get("pause_after") or args.get("await_human_approval"))
-            if ("pause_after" in args or "await_human_approval" in args)
+            bool(
+                _opt_bool(args, "pause_after", False)
+                or _opt_bool(args, "await_human_approval", False)
+            )
+            if has_pause_arg
             else (existing_node.pause_after if existing_node else False)
+        )
+        raw_pos_x = args.get("position_x")
+        pos_x = (
+            float(raw_pos_x)
+            if raw_pos_x is not None
+            else (existing_node.position_x if existing_node else 560.0)
+        )
+        raw_pos_y = args.get("position_y")
+        pos_y = (
+            float(raw_pos_y)
+            if raw_pos_y is not None
+            else (existing_node.position_y if existing_node else 220.0)
         )
         new_node = WorkflowNode(
             id=node_id,
-            label=str(
-                args.get("label")
-                or (existing_node.label if existing_node else node_id)
+            label=_opt_str(
+                args,
+                "label",
+                existing_node.label if existing_node else node_id,
             ),
             kind=kind,
             agent=(
-                str(args["agent"])
-                if args.get("agent")
-                else (existing_node.agent if existing_node else node_id)
+                _opt_str(args, "agent")
+                or (existing_node.agent if existing_node else node_id)
             ),
             output_contract=OutputContract(
-                str(
-                    args.get(
-                        "output_contract",
-                        existing_node.output_contract.value
-                        if existing_node
-                        else "verdict",
-                    )
+                _opt_str(
+                    args,
+                    "output_contract",
+                    existing_node.output_contract.value
+                    if existing_node
+                    else "verdict",
                 )
             ),
             prompt_template=(
@@ -1609,27 +1795,16 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 else (existing_node.prompt_template if existing_node else None)
             ),
             triggers=triggers,
-            optional=bool(
-                args.get(
-                    "optional",
-                    existing_node.optional if existing_node else False,
-                )
+            optional=_opt_bool(
+                args,
+                "optional",
+                existing_node.optional if existing_node else False,
             ),
-            enabled=bool(
-                args.get("enabled", existing_node.enabled if existing_node else True)
+            enabled=_opt_bool(
+                args, "enabled", existing_node.enabled if existing_node else True
             ),
-            position_x=float(
-                args.get(
-                    "position_x",
-                    existing_node.position_x if existing_node else 560.0,
-                )
-            ),
-            position_y=float(
-                args.get(
-                    "position_y",
-                    existing_node.position_y if existing_node else 220.0,
-                )
-            ),
+            position_x=pos_x,
+            position_y=pos_y,
             model=model_val,
             effort=effort_val,
             cli_agent=cli_agent_val,
@@ -1652,8 +1827,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return await _save_workflow(daemon, project, updated_graph)
 
     if name in ("conclave_workflow_remove_node", "conclave_remove_workflow_node"):
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        node_id = str(args.get("node_id", "")).strip()
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        node_id = _opt_str(args, "node_id")
         current = _resolve_active_workflow(project)
         nodes = [n for n in current.nodes if n.id != node_id]
         edges = [
@@ -1671,19 +1846,19 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return await _save_workflow(daemon, project, updated_graph)
 
     if name in ("conclave_workflow_upsert_edge", "conclave_upsert_workflow_edge"):
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        source = str(args.get("source", "")).strip()
-        target = str(args.get("target", "")).strip()
-        condition = EdgeCondition(str(args.get("condition", "always")))
-        edge_id = str(args.get("id") or f"e-{source}-{target}-{condition.value}")
-        require_human = bool(args.get("require_human", False))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        source = _opt_str(args, "source")
+        target = _opt_str(args, "target")
+        condition = EdgeCondition(_opt_str(args, "condition", "always"))
+        edge_id = _opt_str(args, "id") or f"e-{source}-{target}-{condition.value}"
+        require_human = _opt_bool(args, "require_human", False)
         new_edge = WorkflowEdge(
             id=edge_id,
             source=source,
             target=target,
             condition=condition,
-            max_iterations=int(args.get("max_iterations", 3)),
-            label=str(args.get("label", "")),
+            max_iterations=_opt_int(args, "max_iterations", 3),
+            label=_opt_str(args, "label"),
             require_human=require_human,
         )
         current = _resolve_active_workflow(project)
@@ -1707,10 +1882,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return await _save_workflow(daemon, project, updated_graph)
 
     if name in ("conclave_workflow_remove_edge", "conclave_remove_workflow_edge"):
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        edge_id = str(args.get("edge_id", "")).strip()
-        source = str(args.get("source", "")).strip()
-        target = str(args.get("target", "")).strip()
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        edge_id = _opt_str(args, "edge_id")
+        source = _opt_str(args, "source")
+        target = _opt_str(args, "target")
         current = _resolve_active_workflow(project)
         edges = [
             e
@@ -1733,15 +1908,15 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     # --- Agent Personas ---
     if name == "conclave_list_agents":
-        pid_opt = str(args["project_id"]) if args.get("project_id") else None
+        pid_opt = _opt_str(args, "project_id") or None
         agents = await repo.list_agents(daemon.db, pid_opt, limit=200)
         return [a.model_dump(mode="json") for a in agents]
 
     if name == "conclave_upsert_agent":
-        agent_name = str(args.get("name", "")).strip()
-        persona_md = str(args.get("persona_md", "")).strip()
-        role = str(args.get("role", "conditional")).strip() or "conditional"
-        pid_opt = str(args["project_id"]) if args.get("project_id") else None
+        agent_name = _opt_str(args, "name")
+        persona_md = _opt_str(args, "persona_md")
+        role = _opt_str(args, "role", "conditional") or "conditional"
+        pid_opt = _opt_str(args, "project_id") or None
         if not agent_name or not persona_md:
             raise McpToolError("name and persona_md are required")
         agent = await repo.upsert_agent(
@@ -1782,8 +1957,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return agent_json
 
     if name == "conclave_delete_agent":
-        agent_name = str(args.get("name", "")).strip()
-        pid_opt = str(args["project_id"]) if args.get("project_id") else None
+        agent_name = _opt_str(args, "name")
+        pid_opt = _opt_str(args, "project_id") or None
         deleted = await repo.delete_agent(daemon.db, name=agent_name, project_id=pid_opt)
         if pid_opt is None and agent_name in DEFAULT_PERSONAS:
             default_role, default_md = DEFAULT_PERSONAS[agent_name]
@@ -1807,6 +1982,16 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             return {"reset_to_default": agent_name}
         if not deleted:
             raise McpToolError(f"agent not found: {agent_name}")
+        if pid_opt is None:
+            existing_store = await repo.get_store_item_by_name(
+                daemon.db, StoreItemKind.agent, agent_name
+            )
+            if existing_store is not None and not existing_store.built_in:
+                await repo.delete_store_item(daemon.db, existing_store.id)
+                await daemon.bus.emit(
+                    type=EventType.store_deleted,
+                    payload={"id": existing_store.id, "name": agent_name},
+                )
         await daemon.bus.emit(
             type=EventType.agent_deleted,
             project_id=pid_opt,
@@ -1816,17 +2001,17 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     # --- Multi-Agent Planning Sessions ---
     if name == "conclave_list_planning_sessions":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         sessions = await repo.list_planning_sessions(daemon.db, project.id, limit=50)
         return [s.model_dump(mode="json") for s in sessions]
 
     if name == "conclave_create_planning_session":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        prompt = str(args.get("prompt", "")).strip()
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        prompt = _opt_str(args, "prompt")
         if not prompt:
             raise McpToolError("prompt is required")
-        title = str(args.get("title", "")).strip()
-        max_rounds = int(args.get("max_rounds", 5))
+        title = _opt_str(args, "title")
+        max_rounds = _opt_int(args, "max_rounds", 5)
         session = await daemon.planning_orchestrator.create_and_start(
             project_id=project.id,
             title=title,
@@ -1836,7 +2021,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return session.model_dump(mode="json")
 
     if name == "conclave_get_planning_session":
-        sid = str(args.get("session_id", "")).strip()
+        sid = _opt_str(args, "session_id")
         session_row = await repo.get_planning_session(daemon.db, sid)
         if session_row is None:
             raise McpToolError(f"planning session not found: {sid}")
@@ -1849,34 +2034,34 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_interject_planning_message":
-        sid = str(args.get("session_id", "")).strip()
-        content = str(args.get("content", "")).strip()
+        sid = _opt_str(args, "session_id")
+        content = _opt_str(args, "content")
         if not sid or not content:
             raise McpToolError("session_id and content are required")
         msg = await daemon.planning_orchestrator.add_human_message(sid, content)
         return msg.model_dump(mode="json")
 
     if name == "conclave_approve_planning_session":
-        sid = str(args.get("session_id", "")).strip()
+        sid = _opt_str(args, "session_id")
         task_ids = await daemon.planning_orchestrator.approve_session(sid)
         return {"approved": True, "task_ids": task_ids, "count": len(task_ids)}
 
     if name == "conclave_cancel_planning_session":
-        sid = str(args.get("session_id", "")).strip()
+        sid = _opt_str(args, "session_id")
         await daemon.planning_orchestrator.cancel_session(sid)
         return {"cancelled": True, "session_id": sid}
 
     # --- Bug-Fixer & Quarantine ---
     if name == "conclave_list_bug_candidates":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        if args.get("needs_human_only"):
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        if _opt_bool(args, "needs_human_only", False):
             cands = await repo.list_needs_human(daemon.db, project.id)
         else:
             cands = await repo.list_bug_candidates(daemon.db, project.id, limit=100)
         return [c.model_dump(mode="json") for c in cands]
 
     if name == "conclave_list_quarantine":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         entries = await repo.list_quarantine(daemon.db, project.id, limit=100)
         health = await quarantine_integrity(daemon.db, project.id)
         return {
@@ -1885,10 +2070,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_add_quarantine":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        pattern = str(args.get("pattern", "")).strip()
-        reason = str(args.get("reason", "")).strip()
-        until = str(args.get("until", "")).strip()
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        pattern = _opt_str(args, "pattern")
+        reason = _opt_str(args, "reason")
+        until = _opt_str(args, "until")
         date.fromisoformat(until)
         entry = await repo.add_quarantine(
             daemon.db,
@@ -1900,23 +2085,23 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return entry.model_dump(mode="json")
 
     if name == "conclave_delete_quarantine":
-        eid = str(args.get("entry_id", "")).strip()
+        eid = _opt_str(args, "entry_id")
         await repo.delete_quarantine(daemon.db, eid)
         return {"deleted": eid}
 
     # --- Global Store ---
     if name == "conclave_store_list":
-        raw_kind = args.get("kind")
-        store_kind_filter = StoreItemKind(str(raw_kind)) if raw_kind else None
+        raw_kind = _opt_str(args, "kind")
+        store_kind_filter = StoreItemKind(raw_kind) if raw_kind else None
         items = await repo.list_store_items(daemon.db, kind=store_kind_filter, limit=200)
         return [item.model_dump(mode="json") for item in items]
 
     if name in ("conclave_store_publish", "conclave_store_upsert_item"):
-        store_kind = StoreItemKind(str(args.get("kind", "workflow")))
-        item_name = str(args.get("name", "")).strip()
-        description = str(args.get("description", "")).strip()
+        store_kind = StoreItemKind(_opt_str(args, "kind", "workflow"))
+        item_name = _opt_str(args, "name")
+        description = _opt_str(args, "description")
         raw_tags = args.get("tags")
-        tags = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else []
+        tags = [str(t) for t in raw_tags if t is not None] if isinstance(raw_tags, list) else []
         raw_payload = args.get("payload")
         if not item_name or not isinstance(raw_payload, dict):
             raise McpToolError("name and object payload are required")
@@ -1959,7 +2144,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return saved_json
 
     if name in ("conclave_store_delete", "conclave_store_delete_item"):
-        item_id = str(args.get("item_id") or args.get("id") or "").strip()
+        item_id = _opt_str(args, "item_id") or _opt_str(args, "id")
         existing_item = await repo.get_store_item(daemon.db, item_id)
         if existing_item is None:
             raise McpToolError(f"store item not found: {item_id}")
@@ -1973,15 +2158,18 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return {"deleted": item_id}
 
     if name in ("conclave_store_install", "conclave_store_install_item"):
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         item: StoreItem | None = None
-        if args.get("item_id"):
-            item = await repo.get_store_item(daemon.db, str(args["item_id"]))
-        elif args.get("kind") and args.get("name"):
+        req_item_id = _opt_str(args, "item_id")
+        req_kind = _opt_str(args, "kind")
+        req_name = _opt_str(args, "name")
+        if req_item_id:
+            item = await repo.get_store_item(daemon.db, req_item_id)
+        elif req_kind and req_name:
             item = await repo.get_store_item_by_name(
                 daemon.db,
-                StoreItemKind(str(args["kind"])),
-                str(args["name"]),
+                StoreItemKind(req_kind),
+                req_name,
             )
         if item is None:
             raise McpToolError("store item not found (specify item_id or kind + name)")
@@ -2058,16 +2246,16 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     # --- Parallel Swarms ---
     if name == "conclave_launch_swarm":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
         raw_units = args.get("units")
         units_list = (
             [u for u in raw_units if isinstance(u, dict)]
             if isinstance(raw_units, list)
             else None
         )
-        swarm_prompt = str(args["prompt"]) if args.get("prompt") else None
-        concurrency = int(args.get("concurrency", 4))
-        auto_approve = bool(args.get("auto_approve", True))
+        swarm_prompt = _opt_str(args, "prompt") or None
+        concurrency = _opt_int(args, "concurrency", 4)
+        auto_approve = _opt_bool(args, "auto_approve", True)
         return await daemon.launch_swarm(
             project.id,
             units=units_list,
@@ -2077,8 +2265,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         )
 
     if name == "conclave_get_swarm_status":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        swarm_id = str(args.get("swarm_id", "")).strip()
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        swarm_id = _opt_str(args, "swarm_id")
         if not swarm_id:
             raise McpToolError("swarm_id is required")
         tasks = await repo.list_swarm_tasks(daemon.db, project.id, swarm_id)
@@ -2095,8 +2283,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     # --- Agent Execution Settings, Context Compaction & Observability ---
     if name == "conclave_configure_agent":
-        raw_pid = str(args.get("project_id") or "").strip()
-        raw_agent_target = str(args.get("agent") or "").strip()
+        raw_pid = _opt_str(args, "project_id")
+        raw_agent_target = _opt_str(args, "agent")
         agent_target = raw_agent_target.strip('"').strip("'").strip()
         settings_patch: dict[str, Any] = {}
         for field_name in (
@@ -2118,10 +2306,12 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 daemon.db, StoreItemKind.config_preset, "global-defaults"
             )
             raw_global = dict(existing_global.payload) if existing_global is not None else {}
+            patch_delta: dict[str, Any] = {}
             if not agent_target or agent_target in ("default", "defaults", "*"):
                 existing_defaults = dict(raw_global.get("agent_defaults") or {})
                 existing_defaults.update(settings_patch)
                 raw_global["agent_defaults"] = existing_defaults
+                patch_delta["agent_defaults"] = dict(settings_patch)
                 target_label = "agent_defaults"
             else:
                 overrides_map = normalize_config_keys(dict(raw_global.get("agent_overrides") or {}))
@@ -2129,6 +2319,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 existing_ov.update(settings_patch)
                 overrides_map[agent_target] = existing_ov
                 raw_global["agent_overrides"] = overrides_map
+                patch_delta["agent_overrides"] = {agent_target: dict(settings_patch)}
                 target_label = agent_target
             resolved_global = load_project_config(raw_global)
             await repo.upsert_store_item(
@@ -2141,8 +2332,18 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 built_in=False,
             )
             for proj in await repo.list_projects(daemon.db):
-                proj_merged = deep_merge(proj.config, raw_global)
+                proj_merged = deep_merge(proj.config, patch_delta)
+                proj_resolved = load_project_config(proj_merged)
                 await repo.update_project_config(daemon.db, proj.id, proj_merged)
+                updated_proj = await _require_project(daemon, proj.id)
+                await daemon.bus.emit(
+                    type=EventType.project_updated,
+                    project_id=proj.id,
+                    payload={
+                        "project": updated_proj.model_dump(mode="json"),
+                        "config": proj_resolved.model_dump(mode="json"),
+                    },
+                )
             return {
                 "project_id": "global",
                 "target": target_label,
@@ -2189,10 +2390,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         }
 
     if name == "conclave_compact_session":
-        tid = str(args.get("task_id") or "").strip()
-        psid = str(
-            args.get("planning_session_id") or args.get("session_id") or ""
-        ).strip()
+        tid = _opt_str(args, "task_id")
+        psid = _opt_str(args, "planning_session_id") or _opt_str(args, "session_id")
         if tid:
             task = await _require_task(daemon, tid)
             result_payload = await compact_task_context(daemon.db, task.id)
@@ -2220,32 +2419,12 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         raise McpToolError("task_id or planning_session_id is required")
 
     if name == "conclave_list_interactions":
-        pid_filter = (
-            str(args["project_id"]).strip()
-            if args.get("project_id") and str(args["project_id"]).strip()
-            else None
-        )
-        tid_filter = (
-            str(args["task_id"]).strip()
-            if args.get("task_id") and str(args["task_id"]).strip()
-            else None
-        )
-        agent_filter = (
-            str(args["agent"]).strip()
-            if args.get("agent") and str(args["agent"]).strip()
-            else None
-        )
-        model_filter = (
-            str(args["model"]).strip()
-            if args.get("model") and str(args["model"]).strip()
-            else None
-        )
-        search_filter = (
-            str(args["search"]).strip()
-            if args.get("search") and str(args["search"]).strip()
-            else None
-        )
-        limit = max(1, min(int(args.get("limit", 50)), 500))
+        pid_filter = _opt_str(args, "project_id") or None
+        tid_filter = _opt_str(args, "task_id") or None
+        agent_filter = _opt_str(args, "agent") or None
+        model_filter = _opt_str(args, "model") or None
+        search_filter = _opt_str(args, "search") or None
+        limit = max(1, min(_opt_int(args, "limit", 50), 500))
         logs = await repo.list_interaction_logs(
             daemon.db,
             project_id=pid_filter,
@@ -2264,7 +2443,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return out_list
 
     if name == "conclave_get_interaction":
-        sid = str(args.get("session_id", "")).strip()
+        sid = _opt_str(args, "session_id")
         if not sid:
             raise McpToolError("session_id is required")
         log_row = await repo.get_interaction_log(daemon.db, sid)
@@ -2273,22 +2452,33 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return log_row.model_dump(mode="json")
 
     if name == "conclave_query_interactions":
-        sql_query = str(args.get("sql", "")).strip()
-        limit = max(1, min(int(args.get("limit", 200)), 5000))
+        sql_query = _opt_str(args, "sql")
+        limit = max(1, min(_opt_int(args, "limit", 200), 5000))
         return await repo.query_interaction_logs_readonly(
             daemon.db, sql_query, limit=limit
         )
 
+    if name == "conclave_get_observability_stats":
+        pid_filter = _opt_str(args, "project_id") or None
+        if pid_filter in ("global", "default", "defaults", "*"):
+            pid_filter = None
+        stats = await repo.interaction_stats(daemon.db, project_id=pid_filter)
+        if _opt_bool(args, "export_parquet", False):
+            stats["parquet"] = await export_interaction_logs_to_parquet(daemon.db)
+        return stats
+
+    if name == "conclave_get_reload_status":
+        return daemon.reload_status()
+
     if name == "conclave_reload_system":
-        force = bool(args.get("force", False))
+        force = _opt_bool(args, "force", False)
         return await daemon.reload_now(force=force)
 
     if name == "conclave_evolve_workflow":
-        project = await _require_project(daemon, str(args.get("project_id", "")))
-        raw_tid = args.get("task_id")
-        tid_val = str(raw_tid).strip() if raw_tid and str(raw_tid).strip() else None
-        gate_failed = bool(args.get("gate_failed_after_review", False))
-        task_failed = bool(args.get("task_failed", False))
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        tid_val = _opt_str(args, "task_id") or None
+        gate_failed = _opt_bool(args, "gate_failed_after_review", False)
+        task_failed = _opt_bool(args, "task_failed", False)
         return await evolve_project_workflow(
             daemon.db,
             daemon.bus,

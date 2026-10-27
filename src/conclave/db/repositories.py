@@ -275,7 +275,9 @@ async def approve_task(db: Database, task_id: str) -> bool:
     async with db._write() as conn:
         cur = await conn.execute(
             "UPDATE tasks SET state = ?, updated_at = ? "
-            "WHERE id = ? AND state IN ('inbox', 'failed', 'waiting_for_approval')",
+            "WHERE id = ? AND state IN ("
+            "'inbox', 'failed', 'waiting_for_approval', 'blocked', 'cancelled'"
+            ")",
             (TaskState.approved.value, now_iso(), task_id),
         )
         return cur.rowcount > 0
