@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -272,6 +273,25 @@ class Daemon:
             return
         for project in await repo.list_projects(self.db):
             await self.start_worker(project.id)
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            watch_task = asyncio.create_task(self._watch_reload_loop())
+            self._bg_tasks.add(watch_task)
+            watch_task.add_done_callback(self._bg_tasks.discard)
+
+    async def _watch_reload_loop(self) -> None:
+        """Background file-watcher loop that auto-triggers quiescent hot-reload on disk edits."""
+        while True:
+            try:
+                await asyncio.sleep(3.0)
+                if self.reloader.reload_pending or self.reloader.changed_files():
+                    if self.is_quiescent():
+                        await self.reload_now()
+                    else:
+                        self.reloader.reload_pending = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("hot-reload watcher error", exc_info=True)
 
     async def shutdown(self) -> None:
         # 1. Stop per-project workers so no new tasks are claimed.
