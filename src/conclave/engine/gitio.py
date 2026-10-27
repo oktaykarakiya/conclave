@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -89,9 +90,27 @@ async def run_shell(
     # shell leader, which prevents orphaned grandchildren from outliving the parent.
     merged_env = {**os.environ, **env} if env else dict(os.environ)
     win_sh, extra_path = _find_windows_posix_sh()
+    if win_sh is not None and extra_path:
+        merged_env["PATH"] = f"{extra_path}{os.pathsep}{merged_env.get('PATH', '')}"
+
+    venv_dirs: list[str] = []
+    for candidate in (
+        cwd / ".venv" / "Scripts",
+        cwd / ".venv" / "bin",
+        Path(sys.executable).parent if sys.executable else None,
+    ):
+        if candidate is not None and candidate.is_dir():
+            cand_str = str(candidate)
+            if cand_str not in venv_dirs:
+                venv_dirs.append(cand_str)
+    if venv_dirs:
+        existing_path = merged_env.get("PATH") or merged_env.get("Path") or ""
+        if "Path" in merged_env:
+            merged_env.pop("Path", None)
+        prefix = os.pathsep.join(venv_dirs)
+        merged_env["PATH"] = f"{prefix}{os.pathsep}{existing_path}" if existing_path else prefix
+
     if win_sh is not None:
-        if extra_path:
-            merged_env["PATH"] = f"{extra_path}{os.pathsep}{merged_env.get('PATH', '')}"
         proc = await asyncio.create_subprocess_exec(
             win_sh,
             "-c",
@@ -109,7 +128,7 @@ async def run_shell(
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=merged_env if env else None,
+            env=merged_env,
             start_new_session=True,
             **_WIN_SUBPROCESS_KW,
         )

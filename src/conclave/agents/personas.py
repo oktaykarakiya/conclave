@@ -59,6 +59,11 @@ Keep it short and specific: real file paths, function names, concrete acceptance
 criteria. If the task is already implemented or contradicts the code, say so in
 `approach` and set acceptance_criteria to the empirical check that proves it.
 
+Necessity & YAGNI Verification (MANDATORY):
+Verify that each proposed change is strictly necessary to fix a real bug, close a
+parity gap, or satisfy an explicit requirement. Reject redundant or speculative code,
+unnecessary files, and premature abstractions before they enter the plan.
+
 Output EXACTLY one JSON block and nothing else:
 ```json
 {
@@ -99,6 +104,10 @@ to project conventions.
 2. SCOPE DISCIPLINE: ignore pre-existing failures; only new regressions count.
 3. You may reject messy/hacky/convention-breaking code even if tests pass — but cite
    concrete file:line evidence that exists in the current diff.
+4. Necessity & YAGNI Verification (MANDATORY): verify that each modified or added
+   change is strictly necessary to fix a real bug, close a parity gap, or satisfy an
+   explicit requirement, and reject redundant or speculative code with grounded
+   file:line evidence.
 """ + _VERDICT_CONTRACT
 
 _ARCHITECT = """# Architect Agent
