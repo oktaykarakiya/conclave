@@ -312,12 +312,15 @@ async def test_observability_compaction_and_agent_config(
     transport = ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. Verify /api/models returns google/gemini-2.5-flash-lite as default
+        # 1. Verify /api/models returns DeepSeek V4.1 Flash as default
         models_res = await client.get("/api/models")
         assert models_res.status_code == 200
         models_data = models_res.json()
-        assert models_data["default_model"] == "google/gemini-2.5-flash-lite"
+        assert models_data["default_model"] == "deepseek/deepseek-flash"
         assert "tdd-strict" in models_data["skill_templates"]
+        assert "claude-code/opus" in models_data["models"]
+        assert models_data["engines"]["default"] == "opencode"
+        assert set(models_data["engines"]["available"]) == {"opencode", "claude"}
 
         # 2. Attach project via MCP (this also logs an MCP interaction automatically)
         attach_mcp = await client.post(

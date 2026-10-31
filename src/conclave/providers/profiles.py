@@ -17,8 +17,9 @@ from dataclasses import dataclass, field
 
 from ..config import ArgMode
 
-# Always-on CLI args: headless print mode + JSON envelope (for result/usage/cost parsing).
-_BASE_ARGS: tuple[str, ...] = ("--print", "--output-format", "json")
+# Always-on CLI args: headless print mode + NDJSON event stream (live output for the UI; the
+# final ``result`` event carries the result/usage/cost fields). stream-json needs --verbose.
+_BASE_ARGS: tuple[str, ...] = ("--print", "--output-format", "stream-json", "--verbose")
 _DEFAULT_CLI_FLAGS: tuple[str, ...] = ("--dangerously-skip-permissions",)
 
 

@@ -81,8 +81,11 @@ class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     model: str | None = Field(
-        default="google/gemini-2.5-flash-lite",
-        description="Model identifier (provider/model). Defaults to google/gemini-2.5-flash-lite.",
+        default="deepseek/deepseek-flash",
+        description=(
+            "Model identifier: an opencode provider/model, or claude-code/<model> for the "
+            "Claude Code CLI. Defaults to deepseek/deepseek-flash (DeepSeek V4.1 Flash)."
+        ),
     )
     effort: Effort | None = Field(
         default=None, description="Reasoning effort/variant tier, or unset."

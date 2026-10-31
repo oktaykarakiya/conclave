@@ -6,7 +6,7 @@ assistant text, token usage, and cost.
 
 opencode owns model/provider selection through its own config (``opencode.jsonc``), so
 Conclave passes no model flag by default — every dispatch uses opencode's configured
-default (e.g. ``deepseek/deepseek-v4-pro``). A profile may still override with an
+default (e.g. ``deepseek/deepseek-flash``). A profile may still override with an
 opencode-format ``provider/model`` string.
 """
 

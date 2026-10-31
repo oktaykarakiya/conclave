@@ -8,7 +8,9 @@ from conclave.providers import ResolvedProfile, build_invocation
 
 def test_inherit_passes_only_base_args() -> None:
     inv = build_invocation(ResolvedProfile(name="system-default", arg_mode=ArgMode.inherit))
-    assert inv.args == ["--dangerously-skip-permissions", "--print", "--output-format", "json"]
+    assert inv.args == [
+        "--dangerously-skip-permissions", "--print", "--output-format", "stream-json", "--verbose"
+    ]
     assert inv.env == {}
 
 

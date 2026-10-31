@@ -10,7 +10,7 @@ from typing import IO, Any
 import uvicorn
 
 from .db import Database
-from .providers import ClaudeCliProvider, OpenCodeCliProvider, Provider
+from .providers import EngineRouter, Provider, parse_engine
 from .runtime import Daemon
 from .web import create_app
 
@@ -48,7 +48,7 @@ def acquire_daemon_lock(home: Path) -> IO[str]:
     try:
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        else:
+        elif sys.platform == "win32":
             import msvcrt
 
             try:
@@ -70,12 +70,15 @@ def acquire_daemon_lock(home: Path) -> IO[str]:
 
 
 def make_provider() -> Provider:
-    """Select the agent engine. opencode is the default; ``CONCLAVE_ENGINE=claude`` opts
-    back into the legacy ``claude`` CLI."""
-    engine = os.environ.get("CONCLAVE_ENGINE", "opencode").strip().lower()
-    if engine == "claude":
-        return ClaudeCliProvider()
-    return OpenCodeCliProvider()
+    """Build the engine router. ``CONCLAVE_ENGINE`` picks the default engine (opencode unless
+    set to ``claude``); an agent whose model is ``claude-code/<model>`` always runs on the
+    Claude Code CLI, so engines can be mixed per agent."""
+    try:
+        default = parse_engine(os.environ.get("CONCLAVE_ENGINE"))
+    except ValueError as exc:
+        print(f"[conclave] error: CONCLAVE_ENGINE: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    return EngineRouter(default)
 
 
 def cli() -> None:
@@ -91,7 +94,9 @@ def cli() -> None:
     # intentionally unauthenticated. Set CONCLAVE_HOST=127.0.0.1 to restrict to loopback.
     host = os.environ.get("CONCLAVE_HOST", "0.0.0.0")
     port = int(os.environ.get("CONCLAVE_PORT", "8700"))
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # Bounded graceful shutdown: a long-lived stream (e.g. an SSE client) must not hold a
+    # SIGTERM hostage — after the grace period uvicorn cancels whatever is still running.
+    uvicorn.run(app, host=host, port=port, log_level="info", timeout_graceful_shutdown=10)
 
 
 if __name__ == "__main__":

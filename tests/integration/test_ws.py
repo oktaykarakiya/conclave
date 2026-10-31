@@ -39,6 +39,16 @@ class _FakeWebSocket:
         self.closed_code: int | None = None
         self.received: list[dict[str, Any]] = []
         self._disconnect_after = disconnect_after
+        self._client_gone = asyncio.Event()
+
+    def client_disconnects(self) -> None:
+        """Simulate the browser closing the socket (tab closed / server shutdown)."""
+        self._client_gone.set()
+
+    async def receive(self) -> dict[str, Any]:
+        # The UI never sends anything: block until the client goes away.
+        await self._client_gone.wait()
+        return {"type": "websocket.disconnect", "code": 1001}
 
     async def accept(self) -> None:
         self.accepted = True
@@ -109,6 +119,29 @@ async def test_stream_forwards_project_events_and_unsubscribes_on_disconnect(
         assert ws.received[0]["payload"] == {"n": 1}
 
         # The subscriber was cleaned up on disconnect — the set shrank back to empty.
+        assert daemon.bus.subscriber_count() == 0
+    finally:
+        await daemon.shutdown()
+
+
+async def test_idle_stream_releases_subscriber_when_client_disconnects(
+    db: Database, tmp_path: Path,
+) -> None:
+    """With no events flowing, a client disconnect must still end the handler promptly.
+
+    Regression: the handler used to notice a closed socket only on its next send, so an
+    idle subscription blocked forever — leaking the subscriber (the bus is capped) and
+    hanging graceful shutdown, which waits for every handler to return."""
+    daemon = _make_daemon(db, tmp_path)
+    try:
+        ws = _FakeWebSocket(_AppShim(daemon))
+        handler = asyncio.create_task(stream(ws, project_id="idle-project"))
+        await _wait_for_subscribers(daemon, 1)
+
+        ws.client_disconnects()
+        await asyncio.wait_for(handler, timeout=5.0)
+
+        assert ws.received == []
         assert daemon.bus.subscriber_count() == 0
     finally:
         await daemon.shutdown()

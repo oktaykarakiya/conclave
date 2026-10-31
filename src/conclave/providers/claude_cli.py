@@ -24,7 +24,8 @@ from .profiles import ResolvedProfile, build_invocation
 
 
 def _build_win_subprocess_kw() -> dict[str, Any]:
-    if os.name != "nt":
+    # sys.platform (not os.name) so mypy skips the Windows-only branch on POSIX.
+    if sys.platform != "win32":
         return {}
     si = subprocess.STARTUPINFO()
     si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
@@ -61,6 +62,19 @@ _PROVIDER_ENV_KEYS: frozenset[str] = frozenset({
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
     "CLAUDE_CODE_EFFORT_LEVEL",
+    # Session identity of a parent Claude Code process (e.g. the daemon was launched from a
+    # Claude Code terminal). Inherited, they make each dispatch look like a nested session
+    # of that parent instead of an independent headless run.
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
 })
 
 
@@ -177,7 +191,10 @@ class ClaudeCliProvider:
                     with contextlib.suppress(asyncio.CancelledError):
                         await cancel_wait_task
                 last_result = _parse_envelope(raw, proc.returncode)
-                if not last_result.ok and _TRANSIENT_CONN_ERROR.search(raw):
+                # Match the outcome only, not the whole stream: tool output in the
+                # transcript (e.g. a test printing ECONNREFUSED) must not re-run the agent.
+                outcome = last_result.error or last_result.text
+                if not last_result.ok and _TRANSIENT_CONN_ERROR.search(outcome):
                     last_result.error = "Cannot connect to API: transient connection error"
                     continue
                 return last_result
@@ -201,10 +218,16 @@ class ClaudeCliProvider:
 
 
 def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
+    """Parse the CLI's output: a single ``--output-format json`` envelope, or the
+    ``stream-json`` NDJSON stream whose final ``{"type": "result"}`` event carries the
+    same fields. Tool calls and the session id are collected from the stream events."""
     text = raw
     model_reported: str | None = None
     cost_usd: float | None = None
     num_turns: int | None = None
+    session_id: str | None = None
+    is_error = False
+    tool_breakdown: dict[str, int] = {}
     tokens: dict[str, int | None] = {
         "input_tokens": None,
         "output_tokens": None,
@@ -214,9 +237,10 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        parsed = None
+        parsed = _scan_stream(raw, tool_breakdown)
     if isinstance(parsed, dict):
         text = str(parsed.get("result", raw))
+        is_error = parsed.get("is_error") is True
         model_usage = parsed.get("modelUsage") or {}
         if isinstance(model_usage, dict) and model_usage:
             model_reported = ", ".join(str(k) for k in model_usage)
@@ -226,6 +250,9 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
         turns = parsed.get("num_turns")
         if isinstance(turns, int):
             num_turns = turns
+        sid = parsed.get("session_id")
+        if isinstance(sid, str) and sid:
+            session_id = sid
         usage = parsed.get("usage")
         if isinstance(usage, dict):
             tokens["input_tokens"] = _as_int(usage.get("input_tokens"))
@@ -233,7 +260,10 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
             tokens["cache_read_tokens"] = _as_int(usage.get("cache_read_input_tokens"))
             tokens["cache_creation_tokens"] = _as_int(usage.get("cache_creation_input_tokens"))
 
-    ok = exit_code == 0 or bool(_SUCCESS_HINT.search(text))
+    ok = (exit_code == 0 or bool(_SUCCESS_HINT.search(text))) and not is_error
+    error: str | None = None
+    if not ok:
+        error = text.strip()[-500:] or f"claude exited with code {exit_code}"
     return AgentResult(
         ok=ok,
         text=text,
@@ -245,7 +275,39 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
         cache_read_tokens=tokens["cache_read_tokens"],
         cache_creation_tokens=tokens["cache_creation_tokens"],
         exit_code=exit_code,
+        error=error,
+        session_id=session_id,
+        tool_calls_count=sum(tool_breakdown.values()),
+        tool_breakdown=tool_breakdown,
     )
+
+
+def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> dict[str, Any] | None:
+    """Walk ``stream-json`` lines: tally ``tool_use`` blocks into *tool_breakdown* and
+    return the last ``result`` event (``None`` when the stream never produced one, e.g.
+    a killed process or non-JSON output — the caller then keeps the raw text)."""
+    result: dict[str, Any] | None = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        etype = obj.get("type")
+        if etype == "result":
+            result = obj
+        elif etype == "assistant":
+            message = obj.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = str(block.get("name") or "tool")
+                    tool_breakdown[name] = tool_breakdown.get(name, 0) + 1
+    return result
 
 
 def _as_int(value: object) -> int | None:

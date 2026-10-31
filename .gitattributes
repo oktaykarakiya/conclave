@@ -1,0 +1,8 @@
+# Force LF everywhere so a checkout on Windows (or a copy through it) can never
+# break the bash launcher (`#!/usr/bin/env bash\r`) or the Python sources.
+* text=auto eol=lf
+conclave text eol=lf
+*.png binary
+*.ico binary
+*.woff binary
+*.woff2 binary

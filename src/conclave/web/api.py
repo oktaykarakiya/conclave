@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,7 @@ from ..engine.compactor import compact_planning_session_context, compact_task_co
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
+from ..providers import CLAUDE_CODE_PREFIX, Engine
 from ..runtime import Daemon
 from ..verification import quarantine_integrity
 from .deps import get_daemon
@@ -116,7 +119,10 @@ async def _require_planning_session(
 
 # --- meta -------------------------------------------------------------------
 
+_DEFAULT_MODEL = "deepseek/deepseek-flash"  # DeepSeek V4.1 Flash; keep in sync with AgentSettings
+
 _RECOMMENDED_MODELS: list[str] = [
+    _DEFAULT_MODEL,  # supersedes deepseek-v4-pro, which is intentionally not offered
     "google/gemini-2.5-flash-lite",
     "google/gemini-3.1-flash-lite-preview",
     "google/gemini-2.5-flash",
@@ -126,6 +132,11 @@ _RECOMMENDED_MODELS: list[str] = [
     "deepseek/deepseek-chat",
     "deepseek/deepseek-reasoner",
     "anthropic/claude-sonnet-4-5",
+    # Claude Code CLI engine (its own login/subscription), routed by the prefix.
+    f"{CLAUDE_CODE_PREFIX}default",
+    f"{CLAUDE_CODE_PREFIX}opus",
+    f"{CLAUDE_CODE_PREFIX}sonnet",
+    f"{CLAUDE_CODE_PREFIX}haiku",
 ]
 _EFFORT_VARIANTS: list[str] = ["low", "medium", "high", "xhigh", "max"]
 _CLI_AGENTS: list[str] = ["build", "general", "explore", "plan"]
@@ -182,9 +193,9 @@ async def get_config_schema() -> dict[str, Any]:
 
 
 @router.get("/models")
-async def get_models_catalog() -> dict[str, Any]:
+async def get_models_catalog(daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
     return {
-        "default_model": "google/gemini-2.5-flash-lite",
+        "default_model": _DEFAULT_MODEL,
         "models": list(_RECOMMENDED_MODELS),
         "recommended_models": list(_RECOMMENDED_MODELS),
         "efforts": list(_EFFORT_VARIANTS),
@@ -192,6 +203,21 @@ async def get_models_catalog() -> dict[str, Any]:
         "cli_agents": list(_CLI_AGENTS),
         "skills": list(_SKILL_TEMPLATES),
         "skill_templates": list(_SKILL_TEMPLATES),
+        "engines": _engine_status(daemon),
+    }
+
+
+def _engine_status(daemon: Daemon) -> dict[str, Any]:
+    """Which engines this daemon can dispatch to (binary found on PATH / via override)."""
+    default = getattr(daemon.provider, "default", Engine.opencode)
+    bins = {
+        Engine.opencode: os.environ.get("CONCLAVE_OPENCODE_BIN", "opencode"),
+        Engine.claude: os.environ.get("CONCLAVE_CLAUDE_BIN", "claude"),
+    }
+    return {
+        "default": str(default),
+        "claude_code_prefix": CLAUDE_CODE_PREFIX,
+        "available": {str(e): shutil.which(b) is not None for e, b in bins.items()},
     }
 
 

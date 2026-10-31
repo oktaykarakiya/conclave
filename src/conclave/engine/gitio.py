@@ -16,7 +16,8 @@ from typing import Any
 logger = logging.getLogger("conclave.engine.gitio")
 
 def _build_win_subprocess_kw() -> dict[str, Any]:
-    if os.name != "nt":
+    # sys.platform (not os.name) so mypy skips the Windows-only branch on POSIX.
+    if sys.platform != "win32":
         return {}
     si = subprocess.STARTUPINFO()
     si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
