@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,27 @@ def test_resolve_engine(
     model: str | None, default: Engine, expected: tuple[Engine, str | None]
 ) -> None:
     assert resolve_engine(model, default) == expected
+
+
+class _ReloadedEngine(StrEnum):
+    """Stand-in for the Engine class as re-created by a hot reload of the router module."""
+
+    opencode = "opencode"
+    claude = "claude"
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("deepseek/deepseek-flash", (Engine.opencode, "deepseek/deepseek-flash")),
+        ("claude-code/opus", (Engine.claude, "opus")),
+    ],
+)
+def test_resolve_engine_survives_hot_reload(model: str, expected: tuple[Engine, str]) -> None:
+    """Regression: after a hot reload the running router held an old-class Engine member,
+    an identity check failed, and every opencode model silently ran on Claude Code."""
+    stale_default = _ReloadedEngine.opencode
+    assert resolve_engine(model, stale_default) == expected  # type: ignore[arg-type]
 
 
 class _Recorder:

@@ -50,10 +50,13 @@ def parse_engine(value: str | None) -> Engine:
 
 def resolve_engine(model: str | None, default: Engine) -> tuple[Engine, str | None]:
     """Return ``(engine, model_for_that_engine)`` for an agent's configured model (pure)."""
+    # Compare by value, never identity: the daemon hot-reloads this module, which re-creates
+    # the Engine class while a long-lived router still holds a member of the old one.
+    default = Engine(default)
     if model is not None and (model == "claude-code" or model.startswith(CLAUDE_CODE_PREFIX)):
         name = model.removeprefix("claude-code").removeprefix("/").strip()
         return Engine.claude, (name if name and name != "default" else None)
-    if default is Engine.opencode:
+    if default == Engine.opencode:
         return Engine.opencode, model
     if not model:
         return Engine.claude, None
@@ -91,7 +94,7 @@ class EngineRouter:
         cancel_event: asyncio.Event | None = None,
     ) -> AgentResult:
         engine, model = resolve_engine(profile.model, self.default)
-        if engine is Engine.opencode:
+        if engine == Engine.opencode:
             return await self._opencode.run_agent(
                 profile=profile,
                 prompt=prompt,
