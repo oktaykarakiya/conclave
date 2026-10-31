@@ -6,7 +6,14 @@ from .base import AgentResult, OnChunk, Provider
 from .claude_cli import ClaudeCliProvider
 from .opencode_cli import OpenCodeCliProvider
 from .profiles import Invocation, ResolvedProfile, build_invocation
-from .router import CLAUDE_CODE_PREFIX, Engine, EngineRouter, parse_engine, resolve_engine
+from .router import (
+    CLAUDE_CODE_PREFIX,
+    Engine,
+    EngineRouter,
+    engine_status,
+    parse_engine,
+    resolve_engine,
+)
 
 __all__ = [
     "CLAUDE_CODE_PREFIX",
@@ -20,6 +27,7 @@ __all__ = [
     "Provider",
     "ResolvedProfile",
     "build_invocation",
+    "engine_status",
     "parse_engine",
     "resolve_engine",
 ]

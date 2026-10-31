@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -59,7 +57,7 @@ from ..engine.task_merge import TaskMergeError, merge_task
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
-from ..providers import CLAUDE_CODE_PREFIX, Engine
+from ..providers import CLAUDE_CODE_PREFIX, engine_status
 from ..runtime import Daemon
 from ..verification import quarantine_integrity
 from .deps import get_daemon
@@ -210,21 +208,7 @@ async def get_models_catalog(daemon: Daemon = Depends(get_daemon)) -> dict[str, 
         "cli_agents": list(_CLI_AGENTS),
         "skills": list(_SKILL_TEMPLATES),
         "skill_templates": list(_SKILL_TEMPLATES),
-        "engines": _engine_status(daemon),
-    }
-
-
-def _engine_status(daemon: Daemon) -> dict[str, Any]:
-    """Which engines this daemon can dispatch to (binary found on PATH / via override)."""
-    default = getattr(daemon.provider, "default", Engine.opencode)
-    bins = {
-        Engine.opencode: os.environ.get("CONCLAVE_OPENCODE_BIN", "opencode"),
-        Engine.claude: os.environ.get("CONCLAVE_CLAUDE_BIN", "claude"),
-    }
-    return {
-        "default": str(default),
-        "claude_code_prefix": CLAUDE_CODE_PREFIX,
-        "available": {str(e): shutil.which(b) is not None for e, b in bins.items()},
+        "engines": engine_status(daemon.provider),
     }
 
 

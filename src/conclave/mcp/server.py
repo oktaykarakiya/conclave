@@ -13,7 +13,14 @@ from .. import __version__
 from ..db import repositories as repo
 from ..events import EventType
 from ..runtime import Daemon
-from .tools import MCP_TOOLS, McpToolError, call_mcp_tool
+from .tools import (
+    MCP_TOOLS,
+    PILOT_GUIDE_URI,
+    McpToolError,
+    call_mcp_tool,
+    load_pilot_brief,
+    load_pilot_guide,
+)
 
 logger = logging.getLogger("conclave.mcp")
 
@@ -110,6 +117,7 @@ async def handle_mcp_message(
                     "name": "conclave-mcp",
                     "version": __version__,
                 },
+                "instructions": load_pilot_brief(),
             },
         )
 
@@ -179,7 +187,9 @@ async def handle_mcp_message(
                     "content": [
                         {
                             "type": "text",
-                            "text": json.dumps(output, indent=2),
+                            "text": output
+                            if isinstance(output, str)
+                            else json.dumps(output, indent=2),
                         }
                     ],
                     "isError": False,
@@ -234,7 +244,18 @@ async def handle_mcp_message(
 
     if method == "resources/list":
         projects = await repo.list_projects(daemon.db, limit=100)
-        resources = [
+        resources: list[dict[str, Any]] = [
+            {
+                "uri": PILOT_GUIDE_URI,
+                "name": "Conclave Pilot Guide",
+                "description": (
+                    "How to operate Conclave over MCP: multi-agent flows, review/merge, "
+                    "model strategy, pitfalls, tool index"
+                ),
+                "mimeType": "text/markdown",
+            }
+        ]
+        resources.extend(
             {
                 "uri": f"conclave://projects/{p.id}",
                 "name": f"Project: {p.name}",
@@ -242,7 +263,7 @@ async def handle_mcp_message(
                 "mimeType": "application/json",
             }
             for p in projects
-        ]
+        )
         return _jsonrpc_result(msg_id, {"resources": resources})
 
     if method == "resources/templates/list":
@@ -266,6 +287,19 @@ async def handle_mcp_message(
 
     if method == "resources/read":
         uri = str(params.get("uri", ""))
+        if uri == PILOT_GUIDE_URI:
+            return _jsonrpc_result(
+                msg_id,
+                {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "text/markdown",
+                            "text": load_pilot_guide(),
+                        }
+                    ]
+                },
+            )
         if uri.startswith("conclave://projects/"):
             pid = uri.removeprefix("conclave://projects/").strip("/")
             proj = await repo.get_project(daemon.db, pid)

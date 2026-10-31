@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from ..config import ArgMode
-from .base import AgentResult, OnChunk
+from .base import AgentResult, OnChunk, Provider
 from .claude_cli import ClaudeCliProvider
 from .opencode_cli import OpenCodeCliProvider
 from .profiles import ResolvedProfile
@@ -46,6 +48,20 @@ def parse_engine(value: str | None) -> Engine:
     if raw in ("claude", "claude-code", "claude_code"):
         return Engine.claude
     raise ValueError(f"unknown engine {value!r} (expected 'opencode' or 'claude')")
+
+
+def engine_status(provider: Provider) -> dict[str, Any]:
+    """Which engines this daemon can dispatch to (binary found on PATH / via override)."""
+    default = getattr(provider, "default", Engine.opencode)
+    bins = {
+        Engine.opencode: os.environ.get("CONCLAVE_OPENCODE_BIN", "opencode"),
+        Engine.claude: os.environ.get("CONCLAVE_CLAUDE_BIN", "claude"),
+    }
+    return {
+        "default": str(default),
+        "claude_code_prefix": CLAUDE_CODE_PREFIX,
+        "available": {str(e): shutil.which(b) is not None for e, b in bins.items()},
+    }
 
 
 def resolve_engine(model: str | None, default: Engine) -> tuple[Engine, str | None]:

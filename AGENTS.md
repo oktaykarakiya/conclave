@@ -61,6 +61,7 @@ cd frontend && npm run build       # build SPA into src/conclave/web/static/
 - **Security**: single-user, intentionally unauthenticated. Binds `0.0.0.0` by default for LAN use. Set `CONCLAVE_HOST=127.0.0.1` for loopback-only. Multi-user auth is out of scope.
 - **Env vars**: `CONCLAVE_HOST` (default `0.0.0.0`), `CONCLAVE_PORT` (default `8700`), `CONCLAVE_HOME` (default `~/.local/share/conclave`), `CONCLAVE_ENGINE` (default `opencode`; `claude` for Claude Code), `CONCLAVE_OPENCODE_BIN` / `CONCLAVE_CLAUDE_BIN` (binary overrides; the launcher autodiscovers), `PYTHON` (override interpreter for venv bootstrap).
 - **Branch `conclave-selftest`** exists unmerged — contains BMad scale-adaptive planning. Do not accidentally work on it unless that feature is explicitly requested.
+- **Keep the MCP pilot docs current**: when MCP tools or pilot-relevant behaviour/defaults change, update `src/conclave/mcp/pilot_guide.md` (and `pilot_brief.md`) in the same change; the drift tests enforce tool coverage.
 
 ## Testing
 

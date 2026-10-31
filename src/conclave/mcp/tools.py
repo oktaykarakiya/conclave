@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
+from .. import __version__
 from ..agents import DEFAULT_PERSONAS
 from ..config import (
     EdgeCondition,
@@ -41,8 +44,72 @@ from ..engine.task_merge import TaskMergeError, merge_task
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
+from ..providers import engine_status
 from ..runtime import Daemon
 from ..verification import quarantine_integrity
+
+PILOT_GUIDE_URI = "conclave://guide/pilot"
+
+_SECTION_RE = re.compile(r"^## (\d+)\.\s+(.+)$")
+
+
+def load_pilot_guide() -> str:
+    """Read the packaged pilot guide markdown (fresh on every call)."""
+    return resources.files("conclave.mcp").joinpath("pilot_guide.md").read_text(encoding="utf-8")
+
+
+def load_pilot_brief() -> str:
+    """Read the packaged pilot brief that MCP clients add to the system prompt."""
+    return resources.files("conclave.mcp").joinpath("pilot_brief.md").read_text(encoding="utf-8")
+
+
+def _guide_sections(guide: str) -> list[tuple[str | None, str, str]]:
+    """Split the guide into ``(number, title, text)`` for every ``## `` heading."""
+    lines = guide.splitlines(keepends=True)
+    starts = [idx for idx, line in enumerate(lines) if line.startswith("## ")]
+    sections: list[tuple[str | None, str, str]] = []
+    for pos, start in enumerate(starts):
+        end = starts[pos + 1] if pos + 1 < len(starts) else len(lines)
+        text = "".join(lines[start:end]).rstrip()
+        heading = lines[start].rstrip("\n")
+        match = _SECTION_RE.match(heading)
+        number = match.group(1) if match else None
+        title = match.group(2) if match else heading.removeprefix("## ").strip()
+        sections.append((number, title, text))
+    return sections
+
+
+def _match_guide_section(
+    sections: list[tuple[str | None, str, str]], section: str
+) -> tuple[str | None, str, str] | None:
+    """Match a section by exact number first, then by a title substring."""
+    query = section.strip().lower().removesuffix(".").strip()
+    if not query:
+        return None
+    for candidate in sections:
+        if candidate[0] is not None and candidate[0] == query:
+            return candidate
+    for candidate in sections:
+        if query in candidate[1].lower():
+            return candidate
+    return None
+
+
+def _live_environment_footer(daemon: Daemon) -> str:
+    """Markdown footer describing the daemon this tool call actually reached."""
+    status = engine_status(daemon.provider)
+    available = status["available"]
+    engines = ", ".join(
+        f"{name}: {'available' if ok else 'not found'}" for name, ok in available.items()
+    )
+    return (
+        "---\n\n"
+        "**Live environment** (generated at call time)\n\n"
+        f"- Conclave version: {__version__}\n"
+        f"- Default engine: {status['default']}\n"
+        f"- Engines on this host: {engines}\n"
+        f"- MCP tools: {len(MCP_TOOLS)}\n"
+    )
 
 
 class McpToolError(ValueError):
@@ -974,6 +1041,20 @@ MCP_TOOLS: list[dict[str, Any]] = [
             ),
         },
         required=["project_id"],
+    ),
+    # --- Pilot Guide ---
+    _tool(
+        "conclave_get_pilot_guide",
+        "Read the Conclave pilot guide (markdown): operating flows, review/merge, model "
+        "strategy, pitfalls, and the full tool index. Optionally return one section by its "
+        "number or a substring of its title.",
+        {
+            "section": _prop(
+                "string",
+                'Optional section selector: its number (e.g. "6") or a substring of its title '
+                '(e.g. "monitoring"). Omit for the whole guide.',
+            )
+        },
     ),
 ]
 
@@ -2545,5 +2626,24 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             gate_failed_after_review=gate_failed,
             task_failed=task_failed,
         )
+
+    if name == "conclave_get_pilot_guide":
+        section = _opt_str(args, "section")
+        guide = load_pilot_guide()
+        if section:
+            sections = _guide_sections(guide)
+            matched = _match_guide_section(sections, section)
+            if matched is None:
+                headings = [
+                    f"{number}. {title}" if number is not None else title
+                    for number, title, _ in sections
+                ]
+                raise McpToolError(
+                    f"unknown section {section!r}; available sections: " + "; ".join(headings)
+                )
+            body = matched[2]
+        else:
+            body = guide
+        return body.rstrip() + "\n\n" + _live_environment_footer(daemon)
 
     raise McpToolError(f"unknown MCP tool: {name!r}")

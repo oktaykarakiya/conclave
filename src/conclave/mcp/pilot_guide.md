@@ -168,3 +168,90 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   target branch — fix the config, not the code.
 - If a model's `model_reported` differs from the configured one, stop and investigate before
   trusting results (wrong engine, wrong model string, or routing problem).
+
+## 12. Tool index
+
+Every MCP tool, grouped by purpose. Read the guide section named for the flow before using a
+group for the first time.
+
+### Projects & config
+- `conclave_list_projects` — see which repositories are attached before picking a `project_id`.
+- `conclave_attach_project` — attach a local git repo (re-attaching a path updates it).
+- `conclave_detach_project` — remove a project, stop its worker, and clean in-progress worktrees.
+- `conclave_get_project_status` — check whether a project's worker is paused or running.
+- `conclave_pause_project` — stop the worker from starting new tasks.
+- `conclave_resume_project` — restart a paused worker.
+- `conclave_set_project_mode` — switch between task_queue and autonomous_bug_fixer mode.
+- `conclave_get_config` — read the resolved config before changing behaviour.
+- `conclave_patch_config` — deep-merge execution, agent, planning, and workflow settings.
+
+### Tasks
+- `conclave_list_tasks` — find tasks, optionally filtered by state.
+- `conclave_create_task` — queue a coding or PR-review task (auto_approve=true runs it now).
+- `conclave_get_task` — read state, branch, result summary, and checkpoints for one task.
+- `conclave_get_task_events` — page through execution events while a task runs.
+- `conclave_cancel_task` — stop a task you no longer want.
+- `conclave_delete_task` — remove a finished task and its records.
+
+### Review & merge
+- `conclave_get_task_diff` — review the change as a unified diff before merging.
+- `conclave_merge_task` — merge a done task's branch through the guarded merge.
+- `conclave_get_task_verdicts` — read grounded reviewer verdicts across attempts.
+- `conclave_get_task_checkpoints` — inspect step-level checkpoints and tree SHAs.
+
+### Human-in-the-loop
+- `conclave_approve_task` — approve an inbox, failed, blocked, cancelled, or paused task.
+- `conclave_cascade_approve_task` — approve a parent and all descendants in dependency order.
+- `conclave_set_hitl_checkpoint` — arm or disarm a pause on a node or edge.
+- `conclave_complete_node` — resume, fail, or skip a node paused at a checkpoint.
+- `conclave_steer_task` — inject guidance into the next dispatch.
+
+### Workflow
+- `conclave_get_workflow` — inspect the effective graph and available presets.
+- `conclave_apply_workflow_template` — start from a built-in preset.
+- `conclave_set_workflow` — replace the whole graph (validated as a DAG).
+- `conclave_workflow_upsert_node` — add or change an agent/stage node.
+- `conclave_workflow_remove_node` — drop a node and its edges.
+- `conclave_workflow_upsert_edge` — connect or update a directed edge.
+- `conclave_workflow_remove_edge` — remove one directed edge.
+- `conclave_evolve_workflow` — adjust the graph from verdict and gate history.
+
+### Agents
+- `conclave_list_agents` — see global and project-scoped personas.
+- `conclave_upsert_agent` — create or update a persona with Markdown instructions.
+- `conclave_delete_agent` — remove a custom persona or reset a built-in one.
+- `conclave_configure_agent` — set model, effort, tooling, and retry settings per agent.
+- `conclave_compact_session` — compact task or planning context before implementing.
+
+### Planning
+- `conclave_list_planning_sessions` — find planning sessions for a project.
+- `conclave_create_planning_session` — start specialists debating a task tree.
+- `conclave_get_planning_session` — read the transcript and proposed tree.
+- `conclave_interject_planning_message` — add human guidance and trigger a planner turn.
+- `conclave_approve_planning_session` — materialize the tree into executable tasks.
+- `conclave_cancel_planning_session` — stop a session you do not want.
+
+### Quarantine
+- `conclave_list_bug_candidates` — review candidates from the autonomous bug-fixer ledger.
+- `conclave_list_quarantine` — inspect quarantined test patterns and gate health.
+- `conclave_add_quarantine` — quarantine a flaky test pattern until a date.
+- `conclave_delete_quarantine` — remove a quarantine entry.
+
+### Store & swarms
+- `conclave_store_list` — browse reusable workflows, personas, and config presets.
+- `conclave_store_publish` — publish or update an item in the Store.
+- `conclave_store_delete` — remove a custom Store item.
+- `conclave_store_install` — apply a Store item to a project.
+- `conclave_launch_swarm` — run a parallel batch of worktree sessions for mass changes.
+- `conclave_get_swarm_status` — check a swarm's progress and task counts.
+
+### Observability
+- `conclave_list_interactions` — list logged agent and MCP conversations.
+- `conclave_get_interaction` — read one full transcript and tool breakdown.
+- `conclave_query_interactions` — run a read-only SQL SELECT over interaction logs.
+- `conclave_get_observability_stats` — read aggregated cost, token, and model stats.
+
+### System
+- `conclave_get_reload_status` — check hot-reload state without triggering one.
+- `conclave_reload_system` — hot-reload Conclave in place (defers while tasks run).
+- `conclave_get_pilot_guide` — re-read this guide, one section or all of it.
