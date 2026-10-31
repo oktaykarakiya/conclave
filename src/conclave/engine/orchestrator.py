@@ -57,6 +57,10 @@ _REVIEWER_RETRY_BACKOFF_S = 3.0
 # the agent can still reason about scope.
 _MAX_DIFF_CHARS = 40_000
 
+# Bound on git's combined output captured in the result summary when a task commit fails,
+# so a noisy hook cannot bloat the task row while its diagnostic tail stays visible.
+_COMMIT_OUTPUT_TAIL_CHARS = 500
+
 _NECESSITY_YAGNI_RULE = (
     "NECESSITY & YAGNI CHECK: Verify that every change is strictly necessary to fix a "
     "real bug, close a parity gap, or satisfy an explicit requirement before adding files "
@@ -2237,7 +2241,50 @@ class Orchestrator:
         await _stage_worktree_excluding_caches(worktree)
         _, status = await run_git(worktree, "status", "--porcelain")
         if status.strip():
-            await run_git(worktree, "commit", "-m", _commit_message(task))
+            commit_rc, commit_out = await run_git(
+                worktree, "commit", "-m", _commit_message(task)
+            )
+            if commit_rc != 0:
+                # A rejected commit (e.g. a repository pre-commit hook) must never be
+                # reported as success: merging now would ship nothing and cleanup would
+                # destroy the reviewed work. Fail loudly and preserve worktree + branch.
+                summary = (
+                    f"commit failed (exit {commit_rc}); work preserved uncommitted in "
+                    f"worktree {worktree} on branch {task_branch}:\n"
+                    f"{commit_out.strip()[-_COMMIT_OUTPUT_TAIL_CHARS:]}"
+                )
+                await repo.save_task_checkpoint(
+                    self._db,
+                    task_id=task.id,
+                    node_id="merge",
+                    attempt=attempts,
+                    status=CheckpointStatus.failed,
+                    artifact={"branch": task_branch, "worktree": str(worktree)},
+                )
+                await repo.finalize_task(
+                    self._db, task.id, state=TaskState.failed,
+                    result_summary=summary, block_children=True,
+                )
+                await self._bus.emit(
+                    type=EventType.node_completed,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    payload={"node_id": "merge", "attempt": attempts, "status": "failed"},
+                )
+                await self._bus.emit(
+                    type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
+                    payload={
+                        "reason": "commit_failed",
+                        "branch": task_branch,
+                        "worktree": str(worktree),
+                        "exit_code": commit_rc,
+                    },
+                )
+                logger.warning(
+                    "task %s commit failed (exit %s); work preserved in %s",
+                    task.id, commit_rc, worktree,
+                )
+                return False
         await repo.update_task_fields(self._db, task.id, branch=task_branch)
         await self._bus.emit(
             type=EventType.task_committed, project_id=task.project_id, task_id=task.id,

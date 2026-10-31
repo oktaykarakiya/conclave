@@ -34,6 +34,13 @@ async def _init_repo(path: Path) -> None:
     await run_git(path, "commit", "-m", "initial commit")
 
 
+def _install_pre_commit_hook(repo_path: Path, script: str) -> None:
+    hook = repo_path / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(script)
+    hook.chmod(0o755)
+
+
 class _EmptyReviewerProvider:
     """Provider whose every dispatch comes back empty (simulated backend outage).
 
@@ -82,6 +89,143 @@ async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> No
 
     types = {e.type for e in await repo.list_events(db, task_id=task.id)}
     assert {"task.started", "task.committed", "task.merged", "task.done"} <= types
+
+
+async def test_commit_rejected_by_pre_commit_hook_fails_task_and_preserves_work(
+    db: Database, tmp_path: Path,
+) -> None:
+    """A pre-commit hook rejecting the commit must fail the task, not silently
+    'merge' an empty branch and destroy the reviewed work."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    _install_pre_commit_hook(
+        repo_path,
+        "#!/bin/sh\n"
+        f"echo '{'x' * 2000}' >&2\n"
+        "echo 'pre-commit: lint rejected FEATURE.txt' >&2\n"
+        "exit 1\n",
+    )
+    _, base = await run_git(repo_path, "rev-parse", "main")
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    child = await repo.create_task(
+        db, project_id=project.id, request="child work", state=TaskState.approved,
+        parent_task_id=task.id,
+    )
+
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is False
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state is TaskState.failed
+    summary = final.result_summary or ""
+    worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    assert summary.startswith("commit failed")
+    assert "pre-commit: lint rejected FEATURE.txt" in summary
+    assert str(worktree_path) in summary
+    assert len(summary.split("\n", 1)[1]) <= 500
+
+    events = await repo.list_events(db, task_id=task.id)
+    fail_events = [e for e in events if e.type == "task.failed"]
+    assert len(fail_events) == 1
+    assert fail_events[0].payload.get("reason") == "commit_failed"
+    event_types = {e.type for e in events}
+    assert "task.committed" not in event_types
+    assert "task.merged" not in event_types
+    assert "task.done" not in event_types
+
+    # No merge was attempted: main still points at the base commit without the file.
+    _, main_now = await run_git(repo_path, "rev-parse", "main")
+    assert main_now == base
+    rc, _ = await run_git(repo_path, "show", "main:FEATURE.txt")
+    assert rc != 0
+
+    # The worktree and branch survive with the staged, uncommitted change intact.
+    assert worktree_path.is_dir()
+    _, wt_list = await run_git(repo_path, "worktree", "list")
+    assert str(worktree_path) in wt_list
+    assert "done" in (worktree_path / "FEATURE.txt").read_text()
+    _, porcelain = await run_git(worktree_path, "status", "--porcelain")
+    assert "A  FEATURE.txt" in porcelain
+    rc, branch_now = await run_git(repo_path, "rev-parse", f"conclave/{task.id}")
+    assert rc == 0
+    assert branch_now.strip() == base.strip()
+
+    child_row = await repo.get_task(db, child.id)
+    assert child_row is not None and child_row.state is TaskState.blocked
+
+
+async def test_passing_pre_commit_hook_runs_and_commit_merges(
+    db: Database, tmp_path: Path,
+) -> None:
+    """The success path still commits/merges, and hooks are executed (not bypassed)."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    marker = tmp_path / "hook_ran"
+    _install_pre_commit_hook(
+        repo_path,
+        f"#!/bin/sh\necho ran >> '{marker}'\nexit 0\n",
+    )
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None and done.state is TaskState.done
+    assert done.result_summary == "completed in 1 attempt(s); merged=True"
+    code, out = await run_git(repo_path, "show", "main:FEATURE.txt")
+    assert code == 0 and "done" in out
+    assert marker.exists()
+
+    event_types = {e.type for e in await repo.list_events(db, task_id=task.id)}
+    assert {"task.committed", "task.merged"} <= event_types
+
+    _, branches = await run_git(repo_path, "branch", "--list", f"conclave/{task.id}")
+    assert f"conclave/{task.id}" not in branches
+    worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    _, wt_list = await run_git(repo_path, "worktree", "list")
+    assert str(worktree_path) not in wt_list
+
+
+async def test_nothing_to_commit_skips_commit_even_with_failing_hook(
+    db: Database, tmp_path: Path,
+) -> None:
+    """The empty-status path never invokes commit, so a failing hook is irrelevant."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    _install_pre_commit_hook(repo_path, "#!/bin/sh\nexit 1\n")
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="no-op change", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(
+        db, EventBus(db), FakeProvider(developer_writes=False), tmp_path / "home"
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None and done.state is TaskState.done
+    assert done.result_summary == "completed in 1 attempt(s); merged=True"
 
 
 async def test_dispatch_emits_live_agent_output_events(db: Database, tmp_path: Path) -> None:
