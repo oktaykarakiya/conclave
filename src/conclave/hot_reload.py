@@ -85,6 +85,7 @@ _EXPLICIT_MODULE_RANKS: dict[str, tuple[int, int]] = {
     "conclave.engine.region_scheduler": (10, 17),
     "conclave.engine.orchestrator": (10, 80),
     "conclave.engine.task_diff": (10, 82),
+    "conclave.engine.task_merge": (10, 83),
     "conclave.engine.bug_fixer": (10, 85),
     "conclave.engine": (10, 99),
     # planning

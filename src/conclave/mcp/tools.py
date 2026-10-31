@@ -37,6 +37,7 @@ from ..engine.task_diff import (
     TaskDiffError,
     compute_task_diff,
 )
+from ..engine.task_merge import TaskMergeError, merge_task
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
@@ -468,6 +469,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 default=DEFAULT_DIFF_MAX_BYTES,
             ),
         },
+        required=["task_id"],
+    ),
+    _tool(
+        "conclave_merge_task",
+        "Merge a done task's branch into the project's configured target branch.",
+        {"task_id": _prop("string", "Task ID.")},
         required=["task_id"],
     ),
     # --- Dynamic Agent Diagram (Workflow Graph) ---
@@ -1677,6 +1684,14 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 max_bytes=max_bytes,
             )
         except TaskDiffError as exc:
+            raise McpToolError(exc.detail) from exc
+
+    if name == "conclave_merge_task":
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        project = await _require_project(daemon, task.project_id)
+        try:
+            return await merge_task(daemon.orchestrator, project, task)
+        except TaskMergeError as exc:
             raise McpToolError(exc.detail) from exc
 
     # --- Dynamic Agent Diagram (Workflow Graph) ---

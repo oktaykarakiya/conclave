@@ -55,6 +55,7 @@ from ..engine.task_diff import (
     TaskDiffError,
     compute_task_diff,
 )
+from ..engine.task_merge import TaskMergeError, merge_task
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
@@ -1181,6 +1182,19 @@ async def get_task_diff(
             max_bytes=max_bytes,
         )
     except TaskDiffError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@router.post("/tasks/{task_id}/merge")
+async def merge_task_endpoint(
+    task_id: str, daemon: Daemon = Depends(get_daemon)
+) -> dict[str, Any]:
+    """Merge a done task's branch into the project's target branch."""
+    task = await _require_task(daemon, task_id)
+    project = await _require_project(daemon, task.project_id)
+    try:
+        return await merge_task(daemon.orchestrator, project, task)
+    except TaskMergeError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
