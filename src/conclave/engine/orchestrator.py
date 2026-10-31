@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import ConclaveConfig, WorkflowNode, load_project_config, resolve_agent
-from ..db import CheckpointStatus, Database, Task, TaskState
+from ..db import CheckpointStatus, Database, Project, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType, build_notification_sink
 from ..providers import AgentResult, Provider
@@ -476,15 +476,7 @@ class Orchestrator:
         config = load_project_config(project.config)
         repo_path = Path(project.path)
         self._repo_path = repo_path
-        raw_exec = project.config.get("execution") if isinstance(project.config, dict) else None
-        explicit_target = (
-            raw_exec.get("target_branch")
-            if isinstance(raw_exec, dict) and raw_exec.get("target_branch")
-            else None
-        )
-        target_branch = str(
-            explicit_target or project.default_branch or config.execution.target_branch
-        )
+        target_branch = _resolve_target_branch(project, config)
         runner = AgentRunner(self._db, self._bus, self._provider, project.id, config)
         wm = WorktreeManager(repo_path, self._home / "projects" / project.id / "worktrees")
         task_branch = f"{config.execution.branch_prefix}{task.id}"
@@ -2788,6 +2780,23 @@ def _build_venv_guidance(
         f"Do NOT use system-wide {tool_refs} — they are a different "
         "toolchain and will disagree with the gate."
     )
+
+
+def _resolve_target_branch(project: Project, config: ConclaveConfig) -> str:
+    """Resolve the branch a project's tasks integrate into.
+
+    Precedence: explicit ``config.execution.target_branch`` stored on the project,
+    then the project's ``default_branch``, then the model default. Shared by the
+    orchestration loop and the read-only task diff so both always agree on the
+    comparison base.
+    """
+    raw_exec = project.config.get("execution") if isinstance(project.config, dict) else None
+    explicit_target = (
+        raw_exec.get("target_branch")
+        if isinstance(raw_exec, dict) and raw_exec.get("target_branch")
+        else None
+    )
+    return str(explicit_target or project.default_branch or config.execution.target_branch)
 
 
 _TRANSIENT_CACHE_DIRS: tuple[str, ...] = (

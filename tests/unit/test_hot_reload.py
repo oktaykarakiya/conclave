@@ -74,6 +74,8 @@ def test_discover_conclave_modules_covers_100_percent_in_topological_order() -> 
     assert idx["conclave.bootstrap"] < idx["conclave.engine.orchestrator"]
     assert idx["conclave.engine.graph_executor"] < idx["conclave.engine.orchestrator"]
     assert idx["conclave.engine.workflow_evolver"] < idx["conclave.engine.orchestrator"]
+    assert idx["conclave.engine.orchestrator"] < idx["conclave.engine.task_diff"]
+    assert idx["conclave.engine.task_diff"] < idx["conclave.engine"]
     assert idx["conclave.engine"] < idx["conclave.planning.session"]
     assert idx["conclave.planning"] < idx["conclave.hot_reload"]
     assert idx["conclave.hot_reload"] < idx["conclave.runtime"]

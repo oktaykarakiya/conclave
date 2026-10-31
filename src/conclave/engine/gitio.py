@@ -59,7 +59,9 @@ def _find_windows_posix_sh() -> tuple[str | None, str | None]:
     return (sh_bin, None) if sh_bin else (None, None)
 
 
-async def run_git(cwd: Path, *args: str) -> tuple[int, str]:
+async def run_git(
+    cwd: Path, *args: str, env: dict[str, str] | None = None
+) -> tuple[int, str]:
     """Run a git command in ``cwd``; return (exit_code, combined_output)."""
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -67,7 +69,7 @@ async def run_git(cwd: Path, *args: str) -> tuple[int, str]:
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, **GIT_ENV},
+        env={**os.environ, **GIT_ENV, **(env or {})},
         **_WIN_SUBPROCESS_KW,
     )
     stdout, _ = await proc.communicate()

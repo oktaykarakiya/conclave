@@ -31,6 +31,12 @@ from ..db import (
 )
 from ..db import repositories as repo
 from ..engine.compactor import compact_planning_session_context, compact_task_context
+from ..engine.task_diff import (
+    DEFAULT_DIFF_MAX_BYTES,
+    MAX_DIFF_MAX_BYTES,
+    TaskDiffError,
+    compute_task_diff,
+)
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
@@ -445,6 +451,23 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "conclave_get_task_checkpoints",
         "Fetch step-level execution checkpoints and git tree SHAs for a task.",
         {"task_id": _prop("string", "Task ID.")},
+        required=["task_id"],
+    ),
+    _tool(
+        "conclave_get_task_diff",
+        "Read-only unified diff and stat of a task's change (live worktree or task branch).",
+        {
+            "task_id": _prop("string", "Task ID."),
+            "stat_only": _prop(
+                "boolean", "Return only the diff stat and omit the unified diff text.",
+                default=False,
+            ),
+            "max_bytes": _prop(
+                "integer",
+                f"Maximum diff size in bytes (1-{MAX_DIFF_MAX_BYTES}).",
+                default=DEFAULT_DIFF_MAX_BYTES,
+            ),
+        },
         required=["task_id"],
     ),
     # --- Dynamic Agent Diagram (Workflow Graph) ---
@@ -1635,6 +1658,26 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         task = await _require_task(daemon, _opt_str(args, "task_id"))
         checkpoints = await repo.list_task_checkpoints(daemon.db, task.id)
         return [cp.model_dump(mode="json") for cp in checkpoints]
+
+    if name == "conclave_get_task_diff":
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        stat_only = _opt_bool(args, "stat_only", False)
+        max_bytes = _opt_int(args, "max_bytes", DEFAULT_DIFF_MAX_BYTES)
+        if not 1 <= max_bytes <= MAX_DIFF_MAX_BYTES:
+            raise McpToolError(
+                f"max_bytes must be between 1 and {MAX_DIFF_MAX_BYTES}"
+            )
+        project = await _require_project(daemon, task.project_id)
+        try:
+            return await compute_task_diff(
+                daemon.home,
+                project,
+                task,
+                stat_only=stat_only,
+                max_bytes=max_bytes,
+            )
+        except TaskDiffError as exc:
+            raise McpToolError(exc.detail) from exc
 
     # --- Dynamic Agent Diagram (Workflow Graph) ---
     if name == "conclave_get_workflow":

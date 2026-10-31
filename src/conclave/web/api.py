@@ -49,6 +49,12 @@ from ..db import (
 from ..db import repositories as repo
 from ..db.planning_models import PlanningMessage, PlanningSession, PlanningTaskNode
 from ..engine.compactor import compact_planning_session_context, compact_task_context
+from ..engine.task_diff import (
+    DEFAULT_DIFF_MAX_BYTES,
+    MAX_DIFF_MAX_BYTES,
+    TaskDiffError,
+    compute_task_diff,
+)
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
@@ -1154,6 +1160,28 @@ async def list_task_checkpoints(
 ) -> list[TaskCheckpoint]:
     await _require_task(daemon, task_id)
     return await repo.list_task_checkpoints(daemon.db, task_id, attempt=attempt)
+
+
+@router.get("/tasks/{task_id}/diff")
+async def get_task_diff(
+    task_id: str,
+    stat_only: bool = False,
+    max_bytes: int = Query(DEFAULT_DIFF_MAX_BYTES, ge=1, le=MAX_DIFF_MAX_BYTES),
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    """Read-only view of a task's change (live worktree or task branch)."""
+    task = await _require_task(daemon, task_id)
+    project = await _require_project(daemon, task.project_id)
+    try:
+        return await compute_task_diff(
+            daemon.home,
+            project,
+            task,
+            stat_only=stat_only,
+            max_bytes=max_bytes,
+        )
+    except TaskDiffError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 @router.post("/tasks/{task_id}/compact")
