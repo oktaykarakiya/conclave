@@ -213,14 +213,17 @@ async def test_max_rounds_stabilization_persists_reason(db: Database) -> None:
 
     # Wait for the background discussion loop to finish (with max_rounds=0 the
     # round loop body never runs, so it hits the max-rounds branch immediately).
-    for _ in range(100):
+    # The loop awaits aiosqlite work in a worker thread, so poll against a deadline.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while True:
         refreshed = await repo.get_planning_session(db, session.id)
         assert refreshed is not None
         if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
             break
-        await asyncio.sleep(0)
-    else:
-        raise AssertionError("session never reached stable/completed")
+        if loop.time() >= deadline:
+            raise AssertionError("session never reached stable/completed")
+        await asyncio.sleep(0.01)
 
     session_after = await repo.get_planning_session(db, session.id)
     assert session_after is not None

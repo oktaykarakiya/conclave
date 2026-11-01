@@ -22,6 +22,31 @@ from conclave.runtime import Daemon
 # --- repository layer ---------------------------------------------------------
 
 
+async def _wait_until_settled(
+    db: Database,
+    session_id: str,
+    failure: str = "session never reached stable/completed",
+) -> None:
+    """Wait until the background discussion loop marks *session_id* settled.
+
+    ``_run_discussion`` performs awaited database work through aiosqlite's worker
+    thread, so a fixed number of event-loop ticks is not a time bound.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while True:
+        refreshed = await repo.get_planning_session(db, session_id)
+        assert refreshed is not None
+        if refreshed.status in (
+            PlanningSessionStatus.stable,
+            PlanningSessionStatus.completed,
+        ):
+            return
+        if loop.time() >= deadline:
+            raise AssertionError(failure)
+        await asyncio.sleep(0.01)
+
+
 async def test_planning_session_crud(db: Database) -> None:
     p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
 
@@ -551,14 +576,7 @@ async def test_approve_session_idempotent(db: Database) -> None:
     )
 
     # Wait for the background discussion loop to complete (session → stable).
-    for _ in range(100):
-        refreshed = await repo.get_planning_session(db, session.id)
-        assert refreshed is not None
-        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
-            break
-        await asyncio.sleep(0)
-    else:
-        raise AssertionError("session never reached stable/completed")
+    await _wait_until_settled(db, session.id)
 
     # First approval — materialises tasks.
     first_ids = await orchestrator.approve_session(session.id)
@@ -766,16 +784,7 @@ async def test_concurrent_turns_on_same_session_are_serialized(db: Database) -> 
 
     # Wait for the background turn to complete (enter_count >= 2) and the
     # discussion loop to reach stable.
-    for _ in range(200):
-        refreshed = await repo.get_planning_session(db, session.id)
-        if refreshed is not None and refreshed.status in (
-            PlanningSessionStatus.stable,
-            PlanningSessionStatus.completed,
-        ):
-            break
-        await asyncio.sleep(0)
-    else:
-        raise AssertionError("session never reached stable/completed")
+    await _wait_until_settled(db, session.id)
 
     # Both turns must have entered run_agent (serially, not concurrently).
     assert provider.enter_count >= 2, (
@@ -857,14 +866,7 @@ async def test_reviewer_prose_with_approved_word_does_not_count_as_approval(
         max_rounds=2,
     )
 
-    for _ in range(300):
-        refreshed = await repo.get_planning_session(db, session.id)
-        assert refreshed is not None
-        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
-            break
-        await asyncio.sleep(0)
-    else:
-        raise AssertionError("session never reached stable/completed")
+    await _wait_until_settled(db, session.id)
 
     after = await repo.get_planning_session(db, session.id)
     assert after is not None
@@ -935,14 +937,7 @@ async def test_reviewers_vote_on_post_refinement_tree(db: Database) -> None:
         max_rounds=3,
     )
 
-    for _ in range(300):
-        refreshed = await repo.get_planning_session(db, session.id)
-        assert refreshed is not None
-        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
-            break
-        await asyncio.sleep(0)
-    else:
-        raise AssertionError("session never reached stable/completed")
+    await _wait_until_settled(db, session.id)
 
     after = await repo.get_planning_session(db, session.id)
     assert after is not None
@@ -1026,14 +1021,9 @@ async def test_specialists_run_in_parallel_then_senior_reviewer(db: Database) ->
         max_rounds=1,
     )
 
-    for _ in range(1000):
-        refreshed = await repo.get_planning_session(db, session.id)
-        assert refreshed is not None
-        if refreshed.status in (PlanningSessionStatus.stable, PlanningSessionStatus.completed):
-            break
-        await asyncio.sleep(0)
-    else:
-        raise AssertionError("session never reached stable/completed (parallel deadlock?)")
+    await _wait_until_settled(
+        db, session.id, "session never reached stable/completed (parallel deadlock?)"
+    )
 
     # All specialists were in flight simultaneously → dispatched in parallel.
     assert provider.max_in_flight == n, (

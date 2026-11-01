@@ -73,14 +73,19 @@ class _NoopProvider:
 
 
 async def _wait_for_subscribers(daemon: Daemon, count: int) -> None:
-    """Spin until the bus reports *count* subscribers (the handler has subscribed)."""
-    for _ in range(500):
-        if daemon.bus.subscriber_count() == count:
-            return
-        await asyncio.sleep(0)
-    raise AssertionError(
-        f"expected {count} subscribers, got {daemon.bus.subscriber_count()}"
-    )
+    """Wait until the bus reports *count* subscribers (the handler has subscribed).
+
+    The planning-stream handler awaits an aiosqlite lookup in a worker thread before
+    it subscribes, so a fixed number of event-loop ticks is not a time bound.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while daemon.bus.subscriber_count() != count:
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"expected {count} subscribers, got {daemon.bus.subscriber_count()}"
+            )
+        await asyncio.sleep(0.01)
 
 
 class _AppShim:

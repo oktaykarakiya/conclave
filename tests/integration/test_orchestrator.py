@@ -34,6 +34,17 @@ async def _init_repo(path: Path) -> None:
     await run_git(path, "commit", "-m", "initial commit")
 
 
+async def _worktree_paths(repo_path: Path) -> set[Path]:
+    """Return the resolved worktree paths git reports for *repo_path*."""
+    code, out = await run_git(repo_path, "worktree", "list", "--porcelain")
+    assert code == 0, out
+    return {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in out.splitlines()
+        if line.startswith("worktree ")
+    }
+
+
 def _install_pre_commit_hook(repo_path: Path, script: str) -> None:
     hook = repo_path / ".git" / "hooks" / "pre-commit"
     hook.parent.mkdir(parents=True, exist_ok=True)
@@ -149,8 +160,7 @@ async def test_commit_rejected_by_pre_commit_hook_fails_task_and_preserves_work(
 
     # The worktree and branch survive with the staged, uncommitted change intact.
     assert worktree_path.is_dir()
-    _, wt_list = await run_git(repo_path, "worktree", "list")
-    assert str(worktree_path) in wt_list
+    assert worktree_path.resolve() in await _worktree_paths(repo_path)
     assert "done" in (worktree_path / "FEATURE.txt").read_text()
     _, porcelain = await run_git(worktree_path, "status", "--porcelain")
     assert "A  FEATURE.txt" in porcelain
@@ -198,8 +208,7 @@ async def test_passing_pre_commit_hook_runs_and_commit_merges(
     _, branches = await run_git(repo_path, "branch", "--list", f"conclave/{task.id}")
     assert f"conclave/{task.id}" not in branches
     worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
-    _, wt_list = await run_git(repo_path, "worktree", "list")
-    assert str(worktree_path) not in wt_list
+    assert worktree_path.resolve() not in await _worktree_paths(repo_path)
 
 
 async def test_nothing_to_commit_skips_commit_even_with_failing_hook(
@@ -420,11 +429,8 @@ async def test_exception_mid_process_task_fails_task_and_cleans_worktree(
 
     # Worktree must be cleaned up — the task's worktree path must not appear in
     # ``git worktree list`` output. The path is rooted at the orchestrator home.
-    worktree_path = str(
-        tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
-    )
-    _, wt_list = await run_git(repo_path, "worktree", "list")
-    assert worktree_path not in wt_list
+    worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    assert worktree_path.resolve() not in await _worktree_paths(repo_path)
 
 
 async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_path: Path) -> None:
@@ -1321,11 +1327,8 @@ async def test_cancel_in_progress_task_sets_cancelled_and_cleans_worktree(
     assert final.state is TaskState.cancelled
 
     # Worktree must be cleaned — the path must not appear in ``git worktree list``.
-    worktree_path = str(
-        tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
-    )
-    _, wt_list = await run_git(repo_path, "worktree", "list")
-    assert worktree_path not in wt_list
+    worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    assert worktree_path.resolve() not in await _worktree_paths(repo_path)
 
     # Verify the cancellation event was emitted.
     events = await repo.list_events(db, task_id=task.id)
@@ -1401,11 +1404,8 @@ async def test_cancel_event_checked_between_stages(
     assert final.state is TaskState.cancelled
 
     # Worktree cleaned.
-    worktree_path = str(
-        tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
-    )
-    _, wt_list = await run_git(repo_path, "worktree", "list")
-    assert worktree_path not in wt_list
+    worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    assert worktree_path.resolve() not in await _worktree_paths(repo_path)
 
 
 async def test_cancel_on_final_attempt_lands_in_cancelled_not_failed(
