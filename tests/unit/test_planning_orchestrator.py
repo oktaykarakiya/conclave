@@ -601,6 +601,35 @@ async def test_approve_session_idempotent(db: Database) -> None:
     assert second_task_count == first_task_count
 
 
+async def test_approve_session_task_request_carries_the_full_session_prompt(
+    db: Database,
+) -> None:
+    """The session task's request holds the whole Agent-Ception prompt, never a prefix."""
+    project = await repo.create_project(
+        db, name="full-prompt", path="/tmp/full-prompt", default_branch="main",
+    )
+    orchestrator = PlanningOrchestrator(db, EventBus(db), _QuickFakeProvider())
+    prompt = "Rebuild the importer end to end.\n" + "".join(
+        f"Requirement {i}: keep record {i} byte-identical after the import.\n"
+        for i in range(60)
+    )
+    assert len(prompt) > 2_000
+    session = await orchestrator.create_and_start(
+        project_id=project.id, title="Full prompt", prompt=prompt, max_rounds=2,
+    )
+    await _wait_until_settled(db, session.id)
+
+    await orchestrator.approve_session(session.id)
+
+    session_tasks = [
+        t for t in await repo.list_tasks(db, project.id)
+        if t.request.startswith("[Agent-Ception Session]")
+    ]
+    assert len(session_tasks) == 1
+    assert session_tasks[0].request == f"[Agent-Ception Session]\n{prompt}"
+    assert session_tasks[0].title == "Full prompt"
+
+
 async def test_approve_session_on_active_cancels_loop_before_create(db: Database) -> None:
     """Approving an active session cancels the bg loop and creates exactly
     one set of tasks — no duplicates from a racing discussion."""

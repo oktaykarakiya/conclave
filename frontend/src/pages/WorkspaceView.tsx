@@ -1541,7 +1541,7 @@ export function WorkspaceView({
                       size="sm"
                       disabled={compactingTask}
                       onClick={() => void handleCompactTask()}
-                      title="Deterministically compact task context & plan before implementation"
+                      title="Record a deterministic summary of the task context (never changes the request or plan)"
                     >
                       {compactingTask ? (
                         <>

@@ -8,20 +8,21 @@ for exactly that — it reports the set of pre-existing test files a task MODIFI
 later gate can demand a human look before such a diff is trusted.
 
 SECURITY — why the file set comes from ``git diff --name-status`` and NOT the reviewer diff: the
-diff injected into reviewer prompts is byte-truncated at
-:data:`conclave.engine.orchestrator._MAX_DIFF_CHARS` (40k) to protect the context window, so a
-deletion whose ``diff --git`` header lands past the cap is INVISIBLE to anything reading that text.
+diff injected into reviewer prompts is fitted to a per-block character limit
+(``context.bulk_max_chars``, or ``context.compaction_max_chars`` when compaction is on; see
+:mod:`conclave.engine.context_limits`) by keeping only its head and tail, so a deletion whose
+``diff --git`` header lands in the omitted middle is INVISIBLE to anything reading that text.
 ``git diff --name-status <checkpoint>`` is a *content-independent* source: it emits exactly one
 short ``<status>\\t<path>`` record per changed file, so its size is bounded by the file COUNT, not
 by how large the edits are. A deletion is therefore listed no matter how much unrelated churn
-precedes it, and :func:`modified_or_deleted_tests` scans the WHOLE, untruncated listing. Feeding
-this detector the truncated prompt diff instead would reopen the very hole it exists to close.
+surrounds it, and :func:`modified_or_deleted_tests` scans the WHOLE, unfitted listing. Feeding
+this detector the fitted prompt diff instead would reopen the very hole it exists to close.
 
 The split mirrors the rest of the bug-fixer surface (parser + thin async entry, as in
 :mod:`conclave.engine.repro`): :func:`modified_or_deleted_tests` is the pure parser
 (deterministically unit-testable on crafted ``--name-status`` text, including inputs larger than
-the 40k cap), and :func:`collect_modified_or_deleted_tests` is the async entry point that sources
-that text from git in the task worktree.
+the prompt limit), and :func:`collect_modified_or_deleted_tests` is the async entry point that
+sources that text from git in the task worktree.
 """
 
 from __future__ import annotations
@@ -74,8 +75,8 @@ def modified_or_deleted_tests(name_status: str) -> set[str]:
       into ``D`` + ``A`` records, those rules already cover it, so both representations agree.
     * ``C`` (copied) leaves the source intact, so it removes no coverage and is ignored.
 
-    The WHOLE listing is scanned and nothing here truncates, so a deletion buried past the reviewer
-    diff's 40k cap is still found. Unrecognized status codes are ignored rather than guessed at.
+    The WHOLE listing is scanned and nothing here truncates, so a deletion that the fitted reviewer
+    diff omits is still found. Unrecognized status codes are ignored rather than guessed at.
     """
     touched: set[str] = set()
     for line in name_status.splitlines():
@@ -106,7 +107,7 @@ async def collect_modified_or_deleted_tests(worktree: Path, checkpoint: str) -> 
 
     The async entry point over :func:`modified_or_deleted_tests`: it sources the file list from the
     *content-independent* ``--name-status`` plumbing (see the module docstring) rather than the
-    byte-truncated reviewer diff, so a modified/deleted test is never missed for being large or
+    fitted reviewer diff, so a modified/deleted test is never missed for being large or
     late in the diff. A non-zero git exit (bad ref / not a repo) yields an empty set — the detector
     reports "no modified/deleted tests *observed*"; whether an inability to compute should fail
     closed is the calling gate's decision, not this collector's.

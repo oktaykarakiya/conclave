@@ -55,6 +55,7 @@ cd frontend && npm run build       # build SPA into src/conclave/web/static/
 ## Critical conventions
 
 - **Config is SQLite-backed and edited via the UI** — never introduce YAML/config files.
+- **Never cut irreplaceable prompt content** (task request, plan, reviewer feedback, steer, planning prompt). Only recoverable bulk (diffs, gate/test and setup output) is fitted, via `engine/context_limits.py` under the `context.*` limits, with a visible marker and a `context_truncated` event.
 - **DB migrations are append-only**: add a new entry to the `MIGRATIONS` list in `src/conclave/db/migrations/`. Never edit an already-applied migration. The runner records `schema_version` atomically.
 - **Validate API inputs** — return 4xx, never 500 on bad input. Bound list endpoints.
 - **The built SPA** (`src/conclave/web/static/`) is committed so the daemon serves the UI without Node at runtime. Always rebuild after frontend changes.

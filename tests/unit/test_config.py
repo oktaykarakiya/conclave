@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from conclave.config import (
+    AgentSettings,
     BugFixerSessionOverride,
     ConclaveConfig,
     Effort,
@@ -127,3 +131,36 @@ def test_config_schema_is_renderable() -> None:
     assert "execution" in schema["properties"]
     # nested models are referenced/defined for the UI to render
     assert "$defs" in schema
+
+
+# --- context (prompt bulk limits) --------------------------------------------
+
+
+def test_context_defaults() -> None:
+    cfg = ConclaveConfig()
+    assert cfg.context.model_dump() == {
+        "compaction_enabled": False,
+        "compaction_max_chars": 60_000,
+        "bulk_max_chars": 200_000,
+    }
+    # None = inherit context.compaction_enabled; stored true/false stay valid.
+    assert AgentSettings().compact_before_start is None
+    assert AgentSettings(compact_before_start=True).compact_before_start is True
+
+
+@pytest.mark.parametrize("field", ["compaction_max_chars", "bulk_max_chars"])
+@pytest.mark.parametrize("value", [999, 2_000_001])
+def test_context_char_limits_are_bounded(field: str, value: int) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        load_project_config({"context": {field: value}})
+    assert excinfo.value.errors()[0]["loc"] == ("context", field)
+    assert load_project_config({"context": {field: 1_000}}).context.model_dump()[field] == 1_000
+
+
+def test_context_is_in_the_config_schema() -> None:
+    schema = config_schema()
+    assert schema["properties"]["context"] == {"$ref": "#/$defs/ContextSettings"}
+    props = schema["$defs"]["ContextSettings"]["properties"]
+    for field in ("compaction_max_chars", "bulk_max_chars"):
+        assert (props[field]["minimum"], props[field]["maximum"]) == (1_000, 2_000_000)
+    assert props["compaction_enabled"]["default"] is False

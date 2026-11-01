@@ -83,7 +83,8 @@ _PLANNING_CHANGES = (
 
 
 class FakeProvider:
-    """Configurable fake. ``developer_writes`` controls whether the developer makes a change.
+    """Configurable fake. ``developer_writes`` controls whether the developer makes a change,
+    and ``developer_content`` is what it writes (make it large to produce a large diff).
 
     ``reviewer_tampers`` simulates a misbehaving reviewer: because reviewers run with
     ``--dangerously-skip-permissions`` they *can* write to the worktree, so the fake writes
@@ -95,11 +96,13 @@ class FakeProvider:
         self,
         *,
         developer_writes: bool = True,
+        developer_content: str = "done\n",
         filename: str = "FEATURE.txt",
         reviewer_tampers: bool = False,
         use_nested_plan: bool = False,
     ) -> None:
         self.developer_writes = developer_writes
+        self.developer_content = developer_content
         self.filename = filename
         self.reviewer_tampers = reviewer_tampers
         self.use_nested_plan = use_nested_plan
@@ -177,7 +180,7 @@ class FakeProvider:
             )
         # developer fallback
         if self.developer_writes and cwd is not None:
-            (Path(cwd) / self.filename).write_text("done\n", encoding="utf-8")
+            (Path(cwd) / self.filename).write_text(self.developer_content, encoding="utf-8")
         # Stream the result in chunks (with a newline) so on_chunk-driven live output is
         # exercised: this drives the runner's bounded agent_output emission.
         if on_chunk is not None:

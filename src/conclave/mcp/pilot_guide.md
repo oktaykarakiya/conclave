@@ -55,6 +55,19 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
    - `agent_defaults` (applies to every agent) and `agent_overrides.<agent>`:
      `model`, `effort`, `timeout_minutes`, `max_retries`, `compact_before_start`, `skills`
    - `experimental.planner_enabled`, `experimental.auto_planner_char_threshold`
+   - `context.bulk_max_chars` (default 200000), `context.compaction_enabled` (default `false`),
+     `context.compaction_max_chars` (default 60000); both limits accept 1000–2000000. Agents always
+     get the task request, plan, reviewer feedback, steer and planning prompt whole. Only
+     recoverable bulk (diffs, gate/test and setup output) is fitted, per block: to
+     `compaction_max_chars` when compaction is on for that agent, else to `bulk_max_chars`. A
+     fitted block keeps its head and tail, and a marker in the middle says how much was omitted,
+     which setting limited it and the command that shows the rest.
+   - `compact_before_start` (on an agent or a workflow node): `true` turns compaction on for that
+     agent, `false` turns it off, `null` defers to the next layer: node → `agent_overrides.<agent>`
+     → `agent_defaults` → `context.compaction_enabled`. A stored `true` (older saved settings and
+     the `gemini-flash-lite-swarm` preset) therefore means compaction is on; to follow
+     `context.compaction_enabled` instead, set it to `null` with `conclave_patch_config`
+     (`conclave_configure_agent` ignores null values).
    Deep-merge cannot delete keys: to "unset" an override, set it explicitly to the default value.
 3. Personas: `conclave_list_agents` / `conclave_upsert_agent(name, role, persona_md, project_id)`.
    A persona with `project_id` overrides the global one for that project only.
@@ -110,7 +123,9 @@ session (§9) can produce the tree for you.
   (`verdict`, `reason`), `pipeline.derived` (which reviewers will run), `node.started`,
   `node.waiting_for_approval`, `hitl.waiting`, `task.committed`, `task.merged`,
   `task.failed` (payload `reason`), `task.done`. Skip `agent.output_chunk` (live output) unless
-  debugging.
+  debugging. A `log` event with `stage: "context_truncated"` marks every cut of a diff or
+  gate/setup output in an agent's prompt (`block`, `field`, `original_chars`, `kept_chars`,
+  `agent`, `node_id`); there is none when nothing was cut.
 - `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review.
 - Typical timeline: setup + baseline test run, planner, developer, each reviewer in turn, the
   gate, commit. Poll every 15–60 s; long silences during planning or development are normal.
@@ -168,6 +183,12 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   target branch — fix the config, not the code.
 - If a model's `model_reported` differs from the configured one, stop and investigate before
   trusting results (wrong engine, wrong model string, or routing problem).
+- Frequent `context_truncated` events mean diffs or test output exceed the limit (§3): agents can
+  still run the command named in the marker, but for whole-diff review raise
+  `context.bulk_max_chars` (or `compaction_max_chars`), or make the task smaller or the test
+  output quieter.
+- `conclave_compact_session` on a task only records a summary and a size estimate; it never
+  changes the request or plan that agents receive.
 
 ## 12. Tool index
 
@@ -221,7 +242,7 @@ group for the first time.
 - `conclave_upsert_agent` — create or update a persona with Markdown instructions.
 - `conclave_delete_agent` — remove a custom persona or reset a built-in one.
 - `conclave_configure_agent` — set model, effort, tooling, and retry settings per agent.
-- `conclave_compact_session` — compact task or planning context before implementing.
+- `conclave_compact_session` — summarize a task's context, or digest old planning turns.
 
 ### Planning
 - `conclave_list_planning_sessions` — find planning sessions for a project.

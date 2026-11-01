@@ -20,7 +20,6 @@ from ..db import repositories as repo
 from ..events import EventBus, EventType
 from ..observability.parquet_sync import log_agent_interaction
 from ..providers import AgentResult, Provider, ResolvedProfile
-from .compactor import compact_prompt_section
 
 logger = logging.getLogger("conclave.engine.runner")
 
@@ -145,7 +144,6 @@ class AgentRunner:
         cli_agent_override: str | None = None,
         skills_override: list[str] | None = None,
         thinking_override: bool | None = None,
-        compact_override: bool | None = None,
     ) -> AgentResult:
         persona = await repo.get_agent(self._db, agent, self._project_id)
         system = (
@@ -165,15 +163,6 @@ class AgentRunner:
             else list(settings.skills)
         )
         thinking = thinking_override if thinking_override is not None else settings.thinking
-        compact_before_start = (
-            compact_override if compact_override is not None else settings.compact_before_start
-        )
-
-        effective_prompt = (
-            compact_prompt_section("TASK CONTEXT", prompt, max_chars=6000)
-            if compact_before_start and len(prompt) > 6000
-            else prompt
-        )
         profile = self._resolve_profile(
             model,
             effort,
@@ -181,9 +170,7 @@ class AgentRunner:
             thinking=thinking,
             pure=settings.pure,
         )
-        full_prompt = assemble_prompt(
-            system, repo_knowledge, project_rules, effective_prompt, skills=skills
-        )
+        full_prompt = assemble_prompt(system, repo_knowledge, project_rules, prompt, skills=skills)
 
         await self._bus.emit(
             type=EventType.agent_dispatched,
@@ -233,7 +220,7 @@ class AgentRunner:
                 directory=str(worktree),
                 model=profile.model or "opencode/default",
                 agent=agent,
-                prompt=effective_prompt,
+                prompt=prompt,
                 result=result,
                 duration_seconds=duration_seconds,
                 project_id=self._project_id,

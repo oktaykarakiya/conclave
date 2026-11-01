@@ -49,6 +49,15 @@ async def test_run_tests_missing_command(tmp_path: Path) -> None:
     assert result.skipped is False
 
 
+async def test_run_tests_returns_the_complete_output(tmp_path: Path) -> None:
+    """No hidden trim: callers fit the output for prompts, so both ends must survive here."""
+    lines = [f"line {i}" for i in range(300)]
+    (tmp_path / "out.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = await run_tests(tmp_path, "cat out.txt; exit 1")
+    assert result.passed is False
+    assert result.output.splitlines() == lines
+
+
 async def test_run_tests_skipped(tmp_path: Path) -> None:
     """command=None yields skipped=True, outcome='passed'."""
     result = await run_tests(tmp_path, None)

@@ -77,6 +77,7 @@ export function SettingsView({
 
   const execution = asRecord(config.execution);
   const experimental = asRecord(config.experimental);
+  const context = asRecord(config.context);
   const notifications = asRecord(config.notifications);
 
   function updateSection(section: string, key: string, value: unknown) {
@@ -392,6 +393,68 @@ export function SettingsView({
               <span>{item.label}</span>
             </label>
           ))}
+        </div>
+
+        <div className="space-y-3 border-t border-zinc-800/70 pt-3">
+          <div>
+            <h3 className="text-xs font-semibold text-zinc-300">Prompt context</h3>
+            <p className="text-[11px] text-zinc-500">
+              Requests, plans and feedback always reach agents whole. These limits apply only to
+              diffs and gate/setup output; every cut is marked in the prompt and logged in Live.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2 hover:border-zinc-700">
+              <input
+                type="checkbox"
+                checked={Boolean(context.compaction_enabled ?? false)}
+                onChange={(e) => updateSection("context", "compaction_enabled", e.target.checked)}
+                className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-indigo-500"
+              />
+              <span className="space-y-0.5">
+                <span className="block text-xs text-zinc-300">Compact for all agents</span>
+                <span className="block text-[11px] text-zinc-500">
+                  Opt-in for small-context models; an agent's compact_before_start overrides it.
+                </span>
+              </span>
+            </label>
+
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-zinc-400">Compaction budget (chars)</span>
+              <input
+                type="number"
+                min={1000}
+                max={2000000}
+                step={1000}
+                className={input}
+                value={Number(context.compaction_max_chars ?? 60000)}
+                onChange={(e) =>
+                  updateSection("context", "compaction_max_chars", Number(e.target.value) || 60000)
+                }
+              />
+              <span className="block text-[11px] text-zinc-500">
+                Per diff or output block, for agents with compaction on.
+              </span>
+            </label>
+
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-zinc-400">Bulk ceiling (chars)</span>
+              <input
+                type="number"
+                min={1000}
+                max={2000000}
+                step={1000}
+                className={input}
+                value={Number(context.bulk_max_chars ?? 200000)}
+                onChange={(e) =>
+                  updateSection("context", "bulk_max_chars", Number(e.target.value) || 200000)
+                }
+              />
+              <span className="block text-[11px] text-zinc-500">
+                Per diff or output block when compaction is off (safety limit).
+              </span>
+            </label>
+          </div>
         </div>
       </Card>
 

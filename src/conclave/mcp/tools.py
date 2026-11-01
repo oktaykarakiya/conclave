@@ -255,8 +255,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
     _tool(
         "conclave_patch_config",
         "Update configuration settings (target_branch, default_branch, execution, experimental, "
-        "planning, agents, bug_fixer, notifications, protected, agent_defaults, agent_overrides, "
-        "workflow) per-repository or globally across Conclave.",
+        "context, planning, agents, bug_fixer, notifications, protected, agent_defaults, "
+        "agent_overrides, workflow) per-repository or globally across Conclave.",
         {
             "project_id": _prop(
                 "string",
@@ -313,6 +313,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "integer", "Optional max cross-attempt memory entries (0-50)."
             ),
             "webhook_url": _prop("string", "Optional terminal notification webhook URL."),
+            "context": {
+                "type": "object",
+                "description": (
+                    "Optional ContextSettings overrides: compaction_enabled, "
+                    "compaction_max_chars, bulk_max_chars (1000-2000000 chars per block of "
+                    "diff or gate/setup output; requests, plans and feedback are never cut)."
+                ),
+            },
             "planning": {
                 "type": "object",
                 "description": "Optional PlanningSettings overrides.",
@@ -622,7 +630,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
             },
             "thinking": _prop("boolean", "Optional per-node thinking toggle."),
             "compact_before_start": _prop(
-                "boolean", "Optional per-node context compaction toggle."
+                "boolean",
+                "Optional per-node compaction of recoverable bulk (diffs, gate/test output) to "
+                "context.compaction_max_chars; overrides the agent setting.",
             ),
             "pause_after": _prop(
                 "boolean",
@@ -940,7 +950,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "thinking": _prop("boolean", "Enable reasoning/thinking output (--thinking)."),
             "pure": _prop("boolean", "Run opencode in --pure mode without external plugins."),
             "compact_before_start": _prop(
-                "boolean", "Automatically compact context before starting agent."
+                "boolean",
+                "Fit this agent's recoverable bulk (diffs, gate/test and setup output) to "
+                "context.compaction_max_chars per block; unset inherits agent_defaults, then "
+                "context.compaction_enabled. Requests, plans and feedback are never cut.",
             ),
             "timeout_minutes": _prop("integer", "Timeout in minutes (1-600)."),
             "max_retries": _prop("integer", "Max retries (1-50)."),
@@ -948,7 +961,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_compact_session",
-        "Compact context for a task_id or planning_session_id before implementation starts.",
+        "Record a compacted summary and size estimate for a task_id (never rewrites its request "
+        "or plan), or summarize a planning_session_id's earlier turns into one digest message.",
         {
             "task_id": _prop(
                 "string", "Task ID to compact (provide task_id or planning_session_id)."
@@ -1317,6 +1331,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             patch["notifications"] = notif_patch
 
         for sec_name in (
+            "context",
             "planning",
             "agents",
             "bug_fixer",

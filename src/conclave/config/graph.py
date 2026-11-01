@@ -95,7 +95,10 @@ class WorkflowNode(BaseModel):
     )
     compact_before_start: bool | None = Field(
         default=None,
-        description="Optional per-node context compaction toggle.",
+        description=(
+            "Optional per-node compaction of recoverable bulk (diffs, gate/test output). "
+            "True or False overrides the agent setting; None inherits it."
+        ),
     )
     pause_after: bool = Field(
         default=False,

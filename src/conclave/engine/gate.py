@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from ..util import today_iso
-from .baseline import trim_output
 from .gitio import run_shell
 
 if TYPE_CHECKING:
@@ -50,7 +49,11 @@ async def run_tests(
     env: dict[str, str] | None = None,
     timeout_seconds: int = 1800,
 ) -> GateResult:
-    """Run the test command; ``passed`` is a clean (exit 0) run. No command => skipped."""
+    """Run the test command; ``passed`` is a clean (exit 0) run. No command => skipped.
+
+    ``output`` is the command's complete combined output. Callers that put it in a prompt fit
+    it there (:mod:`conclave.engine.context_limits`), so no cut is hidden here.
+    """
     if not command:
         return GateResult(
             passed=True, exit_code=0, output="(no test command configured)", skipped=True,
@@ -60,7 +63,7 @@ async def run_tests(
     return GateResult(
         passed=code == 0,
         exit_code=code,
-        output=trim_output(output),
+        output=output,
         outcome=_classify(code),
     )
 

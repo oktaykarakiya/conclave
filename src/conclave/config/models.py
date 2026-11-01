@@ -106,9 +106,14 @@ class AgentSettings(BaseModel):
         default=False,
         description="Run opencode in --pure mode without external plugins.",
     )
-    compact_before_start: bool = Field(
-        default=True,
-        description="Automatically compact long planning and retry context before starting agent.",
+    compact_before_start: bool | None = Field(
+        default=None,
+        description=(
+            "True fits this agent's recoverable bulk (diffs, gate/test and setup output) to "
+            "context.compaction_max_chars per block; False keeps context.bulk_max_chars; None "
+            "inherits (agent_overrides, then agent_defaults, then context.compaction_enabled). "
+            "The task request, plan, feedback and steer are never cut."
+        ),
     )
     timeout_minutes: int = Field(default=120, ge=1, le=600)
     max_retries: int = Field(default=3, ge=1, le=50)
@@ -182,6 +187,38 @@ class ExperimentalSettings(BaseModel):
     planner_enabled: bool = True
     auto_planner_char_threshold: int = Field(default=400, ge=0)
     post_mortem_enabled: bool = True
+
+
+class ContextSettings(BaseModel):
+    """Limits on the recoverable bulk placed in agent prompts.
+
+    Irreplaceable content (the task request, the plan, reviewer feedback, operator steer) is
+    never cut. Only recoverable bulk is fitted: the current and previous diffs, and gate/test
+    and setup output. A fitted block keeps its head and tail and says what was omitted and how
+    to get the rest.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    compaction_enabled: bool = Field(
+        default=False,
+        description=(
+            "Fit every agent's recoverable bulk to compaction_max_chars (opt-in for "
+            "small-context models). An explicit compact_before_start overrides this per agent."
+        ),
+    )
+    compaction_max_chars: int = Field(
+        default=60_000,
+        ge=1_000,
+        le=2_000_000,
+        description="Per-block budget for recoverable bulk when compaction is on for an agent.",
+    )
+    bulk_max_chars: int = Field(
+        default=200_000,
+        ge=1_000,
+        le=2_000_000,
+        description="Per-block safety ceiling for recoverable bulk when compaction is off.",
+    )
 
 
 _DEFAULT_IGNORE_PATTERNS = [
@@ -443,6 +480,7 @@ class ConclaveConfig(BaseModel):
 
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     experimental: ExperimentalSettings = Field(default_factory=ExperimentalSettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
     planning: PlanningSettings = Field(default_factory=PlanningSettings)
     agents: AgentsPolicy = Field(default_factory=AgentsPolicy)
     bug_fixer: BugFixerPolicy = Field(default_factory=BugFixerPolicy)

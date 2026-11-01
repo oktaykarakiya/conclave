@@ -19,7 +19,8 @@ even config).
   a reviewed, collapsible task tree; you can interject, and on approval the tasks land in the queue.
 - **Web UI is the only control surface** — projects, tasks, live logs, and quarantine, all in the
   browser. Config lives in SQLite, not YAML files. Single-page-per-tab, responsive (works from your
-  phone).
+  phone). Agents always get the whole task request and plan; only diffs and test/setup output are
+  capped (the `context` settings), and every cut is marked in the prompt and shown in the Live tab.
 - **opencode + Claude Code engines** — each agent's `model` picks its engine: an opencode
   `provider/model` (auth and provider config live in opencode) or `claude-code/<model>` (uses your
   Claude Code login; `claude-code/default` = its configured default). So a DeepSeek developer can be

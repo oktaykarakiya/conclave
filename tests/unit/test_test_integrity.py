@@ -7,17 +7,19 @@ Two pure functions, no git and no LLM:
 * :func:`modified_or_deleted_tests` — parses ``git diff --name-status`` text into the set of
   PRE-EXISTING test files a task modified or deleted; purely-added test files are clean.
 
-The headline case is SECURITY: the listing is parsed in full, so a deletion buried PAST the 40k
-reviewer-diff truncation cap is still detected (``test_deletion_past_the_40k_cap_is_still_found``).
-All deterministic and LLM-free.
+The headline case is SECURITY: the listing is parsed in full, so a deletion buried in the middle
+that the fitted reviewer diff omits is still detected
+(``test_deletion_omitted_from_the_fitted_prompt_diff_is_still_found``). All deterministic and
+LLM-free.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from conclave.config import ContextSettings
 from conclave.engine import is_test_path, modified_or_deleted_tests
-from conclave.engine.orchestrator import _MAX_DIFF_CHARS
+from conclave.engine.context_limits import fit_block
 
 # --- is_test_path: positives ------------------------------------------------
 
@@ -142,25 +144,29 @@ def test_empty_input_is_empty_set() -> None:
     assert modified_or_deleted_tests("") == set()
 
 
-# --- the SECURITY case: a deletion past the 40k truncation cap --------------
+# --- the SECURITY case: a deletion the fitted prompt diff omits -------------
 
 
-def test_deletion_past_the_40k_cap_is_still_found() -> None:
-    """A test deletion buried past _MAX_DIFF_CHARS is detected — the whole listing is scanned.
+def test_deletion_omitted_from_the_fitted_prompt_diff_is_still_found() -> None:
+    """A test deletion buried mid-listing is detected — the whole listing is scanned.
 
-    The reviewer prompt diff is byte-truncated at ``_MAX_DIFF_CHARS`` (40k), so a deletion whose
-    record lands past the cap would be invisible there. ``--name-status`` is content-independent
-    (one short line per file), and this parser reads ALL of it, so the buried deletion is still
-    reported. The pre-deletion churn here is all non-test, so the deletion is the ONLY result —
-    proving it was actually found rather than swept in with everything else.
+    Prompt diffs are fitted to ``context.bulk_max_chars`` by keeping only their head and tail, so
+    a deletion whose record lands in the omitted middle would be invisible there.
+    ``--name-status`` is content-independent (one short line per file), and this parser reads ALL
+    of it, so the buried deletion is still reported. The surrounding churn here is all non-test,
+    so the deletion is the ONLY result — proving it was actually found rather than swept in with
+    everything else.
     """
-    # Thousands of non-test modifications, enough to push the buried record well past 40k chars.
-    churn = "".join(f"M\tsrc/module_{i:05d}.py\n" for i in range(3000))
+    # Tens of thousands of non-test modifications, enough to exceed the default prompt limit.
+    churn = [f"M\tsrc/module_{i:05d}.py\n" for i in range(30_000)]
     buried_deletion = "D\ttests/unit/test_buried_deep.py\n"
-    name_status = churn + buried_deletion
+    half = len(churn) // 2
+    name_status = "".join(churn[:half]) + buried_deletion + "".join(churn[half:])
 
-    # The record really is past the cap a truncating reader would have applied.
-    assert len(name_status) > _MAX_DIFF_CHARS
-    assert name_status.index(buried_deletion) > _MAX_DIFF_CHARS
+    # A reader of the fitted prompt text really would have missed the record.
+    limit = ContextSettings().bulk_max_chars
+    fitted = fit_block(name_status, limit=limit, field="bulk_max_chars", how_to_get_rest="-")
+    assert fitted.truncated
+    assert buried_deletion not in fitted.text
 
     assert modified_or_deleted_tests(name_status) == {"tests/unit/test_buried_deep.py"}

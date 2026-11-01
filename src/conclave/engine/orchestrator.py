@@ -16,6 +16,7 @@ import logging
 import re
 import shutil
 import time
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,8 @@ from ..db import repositories as repo
 from ..events import EventBus, EventType, build_notification_sink
 from ..providers import AgentResult, Provider
 from .baseline import build_baseline_preamble
-from .gate import apply_quarantine, run_tests
+from .context_limits import BulkBlock, BulkLimit, fit_block, resolve_bulk_limit
+from .gate import GateResult, apply_quarantine, run_tests
 from .gitio import run_git, run_shell
 from .graph_executor import (
     derive_planner_nodes,
@@ -52,11 +54,6 @@ _PROJECT_RULE_FILES = ("AGENTS.md", "CONCLAVE.md", "CLAUDE.md")
 _REVIEWER_DISPATCH_RETRIES = 2
 _REVIEWER_RETRY_BACKOFF_S = 3.0
 
-# Hard cap on diff characters injected into agent prompts to prevent context-window
-# overflow from very large diffs. The truncation marker includes the original size so
-# the agent can still reason about scope.
-_MAX_DIFF_CHARS = 40_000
-
 # Bound on git's combined output captured in the result summary when a task commit fails,
 # so a noisy hook cannot bloat the task row while its diagnostic tail stays visible.
 _COMMIT_OUTPUT_TAIL_CHARS = 500
@@ -81,6 +78,28 @@ class MergeResult(StrEnum):
     success = "success"
     conflict = "conflict"
     error = "error"
+
+
+@dataclass
+class _Baseline:
+    """Pre-existing test failures on the target branch, kept whole until fitted for a reader."""
+
+    target_branch: str
+    command: str | None = None
+    failures: str = ""
+    # One fitted copy per limit, so each actual cut is made and reported once per task.
+    fitted: dict[BulkLimit, str] = field(default_factory=dict)
+
+
+@dataclass
+class _GateNote:
+    """A gate command that failed in a pass-through flow, kept whole until fitted for a reader."""
+
+    label: str
+    command: str
+    gate: GateResult
+    # One fitted output per limit, so each actual cut is made and reported once.
+    fitted: dict[BulkLimit, str] = field(default_factory=dict)
 
 
 class Orchestrator:
@@ -130,6 +149,104 @@ class Orchestrator:
         config = load_project_config(project.config)
         runner._config = config
         return config
+
+    async def _fit_bulk(
+        self,
+        task: Task,
+        config: ConclaveConfig,
+        text: str,
+        *,
+        block: BulkBlock,
+        how_to_get_rest: str,
+        agent: str | None,
+        node: WorkflowNode | None = None,
+        cache: dict[BulkLimit, str] | None = None,
+    ) -> str:
+        """Fit one recoverable bulk *block* to the limit resolved for *agent*'s dispatch.
+
+        *node* is the workflow node the agent runs as, if any. Emits one ``context_truncated``
+        log event per actual cut. Readers sharing *cache* (e.g. every reviewer of one attempt)
+        reuse a cut, and its single event, whenever they resolve to the same limit.
+        """
+        limit = resolve_bulk_limit(
+            config, agent, node.compact_before_start if node is not None else None
+        )
+        if cache is not None and limit in cache:
+            return cache[limit]
+        fitted = fit_block(
+            text, limit=limit.limit, field=limit.field, how_to_get_rest=how_to_get_rest
+        )
+        if fitted.truncated:
+            await self._bus.emit(
+                type=EventType.log,
+                project_id=task.project_id,
+                task_id=task.id,
+                agent=agent,
+                payload={
+                    "stage": "context_truncated",
+                    "field": limit.field,
+                    "block": block,
+                    "original_chars": fitted.original_chars,
+                    "kept_chars": fitted.kept_chars,
+                    "agent": agent,
+                    "node_id": node.id if node is not None else agent,
+                    # The Live tab renders log rows as "[stage] message".
+                    "message": (
+                        f"{block} for {agent or 'the task'}: kept {fitted.kept_chars} of "
+                        f"{fitted.original_chars} chars (context.{limit.field} = {limit.limit})"
+                    ),
+                },
+            )
+        if cache is not None:
+            cache[limit] = fitted.text
+        return fitted.text
+
+    async def _baseline_preamble(
+        self,
+        task: Task,
+        config: ConclaveConfig,
+        baseline: _Baseline,
+        *,
+        agent: str,
+        node: WorkflowNode | None,
+    ) -> str:
+        """The pre-existing-failures preamble, with the baseline output fitted for *agent*."""
+        if not baseline.failures:
+            return ""
+        failures = await self._fit_bulk(
+            task, config, baseline.failures,
+            block="gate_output",
+            how_to_get_rest=(
+                f"Re-run `{baseline.command}` in your working directory before changing "
+                "anything for the full output."
+            ),
+            agent=agent,
+            node=node,
+            cache=baseline.fitted,
+        )
+        return build_baseline_preamble(baseline.target_branch, failures)
+
+    async def _with_gate_notes(
+        self,
+        task: Task,
+        config: ConclaveConfig,
+        summary: str,
+        notes: list[_GateNote],
+        reader: WorkflowNode | None,
+    ) -> str:
+        """*summary* followed by each pass-through gate failure, fitted for *reader*."""
+        parts = [summary] if summary else []
+        for note in notes:
+            output = await self._fit_bulk(
+                task, config, note.gate.output,
+                block="gate_output",
+                how_to_get_rest=_rerun_hint(note.command),
+                agent=(reader.agent or reader.id) if reader is not None else None,
+                node=reader,
+                cache=note.fitted,
+            )
+            parts.append(f"{note.label.upper()} GATE (exit {note.gate.exit_code}):\n{output}")
+        return "\n\n".join(parts)
 
     def _build_venv_guidance(
         self,
@@ -552,9 +669,15 @@ class Orchestrator:
                     timeout_seconds=config.execution.setup_timeout_seconds,
                 )
                 if rc != 0:
+                    setup_output = await self._fit_bulk(
+                        task, config, out,
+                        block="setup_output",
+                        how_to_get_rest=_rerun_hint(setup_cmd),
+                        agent=None,
+                    )
                     return await self._fail_early(
                         task, wm, task_branch,
-                        f"worktree setup failed (exit {rc}):\n{out[-1000:]}",
+                        f"worktree setup failed (exit {rc}):\n{setup_output}",
                     )
 
             # Cooperative cancellation — check after setup, before baseline.
@@ -588,7 +711,7 @@ class Orchestrator:
                 task_id=task.id,
                 payload={"node_id": "baseline", "attempt": 0},
             )
-            baseline_preamble = await self._baseline(
+            baseline = await self._baseline(
                 project.id, worktree, checkpoint, target_branch, test_command, gate_timeout,
             )
             await repo.save_task_checkpoint(
@@ -619,7 +742,7 @@ class Orchestrator:
                 return await self._finish_cancelled(task, wm, task_branch)
             config = await self._refresh_task_config(project.id, runner, config)
             plan_preamble = await self._maybe_plan(
-                runner, task, worktree, knowledge, rules, baseline_preamble, config,
+                runner, task, worktree, knowledge, rules, baseline, config,
                 cancel_event=cancel_event, checkpoint=checkpoint,
             )
 
@@ -718,7 +841,7 @@ class Orchestrator:
                     await run_git(worktree, "checkout-index", "-a", "-f")
                     _, raw_diff = await run_git(worktree, "diff", "--cached", checkpoint)
                     full_diff = raw_diff
-                    current_diff = _truncate_diff(raw_diff)
+                    diff_cmd = f"git diff --cached {checkpoint}"
                     review_tree = saved_tree
                     await repo.end_attempt(
                         self._db, attempt_id, diff_stat=_diff_stat(full_diff)
@@ -729,8 +852,10 @@ class Orchestrator:
                 ):
                     await _stage_worktree_excluding_caches(worktree)
                     _, raw_diff = await run_git(worktree, "diff", "--cached", checkpoint)
+                    diff_cmd = f"git diff --cached {checkpoint}"
                     if not raw_diff.strip():
                         _, raw_diff = await run_git(worktree, "diff", checkpoint, "HEAD")
+                        diff_cmd = f"git diff {checkpoint} HEAD"
                     if not raw_diff.strip() and task.source_branch:
                         candidate_refs = (
                             (target_branch,)
@@ -741,9 +866,9 @@ class Orchestrator:
                             rc_d, d_out = await run_git(worktree, "diff", f"{ref}..HEAD")
                             if rc_d == 0 and d_out.strip():
                                 raw_diff = d_out
+                                diff_cmd = f"git diff {ref}..HEAD"
                                 break
                     full_diff = raw_diff
-                    current_diff = _truncate_diff(raw_diff)
                     _, review_tree = await run_git(worktree, "write-tree")
                     review_tree = review_tree.strip()
                     await repo.end_attempt(
@@ -773,10 +898,18 @@ class Orchestrator:
                             },
                         )
                 else:
+                    dev_node = dev_node_cfg
+                    dev_node_id = dev_node.id if dev_node else "developer"
+                    dev_agent = (dev_node.agent or "developer") if dev_node else "developer"
+                    prev_tree = ""
                     if attempts > 1:
                         _, previous_diff = await run_git(worktree, "diff", "--cached", checkpoint)
                         if use_memory:
                             memory.add(attempts - 1, previous_diff, feedback)
+                        # The index holds the tree previous_diff came from: record it so the
+                        # full previous diff stays recoverable after the reset below.
+                        tree_rc, tree_out = await run_git(worktree, "write-tree")
+                        prev_tree = tree_out.strip() if tree_rc == 0 else ""
                         await run_git(worktree, "reset", "--hard", base_head_sha)
                         # Preserve the provisioned .venv across attempts; rebuilding it each
                         # retry is slow and pointless.  .gitignore is the belt (the ideal
@@ -784,18 +917,6 @@ class Orchestrator:
                         # — the trailing-slash directory exclusion works even when .gitignore
                         # is absent or doesn't cover the venv.
                         await run_git(worktree, "clean", "-fd", "-e", ".venv/")
-
-                    dev_prompt = self._build_developer_prompt(
-                        task.request,
-                        plan_preamble,
-                        baseline_preamble,
-                        test_command,
-                        check_commands,
-                        use_memory=use_memory,
-                        memory=memory,
-                        feedback=feedback,
-                        previous_diff=previous_diff,
-                    )
 
                     # HARD cap: abort the task if the wall-clock budget has been exceeded
                     # before launching the developer agent. The top-of-loop check catches
@@ -810,11 +931,40 @@ class Orchestrator:
                     if cancel_event is not None and cancel_event.is_set():
                         return await self._finish_cancelled(task, wm, task_branch)
 
+                    # The prompt shows the previous diff only next to feedback, so it is
+                    # fitted only then.
+                    prior_diff = ""
+                    if feedback and previous_diff:
+                        prior_diff = await self._fit_bulk(
+                            task, config, previous_diff,
+                            block="previous_diff",
+                            how_to_get_rest=(
+                                f"Run `git diff {checkpoint} {prev_tree}` in your working "
+                                "directory for the full previous diff."
+                                if prev_tree
+                                else "The rest is not available: your previous attempt was "
+                                "reset before this one started."
+                            ),
+                            agent=dev_agent,
+                            node=dev_node,
+                        )
+                    dev_prompt = self._build_developer_prompt(
+                        task.request,
+                        plan_preamble,
+                        await self._baseline_preamble(
+                            task, config, baseline, agent=dev_agent, node=dev_node
+                        ),
+                        test_command,
+                        check_commands,
+                        use_memory=use_memory,
+                        memory=memory,
+                        feedback=feedback,
+                        previous_diff=prior_diff,
+                    )
+
                     # Operator steer — inject any guidance queued for this task into THIS
                     # developer dispatch, then clear it so it lands exactly once. Best-effort:
                     # absent a steer this is a no-op and never alters processing.
-                    dev_node = dev_node_cfg
-                    dev_node_id = dev_node.id if dev_node else "developer"
                     self._consume_node_steer(task.id, dev_node_id)
                     steer = self._consume_steer(task.id)
                     if steer:
@@ -833,7 +983,6 @@ class Orchestrator:
                             },
                         )
 
-                    dev_agent = (dev_node.agent or "developer") if dev_node else "developer"
                     if dev_node and dev_node.prompt_template:
                         dev_prompt += f"\n\n{dev_node.prompt_template}"
                     await repo.save_task_checkpoint(
@@ -865,7 +1014,6 @@ class Orchestrator:
                         cli_agent_override=dev_node.cli_agent if dev_node else None,
                         skills_override=(dev_node.skills or None) if dev_node else None,
                         thinking_override=dev_node.thinking if dev_node else None,
-                        compact_override=dev_node.compact_before_start if dev_node else None,
                     )
                     if not dev.ok:
                         feedback = f"Developer agent error: {dev.error}"
@@ -903,7 +1051,7 @@ class Orchestrator:
                     await _stage_worktree_excluding_caches(worktree)
                     _, raw_diff = await run_git(worktree, "diff", "--cached", checkpoint)
                     full_diff = raw_diff
-                    current_diff = _truncate_diff(raw_diff)
+                    diff_cmd = f"git diff --cached {checkpoint}"
                     _, review_tree = await run_git(worktree, "write-tree")
                     review_tree = review_tree.strip()
                     await repo.end_attempt(
@@ -953,9 +1101,13 @@ class Orchestrator:
 
                 config = await self._refresh_task_config(project.id, runner, config)
                 budget = config.execution.wall_clock_budget_minutes
+                # One fitted diff per limit for this attempt, shared by the reviewers and the
+                # post-gate nodes, so each actual cut is made and reported once.
+                diff_cache: dict[BulkLimit, str] = {}
                 failed, feedback, review_timed_out = await self._review(
-                    runner, task, project.id, worktree, current_diff, attempts, config, knowledge,
-                    rules, started, budget, cancel_event=cancel_event, grounding_diff=full_diff,
+                    runner, task, project.id, worktree, full_diff, attempts, config, knowledge,
+                    rules, started, budget, cancel_event=cancel_event, diff_cmd=diff_cmd,
+                    diff_cache=diff_cache,
                 )
                 if review_timed_out:
                     timed_out = True
@@ -1035,6 +1187,9 @@ class Orchestrator:
                     payload={"node_id": "gate", "attempt": attempts},
                 )
                 pass_through_flow = is_pass_through_review(config) and not has_enabled_developer
+                post_gate_nodes = derive_post_gate_nodes(config)
+                # Pass-through gate failures, kept whole until fitted for each post-gate reader.
+                gate_notes: list[_GateNote] = []
                 if config.execution.require_full_green:
                     gate_commands: list[tuple[str, str]] = []
                     if test_command:
@@ -1061,13 +1216,7 @@ class Orchestrator:
                             )
                             if not gate.passed:
                                 if pass_through_flow:
-                                    gate_note = (
-                                        f"{label.upper()} GATE (exit {gate.exit_code}):\n"
-                                        f"{gate.output[-2000:]}"
-                                    )
-                                    feedback = (
-                                        f"{feedback}\n\n{gate_note}" if feedback else gate_note
-                                    )
+                                    gate_notes.append(_GateNote(label, cmd, gate))
                                     continue
                                 # Distinguish infra failures (timeout / missing command)
                                 # from real test/check failures. Infra problems get one
@@ -1094,10 +1243,21 @@ class Orchestrator:
                                         gate_mark = "infra"
                                         break
                                 else:
+                                    gate_output = await self._fit_bulk(
+                                        task, config, gate.output,
+                                        block="gate_output",
+                                        how_to_get_rest=_rerun_hint(cmd),
+                                        agent=(
+                                            (dev_node_cfg.agent or "developer")
+                                            if dev_node_cfg
+                                            else "developer"
+                                        ),
+                                        node=dev_node_cfg,
+                                    )
                                     feedback = (
                                         f"{label.upper()} GATE is not green "
                                         f"(exit {gate.exit_code}). "
-                                        f"Fix the failing {label}:\n{gate.output[-2000:]}"
+                                        f"Fix the failing {label}:\n{gate_output}"
                                     )
                                     await self._bus.emit(
                                         type=EventType.attempt_failed,
@@ -1155,8 +1315,13 @@ class Orchestrator:
                             )
                             continue  # real failure — feed back and retry
 
-                post_gate_nodes = derive_post_gate_nodes(config)
                 next_after_gate = post_gate_nodes[0].id if post_gate_nodes else "merge"
+                review_summary = feedback
+                if gate_notes:
+                    feedback = await self._with_gate_notes(
+                        task, config, review_summary, gate_notes,
+                        post_gate_nodes[0] if post_gate_nodes else None,
+                    )
                 gate_artifact: dict[str, Any] = {}
                 if feedback:
                     gate_artifact["review_verdicts_summary"] = feedback
@@ -1199,9 +1364,24 @@ class Orchestrator:
                     if cancel_event is not None and cancel_event.is_set():
                         return await self._finish_cancelled(task, wm, task_branch)
                     pg_agent = pg_node.agent or pg_node.id
-                    pg_prompt = f"{task.request}\n\nDIFF:\n```diff\n{current_diff}\n```"
-                    if feedback:
-                        pg_prompt += f"\n\nREVIEW_VERDICTS_SUMMARY:\n{feedback}"
+                    pg_diff = await self._fit_bulk(
+                        task, config, full_diff,
+                        block="diff",
+                        how_to_get_rest=_diff_hint(diff_cmd),
+                        agent=pg_agent,
+                        node=pg_node,
+                        cache=diff_cache,
+                    )
+                    pg_prompt = f"{task.request}\n\nDIFF:\n```diff\n{pg_diff}\n```"
+                    pg_feedback = (
+                        await self._with_gate_notes(
+                            task, config, review_summary, gate_notes, pg_node
+                        )
+                        if gate_notes
+                        else feedback
+                    )
+                    if pg_feedback:
+                        pg_prompt += f"\n\nREVIEW_VERDICTS_SUMMARY:\n{pg_feedback}"
                     if gate_res and (gate_res.get("message") or gate_res.get("output")):
                         op_notes = str(gate_res.get("message") or gate_res.get("output"))
                         pg_prompt += f"\n\nOPERATOR APPROVAL NOTES:\n{op_notes}"
@@ -1245,7 +1425,6 @@ class Orchestrator:
                         cli_agent_override=pg_node.cli_agent,
                         skills_override=pg_node.skills or None,
                         thinking_override=pg_node.thinking,
-                        compact_override=pg_node.compact_before_start,
                     )
                     pg_status = (
                         CheckpointStatus.completed if pg_result.ok else CheckpointStatus.failed
@@ -1257,7 +1436,7 @@ class Orchestrator:
                         attempt=attempts,
                         status=pg_status,
                         git_tree_sha=review_tree,
-                        artifact={"agent": pg_agent, "output": pg_result.text[:2000]},
+                        artifact={"agent": pg_agent, "output": pg_result.text},
                     )
                     await self._bus.emit(
                         type=EventType.node_completed,
@@ -1279,7 +1458,7 @@ class Orchestrator:
                         config,
                         cancel_event=cancel_event,
                         git_tree_sha=review_tree,
-                        artifact={"agent": pg_agent, "output": pg_result.text[:2000]},
+                        artifact={"agent": pg_agent, "output": pg_result.text},
                     )
                 break  # success
 
@@ -1394,12 +1573,17 @@ class Orchestrator:
         target_branch: str,
         test_command: str | None,
         gate_timeout: int,
-    ) -> str:
+    ) -> _Baseline:
+        """Snapshot the pre-existing test failures at *checkpoint* (cached per SHA).
+
+        The whole output is cached and returned; each reader fits it to its own limit when
+        the preamble is built (:meth:`_baseline_preamble`).
+        """
         if not test_command:
-            return ""
+            return _Baseline(target_branch)
         cached = await repo.get_baseline(self._db, project_id, checkpoint)
         if cached is not None:
-            return build_baseline_preamble(target_branch, cached.output)
+            return _Baseline(target_branch, test_command, cached.output)
         await self._bus.emit(
             type=EventType.baseline_snapshot,
             project_id=project_id,
@@ -1413,7 +1597,7 @@ class Orchestrator:
         else:
             failures = gate.output
         await repo.save_baseline(self._db, project_id, checkpoint, failures)
-        return build_baseline_preamble(target_branch, failures)
+        return _Baseline(target_branch, test_command, failures)
 
     async def _maybe_plan(
         self,
@@ -1422,7 +1606,7 @@ class Orchestrator:
         worktree: Path,
         knowledge: str,
         rules: str,
-        baseline_preamble: str,
+        baseline: _Baseline | None,
         config: ConclaveConfig,
         *,
         cancel_event: asyncio.Event | None = None,
@@ -1501,6 +1685,13 @@ class Orchestrator:
             return ""
 
         planner_agent = planner_node.agent or "planner"
+        baseline_preamble = (
+            await self._baseline_preamble(
+                task, config, baseline, agent=planner_agent, node=planner_node
+            )
+            if baseline is not None
+            else ""
+        )
         prompt = (
             f"{task.request}{baseline_preamble}\n\n"
             "Produce a structured plan per your system prompt.\n\n"
@@ -1567,7 +1758,6 @@ class Orchestrator:
             cli_agent_override=planner_node.cli_agent,
             skills_override=planner_node.skills or None,
             thinking_override=planner_node.thinking,
-            compact_override=planner_node.compact_before_start,
         )
         plan_preamble = ""
         if result.ok:
@@ -1592,7 +1782,7 @@ class Orchestrator:
             if not plan_preamble and config.workflow is not None and result.text.strip():
                 plan_preamble = (
                     "\n\n=== PLANNER CONTEXT BRIEF ===\n"
-                    f"{result.text.strip()[:8000]}\n=== END PLANNER BRIEF ===\n"
+                    f"{result.text.strip()}\n=== END PLANNER BRIEF ===\n"
                 )
         await repo.save_task_checkpoint(
             self._db,
@@ -1681,7 +1871,6 @@ class Orchestrator:
                 "cli_agent_override": node.cli_agent,
                 "skills_override": node.skills or None,
                 "thinking_override": node.thinking,
-                "compact_override": node.compact_before_start,
             }
         for attempt in range(_REVIEWER_DISPATCH_RETRIES + 1):
             result = await runner.run(
@@ -1786,7 +1975,7 @@ class Orchestrator:
             artifact={
                 "agent": agent,
                 "verdict": verdict.verdict,
-                "reason": verdict.reason[:1000] if verdict.reason else "",
+                "reason": verdict.reason,
             },
         )
         await self._bus.emit(
@@ -1894,8 +2083,14 @@ class Orchestrator:
         *,
         cancel_event: asyncio.Event | None = None,
         grounding_diff: str | None = None,
+        diff_cmd: str,
+        diff_cache: dict[BulkLimit, str] | None = None,
     ) -> tuple[bool, str, bool]:
         """Review the current diff through the derived agent pipeline.
+
+        Each reviewer's prompt carries ``current_diff`` fitted to that reviewer's bulk limit;
+        *diff_cmd* is the command that reproduces the full diff in the worktree, and readers
+        sharing *diff_cache* share each cut.
 
         Returns ``(failed, feedback, timed_out)``. ``timed_out`` is ``True`` when the
         wall-clock budget was exceeded mid-review — the caller must abort the task, not
@@ -1927,6 +2122,20 @@ class Orchestrator:
         passes = 0
         all_summaries: list[str] = []
 
+        async def _with_diff(n: WorkflowNode) -> str:
+            """*base_prompt* plus the diff fitted for reviewer *n* (nothing to show if blank)."""
+            if not current_diff.strip():
+                return base_prompt
+            diff = await self._fit_bulk(
+                task, config, current_diff,
+                block="diff",
+                how_to_get_rest=_diff_hint(diff_cmd),
+                agent=n.agent or n.id,
+                node=n,
+                cache=diff_cache,
+            )
+            return f"{base_prompt}\n\nDIFF:\n```diff\n{diff}\n```"
+
         if is_parallel_review(config) and len(review_nodes) > 1:
             if cancel_event is not None and cancel_event.is_set():
                 return True, "cancelled", False
@@ -1956,8 +2165,10 @@ class Orchestrator:
                     },
                 )
 
-            def _build_rev_prompt(n: WorkflowNode) -> str:
-                p = f"{base_prompt}\n\n{n.prompt_template}" if n.prompt_template else base_prompt
+            async def _build_rev_prompt(n: WorkflowNode) -> str:
+                p = await _with_diff(n)
+                if n.prompt_template:
+                    p += f"\n\n{n.prompt_template}"
                 node_steer = self._consume_node_steer(task.id, n.id) or (
                     self._consume_node_steer(task.id, n.agent)
                     if n.agent and n.agent != n.id
@@ -1970,12 +2181,15 @@ class Orchestrator:
                     )
                 return p
 
+            # Build every prompt first, in pipeline order, so shared cuts are made (and
+            # reported) once and deterministically before the reviewers run concurrently.
+            rev_prompts = [await _build_rev_prompt(node) for node in review_nodes]
             dispatched = await asyncio.gather(
                 *(
                     self._dispatch_reviewer(
                         runner,
                         node.agent or node.id,
-                        _build_rev_prompt(node),
+                        rev_prompt,
                         task,
                         worktree,
                         knowledge,
@@ -1983,7 +2197,7 @@ class Orchestrator:
                         cancel_event=cancel_event,
                         node=node,
                     )
-                    for node in review_nodes
+                    for node, rev_prompt in zip(review_nodes, rev_prompts, strict=True)
                 )
             )
             if cancel_event is not None and cancel_event.is_set():
@@ -2069,11 +2283,9 @@ class Orchestrator:
                         "attempt": attempt,
                     },
                 )
-                reviewer_prompt = (
-                    f"{base_prompt}\n\n{node.prompt_template}"
-                    if node.prompt_template
-                    else base_prompt
-                )
+                reviewer_prompt = await _with_diff(node)
+                if node.prompt_template:
+                    reviewer_prompt += f"\n\n{node.prompt_template}"
                 node_steer = self._consume_node_steer(task.id, node.id) or (
                     self._consume_node_steer(task.id, agent) if agent != node.id else None
                 )
@@ -2415,7 +2627,9 @@ class Orchestrator:
         Gated by ``experimental.post_mortem_enabled``. Runs BEFORE the worktree is cleaned
         so the agent can inspect the failed work, and feeds it the last reviewer/gate
         feedback plus the recorded verdicts so it can reason about why the task failed.
-        The analysis is recorded as a ``postmortem_draft`` event.
+        The feedback is passed exactly as the developer received it, so any gate output in
+        it is already fitted (with its marker). The analysis is recorded as a
+        ``postmortem_draft`` event.
 
         Wholly best-effort: ANY failure (provider error, cancelled dispatch, DB hiccup) is
         swallowed and logged — a post-mortem must never crash the worker or change the
@@ -2662,11 +2876,14 @@ def _check_budget(started: float, budget_minutes: float) -> bool:
     return (time.monotonic() - started) / 60.0 >= budget_minutes
 
 
-def _truncate_diff(diff: str) -> str:
-    """Truncate an oversized diff with a clear marker so it doesn't overflow context."""
-    if len(diff) <= _MAX_DIFF_CHARS:
-        return diff
-    return diff[:_MAX_DIFF_CHARS] + f"\n... [diff truncated — original was {len(diff)} chars]"
+def _diff_hint(diff_cmd: str) -> str:
+    """How an agent recovers a fitted diff: the command that produced it."""
+    return f"Run `{diff_cmd}` in your working directory for the full diff."
+
+
+def _rerun_hint(command: str) -> str:
+    """How an agent recovers the fitted output of a gate/test or setup *command*."""
+    return f"Re-run `{command}` in your working directory for the full output."
 
 
 def _diff_stat(diff: str) -> str:
@@ -2761,8 +2978,7 @@ def _build_developer_prompt(
         )
         if previous_diff:
             dev_prompt += (
-                "\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n"
-                + _truncate_diff(previous_diff) + "\n```"
+                "\n\nYOUR IMMEDIATELY PRIOR DIFF:\n```diff\n" + previous_diff + "\n```"
             )
     return dev_prompt
 

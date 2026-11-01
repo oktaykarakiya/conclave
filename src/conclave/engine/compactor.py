@@ -105,7 +105,11 @@ def _compact_plan_dict(plan: dict[str, Any], max_str_chars: int = 400) -> dict[s
 
 
 async def compact_task_context(db: Database, task_id: str) -> dict[str, Any]:
-    """Compact a task's accumulated plan and checkpoint context and record a checkpoint."""
+    """Record a compacted summary of a task's context and its estimated size savings.
+
+    Writes only a ``compaction`` checkpoint (summary and statistics). The task's request and
+    plan are never rewritten, so agents always receive them whole.
+    """
     task = await repo.get_task(db, task_id)
     if task is None:
         raise ValueError(f"task not found: {task_id}")
@@ -124,12 +128,9 @@ async def compact_task_context(db: Database, task_id: str) -> dict[str, Any]:
     )
     chars_before = len(combined_before)
 
-    compacted_plan = task.plan
-    if task.plan is not None:
-        compacted_plan = _compact_plan_dict(task.plan, max_str_chars=300)
-        if compacted_plan != task.plan:
-            await repo.update_task_fields(db, task_id, plan=compacted_plan)
-
+    compacted_plan = (
+        _compact_plan_dict(task.plan, max_str_chars=300) if task.plan is not None else None
+    )
     plan_after = (
         json.dumps(compacted_plan, ensure_ascii=False) if compacted_plan is not None else ""
     )

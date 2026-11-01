@@ -216,11 +216,12 @@ class PlanningOrchestrator:
         # --- task materialisation -------------------------------------------
         nodes = await repo.list_planning_task_nodes(self._db, session_id)
 
-        # Create a parent task representing the session itself
+        # Create a parent task representing the session itself. Its request carries the
+        # whole session prompt (only the title is shortened).
         session_task = await repo.create_task(
             self._db,
             project_id=session.project_id,
-            request=f"[Agent-Ception Session]\n{session.prompt[:500]}",
+            request=f"[Agent-Ception Session]\n{session.prompt}",
             title=session.title or session.prompt[:80],
             level=0,
             state=TaskState.done,

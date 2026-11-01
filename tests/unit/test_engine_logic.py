@@ -1,5 +1,5 @@
-"""Unit tests for the ported engine logic: verdicts, grounding, pipeline, memory,
-budget checks, and diff truncation."""
+"""Unit tests for the ported engine logic: verdicts, grounding, pipeline, memory, and
+budget checks. Diff fitting is covered by test_context_limits.py."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from conclave.engine import (
     parse_verdict,
     trim_output,
 )
-from conclave.engine.orchestrator import _MAX_DIFF_CHARS, _check_budget, _truncate_diff
+from conclave.engine.orchestrator import _check_budget
 
 # --- parse_verdict ----------------------------------------------------------
 
@@ -309,35 +309,6 @@ def test_check_budget_returns_false_when_budget_is_zero() -> None:
     import time
     started = time.monotonic() - 3600  # started an hour ago
     assert _check_budget(started, 0.0) is False
-
-
-# --- _truncate_diff ----------------------------------------------------------
-
-
-def test_truncate_diff_truncates_oversized_diff_and_includes_marker() -> None:
-    """A diff larger than _MAX_DIFF_CHARS is truncated with a clear marker."""
-    big = "x" * (_MAX_DIFF_CHARS + 100)
-    result = _truncate_diff(big)
-    assert len(result) < len(big)
-    assert "[diff truncated — original was" in result
-    assert str(len(big)) in result
-    # The truncated content should be the first _MAX_DIFF_CHARS chars plus the marker.
-    assert result.startswith("x" * _MAX_DIFF_CHARS)
-
-
-def test_truncate_diff_leaves_small_diff_unchanged() -> None:
-    """A diff under the cap is returned verbatim."""
-    small = "diff --git a/x b/x\n+hello"
-    result = _truncate_diff(small)
-    assert result == small
-
-
-def test_truncate_diff_at_exact_boundary_is_unchanged() -> None:
-    """A diff exactly at _MAX_DIFF_CHARS is not truncated."""
-    exact = "y" * _MAX_DIFF_CHARS
-    result = _truncate_diff(exact)
-    assert result == exact
-    assert "[diff truncated" not in result
 
 
 # --- check_grounding path traversal ------------------------------------------

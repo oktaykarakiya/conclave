@@ -66,6 +66,7 @@ def test_null_safe_helpers_and_tool_schemas() -> None:
         "persistent_baseline_cache",
         "auto_planner_char_threshold",
         "cross_attempt_memory_entries",
+        "context",
         "planning",
         "agents",
         "bug_fixer",

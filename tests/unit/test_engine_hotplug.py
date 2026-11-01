@@ -101,7 +101,7 @@ async def test_maybe_plan_prompt_includes_necessity_and_yagni_check(
         tmp_path,
         knowledge="",
         rules="",
-        baseline_preamble="",
+        baseline=None,
         config=config,
     )
     assert "PLAN" in plan_preamble

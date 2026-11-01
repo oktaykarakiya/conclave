@@ -379,7 +379,7 @@ async def test_review_all_empty_reviewers_record_unknown_and_block(
 
     failed, feedback, review_timed_out = await orchestrator._review(
         runner, task, project.id, repo_path, "diff --git a/x.py b/x.py\n", 1, config, "", "",
-        started=time.monotonic(), budget=0.0,
+        started=time.monotonic(), budget=0.0, diff_cmd="git diff --cached HEAD",
     )
 
     assert review_timed_out is False
