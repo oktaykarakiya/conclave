@@ -4,24 +4,32 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import httpx
+import pytest
 from httpx import ASGITransport
 
 from conclave.config import (
     ConclaveConfig,
     EdgeCondition,
+    NodeKind,
+    WorkflowEdge,
+    WorkflowGraph,
+    WorkflowNode,
     load_project_config,
     workflow_templates,
 )
-from conclave.db import CheckpointStatus, Database, TaskState
+from conclave.db import CheckpointStatus, Database, Project, Task, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import (
     derive_planner_nodes,
     derive_review_nodes,
     evolve_project_workflow,
     scale_workflow_for_task,
+    workflow_evolver,
 )
+from conclave.engine.workflow_evolver import describe_workflow_changes
 from conclave.events import EventBus, EventType
 from conclave.mcp.tools import call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, Provider, ResolvedProfile
@@ -130,7 +138,10 @@ async def test_evolve_project_workflow_grows_on_gate_failure_and_grounded_catche
         name="evo-grow",
         path=str(tmp_path),
         default_branch="main",
-        config={"workflow": fast_track.model_dump(mode="json")},
+        config={
+            "workflow": fast_track.model_dump(mode="json"),
+            "experimental": {"workflow_evolution": "auto"},
+        },
     )
     task = await repo.create_task(
         db,
@@ -214,7 +225,10 @@ async def test_evolve_project_workflow_shrinks_after_3_clean_done_tasks(
         name="evo-shrink",
         path=str(tmp_path),
         default_branch="main",
-        config={"workflow": deep_audit.model_dump(mode="json")},
+        config={
+            "workflow": deep_audit.model_dump(mode="json"),
+            "experimental": {"workflow_evolution": "auto"},
+        },
     )
 
     # Create 3 consecutive clean done tasks (including an ungrounded 'unknown' demotion)
@@ -286,7 +300,10 @@ async def test_workflow_evolve_rest_and_mcp_endpoints(
         name="api-evolve",
         path=str(tmp_path),
         default_branch="main",
-        config={"workflow": workflow_templates()["fast_track"].model_dump(mode="json")},
+        config={
+            "workflow": workflow_templates()["fast_track"].model_dump(mode="json"),
+            "experimental": {"workflow_evolution": "auto"},
+        },
     )
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -316,3 +333,221 @@ async def test_workflow_evolve_rest_and_mcp_endpoints(
         )
         assert mcp_data["evolved"] is True
         assert mcp_data["action"] == "shrink"
+
+
+# --- evolution modes: off / suggest / auto ------------------------------------
+
+
+async def _evolution_project(db: Database, tmp_path: Path, mode: str | None) -> Project:
+    """A fast_track project; *mode* None keeps the default workflow_evolution."""
+    fast_track = workflow_templates()["fast_track"]
+    config: dict[str, Any] = {"workflow": fast_track.model_dump(mode="json")}
+    if mode is not None:
+        config["experimental"] = {"workflow_evolution": mode}
+    return await repo.create_project(
+        db, name=f"evo-{mode}", path=str(tmp_path), default_branch="main", config=config
+    )
+
+
+async def _growth_task(db: Database, project_id: str) -> Task:
+    """A failed task whose gate failed after the review passed, with a grounded security block."""
+    task = await repo.create_task(
+        db, project_id=project_id, title="Risky", request="Update schema", state=TaskState.failed
+    )
+    await repo.save_task_checkpoint(
+        db, task_id=task.id, node_id="review", attempt=1, status=CheckpointStatus.completed
+    )
+    await repo.save_task_checkpoint(
+        db, task_id=task.id, node_id="gate", attempt=1, status=CheckpointStatus.failed
+    )
+    await repo.add_verdict(
+        db,
+        task_id=task.id,
+        attempt=1,
+        agent="security",
+        verdict="block",
+        reason="Hardcoded token in src/auth.py",
+        source="json",
+        grounded_count=1,
+        evidence=[{"file": "src/auth.py", "line": 12}],
+    )
+    return task
+
+
+async def _workflow_events(db: Database, project_id: str) -> list[str]:
+    events = await repo.list_events(db, project_id=project_id, limit=500)
+    return [e.type for e in events if e.type.startswith("workflow.")]
+
+
+async def test_off_mode_post_task_hook_computes_nothing_and_changes_nothing(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _never(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("off mode must not compute an evolution")
+
+    monkeypatch.setattr(workflow_evolver, "compute_workflow_evolution", _never)
+    project = await _evolution_project(db, tmp_path, "off")
+    task = await _growth_task(db, project.id)
+
+    res = await evolve_project_workflow(
+        db, EventBus(db), project.id, task_id=task.id, automatic=True
+    )
+
+    assert res["evolved"] is False and res["mode"] == "off"
+    assert res["proposal"] is None and res["version"] is None
+    assert (await repo.get_project(db, project.id)) == project
+    assert await repo.list_workflow_proposals(db, project.id) == []
+    assert await repo.list_workflow_versions(db, project.id) == []
+    assert await _workflow_events(db, project.id) == []
+
+
+async def test_suggest_mode_stores_one_proposal_and_leaves_the_workflow(
+    db: Database, tmp_path: Path
+) -> None:
+    bus = EventBus(db)
+    project = await _evolution_project(db, tmp_path, None)  # suggest is the default
+    task = await _growth_task(db, project.id)
+
+    res = await evolve_project_workflow(db, bus, project.id, task_id=task.id, automatic=True)
+
+    assert res["mode"] == "suggest" and res["evolved"] is False and res["version"] is None
+    assert (await repo.get_project(db, project.id)) == project  # the live workflow is untouched
+    proposals = await repo.list_workflow_proposals(db, project.id)
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert res["proposal"]["id"] == proposal.id
+    assert proposal.state.value == "pending"
+    assert proposal.reason["action"] == "grow"
+    assert proposal.reason["task_id"] == task.id
+    assert "security" in proposal.reason["catching_reviewers"]
+    assert proposal.reason["task_failed"] is True
+    assert proposal.reason["gate_failed_after_review"] is True
+    assert proposal.reason["summary"] and proposal.reason["changes"]
+    assert proposal.base_graph == workflow_templates()["fast_track"].model_dump(mode="json")
+    assert proposal.proposed_graph == res["workflow"]
+    assert await _workflow_events(db, project.id) == ["workflow.evolution_proposed"]
+    assert await repo.list_workflow_versions(db, project.id) == []
+
+    # The same trigger again neither duplicates the pending proposal nor announces it again.
+    again = await evolve_project_workflow(db, bus, project.id, task_id=task.id, automatic=True)
+    assert again["proposal"]["id"] == proposal.id
+    assert len(await repo.list_workflow_proposals(db, project.id)) == 1
+    assert await _workflow_events(db, project.id) == ["workflow.evolution_proposed"]
+
+
+async def test_auto_mode_applies_the_change_as_an_evolver_version(
+    db: Database, tmp_path: Path
+) -> None:
+    project = await _evolution_project(db, tmp_path, "auto")
+    task = await _growth_task(db, project.id)
+
+    res = await evolve_project_workflow(
+        db, EventBus(db), project.id, task_id=task.id, automatic=True
+    )
+
+    assert res["evolved"] is True and res["action"] == "grow" and res["proposal"] is None
+    updated = await repo.get_project(db, project.id)
+    assert updated is not None
+    live = load_project_config(updated.config).workflow
+    assert live is not None and "tester" in {n.id for n in live.nodes}
+    versions = await repo.list_workflow_versions(db, project.id)
+    assert len(versions) == 1
+    version = versions[0]
+    assert version.source.value == "evolver"
+    assert version.graph_before == workflow_templates()["fast_track"].model_dump(mode="json")
+    assert version.graph_after == live.model_dump(mode="json")
+    assert version.reason.startswith("Grow:")
+    assert res["version"]["id"] == version.id
+    assert await _workflow_events(db, project.id) == ["workflow.evolved", "workflow.updated"]
+    assert await repo.list_workflow_proposals(db, project.id) == []
+
+
+async def test_manual_evolve_in_off_mode_previews_and_apply_applies_it(
+    db: Database, tmp_path: Path
+) -> None:
+    bus = EventBus(db)
+    project = await _evolution_project(db, tmp_path, "off")
+    task = await _growth_task(db, project.id)
+
+    preview = await evolve_project_workflow(db, bus, project.id, task_id=task.id)
+    assert preview["evolved"] is False and preview["action"] == "grow"
+    assert preview["proposal"] is None and preview["version"] is None
+    assert preview["workflow"]["version"] == 2  # what it would become
+    assert (await repo.get_project(db, project.id)) == project
+    assert await repo.list_workflow_proposals(db, project.id) == []
+    assert await _workflow_events(db, project.id) == []
+
+    applied = await evolve_project_workflow(
+        db, bus, project.id, task_id=task.id, apply=True, reason="  operator call  "
+    )
+    assert applied["evolved"] is True
+    versions = await repo.list_workflow_versions(db, project.id)
+    assert [(v.source.value, v.reason) for v in versions] == [("operator", "  operator call  ")]
+    assert versions[0].graph_after == applied["workflow"]
+
+
+def _node(node_id: str, kind: NodeKind = NodeKind.reviewer, **fields: Any) -> WorkflowNode:
+    return WorkflowNode(id=node_id, kind=kind, agent=node_id, **fields)
+
+
+def test_describe_workflow_changes_lists_each_change_in_a_stable_order() -> None:
+    before = WorkflowGraph(
+        nodes=[
+            _node("developer", NodeKind.developer),
+            _node("tester"),
+            _node("architect", optional=True),
+            _node("legal", enabled=False),
+            _node("old"),
+        ],
+        edges=[
+            WorkflowEdge(id="d-t", source="developer", target="tester"),
+            WorkflowEdge(
+                id="t-d", source="tester", target="developer", condition=EdgeCondition.on_fail
+            ),
+            WorkflowEdge(
+                id="d-a",
+                source="developer",
+                target="architect",
+                condition=EdgeCondition.on_diff_trigger,
+            ),
+            WorkflowEdge(id="d-o", source="developer", target="old"),
+        ],
+    )
+    after = WorkflowGraph(
+        parallel_reviewers=True,
+        nodes=[
+            _node("developer", NodeKind.developer),
+            _node("tester", position_x=999.0),  # layout only: not reported
+            _node("architect", triggers=["new_files"]),
+            _node("legal"),
+            _node("security"),
+        ],
+        edges=[
+            WorkflowEdge(id="d-t", source="developer", target="tester"),
+            WorkflowEdge(
+                id="t-d",
+                source="tester",
+                target="developer",
+                condition=EdgeCondition.on_fail,
+                max_iterations=4,
+            ),
+            WorkflowEdge(id="d-a", source="developer", target="architect"),
+            WorkflowEdge(id="d-s", source="developer", target="security"),
+        ],
+    )
+
+    expected = [
+        "make architect mandatory",
+        "change architect: triggers",
+        "enable node legal",
+        "add reviewer node security (mandatory)",
+        "remove node old",
+        "edge tester -> developer (on_fail): max_iterations 3 -> 4",
+        "edge developer -> architect: on_diff_trigger -> always",
+        "add edge developer -> security (always)",
+        "remove edge developer -> old (always)",
+        "enable parallel reviewers",
+    ]
+    assert describe_workflow_changes(before, after) == expected
+    assert describe_workflow_changes(before, after) == expected  # deterministic
+    assert describe_workflow_changes(after, after) == []

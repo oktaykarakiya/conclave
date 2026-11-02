@@ -370,6 +370,25 @@ export function SettingsView({
             </span>
           </label>
 
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">Workflow evolution</span>
+            <select
+              className={input}
+              value={String(experimental.workflow_evolution ?? "suggest")}
+              onChange={(e) =>
+                updateSection("experimental", "workflow_evolution", e.target.value)
+              }
+            >
+              <option value="suggest">suggest: propose changes for you to approve</option>
+              <option value="auto">auto: apply changes (each one versioned)</option>
+              <option value="off">off</option>
+            </select>
+            <span className="block text-[11px] text-zinc-500">
+              What the evolver does with the workflow after each task; review in Agent Studio
+              → History.
+            </span>
+          </label>
+
           <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2 hover:border-zinc-700">
             <input
               type="checkbox"

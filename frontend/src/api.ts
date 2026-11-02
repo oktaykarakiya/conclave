@@ -20,8 +20,12 @@ import type {
   Task,
   TaskCheckpoint,
   Verdict,
+  WorkflowChangeResult,
   WorkflowEnvelope,
   WorkflowGraph,
+  WorkflowProposal,
+  WorkflowProposalState,
+  WorkflowVersion,
 } from "./types";
 
 async function req<T>(
@@ -142,6 +146,33 @@ export const api = {
       `/api/projects/${id}/workflow`,
       payload,
       idempotencyKey,
+    ),
+  /** Recorded workflow changes, newest first. */
+  listWorkflowVersions: (id: string, limit = 50) =>
+    req<WorkflowVersion[]>("GET", `/api/projects/${id}/workflow/versions${qs({ limit })}`),
+  /** Restore a version's graph as a new `revert` version. */
+  revertWorkflowVersion: (id: string, versionId: string, reason?: string) =>
+    req<WorkflowChangeResult & { changed: boolean }>(
+      "POST",
+      `/api/projects/${id}/workflow/versions/${encodeURIComponent(versionId)}/revert`,
+      { reason },
+    ),
+  listWorkflowProposals: (id: string, state?: WorkflowProposalState) =>
+    req<WorkflowProposal[]>(
+      "GET",
+      `/api/projects/${id}/workflow/proposals${qs({ state, limit: 50 })}`,
+    ),
+  /** Approve (apply) or reject a pending proposal; approving answers 409 when it is stale. */
+  decideWorkflowProposal: (
+    id: string,
+    proposalId: string,
+    decision: "approve" | "reject",
+    reason?: string,
+  ) =>
+    req<WorkflowChangeResult & { decision: string; proposal: WorkflowProposal | null }>(
+      "POST",
+      `/api/projects/${id}/workflow/proposals/${encodeURIComponent(proposalId)}/${decision}`,
+      { reason },
     ),
   listAgents: (projectId?: string) =>
     req<AgentPersona[]>(

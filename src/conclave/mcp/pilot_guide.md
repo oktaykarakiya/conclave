@@ -20,6 +20,12 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
 - **Workflow** = a graph of nodes (agents, `gate`, `merge`) and edges (`always`, `on_pass`,
   `on_fail`, `on_diff_trigger`). Nodes/edges can pause for a human (`await_human_approval`,
   `pause_after`, `require_human`). `conclave_get_workflow` shows the effective graph.
+- **Workflow evolution**: after each task the evolver works out how the workflow should change
+  (grow it after a failure or grounded catches; make quiet non-core reviewers optional after 3
+  clean tasks). `experimental.workflow_evolution` decides what happens: `suggest` (default)
+  stores a **proposal** that changes nothing until you approve it, `auto` applies the change,
+  `off` skips the post-task evolution. Every change to a project's workflow, whoever makes it,
+  is recorded as a **version** with its source and reason, and can be reverted (§8).
 - **Gate** = the project's `execution.baseline_test_command`, run on a baseline before work and
   again after review. Verdicts from reviewers are **grounded**: claims must cite evidence that
   exists in the diff, or they are downgraded.
@@ -249,6 +255,35 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   same base commit, the same spec and the same reviewers; score with acceptance tests the agents
   never see, the gate, review rounds, diff quality, cost and time. Merge the better diff.
 
+### Workflow proposals and versions
+- `conclave_list_workflow_proposals(project_id, state: "pending")` lists what the evolver
+  suggests (a `workflow.evolution_proposed` event announces each new one): `reason.summary`,
+  `reason.changes` (one line per change), the evidence (`task_id`, `catching_reviewers`,
+  `task_failed`, `gate_failed_after_review`, `clean_streak`), the `proposed_graph` and the
+  `base_graph` it was computed from. While a proposal is pending, an identical one is not stored
+  again.
+- `conclave_decide_workflow_proposal(project_id, proposal_id, decision, reason?)`: `approve`
+  applies the proposed graph as a `proposal` version; it is refused while the live workflow
+  differs from `base_graph`, so reject that proposal and run `conclave_evolve_workflow` for a
+  fresh one. `reject` records the decision and leaves the workflow alone.
+- `conclave_evolve_workflow(project_id, task_id?)` runs evolution on demand: in `suggest` mode it
+  stores and returns a `proposal`, in `auto` mode it applies the change (an `evolver` version),
+  in `off` mode it only previews; `apply: true` applies the change at once as your decision (an
+  `operator` version).
+- `conclave_list_workflow_versions(project_id, limit?)` shows every change, newest first:
+  `source` (`evolver`, `operator`, `template`, `revert`, `proposal`), `reason`, `created_at`,
+  `graph_after` and `graph_before` (`null` = the pipeline derived from the agents policy). The
+  graph, node and edge tools, templates, Store installs, config patches that change `workflow`
+  and the evolver all record one; pass `reason` to say why.
+- `conclave_revert_workflow(project_id, version_id, reason?)` restores that version's
+  `graph_after` as a new `revert` version (history is never deleted); a version holding `null`
+  restores the derived pipeline.
+- REST: `GET /api/projects/{id}/workflow/versions?limit=`,
+  `POST /api/projects/{id}/workflow/versions/{version_id}/revert`,
+  `GET /api/projects/{id}/workflow/proposals?state=`, and
+  `POST /api/projects/{id}/workflow/proposals/{proposal_id}/approve` (or `/reject`); a refused
+  approval is a `409`.
+
 ## 9. Planning big goals
 
 `conclave_create_planning_session(project_id, prompt, title, max_rounds)` runs a panel of
@@ -309,6 +344,17 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   output quieter.
 - `conclave_compact_session` on a task only records a summary and a size estimate; it never
   changes the request or plan that agents receive.
+- With the default `experimental.workflow_evolution: suggest` the evolver never changes a
+  workflow by itself: its proposals wait for you. After failed tasks, check
+  `conclave_list_workflow_proposals(state: "pending")` and decide them (§8).
+- Approving a proposal fails with `isError` when the workflow changed after it was computed (an
+  edit, a template, a revert or another approval); reject it and run `conclave_evolve_workflow`
+  again.
+- A revert restores a version's `graph_after`. The workflow a project had before its first
+  recorded change is only that version's `graph_before`: to get back to the derived pipeline
+  when no version holds `null`, apply the `standard` template (itself recorded).
+- Versions record changes to a project's own settings. A global `workflow` change reaches the
+  projects that inherit it without a version in their history.
 
 ## 12. Tool index
 
@@ -359,7 +405,12 @@ group for the first time.
 - `conclave_workflow_remove_node` — drop a node and its edges.
 - `conclave_workflow_upsert_edge` — connect or update a directed edge.
 - `conclave_workflow_remove_edge` — remove one directed edge.
-- `conclave_evolve_workflow` — adjust the graph from verdict and gate history.
+- `conclave_evolve_workflow` — evolve the graph from verdict and gate history (a proposal in
+  `suggest` mode; `apply: true` applies it now).
+- `conclave_list_workflow_proposals` — review the evolver's proposals and their evidence.
+- `conclave_decide_workflow_proposal` — approve (apply) or reject a pending proposal.
+- `conclave_list_workflow_versions` — see every recorded workflow change, newest first.
+- `conclave_revert_workflow` — restore an earlier version's graph as a new version.
 
 ### Agents
 - `conclave_list_agents` — see global and project-scoped personas.

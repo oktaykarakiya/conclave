@@ -586,6 +586,101 @@ class StoreItem(BaseModel):
         )
 
 
+class WorkflowVersionSource(StrEnum):
+    """What made a recorded change to a project's workflow."""
+
+    evolver = "evolver"  # the workflow evolver in auto mode
+    operator = "operator"  # a person or pilot editing the graph or the config
+    template = "template"  # a built-in template or a Store workflow
+    revert = "revert"  # a revert to an earlier version
+    proposal = "proposal"  # an approved evolver proposal
+
+
+class WorkflowProposalState(StrEnum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+
+
+class WorkflowConflictError(ValueError):
+    """A workflow change computed from a state that is gone: the live workflow changed since,
+    or the proposal was already decided. A ``ValueError``, so an MCP call reports it as a tool
+    error; REST answers 409."""
+
+
+def _graph(value: Any) -> dict[str, Any] | None:
+    """Decode a workflow graph column; ``None`` (SQL NULL) is the derived pipeline."""
+    graph = _loads(value, None)
+    return graph if isinstance(graph, dict) else None
+
+
+class WorkflowVersion(BaseModel):
+    """One recorded change to a project's workflow: the graph before and after it.
+
+    A ``None`` graph is the pipeline derived from the agents policy (no custom workflow).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    created_at: str
+    source: WorkflowVersionSource
+    reason: str = ""
+    graph_after: dict[str, Any] | None = None
+    graph_before: dict[str, Any] | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> WorkflowVersion:
+        return cls(
+            id=row["id"],
+            project_id=row["project_id"],
+            created_at=row["created_at"],
+            source=_enum(WorkflowVersionSource, row["source"], WorkflowVersionSource.operator),
+            reason=row["reason"],
+            graph_after=_graph(row["graph_after_json"]),
+            graph_before=_graph(row["graph_before_json"]),
+        )
+
+
+class WorkflowProposal(BaseModel):
+    """A workflow change the evolver suggests, waiting for a person to approve or reject it.
+
+    ``base_graph`` is the active graph the change was computed from; approving applies
+    ``proposed_graph`` only while the live graph still equals it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    created_at: str
+    state: WorkflowProposalState = WorkflowProposalState.pending
+    reason: dict[str, Any] = Field(default_factory=dict)
+    proposed_graph: dict[str, Any]
+    base_graph: dict[str, Any]
+    decided_at: str | None = None
+    decision_reason: str | None = None
+    version_id: str | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> WorkflowProposal:
+        raw_reason = _loads(row["reason_json"], {})
+        return cls(
+            id=row["id"],
+            project_id=row["project_id"],
+            created_at=row["created_at"],
+            # An unknown state must never read as pending, or it could be approved.
+            state=_enum(WorkflowProposalState, row["state"], WorkflowProposalState.rejected),
+            reason=raw_reason if isinstance(raw_reason, dict) else {},
+            proposed_graph=_graph(row["proposed_graph_json"]) or {},
+            base_graph=_graph(row["base_graph_json"]) or {},
+            decided_at=row["decided_at"],
+            decision_reason=row["decision_reason"],
+            version_id=row["version_id"],
+        )
+
+
 class InteractionLog(BaseModel):
     """A recorded agent/CLI interaction session in the interaction_logs ledger."""
 

@@ -440,7 +440,8 @@ def test_no_project_config_writes_bypass_the_resolver() -> None:
                 else ""
             )
             writes_config = callee == "update_project_config" or (
-                callee in ("create_project", "update_project")
+                callee
+                in ("create_project", "update_project", "update_project_with_workflow_version")
                 and any(kw.arg == "config" for kw in node.keywords)
             )
             if writes_config:

@@ -420,6 +420,39 @@ CREATE TABLE IF NOT EXISTS pending_data_migrations (
 INSERT OR IGNORE INTO pending_data_migrations(version) VALUES (13);
 """
 
+# Migration 14 — workflow history and evolver proposals. Every change to a project's workflow
+# records a version (the graph after and before it), so any change can be reverted; the
+# evolver's suggestions wait in workflow_proposals until a person approves or rejects them.
+# Graphs are sort_keys JSON; a NULL graph is the pipeline derived from the agents policy.
+_SQL_014 = """
+CREATE TABLE workflow_versions (
+  id                 TEXT PRIMARY KEY,
+  project_id         TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  source             TEXT NOT NULL,
+  reason             TEXT NOT NULL DEFAULT '',
+  graph_after_json   TEXT,
+  graph_before_json  TEXT,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_workflow_versions_project ON workflow_versions(project_id, created_at);
+
+CREATE TABLE workflow_proposals (
+  id                   TEXT PRIMARY KEY,
+  project_id           TEXT NOT NULL,
+  created_at           TEXT NOT NULL,
+  state                TEXT NOT NULL DEFAULT 'pending',
+  reason_json          TEXT NOT NULL DEFAULT '{}',
+  proposed_graph_json  TEXT NOT NULL,
+  base_graph_json      TEXT NOT NULL,
+  decided_at           TEXT,
+  decision_reason      TEXT,
+  version_id           TEXT,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_workflow_proposals_project ON workflow_proposals(project_id, state, created_at);
+"""
+
 
 def _json_object(raw: Any) -> dict[str, Any] | None:
     try:
@@ -491,4 +524,5 @@ MIGRATIONS: list[Migration] = [
         sql=_SQL_013,
         run=_normalise_project_config_deltas,
     ),
+    Migration(version=14, name="workflow_versions_and_proposals", sql=_SQL_014),
 ]

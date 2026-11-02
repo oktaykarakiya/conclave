@@ -34,6 +34,7 @@ from ..config import (
     resolve_project_config,
     save_global_config,
     save_project_config,
+    save_project_workflow,
     workflow_templates,
 )
 from ..db import (
@@ -49,6 +50,11 @@ from ..db import (
     TaskCheckpoint,
     TaskState,
     VerdictRow,
+    WorkflowConflictError,
+    WorkflowProposal,
+    WorkflowProposalState,
+    WorkflowVersion,
+    WorkflowVersionSource,
 )
 from ..db import repositories as repo
 from ..db.planning_models import PlanningMessage, PlanningSession, PlanningTaskNode
@@ -60,7 +66,11 @@ from ..engine.task_diff import (
     compute_task_diff,
 )
 from ..engine.task_merge import TaskMergeError, merge_task
-from ..engine.workflow_evolver import evolve_project_workflow
+from ..engine.workflow_evolver import (
+    decide_workflow_proposal,
+    evolve_project_workflow,
+    revert_workflow,
+)
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..providers import CLAUDE_CODE_PREFIX, Engine, engine_status, resolve_engine
@@ -83,6 +93,8 @@ from .schemas import (
     StoreItemUpsert,
     SwarmCreateInput,
     TaskCreate,
+    WorkflowDecisionInput,
+    WorkflowEvolveInput,
     WorkflowUpdate,
 )
 
@@ -122,6 +134,29 @@ def _invalid_config(exc: ValueError) -> HTTPException:
     """
     detail: Any = json.loads(exc.json()) if isinstance(exc, ValidationError) else str(exc)
     return HTTPException(status_code=422, detail=detail)
+
+
+def _reason(given: str | None, default: str) -> str:
+    """The operator's reason verbatim when given, else *default*."""
+    return given if given and given.strip() else default
+
+
+async def _require_workflow_version(
+    daemon: Daemon, project_id: str, version_id: str
+) -> WorkflowVersion:
+    version = await repo.get_workflow_version(daemon.db, version_id)
+    if version is None or version.project_id != project_id:
+        raise HTTPException(status_code=404, detail="workflow version not found")
+    return version
+
+
+async def _require_workflow_proposal(
+    daemon: Daemon, project_id: str, proposal_id: str
+) -> WorkflowProposal:
+    proposal = await repo.get_workflow_proposal(daemon.db, proposal_id)
+    if proposal is None or proposal.project_id != project_id:
+        raise HTTPException(status_code=404, detail="workflow proposal not found")
+    return proposal
 
 
 async def _require_planning_session(
@@ -177,12 +212,6 @@ class ObservabilityQueryInput(BaseModel):
 
 class SystemReloadInput(BaseModel):
     force: bool = False
-
-
-class WorkflowEvolveInput(BaseModel):
-    task_id: str | None = None
-    gate_failed_after_review: bool = False
-    task_failed: bool = False
 
 
 @router.get("/health")
@@ -425,6 +454,7 @@ async def patch_global_config(
             patch_dict,
             unset=body.unset,
             apply_to_all_projects=body.apply_to_all_projects,
+            workflow_reason=body.reason if body.reason and body.reason.strip() else None,
         )
     except ValueError as exc:
         raise _invalid_config(exc) from exc
@@ -490,6 +520,7 @@ async def patch_config(
             unset=body.unset,
             name=body.name.strip() if body.name and body.name.strip() else None,
             default_branch=new_default_branch,
+            workflow_reason=_reason(body.reason, "config patch"),
         )
     except ValueError as exc:
         raise _invalid_config(exc) from exc
@@ -570,12 +601,19 @@ async def update_project_workflow(
             )
         if body.template_id != "standard":
             workflow = templates[body.template_id]
+        source = WorkflowVersionSource.template
+        default_reason = f"template applied: {body.template_id}"
+    else:
+        source = WorkflowVersionSource.operator
+        default_reason = "workflow saved"
     # None derives the graph from the agents policy, even over a global custom workflow.
     try:
-        resolved = await save_project_config(
+        resolved, _ = await save_project_workflow(
             daemon.db,
             project,
-            {"workflow": workflow.model_dump(mode="json") if workflow is not None else None},
+            workflow.model_dump(mode="json") if workflow is not None else None,
+            source=source,
+            reason=_reason(body.reason, default_reason),
         )
     except ValueError as exc:
         raise _invalid_config(exc) from exc
@@ -600,17 +638,124 @@ async def evolve_project_workflow_endpoint(
     body: WorkflowEvolveInput | None = None,
     daemon: Daemon = Depends(get_daemon),
 ) -> dict[str, Any]:
+    """Evolve the workflow from verdict and gate history as experimental.workflow_evolution
+    says (suggest: store a proposal; auto: apply it; off: preview). ``apply`` applies the
+    change now as an operator decision; 409 when the workflow changed meanwhile."""
     await _require_project(daemon, project_id)
-    return await evolve_project_workflow(
-        daemon.db,
-        daemon.bus,
-        project_id,
-        task_id=body.task_id if body is not None else None,
-        gate_failed_after_review=(
-            body.gate_failed_after_review if body is not None else False
-        ),
-        task_failed=body.task_failed if body is not None else False,
+    req = body or WorkflowEvolveInput()
+    if req.task_id is not None:
+        task = await _require_task(daemon, req.task_id)
+        if task.project_id != project_id:
+            raise HTTPException(status_code=404, detail="task not found")
+    try:
+        return await evolve_project_workflow(
+            daemon.db,
+            daemon.bus,
+            project_id,
+            task_id=req.task_id,
+            gate_failed_after_review=req.gate_failed_after_review,
+            task_failed=req.task_failed,
+            apply=req.apply,
+            reason=req.reason,
+        )
+    except WorkflowConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise _invalid_config(exc) from exc
+
+
+@router.get("/projects/{project_id}/workflow/versions")
+async def list_workflow_versions(
+    project_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
+) -> list[WorkflowVersion]:
+    """Every recorded change to the project's workflow, newest first."""
+    await _require_project(daemon, project_id)
+    return await repo.list_workflow_versions(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
     )
+
+
+@router.post("/projects/{project_id}/workflow/versions/{version_id}/revert")
+async def revert_workflow_version(
+    project_id: str,
+    version_id: str,
+    body: WorkflowDecisionInput | None = None,
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    """Restore the graph a version recorded (null: the derived pipeline) as a new ``revert``
+    version; history is never deleted."""
+    project = await _require_project(daemon, project_id)
+    version = await _require_workflow_version(daemon, project_id, version_id)
+    try:
+        return await revert_workflow(
+            daemon.db, daemon.bus, project, version, reason=body.reason if body else None
+        )
+    except ValueError as exc:
+        raise _invalid_config(exc) from exc
+
+
+@router.get("/projects/{project_id}/workflow/proposals")
+async def list_workflow_proposals(
+    project_id: str,
+    state: WorkflowProposalState | None = None,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
+) -> list[WorkflowProposal]:
+    """The evolver's workflow proposals, newest first, optionally in one state."""
+    await _require_project(daemon, project_id)
+    return await repo.list_workflow_proposals(
+        daemon.db, project_id, state=state, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+async def _decide_workflow_proposal(
+    daemon: Daemon,
+    project_id: str,
+    proposal_id: str,
+    body: WorkflowDecisionInput | None,
+    *,
+    approve: bool,
+) -> dict[str, Any]:
+    project = await _require_project(daemon, project_id)
+    proposal = await _require_workflow_proposal(daemon, project_id, proposal_id)
+    try:
+        return await decide_workflow_proposal(
+            daemon.db,
+            daemon.bus,
+            project,
+            proposal,
+            approve=approve,
+            reason=body.reason if body else None,
+        )
+    except WorkflowConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise _invalid_config(exc) from exc
+
+
+@router.post("/projects/{project_id}/workflow/proposals/{proposal_id}/approve")
+async def approve_workflow_proposal(
+    project_id: str,
+    proposal_id: str,
+    body: WorkflowDecisionInput | None = None,
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    """Apply a pending proposal as a ``proposal`` version; 409 when it is no longer pending
+    or the workflow changed since it was computed (run evolution again)."""
+    return await _decide_workflow_proposal(daemon, project_id, proposal_id, body, approve=True)
+
+
+@router.post("/projects/{project_id}/workflow/proposals/{proposal_id}/reject")
+async def reject_workflow_proposal(
+    project_id: str,
+    proposal_id: str,
+    body: WorkflowDecisionInput | None = None,
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    """Reject a pending proposal, recording the reason; the workflow is left as it is."""
+    return await _decide_workflow_proposal(daemon, project_id, proposal_id, body, approve=False)
 
 
 @router.post("/projects/{project_id}/mode")
@@ -1426,7 +1571,13 @@ async def install_store_item(
 
     if item.kind is StoreItemKind.workflow:
         try:
-            resolved = await save_project_config(daemon.db, project, {"workflow": item.payload})
+            resolved = await save_project_config(
+                daemon.db,
+                project,
+                {"workflow": item.payload},
+                workflow_source=WorkflowVersionSource.template,
+                workflow_reason=f"Store workflow installed: {item.name}",
+            )
         except ValueError as exc:
             raise _invalid_config(exc) from exc
         wf_dump = (resolved.workflow or build_default_workflow()).model_dump(mode="json")
@@ -1449,7 +1600,13 @@ async def install_store_item(
 
     if item.kind is StoreItemKind.config_preset:
         try:
-            resolved = await save_project_config(daemon.db, project, item.payload)
+            resolved = await save_project_config(
+                daemon.db,
+                project,
+                item.payload,
+                workflow_source=WorkflowVersionSource.template,
+                workflow_reason=f"Store config preset installed: {item.name}",
+            )
         except ValueError as exc:
             raise _invalid_config(exc) from exc
         updated_proj = await _require_project(daemon, project_id)

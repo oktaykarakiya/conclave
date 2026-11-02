@@ -219,6 +219,13 @@ class ExperimentalSettings(BaseModel):
         ),
     )
     post_mortem_enabled: bool = True
+    workflow_evolution: Literal["off", "suggest", "auto"] = Field(
+        default="suggest",
+        description=(
+            "What the evolver does after each task. suggest: store a proposal for a person to "
+            "approve; auto: apply the change (recorded as a workflow version); off: nothing."
+        ),
+    )
 
 
 class ContextSettings(BaseModel):

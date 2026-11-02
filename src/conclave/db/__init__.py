@@ -27,6 +27,11 @@ from .models import (
     TaskState,
     UsageRow,
     VerdictRow,
+    WorkflowConflictError,
+    WorkflowProposal,
+    WorkflowProposalState,
+    WorkflowVersion,
+    WorkflowVersionSource,
 )
 
 __all__ = [
@@ -53,5 +58,10 @@ __all__ = [
     "TaskState",
     "UsageRow",
     "VerdictRow",
+    "WorkflowConflictError",
+    "WorkflowProposal",
+    "WorkflowProposalState",
+    "WorkflowVersion",
+    "WorkflowVersionSource",
     "repositories",
 ]

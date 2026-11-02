@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "../api";
 import { WorkflowCanvas, autoLayoutWorkflow } from "../components/WorkflowCanvas";
@@ -6,14 +6,19 @@ import { diffConfig } from "../configDiff";
 import type {
   AgentPersona,
   EdgeCondition,
+  EventRow,
   NodeKind,
   OutputContract,
   StoreItem,
   WorkflowEdge,
   WorkflowGraph,
+  WorkflowChangeResult,
   WorkflowNode,
+  WorkflowProposal,
+  WorkflowVersion,
+  WorkflowVersionSource,
 } from "../types";
-import { Badge, Button, NODE_KIND_COLORS, Spinner, input } from "../ui";
+import { Badge, Button, NODE_KIND_COLORS, Spinner, fmtRelative, input } from "../ui";
 
 const BUILTIN_TEMPLATES: { id: string; label: string; hint: string }[] = [
   { id: "standard", label: "Standard", hint: "Plan → Develop → Review → Gate → Merge" },
@@ -59,6 +64,21 @@ const COMMON_TRIGGERS: string[] = [
 ];
 
 const EFFORT_TIERS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/** Events after which the History tab reloads its proposals and versions (never the canvas). */
+const HISTORY_EVENTS = new Set([
+  "workflow.updated",
+  "workflow.evolved",
+  "workflow.evolution_proposed",
+]);
+
+const VERSION_SOURCE_COLORS: Record<WorkflowVersionSource, string> = {
+  evolver: "bg-amber-950/80 text-amber-300 border border-amber-800/70",
+  operator: "bg-zinc-800 text-zinc-300 border border-zinc-700",
+  template: "bg-indigo-950/80 text-indigo-300 border border-indigo-800/70",
+  revert: "bg-sky-950/80 text-sky-300 border border-sky-800/70",
+  proposal: "bg-emerald-950/80 text-emerald-300 border border-emerald-800/70",
+};
 
 const AGENT_ROLES = [
   "planning",
@@ -116,7 +136,13 @@ function inferKindAndContract(role: string): {
   }
 }
 
-export function AgentStudioView({ projectId }: { projectId?: string | null }) {
+export function AgentStudioView({
+  projectId,
+  lastEvent = null,
+}: {
+  projectId?: string | null;
+  lastEvent?: EventRow | null;
+}) {
   const [graph, setGraph] = useState<WorkflowGraph | null>(null);
   const [isCustom, setIsCustom] = useState<boolean>(false);
   const [templates, setTemplates] = useState<Record<string, WorkflowGraph>>({});
@@ -132,9 +158,15 @@ export function AgentStudioView({ projectId }: { projectId?: string | null }) {
   const [connectingFromId, setConnectingFromId] = useState<string | null>(null);
 
   const [drawerOpen, setDrawerOpen] = useState<boolean>(true);
-  const [inspectorTab, setInspectorTab] = useState<"inspector" | "personas" | "store">(
-    "inspector",
-  );
+  const [inspectorTab, setInspectorTab] = useState<
+    "inspector" | "personas" | "store" | "history"
+  >("inspector");
+
+  // Workflow history (project only): pending evolver proposals and recorded versions
+  const [proposals, setProposals] = useState<WorkflowProposal[]>([]);
+  const [versions, setVersions] = useState<WorkflowVersion[]>([]);
+  const [historyBusyId, setHistoryBusyId] = useState<string | null>(null);
+  const historyRequest = useRef(0);
 
   // Status banners for workflow save, persona save, and agent override save
   const [dirty, setDirty] = useState<boolean>(false);
@@ -228,6 +260,39 @@ export function AgentStudioView({ projectId }: { projectId?: string | null }) {
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
+
+  const loadHistory = useCallback(async () => {
+    // Only the latest request may set state, so a slow reply never overwrites a newer one.
+    const request = ++historyRequest.current;
+    if (!projectId) {
+      setProposals([]);
+      setVersions([]);
+      return;
+    }
+    try {
+      const [pending, recorded] = await Promise.all([
+        api.listWorkflowProposals(projectId, "pending"),
+        api.listWorkflowVersions(projectId),
+      ]);
+      if (request !== historyRequest.current) return;
+      setProposals(pending);
+      setVersions(recorded);
+    } catch (e) {
+      if (request === historyRequest.current) {
+        setStatusMessage(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    void loadHistory();
+  }, [loadHistory]);
+
+  useEffect(() => {
+    if (!projectId || !lastEvent || !HISTORY_EVENTS.has(lastEvent.type)) return;
+    if (lastEvent.project_id && lastEvent.project_id !== projectId) return;
+    void loadHistory();
+  }, [lastEvent, projectId, loadHistory]);
 
   const selectedNode = useMemo<WorkflowNode | null>(() => {
     if (!graph || !selectedNodeId) return null;
@@ -533,6 +598,36 @@ export function AgentStudioView({ projectId }: { projectId?: string | null }) {
     }
   }
 
+  /**
+   * Run a History action (approve, reject, revert). A workflow it applies replaces the canvas
+   * graph, as switching templates does; the lists reload either way.
+   */
+  async function runHistoryAction(
+    busyId: string,
+    action: (pid: string) => Promise<WorkflowChangeResult>,
+  ) {
+    if (!projectId) return;
+    setHistoryBusyId(busyId);
+    setStatusMessage(null);
+    try {
+      const res = await action(projectId);
+      if (res.workflow) {
+        setGraph(res.workflow);
+        setIsCustom(Boolean(res.is_custom));
+        setSelectedNodeId(null);
+        setSelectedEdgeId(null);
+        setConnectingFromId(null);
+        setDirty(false);
+        setConfig(await api.getConfig(projectId));
+      }
+    } catch (e) {
+      setStatusMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHistoryBusyId(null);
+      await loadHistory();
+    }
+  }
+
   async function handlePublishWorkflowToStore() {
     if (!graph) return;
     setSaveStatus("saving");
@@ -759,6 +854,13 @@ export function AgentStudioView({ projectId }: { projectId?: string | null }) {
   }
 
   const activeTemplateId = graph.template_id ?? (isCustom ? "custom" : "standard");
+  const experimentalCfg = config.experimental;
+  const evolutionMode =
+    experimentalCfg &&
+    typeof experimentalCfg === "object" &&
+    "workflow_evolution" in experimentalCfg
+      ? String(experimentalCfg.workflow_evolution)
+      : "suggest";
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2.5">
@@ -964,6 +1066,20 @@ export function AgentStudioView({ projectId }: { projectId?: string | null }) {
               >
                 Store ({storeItems.length})
               </button>
+              {projectId && (
+                <button
+                  type="button"
+                  onClick={() => setInspectorTab("history")}
+                  title="Evolver proposals and the workflow's version history"
+                  className={`flex-1 border-b-2 py-2 text-xs font-semibold transition-colors ${
+                    inspectorTab === "history"
+                      ? "border-indigo-500 text-white"
+                      : "border-transparent text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  History{proposals.length > 0 ? ` (${proposals.length})` : ""}
+                </button>
+              )}
             </div>
 
             {/* Drawer Body */}
@@ -1760,6 +1876,160 @@ export function AgentStudioView({ projectId }: { projectId?: string | null }) {
                         </div>
                       </div>
                     ))}
+                  </div>
+                </div>
+              ) : inspectorTab === "history" && projectId ? (
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-zinc-300">
+                        Pending proposals
+                      </span>
+                      <span className="text-[11px] text-zinc-500">
+                        Evolution: {evolutionMode}
+                      </span>
+                    </div>
+                    {dirty && (
+                      <p className="text-[11px] text-amber-300/90">
+                        Approving or reverting replaces the unsaved changes on the canvas.
+                      </p>
+                    )}
+                    {proposals.length === 0 ? (
+                      <p className="text-[11px] text-zinc-500">
+                        No pending proposals. In suggest mode the evolver proposes changes here
+                        after tasks; nothing changes until you approve one.
+                      </p>
+                    ) : (
+                      proposals.map((proposal) => {
+                        const why = proposal.reason;
+                        const evidence = [
+                          why.task_id ? `task ${why.task_id.slice(0, 8)}` : null,
+                          why.catching_reviewers?.length
+                            ? `caught by ${why.catching_reviewers.join(", ")}`
+                            : null,
+                          why.gate_failed_after_review ? "gate failed after review" : null,
+                          why.action === "shrink" ? `${why.clean_streak ?? 0} clean tasks` : null,
+                        ].filter((part): part is string => part !== null);
+                        return (
+                          <div
+                            key={proposal.id}
+                            className="space-y-2 rounded-lg border border-zinc-800/90 bg-zinc-950/70 p-2.5"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <Badge
+                                text={why.action ?? "change"}
+                                color={
+                                  why.action === "grow"
+                                    ? "bg-amber-950/80 text-amber-300 border border-amber-800/70"
+                                    : "bg-sky-950/80 text-sky-300 border border-sky-800/70"
+                                }
+                              />
+                              <span
+                                className="text-[11px] text-zinc-500"
+                                title={proposal.created_at}
+                              >
+                                {fmtRelative(proposal.created_at)}
+                              </span>
+                            </div>
+                            {why.summary && (
+                              <p className="text-[11px] text-zinc-300">{why.summary}</p>
+                            )}
+                            {(why.changes ?? []).length > 0 && (
+                              <ul className="list-disc space-y-0.5 pl-4 font-mono text-[11px] text-zinc-400">
+                                {(why.changes ?? []).map((change, idx) => (
+                                  <li key={idx}>{change}</li>
+                                ))}
+                              </ul>
+                            )}
+                            {evidence.length > 0 && (
+                              <p className="text-[11px] text-zinc-500">
+                                Evidence: {evidence.join(" · ")}
+                              </p>
+                            )}
+                            {why.note && (
+                              <p className="text-[11px] text-zinc-400">Note: {why.note}</p>
+                            )}
+                            <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                              <Button
+                                size="sm"
+                                variant="primary"
+                                disabled={historyBusyId !== null}
+                                onClick={() =>
+                                  void runHistoryAction(proposal.id, (pid) =>
+                                    api.decideWorkflowProposal(pid, proposal.id, "approve"),
+                                  )
+                                }
+                                title="Apply this change to the project's workflow"
+                              >
+                                {historyBusyId === proposal.id ? "Working…" : "Approve"}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="danger"
+                                disabled={historyBusyId !== null}
+                                onClick={() =>
+                                  void runHistoryAction(proposal.id, (pid) =>
+                                    api.decideWorkflowProposal(pid, proposal.id, "reject"),
+                                  )
+                                }
+                              >
+                                Reject
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <div className="space-y-2">
+                    <span className="text-xs font-semibold text-zinc-300">Version history</span>
+                    {versions.length === 0 ? (
+                      <p className="text-[11px] text-zinc-500">
+                        No recorded changes yet. Every change to this workflow is recorded here
+                        and can be reverted.
+                      </p>
+                    ) : (
+                      versions.map((version) => (
+                        <div
+                          key={version.id}
+                          className="space-y-1.5 rounded-lg border border-zinc-800/90 bg-zinc-950/70 p-2.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <Badge
+                              text={version.source}
+                              color={VERSION_SOURCE_COLORS[version.source]}
+                            />
+                            <span
+                              className="text-[11px] text-zinc-500"
+                              title={version.created_at}
+                            >
+                              {fmtRelative(version.created_at)}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-zinc-300">{version.reason || "—"}</p>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate text-[11px] text-zinc-500">
+                              {version.graph_after
+                                ? `${version.graph_after.name} · ${version.graph_after.nodes.length} nodes`
+                                : "Derived pipeline (agents policy)"}
+                            </span>
+                            <Button
+                              size="sm"
+                              disabled={historyBusyId !== null}
+                              onClick={() =>
+                                void runHistoryAction(version.id, (pid) =>
+                                  api.revertWorkflowVersion(pid, version.id),
+                                )
+                              }
+                              title="Restore the graph this version recorded, as a new version"
+                            >
+                              {historyBusyId === version.id ? "Working…" : "Revert"}
+                            </Button>
+                          </div>
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
               ) : (

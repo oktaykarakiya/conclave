@@ -54,6 +54,7 @@ from .resolver import (
     resolve_project_config,
     save_global_config,
     save_project_config,
+    save_project_workflow,
     validate_unset_paths,
 )
 from .schema import agent_schema, config_schema, default_config_dict
@@ -108,6 +109,7 @@ __all__ = [
     "resolve_project_config",
     "save_global_config",
     "save_project_config",
+    "save_project_workflow",
     "validate_unset_paths",
     "workflow_templates",
 ]

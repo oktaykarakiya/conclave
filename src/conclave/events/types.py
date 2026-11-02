@@ -75,6 +75,7 @@ class EventType(StrEnum):
     project_deleted = "project.deleted"
     workflow_updated = "workflow.updated"
     workflow_evolved = "workflow.evolved"
+    workflow_evolution_proposed = "workflow.evolution_proposed"
     agent_upserted = "agent.upserted"
     agent_deleted = "agent.deleted"
     store_upserted = "store.upserted"

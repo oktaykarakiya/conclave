@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from ..config import WorkflowGraph
 from ..db import ProjectMode, StoreItemKind
+from ..engine.workflow_evolver import REASON_MAX_CHARS
 
 
 class ProjectCreate(BaseModel):
@@ -43,11 +44,42 @@ class ConfigPatch(BaseModel):
             "stored delta, so every project inherits the new global value."
         ),
     )
+    reason: str | None = Field(
+        default=None,
+        max_length=REASON_MAX_CHARS,
+        description="Recorded on the workflow version when this write changes a workflow.",
+    )
 
 
 class WorkflowUpdate(BaseModel):
     workflow: WorkflowGraph | None = None
     template_id: str | None = None
+    reason: str | None = Field(
+        default=None,
+        max_length=REASON_MAX_CHARS,
+        description="Recorded on the workflow version this change creates.",
+    )
+
+
+class WorkflowEvolveInput(BaseModel):
+    task_id: str | None = None
+    gate_failed_after_review: bool = False
+    task_failed: bool = False
+    apply: bool = Field(
+        default=False,
+        description="Apply the change now as a workflow version instead of following the mode.",
+    )
+    reason: str | None = Field(
+        default=None,
+        max_length=REASON_MAX_CHARS,
+        description="Recorded on the version when applied, else kept as the proposal's note.",
+    )
+
+
+class WorkflowDecisionInput(BaseModel):
+    """Optional body of a workflow revert or a proposal approve/reject."""
+
+    reason: str | None = Field(default=None, max_length=REASON_MAX_CHARS)
 
 
 class TaskCreate(BaseModel):

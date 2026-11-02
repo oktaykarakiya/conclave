@@ -39,6 +39,11 @@ from .models import (
     TaskOrigin,
     TaskState,
     VerdictRow,
+    WorkflowConflictError,
+    WorkflowProposal,
+    WorkflowProposalState,
+    WorkflowVersion,
+    WorkflowVersionSource,
     normalize_dict_keys,
 )
 from .planning_models import (
@@ -140,6 +145,199 @@ async def set_project_mode(db: Database, project_id: str, mode: ProjectMode) -> 
 
 async def delete_project(db: Database, project_id: str) -> None:
     await db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+
+# --- workflow versions & proposals --------------------------------------------
+
+
+def _graph_json(graph: dict[str, Any] | None) -> str | None:
+    """Canonical JSON of a workflow graph; ``None`` (the derived pipeline) stays SQL NULL."""
+    return None if graph is None else json.dumps(graph, sort_keys=True)
+
+
+async def update_project_with_workflow_version(
+    db: Database,
+    project_id: str,
+    *,
+    config: dict[str, Any],
+    source: WorkflowVersionSource,
+    reason: str,
+    graph_before: dict[str, Any] | None,
+    graph_after: dict[str, Any] | None,
+    name: str | None = None,
+    default_branch: str | None = None,
+    approves_proposal: str | None = None,
+    decision_reason: str | None = None,
+) -> WorkflowVersion:
+    """Store a project's config and the workflow version it creates, in one transaction.
+
+    With *approves_proposal*, that proposal is marked approved (pointing at the new version)
+    in the same transaction; when it is no longer pending nothing is written and
+    :class:`WorkflowConflictError` is raised. Only the config resolver calls this.
+    """
+    version = WorkflowVersion(
+        id=new_id(),
+        project_id=project_id,
+        created_at=now_iso(),
+        source=source,
+        reason=reason,
+        graph_after=graph_after,
+        graph_before=graph_before,
+    )
+    sets = ["config_json = ?"]
+    params: list[Any] = [json.dumps(normalize_dict_keys(config))]
+    if name is not None:
+        sets.append("name = ?")
+        params.append(name)
+    if default_branch is not None:
+        sets.append("default_branch = ?")
+        params.append(default_branch)
+    async with db.transaction() as conn:
+        await conn.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", (*params, project_id)
+        )
+        await conn.execute(
+            "INSERT INTO workflow_versions(id, project_id, created_at, source, reason, "
+            "graph_after_json, graph_before_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                version.id,
+                project_id,
+                version.created_at,
+                source.value,
+                reason,
+                _graph_json(graph_after),
+                _graph_json(graph_before),
+            ),
+        )
+        if approves_proposal is not None:
+            cur = await conn.execute(
+                "UPDATE workflow_proposals SET state = ?, decided_at = ?, decision_reason = ?, "
+                "version_id = ? WHERE id = ? AND project_id = ? AND state = ?",
+                (
+                    WorkflowProposalState.approved.value,
+                    version.created_at,
+                    decision_reason,
+                    version.id,
+                    approves_proposal,
+                    project_id,
+                    WorkflowProposalState.pending.value,
+                ),
+            )
+            if cur.rowcount == 0:
+                raise WorkflowConflictError(
+                    f"workflow proposal {approves_proposal} is no longer pending"
+                )
+    return version
+
+
+async def get_workflow_version(db: Database, version_id: str) -> WorkflowVersion | None:
+    row = await db.fetchone("SELECT * FROM workflow_versions WHERE id = ?", (version_id,))
+    return WorkflowVersion.from_row(row) if row else None
+
+
+async def list_workflow_versions(
+    db: Database, project_id: str, *, limit: int = 50, offset: int = 0
+) -> list[WorkflowVersion]:
+    """A project's workflow versions, newest first."""
+    rows = await db.fetchall(
+        "SELECT * FROM workflow_versions WHERE project_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+        (project_id, limit, offset),
+    )
+    return [WorkflowVersion.from_row(r) for r in rows]
+
+
+async def add_workflow_proposal(
+    db: Database,
+    *,
+    project_id: str,
+    reason: dict[str, Any],
+    proposed_graph: dict[str, Any],
+    base_graph: dict[str, Any],
+) -> tuple[WorkflowProposal, bool]:
+    """Store a pending proposal unless an identical one (same proposed and base graph) is
+    pending already. Returns ``(proposal, created)``; the check and insert are atomic."""
+    proposed_json = json.dumps(proposed_graph, sort_keys=True)
+    base_json = json.dumps(base_graph, sort_keys=True)
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM workflow_proposals WHERE project_id = ? AND state = ? "
+            "AND proposed_graph_json = ? AND base_graph_json = ? ORDER BY created_at LIMIT 1",
+            (project_id, WorkflowProposalState.pending.value, proposed_json, base_json),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return WorkflowProposal.from_row(row), False
+        proposal = WorkflowProposal(
+            id=new_id(),
+            project_id=project_id,
+            created_at=now_iso(),
+            reason=reason,
+            proposed_graph=proposed_graph,
+            base_graph=base_graph,
+        )
+        await conn.execute(
+            "INSERT INTO workflow_proposals(id, project_id, created_at, state, reason_json, "
+            "proposed_graph_json, base_graph_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                proposal.id,
+                project_id,
+                proposal.created_at,
+                proposal.state.value,
+                json.dumps(reason),
+                proposed_json,
+                base_json,
+            ),
+        )
+    return proposal, True
+
+
+async def get_workflow_proposal(db: Database, proposal_id: str) -> WorkflowProposal | None:
+    row = await db.fetchone("SELECT * FROM workflow_proposals WHERE id = ?", (proposal_id,))
+    return WorkflowProposal.from_row(row) if row else None
+
+
+async def list_workflow_proposals(
+    db: Database,
+    project_id: str,
+    *,
+    state: WorkflowProposalState | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[WorkflowProposal]:
+    """A project's workflow proposals, newest first, optionally in one state."""
+    if state is None:
+        rows = await db.fetchall(
+            "SELECT * FROM workflow_proposals WHERE project_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            (project_id, limit, offset),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT * FROM workflow_proposals WHERE project_id = ? AND state = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            (project_id, state.value, limit, offset),
+        )
+    return [WorkflowProposal.from_row(r) for r in rows]
+
+
+async def reject_workflow_proposal(
+    db: Database, proposal_id: str, *, decision_reason: str | None
+) -> bool:
+    """Mark a pending proposal rejected; ``False`` when it is no longer pending."""
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE workflow_proposals SET state = ?, decided_at = ?, decision_reason = ? "
+            "WHERE id = ? AND state = ?",
+            (
+                WorkflowProposalState.rejected.value,
+                now_iso(),
+                decision_reason,
+                proposal_id,
+                WorkflowProposalState.pending.value,
+            ),
+        )
+        return cur.rowcount > 0
 
 
 # --- tasks ------------------------------------------------------------------

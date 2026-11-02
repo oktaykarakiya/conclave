@@ -19,6 +19,9 @@ from conclave.db import (
     ProjectMode,
     TaskOrigin,
     TaskState,
+    WorkflowConflictError,
+    WorkflowProposalState,
+    WorkflowVersionSource,
 )
 from conclave.db import repositories as repo
 from conclave.db.migrations import MIGRATIONS, Migration
@@ -88,10 +91,77 @@ async def _seed_candidate(
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 13
+    assert version == 14
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 13
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 14
+
+
+async def test_migration_14_adds_workflow_history_that_cascades_with_its_project(
+    db: Database,
+) -> None:
+    tables = {
+        r["name"]
+        for r in await db.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert {"workflow_versions", "workflow_proposals"} <= tables
+    applied = await db.fetchall("SELECT version, name FROM schema_version WHERE version = 14")
+    assert [(r[0], r[1]) for r in applied] == [(14, "workflow_versions_and_proposals")]
+
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    graph = {"version": 1, "nodes": [], "edges": []}
+    version = await repo.update_project_with_workflow_version(
+        db,
+        p.id,
+        config={"workflow": graph},
+        source=WorkflowVersionSource.operator,
+        reason="pin it",
+        graph_before=None,
+        graph_after=graph,
+    )
+    assert await repo.get_workflow_version(db, version.id) == version
+    proposal, created = await repo.add_workflow_proposal(
+        db, project_id=p.id, reason={"action": "grow"}, proposed_graph=graph, base_graph=graph
+    )
+    assert created and await repo.get_workflow_proposal(db, proposal.id) == proposal
+
+    await repo.delete_project(db, p.id)
+    assert await db.fetchval("SELECT COUNT(*) FROM workflow_versions") == 0
+    assert await db.fetchval("SELECT COUNT(*) FROM workflow_proposals") == 0
+
+
+async def test_approving_a_proposal_that_is_no_longer_pending_writes_nothing(
+    db: Database,
+) -> None:
+    """The version, the project row and the proposal's decision land in one transaction."""
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    graph = {"version": 2, "nodes": [], "edges": []}
+    proposal, _ = await repo.add_workflow_proposal(
+        db, project_id=p.id, reason={}, proposed_graph=graph, base_graph={"version": 1}
+    )
+    assert await repo.reject_workflow_proposal(db, proposal.id, decision_reason="no")
+    assert not await repo.reject_workflow_proposal(db, proposal.id, decision_reason="again")
+
+    with pytest.raises(WorkflowConflictError):
+        await repo.update_project_with_workflow_version(
+            db,
+            p.id,
+            config={"workflow": graph},
+            source=WorkflowVersionSource.proposal,
+            reason="approve",
+            graph_before=None,
+            graph_after=graph,
+            approves_proposal=proposal.id,
+        )
+    assert await repo.list_workflow_versions(db, p.id) == []
+    assert (await repo.get_project(db, p.id)) == p
+    decided = await repo.get_workflow_proposal(db, proposal.id)
+    assert decided is not None
+    assert (decided.state, decided.decision_reason, decided.version_id) == (
+        WorkflowProposalState.rejected,
+        "no",
+        None,
+    )
 
 
 async def test_migration_failure_is_atomic(
@@ -102,12 +172,12 @@ async def test_migration_failure_is_atomic(
 
     Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
     replays the same migration and wedges on a duplicate-column error. The fixture DB is
-    already at version 13; we inject a v14 migration whose first statement succeeds (creates
+    already at version 14; we inject a v15 migration whose first statement succeeds (creates
     a probe table) and whose second fails — ``stabilization_reason`` was already added by
     migration 7, so re-adding it raises a duplicate-column error — which is exactly that wedge.
     """
     failing = Migration(
-        version=14,
+        version=15,
         name="injected_failure",
         sql=(
             "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
@@ -120,7 +190,7 @@ async def test_migration_failure_is_atomic(
         await db._apply_migrations()
 
     # Version did not advance past the last good migration...
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 13
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 14
     # ...and the partial DDL (the probe table from the first statement) was rolled back.
     assert (
         await db.fetchval(
@@ -133,12 +203,12 @@ async def test_migration_failure_is_atomic(
 async def test_migration_8_bug_candidate_ledger_schema(db: Database) -> None:
     """Migration 8 reshapes bug_candidates into the 7-state ledger and extends coverage.
 
-    A fresh DB is at version 13. The old two-field status model (status DEFAULT 'candidate'
+    A fresh DB is at version 14. The old two-field status model (status DEFAULT 'candidate'
     plus a separate ``reproduced`` boolean) is gone, replaced by a single permissive
     ``status`` TEXT defaulting to 'discovered', alongside the reproduction/consensus columns;
     coverage gains priority + examined_count.
     """
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 13
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 14
 
     cols = {r["name"]: r for r in await db.fetchall("PRAGMA table_info(bug_candidates)")}
     # New columns are present...
@@ -220,7 +290,7 @@ async def test_migration_8_recreates_seeded_bug_candidates(
         monkeypatch.setattr("conclave.db.database.MIGRATIONS", MIGRATIONS)
         await database._apply_migrations()
 
-        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 13
+        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 14
         v8_cols = {
             r["name"] for r in await database.fetchall("PRAGMA table_info(bug_candidates)")
         }

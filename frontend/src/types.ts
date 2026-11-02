@@ -206,6 +206,58 @@ export interface WorkflowEnvelope {
   templates: Record<string, WorkflowGraph>;
 }
 
+/** What made a recorded workflow change (mirrors the backend `WorkflowVersionSource`). */
+export type WorkflowVersionSource = "evolver" | "operator" | "template" | "revert" | "proposal";
+
+/** One recorded change to a project's workflow; a null graph is the derived pipeline. */
+export interface WorkflowVersion {
+  id: string;
+  project_id: string;
+  created_at: string;
+  source: WorkflowVersionSource;
+  reason: string;
+  graph_after: WorkflowGraph | null;
+  graph_before: WorkflowGraph | null;
+}
+
+export type WorkflowProposalState = "pending" | "approved" | "rejected";
+
+/** Why the evolver proposes a change, with the evidence it used. */
+export interface WorkflowProposalReason {
+  action?: string;
+  summary?: string;
+  changes?: string[];
+  promoted_agents?: string[];
+  demoted_agents?: string[];
+  task_id?: string | null;
+  catching_reviewers?: string[];
+  task_failed?: boolean;
+  gate_failed_after_review?: boolean;
+  clean_streak?: number;
+  note?: string;
+}
+
+/** A workflow change the evolver suggests, computed from `base_graph`. */
+export interface WorkflowProposal {
+  id: string;
+  project_id: string;
+  created_at: string;
+  state: WorkflowProposalState;
+  reason: WorkflowProposalReason;
+  proposed_graph: WorkflowGraph;
+  base_graph: WorkflowGraph;
+  decided_at: string | null;
+  decision_reason: string | null;
+  version_id: string | null;
+}
+
+/** Result of approving a proposal or reverting to a version. */
+export interface WorkflowChangeResult {
+  version: WorkflowVersion | null;
+  workflow?: WorkflowGraph;
+  is_custom?: boolean;
+}
+
 export interface AgentPersona {
   id: string;
   project_id: string | null;

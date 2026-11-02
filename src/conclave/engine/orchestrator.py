@@ -1571,6 +1571,8 @@ class Orchestrator:
                 self._node_steers.pop(k, None)
             for k in [k for k in self._approval_resolutions if k[0] == task.id]:
                 self._approval_resolutions.pop(k, None)
+            # experimental.workflow_evolution decides: off skips this, suggest (default) stores a
+            # proposal, auto applies the change as a workflow version.
             with contextlib.suppress(Exception):
                 await evolve_project_workflow(
                     self._db,
@@ -1578,6 +1580,7 @@ class Orchestrator:
                     project.id,
                     task_id=task.id,
                     gate_failed_after_review=gate_failed_after_review,
+                    automatic=True,
                 )
             # Prune events/baselines unconditionally — every processed task, regardless of
             # outcome (success/failure/cancel/exception) and crucially even for projects with

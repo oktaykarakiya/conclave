@@ -14,7 +14,8 @@ whole. A project stores only its delta — the keys whose value differs from wha
 from built-in + global + its branch — so later global and built-in changes keep reaching it,
 and the effective ``execution.target_branch`` is the branch its tasks really merge into. Every
 project config read and write goes through this module (:func:`resolve_project_config`,
-:func:`save_project_config`, :func:`create_project_with_config`, :func:`save_global_config`).
+:func:`save_project_config`, :func:`save_project_workflow`, :func:`create_project_with_config`,
+:func:`save_global_config`), and a write that changes a project's workflow records a version.
 
 This mirrors team-ai's ``models.overrides.{agent}`` → ``models.default`` semantics,
 but fully typed and validated.
@@ -25,6 +26,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+from pydantic import ValidationError
+
+from .graph import WorkflowGraph
 from .models import (
     AgentSettings,
     BugFixerSessionConfig,
@@ -35,7 +39,7 @@ from .models import (
 if TYPE_CHECKING:
     # Only for annotations: the db layer ranks above config (hot reload, migrations), so the
     # DB-aware functions below import it inside their bodies.
-    from ..db import Database, Project
+    from ..db import Database, Project, WorkflowVersion, WorkflowVersionSource
 
 # Safety floor: these are always protected regardless of project config. Users may
 # ADD protected paths via config but can never remove these (closes a team-ai footgun).
@@ -47,6 +51,9 @@ GLOBAL_DEFAULTS_PRESET = "global-defaults"
 
 # Top-level keys merged, compared and unset whole rather than key by key.
 _WHOLE_KEYS = frozenset({"workflow"})
+
+# Reason recorded on a workflow version when the write's caller gave none.
+_DEFAULT_WORKFLOW_REASON = "project settings saved"
 
 
 def _unquote_key(k: str) -> str:
@@ -275,6 +282,31 @@ def apply_global_overrides(
     return load_layered_config(payload), payload
 
 
+def _stored_workflow(
+    global_overrides: dict[str, Any] | None, stored: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The workflow a project gets from its stored layers (its own, else the global one), as
+    a graph dump; ``None`` is the derived pipeline.
+
+    Read from the workflow layers alone rather than by resolving the whole config, so a write
+    that repairs an invalid stored layer still works; a workflow that does not validate is
+    kept as stored.
+    """
+    for layer in (stored, global_overrides):
+        norm_layer: dict[str, Any] = normalize_config_keys(layer or {})
+        if "workflow" in norm_layer:
+            raw = norm_layer["workflow"]
+            break
+    else:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return WorkflowGraph.model_validate(raw).model_dump(mode="json")
+    except ValidationError:
+        return raw
+
+
 def _target_branch(layer: dict[str, Any] | None) -> str:
     execution = (layer or {}).get("execution")
     raw = execution.get("target_branch") if isinstance(execution, dict) else None
@@ -318,6 +350,59 @@ async def resolve_project_config(db: Database, project: Project | None) -> Concl
     )
 
 
+async def _write_project_config(
+    db: Database,
+    project: Project,
+    patch: dict[str, Any] | None,
+    *,
+    unset: Iterable[str] = (),
+    name: str | None = None,
+    default_branch: str | None = None,
+    workflow_source: WorkflowVersionSource | None = None,
+    workflow_reason: str | None = None,
+    approves_proposal: str | None = None,
+    decision_reason: str | None = None,
+) -> tuple[ConclaveConfig, WorkflowVersion | None]:
+    """The one write of a project's stored layer, so no path can skip workflow versioning.
+
+    Stores the minimal delta and, when the write changes the project's effective workflow, a
+    version (the graph before and after it) in the same transaction; with
+    *approves_proposal* that proposal is marked approved in it too.
+    """
+    from ..db import WorkflowVersionSource
+    from ..db import repositories as repo
+
+    global_overrides = await load_global_overrides(db)
+    effective, delta = apply_project_overrides(
+        global_overrides,
+        project.config,
+        patch,
+        unset,
+        default_branch=default_branch or project.default_branch,
+    )
+    before = _stored_workflow(global_overrides, project.config)
+    after = None if effective.workflow is None else effective.workflow.model_dump(mode="json")
+    if before == after and approves_proposal is None:
+        await repo.update_project(
+            db, project.id, name=name, default_branch=default_branch, config=delta
+        )
+        return effective, None
+    version = await repo.update_project_with_workflow_version(
+        db,
+        project.id,
+        config=delta,
+        name=name,
+        default_branch=default_branch,
+        source=workflow_source or WorkflowVersionSource.operator,
+        reason=workflow_reason or _DEFAULT_WORKFLOW_REASON,
+        graph_before=before,
+        graph_after=after,
+        approves_proposal=approves_proposal,
+        decision_reason=decision_reason,
+    )
+    return effective, version
+
+
 async def save_project_config(
     db: Database,
     project: Project,
@@ -326,26 +411,56 @@ async def save_project_config(
     unset: Iterable[str] = (),
     name: str | None = None,
     default_branch: str | None = None,
+    workflow_source: WorkflowVersionSource | None = None,
+    workflow_reason: str | None = None,
 ) -> ConclaveConfig:
     """Apply a write to *project*, store its minimal delta, and return the effective config.
 
     Bad input raises ``ValueError`` before anything is written (see
     :func:`apply_project_overrides`). *name* / *default_branch* update those columns too; the
-    delta is taken against the branch the project has after the write.
+    delta is taken against the branch the project has after the write. A write that changes
+    the project's workflow records a version: *workflow_source* (default ``operator``) and
+    *workflow_reason* describe it.
     """
-    from ..db import repositories as repo
-
-    effective, delta = apply_project_overrides(
-        await load_global_overrides(db),
-        project.config,
+    effective, _ = await _write_project_config(
+        db,
+        project,
         patch,
-        unset,
-        default_branch=default_branch or project.default_branch,
-    )
-    await repo.update_project(
-        db, project.id, name=name, default_branch=default_branch, config=delta
+        unset=unset,
+        name=name,
+        default_branch=default_branch,
+        workflow_source=workflow_source,
+        workflow_reason=workflow_reason,
     )
     return effective
+
+
+async def save_project_workflow(
+    db: Database,
+    project: Project,
+    workflow: dict[str, Any] | None,
+    *,
+    source: WorkflowVersionSource,
+    reason: str,
+    approves_proposal: str | None = None,
+    decision_reason: str | None = None,
+) -> tuple[ConclaveConfig, WorkflowVersion | None]:
+    """Replace *project*'s workflow (``None`` derives it from the agents policy, even over a
+    global custom workflow).
+
+    Returns ``(effective config, version)``; the version is ``None`` when the workflow did
+    not change. With *approves_proposal*, that pending proposal is marked approved in the same
+    transaction (:class:`~conclave.db.WorkflowConflictError` when it is no longer pending).
+    """
+    return await _write_project_config(
+        db,
+        project,
+        {"workflow": workflow},
+        workflow_source=source,
+        workflow_reason=reason,
+        approves_proposal=approves_proposal,
+        decision_reason=decision_reason,
+    )
 
 
 async def create_project_with_config(
@@ -373,6 +488,7 @@ async def save_global_config(
     *,
     unset: Iterable[str] = (),
     apply_to_all_projects: bool = False,
+    workflow_reason: str | None = None,
 ) -> tuple[ConclaveConfig, list[Project]]:
     """Apply a write to the global layer; return ``(resolved global config, updated projects)``.
 
@@ -381,7 +497,8 @@ async def save_global_config(
     With *apply_to_all_projects* every patched and unset key is also removed from each
     project's stored delta, so the new global value reaches every project; a patched
     ``execution.target_branch`` also becomes each project's ``default_branch``. Every new
-    delta is validated before the first write, so a bad input changes nothing.
+    delta is validated before the first write, so a bad input changes nothing. A project
+    whose own workflow this removes records a version (reason *workflow_reason*).
     """
     from ..db import StoreItemKind
     from ..db import repositories as repo
@@ -416,7 +533,13 @@ async def save_global_config(
     )
     updated: list[Project] = []
     for proj in projects:
-        await save_project_config(db, proj, unset=cleared, default_branch=new_branch or None)
+        await save_project_config(
+            db,
+            proj,
+            unset=cleared,
+            default_branch=new_branch or None,
+            workflow_reason=workflow_reason or "global settings applied to all projects",
+        )
         fresh = await repo.get_project(db, proj.id)
         if fresh is not None:
             updated.append(fresh)

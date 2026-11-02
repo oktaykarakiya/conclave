@@ -27,6 +27,7 @@ from ..config import (
     resolve_project_config,
     save_global_config,
     save_project_config,
+    save_project_workflow,
     workflow_templates,
 )
 from ..db import (
@@ -37,6 +38,10 @@ from ..db import (
     StoreItemKind,
     Task,
     TaskState,
+    WorkflowProposal,
+    WorkflowProposalState,
+    WorkflowVersion,
+    WorkflowVersionSource,
 )
 from ..db import repositories as repo
 from ..engine.compactor import compact_planning_session_context, compact_task_context
@@ -47,7 +52,12 @@ from ..engine.task_diff import (
     compute_task_diff,
 )
 from ..engine.task_merge import TaskMergeError, merge_task
-from ..engine.workflow_evolver import evolve_project_workflow
+from ..engine.workflow_evolver import (
+    REASON_MAX_CHARS,
+    decide_workflow_proposal,
+    evolve_project_workflow,
+    revert_workflow,
+)
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..providers import engine_status
@@ -150,6 +160,18 @@ def _opt_bool(args: dict[str, Any], key: str, default: bool) -> bool:
     return bool(val)
 
 
+def _opt_reason(args: dict[str, Any]) -> str | None:
+    """The optional ``reason`` argument verbatim; ``None`` when absent or blank."""
+    val = args.get("reason")
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise McpToolError("reason must be a string")
+    if len(val) > REASON_MAX_CHARS:
+        raise McpToolError(f"reason must be at most {REASON_MAX_CHARS} characters")
+    return val if val.strip() else None
+
+
 def _prop(
     typ: str,
     description: str,
@@ -181,6 +203,11 @@ def _tool(
         },
     }
 
+
+_VERSION_REASON = (
+    "Optional reason recorded on the workflow version this change creates "
+    f"(at most {REASON_MAX_CHARS} characters)."
+)
 
 MCP_TOOLS: list[dict[str, Any]] = [
     # --- Projects & Worker Control ---
@@ -356,6 +383,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "cross_attempt_memory_entries": _prop(
                 "integer", "Optional max cross-attempt memory entries (0-50)."
             ),
+            "workflow_evolution": _prop(
+                "string",
+                "Optional workflow evolution after each task: suggest (default; store a proposal "
+                "to approve or reject), auto (apply it, recorded as a workflow version) or off.",
+                enum=["off", "suggest", "auto"],
+            ),
             "webhook_url": _prop("string", "Optional terminal notification webhook URL."),
             "context": {
                 "type": "object",
@@ -418,6 +451,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "project's stored delta, so every project inherits the new global value (a "
                 "patched target_branch also becomes each project's default_branch).",
                 default=False,
+            ),
+            "reason": _prop(
+                "string",
+                "Optional reason recorded on the workflow version when this write changes a "
+                "project's workflow (at most 2000 characters).",
             ),
         },
     ),
@@ -630,6 +668,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "Template identifier.",
                 enum=["standard", "fast_track", "tdd_loop", "deep_audit"],
             ),
+            "reason": _prop("string", _VERSION_REASON),
         },
         required=["project_id", "template_id"],
     ),
@@ -639,6 +678,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
         {
             "project_id": _prop("string", "Project ID."),
             "workflow": {"type": "object", "description": "Full WorkflowGraph JSON object."},
+            "reason": _prop("string", _VERSION_REASON),
         },
         required=["project_id", "workflow"],
     ),
@@ -705,6 +745,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "Alias for pause_after: wait for human approval after this node finishes.",
                 default=False,
             ),
+            "reason": _prop("string", _VERSION_REASON),
         },
         required=["project_id", "id", "kind"],
     ),
@@ -714,6 +755,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
         {
             "project_id": _prop("string", "Project ID."),
             "node_id": _prop("string", "Node ID to remove."),
+            "reason": _prop("string", _VERSION_REASON),
         },
         required=["project_id", "node_id"],
     ),
@@ -737,6 +779,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "If True, pause on this connector for Human-in-the-Loop approval before advancing.",
                 default=False,
             ),
+            "reason": _prop("string", _VERSION_REASON),
         },
         required=["project_id", "source", "target"],
     ),
@@ -748,6 +791,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "edge_id": _prop("string", "Edge ID to remove (optional if source+target given)."),
             "source": _prop("string", "Source node ID (optional if edge_id given)."),
             "target": _prop("string", "Target node ID (optional if edge_id given)."),
+            "reason": _prop("string", _VERSION_REASON),
         },
         required=["project_id"],
     ),
@@ -1103,12 +1147,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_evolve_workflow",
-        "Longitudinally evolve a project's workflow graph based on historical verdicts, "
-        "gate outcomes, and clean task streaks (growing on failures/catches, shrinking "
-        "zero-catch non-core reviewers after >= 3 clean done tasks).",
+        "Evolve a project's workflow graph from historical verdicts, gate outcomes, and clean "
+        "task streaks (growing on failures/catches, shrinking zero-catch non-core reviewers "
+        "after >= 3 clean done tasks), as experimental.workflow_evolution says: suggest "
+        "(default) stores a proposal and returns it, auto applies the change as a workflow "
+        "version, off only previews it. apply=true applies it now as your decision.",
         {
             "project_id": _prop("string", "Project ID."),
-            "task_id": _prop("string", "Optional task ID to evaluate."),
+            "task_id": _prop("string", "Optional ID of a task of this project to evaluate."),
             "gate_failed_after_review": _prop(
                 "boolean",
                 "Whether the green-gate failed after reviewers passed.",
@@ -1119,8 +1165,83 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "Whether the task failed.",
                 default=False,
             ),
+            "apply": _prop(
+                "boolean",
+                "Apply the change now, whatever the mode (a workflow version with source "
+                "operator).",
+                default=False,
+            ),
+            "reason": _prop(
+                "string",
+                "Optional reason recorded on the version when applied, else kept as the "
+                "proposal's note (at most 2000 characters).",
+            ),
         },
         required=["project_id"],
+    ),
+    _tool(
+        "conclave_list_workflow_versions",
+        "List the recorded changes to a project's workflow, newest first: source (evolver, "
+        "operator, template, revert, proposal), reason, time, and the graph after and before "
+        "each change (null: the pipeline derived from the agents policy).",
+        {
+            "project_id": _prop("string", "Project ID."),
+            "limit": _prop("integer", "Max versions to return (1-500, default 50).", default=50),
+        },
+        required=["project_id"],
+    ),
+    _tool(
+        "conclave_revert_workflow",
+        "Restore the graph a workflow version recorded after its change (null restores the "
+        "derived pipeline) as a new revert version. History is never deleted; restoring the "
+        "graph the project already has changes nothing (changed: false).",
+        {
+            "project_id": _prop("string", "Project ID."),
+            "version_id": _prop(
+                "string", "Workflow version ID from conclave_list_workflow_versions."
+            ),
+            "reason": _prop(
+                "string",
+                "Optional reason recorded on the revert version (at most 2000 characters).",
+            ),
+        },
+        required=["project_id", "version_id"],
+    ),
+    _tool(
+        "conclave_list_workflow_proposals",
+        "List the workflow evolver's proposals for a project, newest first: the reason "
+        "(action, summary, changes, promoted/demoted agents, task_id, catching reviewers), the "
+        "proposed graph, the base graph it was computed from, the state and the decision.",
+        {
+            "project_id": _prop("string", "Project ID."),
+            "state": _prop(
+                "string",
+                "Optional state filter.",
+                enum=["pending", "approved", "rejected"],
+            ),
+            "limit": _prop("integer", "Max proposals to return (1-500, default 50).", default=50),
+        },
+        required=["project_id"],
+    ),
+    _tool(
+        "conclave_decide_workflow_proposal",
+        "Approve or reject a pending workflow proposal. approve applies its graph as a "
+        "proposal version, and is refused when the workflow changed since the proposal was "
+        "computed (reject it and run conclave_evolve_workflow again); reject leaves the "
+        "workflow as it is.",
+        {
+            "project_id": _prop("string", "Project ID."),
+            "proposal_id": _prop(
+                "string", "Proposal ID from conclave_list_workflow_proposals."
+            ),
+            "decision": _prop("string", "approve or reject.", enum=["approve", "reject"]),
+            "reason": _prop(
+                "string",
+                "Optional decision reason, also recorded on the version when approving (at "
+                "most 2000 characters).",
+            ),
+        },
+        required=["project_id", "proposal_id", "decision"],
     ),
     # --- Pilot Guide ---
     _tool(
@@ -1165,9 +1286,16 @@ async def _resolve_active_workflow(daemon: Daemon, project: Project) -> Workflow
     )
 
 
-async def _save_workflow(daemon: Daemon, project: Project, graph: WorkflowGraph) -> dict[str, Any]:
-    resolved = await save_project_config(
-        daemon.db, project, {"workflow": graph.model_dump(mode="json")}
+async def _save_workflow(
+    daemon: Daemon, project: Project, graph: WorkflowGraph, reason: str
+) -> dict[str, Any]:
+    """Store an operator's edit of the whole graph (recorded as a workflow version)."""
+    resolved, _ = await save_project_workflow(
+        daemon.db,
+        project,
+        graph.model_dump(mode="json"),
+        source=WorkflowVersionSource.operator,
+        reason=reason,
     )
     active = resolved.workflow or graph
     wf_payload: dict[str, Any] = {
@@ -1186,6 +1314,28 @@ async def _save_workflow(daemon: Daemon, project: Project, graph: WorkflowGraph)
         payload={"project": updated_proj.model_dump(mode="json")},
     )
     return wf_payload
+
+
+async def _require_workflow_version(
+    daemon: Daemon, project: Project, version_id: str
+) -> WorkflowVersion:
+    if not version_id:
+        raise McpToolError("version_id is required")
+    version = await repo.get_workflow_version(daemon.db, version_id)
+    if version is None or version.project_id != project.id:
+        raise McpToolError(f"workflow version not found: {version_id}")
+    return version
+
+
+async def _require_workflow_proposal(
+    daemon: Daemon, project: Project, proposal_id: str
+) -> WorkflowProposal:
+    if not proposal_id:
+        raise McpToolError("proposal_id is required")
+    proposal = await repo.get_workflow_proposal(daemon.db, proposal_id)
+    if proposal is None or proposal.project_id != project.id:
+        raise McpToolError(f"workflow proposal not found: {proposal_id}")
+    return proposal
 
 
 async def _emit_projects_updated(daemon: Daemon, projects: list[Project]) -> None:
@@ -1398,6 +1548,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             "persistent_baseline_cache",
             "auto_planner_char_threshold",
             "cross_attempt_memory_entries",
+            "workflow_evolution",
         ):
             if exp_key in args and args[exp_key] is not None:
                 exp_patch[exp_key] = args[exp_key]
@@ -1434,6 +1585,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
         if not patch and not new_branch and not new_name and not unset_paths:
             raise McpToolError("config object, unset paths or setting fields are required")
+        patch_reason = _opt_reason(args)
 
         if not raw_pid or raw_pid in ("global", "default", "defaults", "*"):
             resolved_global, updated_projects = await save_global_config(
@@ -1441,6 +1593,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 patch,
                 unset=unset_paths,
                 apply_to_all_projects=_opt_bool(args, "apply_to_all_projects", False),
+                workflow_reason=patch_reason,
             )
             await _emit_projects_updated(daemon, updated_projects)
             return resolved_global.model_dump(mode="json")
@@ -1457,6 +1610,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             unset=unset_paths,
             name=new_name or project.name,
             default_branch=new_branch or project.default_branch,
+            workflow_reason=patch_reason or "config patch",
         )
         updated_proj = await _require_project(daemon, project.id)
         resolved_json = resolved.model_dump(mode="json")
@@ -1878,8 +2032,12 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             raise McpToolError(f"unknown template_id: {template_id}")
         wf_dump = templates[template_id].model_dump(mode="json")
         # "standard" derives the graph from the agents policy, even over a global workflow.
-        await save_project_config(
-            daemon.db, project, {"workflow": None if template_id == "standard" else wf_dump}
+        await save_project_workflow(
+            daemon.db,
+            project,
+            None if template_id == "standard" else wf_dump,
+            source=WorkflowVersionSource.template,
+            reason=_opt_reason(args) or f"template applied: {template_id}",
         )
         updated_proj = await _require_project(daemon, project.id)
         await daemon.bus.emit(
@@ -1907,7 +2065,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         if not isinstance(wf_raw, dict):
             raise McpToolError("workflow must be a JSON object")
         graph = WorkflowGraph.model_validate(wf_raw)
-        return await _save_workflow(daemon, project, graph)
+        return await _save_workflow(
+            daemon, project, graph, _opt_reason(args) or "workflow replaced"
+        )
 
     if name in ("conclave_workflow_upsert_node", "conclave_upsert_workflow_node"):
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -2038,7 +2198,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             nodes=nodes,
             edges=current.edges,
         )
-        return await _save_workflow(daemon, project, updated_graph)
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"node upserted: {node_id}"
+        )
 
     if name in ("conclave_workflow_remove_node", "conclave_remove_workflow_node"):
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -2057,7 +2219,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             nodes=nodes,
             edges=edges,
         )
-        return await _save_workflow(daemon, project, updated_graph)
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"node removed: {node_id}"
+        )
 
     if name in ("conclave_workflow_upsert_edge", "conclave_upsert_workflow_edge"):
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -2093,7 +2257,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             nodes=current.nodes,
             edges=edges,
         )
-        return await _save_workflow(daemon, project, updated_graph)
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"edge upserted: {edge_id}"
+        )
 
     if name in ("conclave_workflow_remove_edge", "conclave_remove_workflow_edge"):
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -2118,7 +2284,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             nodes=current.nodes,
             edges=edges,
         )
-        return await _save_workflow(daemon, project, updated_graph)
+        removed = edge_id or f"{source} -> {target}"
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"edge removed: {removed}"
+        )
 
     # --- Agent Personas ---
     if name == "conclave_list_agents":
@@ -2394,7 +2563,13 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         )
 
         if item.kind is StoreItemKind.workflow:
-            resolved = await save_project_config(daemon.db, project, {"workflow": item.payload})
+            resolved = await save_project_config(
+                daemon.db,
+                project,
+                {"workflow": item.payload},
+                workflow_source=WorkflowVersionSource.template,
+                workflow_reason=f"Store workflow installed: {item.name}",
+            )
             wf_out = (resolved.workflow or build_default_workflow()).model_dump(
                 mode="json"
             )
@@ -2415,7 +2590,13 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 "workflow": wf_out,
             }
         if item.kind is StoreItemKind.config_preset:
-            resolved = await save_project_config(daemon.db, project, item.payload)
+            resolved = await save_project_config(
+                daemon.db,
+                project,
+                item.payload,
+                workflow_source=WorkflowVersionSource.template,
+                workflow_reason=f"Store config preset installed: {item.name}",
+            )
             updated_proj = await _require_project(daemon, project.id)
             resolved_json = resolved.model_dump(mode="json")
             await daemon.bus.emit(
@@ -2644,6 +2825,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     if name == "conclave_evolve_workflow":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
         tid_val = _opt_str(args, "task_id") or None
+        if tid_val is not None:
+            evo_task = await _require_task(daemon, tid_val)
+            if evo_task.project_id != project.id:
+                raise McpToolError(f"task not found: {tid_val}")
         gate_failed = _opt_bool(args, "gate_failed_after_review", False)
         task_failed = _opt_bool(args, "task_failed", False)
         return await evolve_project_workflow(
@@ -2653,6 +2838,53 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             task_id=tid_val,
             gate_failed_after_review=gate_failed,
             task_failed=task_failed,
+            apply=_opt_bool(args, "apply", False),
+            reason=_opt_reason(args),
+        )
+
+    if name == "conclave_list_workflow_versions":
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        limit = max(1, min(_opt_int(args, "limit", 50), 500))
+        versions = await repo.list_workflow_versions(daemon.db, project.id, limit=limit)
+        return [v.model_dump(mode="json") for v in versions]
+
+    if name == "conclave_revert_workflow":
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        version = await _require_workflow_version(daemon, project, _opt_str(args, "version_id"))
+        return await revert_workflow(
+            daemon.db, daemon.bus, project, version, reason=_opt_reason(args)
+        )
+
+    if name == "conclave_list_workflow_proposals":
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        raw_state = _opt_str(args, "state")
+        try:
+            proposal_state = WorkflowProposalState(raw_state) if raw_state else None
+        except ValueError as exc:
+            raise McpToolError(
+                f"invalid state {raw_state!r}: use pending, approved or rejected"
+            ) from exc
+        limit = max(1, min(_opt_int(args, "limit", 50), 500))
+        proposals = await repo.list_workflow_proposals(
+            daemon.db, project.id, state=proposal_state, limit=limit
+        )
+        return [p.model_dump(mode="json") for p in proposals]
+
+    if name == "conclave_decide_workflow_proposal":
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        decision = _opt_str(args, "decision")
+        if decision not in ("approve", "reject"):
+            raise McpToolError(f"invalid decision {decision!r}: use approve or reject")
+        proposal = await _require_workflow_proposal(
+            daemon, project, _opt_str(args, "proposal_id")
+        )
+        return await decide_workflow_proposal(
+            daemon.db,
+            daemon.bus,
+            project,
+            proposal,
+            approve=decision == "approve",
+            reason=_opt_reason(args),
         )
 
     if name == "conclave_get_pilot_guide":
