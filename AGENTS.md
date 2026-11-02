@@ -14,7 +14,7 @@ Conclave — a portable, web-driven autonomous AI coding team that drives the `o
 ## Quality gate (always run before declaring done)
 
 ```bash
-ruff check src tests && mypy && pytest -q         # Python: 494 tests (deterministic, zero LLM cost)
+ruff check src tests && mypy && pytest -q         # Python: 836 tests (deterministic, zero LLM cost)
 cd frontend && npx tsc --noEmit && npm run build  # TypeScript strict + rebuild SPA
 ```
 
