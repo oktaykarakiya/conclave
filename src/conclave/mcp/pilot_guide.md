@@ -46,8 +46,10 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
 
 1. `conclave_attach_project(name, path, default_branch)`. **Attaching a path that is already
    attached updates that project** (it is not a duplicate): to run two configurations against
-   one repository, attach separate clones.
-2. `conclave_patch_config(project_id, config={...})` deep-merges into the project config
+   one repository, attach separate clones. The project stores only what you choose here (its
+   branch, `config_preset`, `workflow_template`, `max_parallel_tasks`); everything else is
+   inherited from the global settings (see "Settings layers" below).
+2. `conclave_patch_config(project_id, config={...})` merges into the project's settings
    (`conclave_get_config` shows the effective result; `conclave_get_workflow` the graph). Key
    fields:
    - `execution.target_branch`, `execution.auto_merge`, `execution.setup_command`,
@@ -81,9 +83,44 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      the `gemini-flash-lite-swarm` preset) therefore means compaction is on; to follow
      `context.compaction_enabled` instead, set it to `null` with `conclave_patch_config`
      (`conclave_configure_agent` ignores null values).
-   Deep-merge cannot delete keys: to "unset" an override, set it explicitly to the default value.
 3. Personas: `conclave_list_agents` / `conclave_upsert_agent(name, role, persona_md, project_id)`.
    A persona with `project_id` overrides the global one for that project only.
+
+### Settings layers
+- The effective config is built from layers, later ones winning: built-in defaults → global
+  settings (`conclave_patch_config` without `project_id`) → the project's overrides →
+  `agent_overrides.<agent>` on top of `agent_defaults`. That last step runs on the merged
+  result, so a global `agent_overrides.<agent>` also beats a project's `agent_defaults` for
+  that agent.
+- A project stores only its **delta**: the keys whose value differs from what it inherits from
+  built-in + global (+ its branch, below). A global change therefore reaches every project's
+  next task, except where a project overrides that key.
+- Every write is reduced to the delta: sending back the whole `conclave_get_config` document
+  stores nothing new, and setting a key to the value it inherits removes the override (it then
+  follows later global changes again).
+- To unset an override, pass `unset` with dotted paths (at most 100), e.g.
+  `unset: ["agent_overrides.reviewer", "execution.setup_command"]`. They are removed from the
+  target layer before `config` is applied, so they inherit again; this is the only way to drop
+  a project-only entry such as `agent_overrides.<agent>`. `null` is a value, not a delete:
+  `setup_command: null` means "no setup command" even when the global settings set one.
+- Dicts merge key by key; lists and `workflow` are replaced whole. A project `workflow: null`
+  (or the `standard` template) derives the graph from the agents policy even when the global
+  settings hold a custom workflow; unset `workflow` to inherit the global graph instead.
+- A global patch changes the global layer only. With `apply_to_all_projects: true` (default
+  `false`) it also removes the patched and unset keys from every project's delta, so every
+  project takes the new global value. A global `conclave_configure_agent` always does this
+  for the fields it sets.
+- The integration branch is per project. A project inherits its `default_branch` (set at
+  attach) as `execution.target_branch`, between the global and project layers, so the effective
+  `target_branch` that `conclave_get_config` shows is always the branch its tasks merge into.
+  Patching `target_branch` to another branch moves `default_branch` with it (restating the
+  current one changes nothing). A project's delta holds a `target_branch` only when it names
+  another branch than its `default_branch`, e.g. one an older attach copied from the global
+  settings. A global `target_branch` therefore does not move existing projects; with
+  `apply_to_all_projects: true` it becomes every project's `default_branch`.
+- `conclave_get_config(project_id, include_layers: true)` returns `{effective, global,
+  project}`: the effective config, the global payload and the project's stored delta (for
+  the global target, `{effective, global}`). REST: `GET /api/projects/{id}/config?layers=true`.
 
 ### Engines and model strings
 - `provider/model` (e.g. `deepseek/deepseek-flash`) runs on the **opencode** CLI with that
@@ -207,6 +244,17 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 - Event lists are paged (§6); a single call is not the full history.
 - Tool errors come back with `isError: true` and a text message; they are not exceptions.
 - Attaching an already-attached path updates that project (§3).
+- Settings are layered (§3): a global change reaches every project that does not override that
+  key, on its next task. To see where a value comes from, call `conclave_get_config` with
+  `include_layers: true`.
+- A project override hides later global changes to that key. To follow the global value
+  again, unset it (`unset: [...]`) or set it to the inherited value.
+- `null` sets a value; it does not delete an override. Use `unset` to remove one.
+- `apply_to_all_projects` defaults to `false`: a global patch writes nothing into projects. Pass
+  `true` to also clear the patched keys from every project, for example when projects still
+  override the old value.
+- A global `target_branch` alone does not change where a project's tasks merge: patch the
+  project's `target_branch`, or pass `apply_to_all_projects: true` (§3).
 - A task that fails at **baseline** usually means the test or setup command is wrong for the
   target branch — fix the config, not the code.
 - A task that fails at once with reason `no_test_command` never ran an agent: set
@@ -230,14 +278,18 @@ group for the first time.
 
 ### Projects & config
 - `conclave_list_projects` — see which repositories are attached before picking a `project_id`.
-- `conclave_attach_project` — attach a local git repo (re-attaching a path updates it).
+- `conclave_attach_project` — attach a local git repo (re-attaching a path updates it); it
+  stores only the settings chosen at attach.
 - `conclave_detach_project` — remove a project, stop its worker, and clean in-progress worktrees.
 - `conclave_get_project_status` — check whether a project's worker is paused or running.
 - `conclave_pause_project` — stop the worker from starting new tasks.
 - `conclave_resume_project` — restart a paused worker.
 - `conclave_set_project_mode` — switch between task_queue and autonomous_bug_fixer mode.
-- `conclave_get_config` — read the resolved config before changing behaviour.
-- `conclave_patch_config` — deep-merge execution, agent, planning, and workflow settings.
+- `conclave_get_config` — read the effective config before changing behaviour;
+  `include_layers: true` also returns the global and project layers.
+- `conclave_patch_config` — merge execution, agent, planning, and workflow settings into a
+  project or the global layer; `unset` removes overrides, `apply_to_all_projects` clears the
+  patched keys from every project.
 
 ### Tasks
 - `conclave_list_tasks` — find tasks, optionally filtered by state.

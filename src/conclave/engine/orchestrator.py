@@ -22,7 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from ..config import ConclaveConfig, WorkflowNode, load_project_config, resolve_agent
+from ..config import ConclaveConfig, WorkflowNode, resolve_agent, resolve_project_config
 from ..db import CheckpointStatus, Database, Project, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType, build_notification_sink
@@ -159,12 +159,12 @@ class Orchestrator:
     async def _refresh_task_config(
         self, project_id: str, runner: AgentRunner, current_config: ConclaveConfig
     ) -> ConclaveConfig:
-        """Re-fetch ``project.config`` from SQLite and hot-plug it into *runner*."""
+        """Re-resolve the project's config from SQLite and hot-plug it into *runner*."""
         project = await repo.get_project(self._db, project_id)
         if project is None:
             runner._config = current_config
             return current_config
-        config = load_project_config(project.config)
+        config = await resolve_project_config(self._db, project)
         runner._config = config
         return config
 
@@ -612,7 +612,7 @@ class Orchestrator:
         project = await repo.get_project(self._db, task.project_id)
         if project is None:
             return False
-        config = load_project_config(project.config)
+        config = await resolve_project_config(self._db, project)
         repo_path = Path(project.path)
         self._repo_path = repo_path
         target_branch = _resolve_target_branch(project, config)

@@ -6,14 +6,32 @@ are append-only — never edit a shipped migration; add a new one.
 
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
+
+from ...config import GLOBAL_DEFAULTS_PRESET, apply_project_overrides
+
+logger = logging.getLogger("conclave.db.migrations")
 
 
 @dataclass(frozen=True)
 class Migration:
+    """One step: SQL statements, a Python data step (``run``), or both — SQL runs first.
+
+    ``run`` receives the connection of the migration's open transaction and must use only
+    it: the write lock is held, so a :class:`Database` helper or repository call would
+    deadlock. A migration with ``run`` must also insert its version into
+    ``pending_data_migrations`` in its SQL; the runner clears it after ``run``, so a step a
+    runner without data steps skipped still runs on the next start.
+    """
+
     version: int
     name: str
-    sql: str
+    sql: str = ""
+    run: Callable[[Any], Awaitable[None]] | None = None
 
 
 _SQL_001 = """
@@ -395,6 +413,65 @@ _SQL_012 = """
 ALTER TABLE tasks ADD COLUMN source_branch TEXT;
 """
 
+_SQL_013 = """
+CREATE TABLE IF NOT EXISTS pending_data_migrations (
+  version  INTEGER PRIMARY KEY
+);
+INSERT OR IGNORE INTO pending_data_migrations(version) VALUES (13);
+"""
+
+
+def _json_object(raw: Any) -> dict[str, Any] | None:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+async def _normalise_project_config_deltas(conn: Any) -> None:
+    """v13: rewrite each project's stored config to its minimal delta (built-in + global).
+
+    Before layering, attach copied ``global-defaults`` into the project and a Settings save
+    froze the whole resolved document into it, so later global and built-in changes never
+    reached it. The delta is taken against what the project inherits, its ``default_branch``
+    included, so it keeps the layered effective config exactly (the step is idempotent) and a
+    stored ``execution.target_branch`` naming another branch, so tasks keep merging into the
+    same branch. A stored config that is corrupt or does not validate is left as it is.
+    """
+    cur = await conn.execute(
+        "SELECT payload_json FROM store_items WHERE kind = 'config_preset' AND name = ?",
+        (GLOBAL_DEFAULTS_PRESET,),
+    )
+    row = await cur.fetchone()
+    global_overrides = (_json_object(row["payload_json"]) if row is not None else None) or {}
+    cur = await conn.execute("SELECT id, default_branch, config_json FROM projects")
+    projects = list(await cur.fetchall())
+    rewritten = 0
+    for proj in projects:
+        stored = _json_object(proj["config_json"])
+        if stored is None:
+            logger.warning("project %s: stored config is not a JSON object; left as is", proj["id"])
+            continue
+        try:
+            _, delta = apply_project_overrides(
+                global_overrides, stored, default_branch=proj["default_branch"]
+            )
+        except ValueError as exc:
+            logger.warning("project %s: stored config is invalid; left as is: %s", proj["id"], exc)
+            continue
+        if delta != stored:
+            await conn.execute(
+                "UPDATE projects SET config_json = ? WHERE id = ?", (json.dumps(delta), proj["id"])
+            )
+            rewritten += 1
+    logger.info(
+        "normalised project configs to minimal deltas: %d of %d rewritten",
+        rewritten,
+        len(projects),
+    )
+
+
 MIGRATIONS: list[Migration] = [
     Migration(version=1, name="initial_schema", sql=_SQL_001),
     Migration(version=2, name="add_ai_enriched_to_repo_knowledge", sql=_SQL_002),
@@ -408,4 +485,10 @@ MIGRATIONS: list[Migration] = [
     Migration(version=10, name="store_and_swarms", sql=_SQL_010),
     Migration(version=11, name="interaction_logs_ledger", sql=_SQL_011),
     Migration(version=12, name="add_source_branch_to_tasks", sql=_SQL_012),
+    Migration(
+        version=13,
+        name="normalise_project_config_deltas",
+        sql=_SQL_013,
+        run=_normalise_project_config_deltas,
+    ),
 ]

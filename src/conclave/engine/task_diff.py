@@ -12,8 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..config import ConclaveConfig, load_project_config
-from ..db import Project, Task
+from ..config import ConclaveConfig, resolve_project_config
+from ..db import Database, Project, Task
 from .gitio import run_git
 from .orchestrator import _TRANSIENT_CACHE_DIRS, _resolve_target_branch
 from .worktree import WorktreeManager
@@ -168,6 +168,7 @@ async def _find_task_branch(
 
 
 async def compute_task_diff(
+    db: Database,
     home: Path,
     project: Project,
     task: Task,
@@ -179,7 +180,7 @@ async def compute_task_diff(
 
     Source order: the live worktree, then the task branch, then a 404.
     """
-    config = load_project_config(project.config)
+    config = await resolve_project_config(db, project)
     target_branch = _resolve_target_branch(project, config)
     repo_path = Path(project.path)
     worktree = WorktreeManager(

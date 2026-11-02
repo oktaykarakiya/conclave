@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import ArgMode, load_project_config, resolve_agent
+from ..config import ArgMode, resolve_agent, resolve_project_config
 from ..db import Database, TaskOrigin, TaskState
 from ..db import repositories as repo
 from ..db.planning_models import (
@@ -554,7 +554,7 @@ class PlanningOrchestrator:
             context_parts.append(user_message)
             full_prompt = "\n\n".join(context_parts)
 
-            cfg = load_project_config(project.config if project else None)
+            cfg = await resolve_project_config(self._db, project)
             settings = resolve_agent(cfg, agent_name)
             profile = ResolvedProfile(
                 name="opencode",

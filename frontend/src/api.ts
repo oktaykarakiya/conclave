@@ -104,8 +104,9 @@ export const api = {
   projectStatus: (id: string) =>
     req<ProjectStatus>("GET", `/api/projects/${id}/status`),
   getConfig: (id: string) => req<Record<string, unknown>>("GET", `/api/projects/${id}/config`),
-  patchConfig: (id: string, config: unknown, idempotencyKey?: string) =>
-    req<unknown>("PATCH", `/api/projects/${id}/config`, { config }, idempotencyKey),
+  /** Merge `config` into the project's settings; `unset` paths are removed so they inherit. */
+  patchConfig: (id: string, config: unknown, idempotencyKey?: string, unset?: string[]) =>
+    req<unknown>("PATCH", `/api/projects/${id}/config`, { config, unset }, idempotencyKey),
   configSchema: () => req<Record<string, unknown>>("GET", "/api/config/schema"),
   mcpInfo: () =>
     req<{

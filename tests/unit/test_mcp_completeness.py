@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from conclave.config import resolve_agent, resolve_project_config
 from conclave.db import CheckpointStatus, Database, StoreItemKind, TaskState
 from conclave.db import repositories as repo
 from conclave.events import EventType
@@ -82,6 +83,16 @@ def test_null_safe_helpers_and_tool_schemas() -> None:
         assert expected_field in patch_props, f"missing {expected_field} in conclave_patch_config"
     assert patch_props["allow_no_test_command"]["type"] == "boolean"
     assert patch_props["test_integrity"]["enum"] == ["block", "warn", "off"]
+    assert patch_props["unset"] == {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": patch_props["unset"]["description"],
+    }
+    assert patch_props["apply_to_all_projects"]["default"] is False
+
+    get_props = by_name["conclave_get_config"]["inputSchema"]["properties"]
+    assert get_props["include_layers"]["type"] == "boolean"
+    assert get_props["include_layers"]["default"] is False
 
 
 async def test_patch_config_round_trips_the_gate_integrity_fields(
@@ -267,7 +278,11 @@ async def test_parity_tools_hitl_reload_status_and_observability_stats(
 async def test_configure_agent_global_preserves_project_overrides(
     db: Database, tmp_path: Path
 ) -> None:
-    """Global conclave_configure_agent merges only patch_delta without clobbering project config."""
+    """Global conclave_configure_agent reaches every project without clobbering its overrides.
+
+    The configured fields are cleared from each project's delta (nothing is copied in), so the
+    project inherits the new global value while its own execution and agent_overrides stay.
+    """
     daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
 
     # Seed global-defaults with an existing execution setting and reviewer override
@@ -312,12 +327,20 @@ async def test_configure_agent_global_preserves_project_overrides(
 
     updated_proj = await repo.get_project(db, project.id)
     assert updated_proj is not None
-    # Project's custom execution and agent_overrides must be untouched!
-    assert updated_proj.config["execution"]["target_branch"] == "staging"
+    # Project's custom execution and agent_overrides must be untouched! (Its target_branch
+    # equals its default_branch, which it inherits as its branch, so the delta drops it.)
+    assert updated_proj.default_branch == "staging"
     assert updated_proj.config["execution"]["max_parallel_tasks"] == 4
     assert updated_proj.config["agent_overrides"]["developer"]["model"] == "project/custom-dev"
     assert updated_proj.config["agent_overrides"]["reviewer"]["model"] == "project/custom-reviewer"
-    assert updated_proj.config["agent_defaults"]["model"] == "google/gemini-4-argon"
+    # ...and the new default is inherited, not frozen into the project.
+    assert "agent_defaults" not in updated_proj.config
+    effective = await resolve_project_config(db, updated_proj)
+    assert effective.execution.target_branch == "staging"  # not the global "main"
+    assert effective.agent_defaults.model == "google/gemini-4-argon"
+    assert resolve_agent(effective, "tester").model == "google/gemini-4-argon"
+    assert resolve_agent(effective, "tester").effort == "high"
+    assert resolve_agent(effective, "reviewer").model == "project/custom-reviewer"
 
     events = await repo.list_events(db, project_id=project.id)
     assert any(e.type == EventType.project_updated for e in events)

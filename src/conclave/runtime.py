@@ -20,7 +20,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import ConclaveConfig, load_project_config, resolve_bug_fixer_session
+from .config import (
+    ConclaveConfig,
+    resolve_bug_fixer_session,
+    resolve_project_config,
+    save_project_config,
+)
 from .db import Database, Project, ProjectMode, Task, TaskState
 from .db import repositories as repo
 from .engine import AgentRunner, BugFixerController, Orchestrator, SessionBudget, WorktreeManager
@@ -83,11 +88,8 @@ class ProjectWorker:
                 if project.mode is ProjectMode.autonomous_bug_fixer:
                     await self._bug_fixer_tick(project)
                 else:
-                    max_parallel = (
-                        load_project_config(project.config).execution.max_parallel_tasks
-                        if project.config
-                        else 1
-                    )
+                    config = await resolve_project_config(self._db, project)
+                    max_parallel = config.execution.max_parallel_tasks
                     if max_parallel > 1:
                         await self._swarm_queue_tick(max_parallel)
                     else:
@@ -170,7 +172,7 @@ class ProjectWorker:
         defers it), so there is never a candidate stranded in ``fixing`` between ticks. A cycle that
         found nothing (idle) backs off; a cycle that did work resets the backoff.
         """
-        config = load_project_config(project.config)
+        config = await resolve_project_config(self._db, project)
         budget = self._ensure_session(config)
 
         if budget.exhausted(elapsed_seconds=self._session_elapsed()):
@@ -410,17 +412,14 @@ class Daemon:
             raise ValueError(f"project not found: {project_id}")
 
         effective_concurrency = max(1, min(int(concurrency), 16))
-        raw_cfg = dict(project.config)
-        exec_cfg = dict(raw_cfg.get("execution") or {})
-        cur_parallel = int(exec_cfg.get("max_parallel_tasks") or 1)
-        if effective_concurrency > cur_parallel:
-            exec_cfg["max_parallel_tasks"] = effective_concurrency
-            raw_cfg["execution"] = exec_cfg
-            await repo.update_project_config(self.db, project_id, raw_cfg)
+        config = await resolve_project_config(self.db, project)
+        if effective_concurrency > config.execution.max_parallel_tasks:
+            config = await save_project_config(
+                self.db, project, {"execution": {"max_parallel_tasks": effective_concurrency}}
+            )
 
         resolved_units: list[dict[str, Any]] = list(units or [])
         if not resolved_units and prompt and prompt.strip():
-            config = load_project_config(raw_cfg)
             runner = AgentRunner(self.db, self.bus, self.provider, project_id, config)
             decompose_prompt = (
                 f"Break this mass-change objective into {effective_concurrency} independent, "

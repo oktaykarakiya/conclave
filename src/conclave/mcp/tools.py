@@ -18,9 +18,15 @@ from ..config import (
     WorkflowGraph,
     WorkflowNode,
     build_default_workflow,
+    create_project_with_config,
     deep_merge,
+    load_global_overrides,
     load_project_config,
     normalize_config_keys,
+    patched_branch,
+    resolve_project_config,
+    save_global_config,
+    save_project_config,
     workflow_templates,
 )
 from ..db import (
@@ -185,7 +191,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_attach_project",
-        "Attach a local git repository to Conclave and start its background worker.",
+        "Attach a local git repository to Conclave and start its background worker. The "
+        "project stores only the branch, preset, template and parallelism chosen here and "
+        "inherits everything else from the global settings.",
         {
             "name": _prop("string", "Display name for the project."),
             "path": _prop("string", "Absolute path to the local git repository."),
@@ -244,19 +252,28 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_config",
-        "Get the full resolved ConclaveConfig JSON for a project (or global defaults).",
+        "Get the effective (resolved) ConclaveConfig JSON for a project (or the global "
+        "settings); include_layers=true also returns the layers it is built from.",
         {
             "project_id": _prop(
                 "string",
                 "Optional Project ID (omit or pass 'global' to inspect global defaults).",
-            )
+            ),
+            "include_layers": _prop(
+                "boolean",
+                "Return {effective, global, project} instead: the effective config, the global "
+                "payload and the project's stored delta (no project key for the global target).",
+                default=False,
+            ),
         },
     ),
     _tool(
         "conclave_patch_config",
         "Update configuration settings (target_branch, default_branch, execution, experimental, "
         "context, planning, agents, bug_fixer, notifications, protected, agent_defaults, "
-        "agent_overrides, workflow) per-repository or globally across Conclave.",
+        "agent_overrides, workflow) per-repository or globally across Conclave. A project "
+        "stores only what differs from what it inherits (built-in -> global): a key set to the "
+        "inherited value, or listed in unset, inherits again.",
         {
             "project_id": _prop(
                 "string",
@@ -269,6 +286,15 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "config": {
                 "type": "object",
                 "description": "Partial ConclaveConfig overrides object.",
+            },
+            "unset": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Dotted paths removed from the target layer before config is applied, so "
+                    "they inherit again (e.g. 'agent_overrides.reviewer', "
+                    "'execution.setup_command'; at most 100)."
+                ),
             },
             "default_branch": _prop(
                 "string",
@@ -366,8 +392,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
             },
             "apply_to_all_projects": _prop(
                 "boolean",
-                "When updating global config, also apply the patch to all attached projects.",
-                default=True,
+                "Global updates only: also remove the patched and unset keys from every "
+                "project's stored delta, so every project inherits the new global value (a "
+                "patched target_branch also becomes each project's default_branch).",
+                default=False,
             ),
         },
     ),
@@ -930,7 +958,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "conclave_configure_agent",
         "Configure an agent's execution settings (model, effort, cli_agent, skills, thinking, "
         "pure, compact_before_start, timeout_minutes, max_retries) in agent_defaults or "
-        "agent_overrides[agent] for a project (or globally if project_id omitted/'global').",
+        "agent_overrides[agent] for a project, or globally if project_id is omitted/'global' "
+        "(the configured fields are then cleared from every project, which inherits them).",
         {
             "project_id": _prop(
                 "string",
@@ -1102,8 +1131,8 @@ async def _require_task(daemon: Daemon, task_id: str) -> Task:
     return task
 
 
-def _resolve_active_workflow(project: Project) -> WorkflowGraph:
-    config = load_project_config(project.config)
+async def _resolve_active_workflow(daemon: Daemon, project: Project) -> WorkflowGraph:
+    config = await resolve_project_config(daemon.db, project)
     return config.workflow or build_default_workflow(
         config.agents,
         parallel_reviewers=config.execution.parallel_reviewers,
@@ -1111,10 +1140,9 @@ def _resolve_active_workflow(project: Project) -> WorkflowGraph:
 
 
 async def _save_workflow(daemon: Daemon, project: Project, graph: WorkflowGraph) -> dict[str, Any]:
-    raw_cfg = dict(project.config)
-    raw_cfg["workflow"] = graph.model_dump(mode="json")
-    resolved = load_project_config(raw_cfg)
-    await repo.update_project_config(daemon.db, project.id, raw_cfg)
+    resolved = await save_project_config(
+        daemon.db, project, {"workflow": graph.model_dump(mode="json")}
+    )
     active = resolved.workflow or graph
     wf_payload: dict[str, Any] = {
         "workflow": active.model_dump(mode="json"),
@@ -1132,6 +1160,20 @@ async def _save_workflow(daemon: Daemon, project: Project, graph: WorkflowGraph)
         payload={"project": updated_proj.model_dump(mode="json")},
     )
     return wf_payload
+
+
+async def _emit_projects_updated(daemon: Daemon, projects: list[Project]) -> None:
+    """Announce each project's row and effective config after a global config change."""
+    for proj in projects:
+        resolved = await resolve_project_config(daemon.db, proj)
+        await daemon.bus.emit(
+            type=EventType.project_updated,
+            project_id=proj.id,
+            payload={
+                "project": proj.model_dump(mode="json"),
+                "config": resolved.model_dump(mode="json"),
+            },
+        )
 
 
 async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
@@ -1154,12 +1196,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         if not (path / ".git").exists():
             raise McpToolError(f"not a git repository: {path}")
 
+        # Only what the caller chose is stored; everything else is inherited (built-in ->
+        # global) when the config is resolved, and the server keeps just the delta.
         initial_cfg: dict[str, Any] = {}
-        global_preset = await repo.get_store_item_by_name(
-            daemon.db, StoreItemKind.config_preset, "global-defaults"
-        )
-        if global_preset is not None:
-            initial_cfg = deep_merge(initial_cfg, global_preset.payload)
         preset_name = _opt_str(args, "config_preset")
         if preset_name:
             preset = await repo.get_store_item_by_name(
@@ -1185,25 +1224,21 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             )
             initial_cfg["execution"] = exec_sec
 
+        existing = await repo.get_project_by_path(daemon.db, str(path))
         exec_cfg = dict(initial_cfg.get("execution") or {})
-        if "target_branch" not in exec_cfg or default_branch != "main":
+        if existing is not None or "target_branch" not in exec_cfg or default_branch != "main":
             exec_cfg["target_branch"] = default_branch
         initial_cfg["execution"] = exec_cfg
 
-        existing = await repo.get_project_by_path(daemon.db, str(path))
         if existing is not None:
-            merged_cfg = deep_merge(existing.config, initial_cfg)
-            merged_exec = dict(merged_cfg.get("execution") or {})
-            merged_exec["target_branch"] = default_branch
-            merged_cfg["execution"] = merged_exec
-            updated_existing = await repo.update_project(
+            await save_project_config(
                 daemon.db,
-                existing.id,
+                existing,
+                initial_cfg,
                 name=proj_name or existing.name,
                 default_branch=default_branch,
-                config=merged_cfg,
             )
-            assert updated_existing is not None
+            updated_existing = await _require_project(daemon, existing.id)
             await daemon.start_worker(updated_existing.id)
             proj_json = updated_existing.model_dump(mode="json")
             await daemon.bus.emit(
@@ -1213,12 +1248,12 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             )
             return proj_json
 
-        project = await repo.create_project(
+        project = await create_project_with_config(
             daemon.db,
             name=proj_name,
             path=str(path),
             default_branch=default_branch,
-            config=initial_cfg,
+            patch=initial_cfg,
         )
         await daemon.start_worker(project.id)
         proj_json = project.model_dump(mode="json")
@@ -1273,14 +1308,21 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     if name == "conclave_get_config":
         raw_pid = _opt_str(args, "project_id")
-        if not raw_pid or raw_pid in ("global", "default", "defaults", "*"):
-            global_item = await repo.get_store_item_by_name(
-                daemon.db, StoreItemKind.config_preset, "global-defaults"
-            )
-            overrides = global_item.payload if global_item is not None else {}
-            return load_project_config(overrides).model_dump(mode="json")
-        project = await _require_project(daemon, raw_pid)
-        return load_project_config(project.config).model_dump(mode="json")
+        cfg_project = (
+            None
+            if not raw_pid or raw_pid in ("global", "default", "defaults", "*")
+            else await _require_project(daemon, raw_pid)
+        )
+        effective = (await resolve_project_config(daemon.db, cfg_project)).model_dump(mode="json")
+        if not _opt_bool(args, "include_layers", False):
+            return effective
+        layers: dict[str, Any] = {
+            "effective": effective,
+            "global": await load_global_overrides(daemon.db),
+        }
+        if cfg_project is not None:
+            layers["project"] = cfg_project.config
+        return layers
 
     if name in ("conclave_patch_config", "conclave_update_config", "conclave_update_settings"):
         raw_pid = _opt_str(args, "project_id")
@@ -1299,8 +1341,6 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         exec_patch = dict(patch.get("execution") or {})
         if new_branch:
             exec_patch["target_branch"] = new_branch
-        elif exec_patch.get("target_branch"):
-            new_branch = str(exec_patch["target_branch"]).strip()
         for exec_key in (
             "branch_prefix",
             "auto_merge",
@@ -1359,56 +1399,36 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                     dict(patch.get(sec_name) or {}), normalize_config_keys(args[sec_name])
                 )
 
-        if not patch and not new_branch and not new_name:
-            raise McpToolError("config object or setting fields are required")
+        raw_unset = args.get("unset")
+        if raw_unset is not None and (not isinstance(raw_unset, list) or len(raw_unset) > 100):
+            raise McpToolError("unset must be a list of at most 100 dotted paths")
+        unset_paths: list[Any] = list(raw_unset or [])
+
+        if not patch and not new_branch and not new_name and not unset_paths:
+            raise McpToolError("config object, unset paths or setting fields are required")
 
         if not raw_pid or raw_pid in ("global", "default", "defaults", "*"):
-            existing_global = await repo.get_store_item_by_name(
-                daemon.db, StoreItemKind.config_preset, "global-defaults"
-            )
-            base_global = existing_global.payload if existing_global is not None else {}
-            merged_global = deep_merge(base_global, patch)
-            resolved_global = load_project_config(merged_global)
-            await repo.upsert_store_item(
+            resolved_global, updated_projects = await save_global_config(
                 daemon.db,
-                kind=StoreItemKind.config_preset,
-                name="global-defaults",
-                description="Global default settings applied across Conclave repositories.",
-                tags=["global", "defaults"],
-                payload=merged_global,
-                built_in=False,
+                patch,
+                unset=unset_paths,
+                apply_to_all_projects=_opt_bool(args, "apply_to_all_projects", False),
             )
-            apply_all = _opt_bool(args, "apply_to_all_projects", True)
-            if apply_all:
-                for proj in await repo.list_projects(daemon.db):
-                    proj_merged = deep_merge(proj.config, patch)
-                    proj_resolved = load_project_config(proj_merged)
-                    updated_p = await repo.update_project(
-                        daemon.db,
-                        proj.id,
-                        default_branch=new_branch or proj.default_branch,
-                        config=proj_merged,
-                    )
-                    if updated_p is not None:
-                        await daemon.bus.emit(
-                            type=EventType.project_updated,
-                            project_id=proj.id,
-                            payload={
-                                "project": updated_p.model_dump(mode="json"),
-                                "config": proj_resolved.model_dump(mode="json"),
-                            },
-                        )
+            await _emit_projects_updated(daemon, updated_projects)
             return resolved_global.model_dump(mode="json")
 
         project = await _require_project(daemon, raw_pid)
-        merged = deep_merge(project.config, patch) if patch else dict(project.config)
-        resolved = load_project_config(merged)
-        await repo.update_project(
+        # A patched target_branch moves the project's branch; restating it changes nothing.
+        new_branch = new_branch or patched_branch(project, patch)
+        if new_branch:
+            patch = deep_merge(patch, {"execution": {"target_branch": new_branch}})
+        resolved = await save_project_config(
             daemon.db,
-            project.id,
+            project,
+            patch,
+            unset=unset_paths,
             name=new_name or project.name,
             default_branch=new_branch or project.default_branch,
-            config=merged,
         )
         updated_proj = await _require_project(daemon, project.id)
         resolved_json = resolved.model_dump(mode="json")
@@ -1786,6 +1806,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         project = await _require_project(daemon, task.project_id)
         try:
             return await compute_task_diff(
+                daemon.db,
                 daemon.home,
                 project,
                 task,
@@ -1806,7 +1827,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     # --- Dynamic Agent Diagram (Workflow Graph) ---
     if name == "conclave_get_workflow":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
-        config = load_project_config(project.config)
+        config = await resolve_project_config(daemon.db, project)
         active = config.workflow or build_default_workflow(
             config.agents,
             parallel_reviewers=config.execution.parallel_reviewers,
@@ -1823,17 +1844,15 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     if name == "conclave_apply_workflow_template":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
         template_id = _opt_str(args, "template_id")
-        config = load_project_config(project.config)
+        config = await resolve_project_config(daemon.db, project)
         templates = workflow_templates(config.agents)
         if template_id not in templates:
             raise McpToolError(f"unknown template_id: {template_id}")
-        raw_cfg = dict(project.config)
         wf_dump = templates[template_id].model_dump(mode="json")
-        if template_id == "standard":
-            raw_cfg.pop("workflow", None)
-        else:
-            raw_cfg["workflow"] = wf_dump
-        await repo.update_project_config(daemon.db, project.id, raw_cfg)
+        # "standard" derives the graph from the agents policy, even over a global workflow.
+        await save_project_config(
+            daemon.db, project, {"workflow": None if template_id == "standard" else wf_dump}
+        )
         updated_proj = await _require_project(daemon, project.id)
         await daemon.bus.emit(
             type=EventType.workflow_updated,
@@ -1864,7 +1883,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     if name in ("conclave_workflow_upsert_node", "conclave_upsert_workflow_node"):
         project = await _require_project(daemon, _opt_str(args, "project_id"))
-        current = _resolve_active_workflow(project)
+        current = await _resolve_active_workflow(daemon, project)
         node_id = _opt_str(args, "id")
         existing_node = next((n for n in current.nodes if n.id == node_id), None)
         kind = NodeKind(
@@ -1996,7 +2015,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     if name in ("conclave_workflow_remove_node", "conclave_remove_workflow_node"):
         project = await _require_project(daemon, _opt_str(args, "project_id"))
         node_id = _opt_str(args, "node_id")
-        current = _resolve_active_workflow(project)
+        current = await _resolve_active_workflow(daemon, project)
         nodes = [n for n in current.nodes if n.id != node_id]
         edges = [
             e for e in current.edges if e.source != node_id and e.target != node_id
@@ -2028,7 +2047,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             label=_opt_str(args, "label"),
             require_human=require_human,
         )
-        current = _resolve_active_workflow(project)
+        current = await _resolve_active_workflow(daemon, project)
         edges = [
             e
             for e in current.edges
@@ -2053,7 +2072,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         edge_id = _opt_str(args, "edge_id")
         source = _opt_str(args, "source")
         target = _opt_str(args, "target")
-        current = _resolve_active_workflow(project)
+        current = await _resolve_active_workflow(daemon, project)
         edges = [
             e
             for e in current.edges
@@ -2347,10 +2366,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         )
 
         if item.kind is StoreItemKind.workflow:
-            raw_cfg = dict(project.config)
-            raw_cfg["workflow"] = item.payload
-            resolved = load_project_config(raw_cfg)
-            await repo.update_project_config(daemon.db, project.id, raw_cfg)
+            resolved = await save_project_config(daemon.db, project, {"workflow": item.payload})
             wf_out = (resolved.workflow or build_default_workflow()).model_dump(
                 mode="json"
             )
@@ -2371,9 +2387,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 "workflow": wf_out,
             }
         if item.kind is StoreItemKind.config_preset:
-            merged = deep_merge(project.config, item.payload)
-            resolved = load_project_config(merged)
-            await repo.update_project_config(daemon.db, project.id, merged)
+            resolved = await save_project_config(daemon.db, project, item.payload)
             updated_proj = await _require_project(daemon, project.id)
             resolved_json = resolved.model_dump(mode="json")
             await daemon.bus.emit(
@@ -2468,49 +2482,21 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             if field_name in args and args[field_name] is not None:
                 settings_patch[field_name] = args[field_name]
 
+        is_defaults = not agent_target or agent_target in ("default", "defaults", "*")
+        target_label = "agent_defaults" if is_defaults else agent_target
+        agent_patch: dict[str, Any] = (
+            {"agent_defaults": settings_patch}
+            if is_defaults
+            else {"agent_overrides": {agent_target: settings_patch}}
+        )
+
         if not raw_pid or raw_pid in ("global", "default", "defaults", "*"):
-            existing_global = await repo.get_store_item_by_name(
-                daemon.db, StoreItemKind.config_preset, "global-defaults"
+            # Every project inherits the new global value: clearing the configured fields from
+            # each project's delta (instead of copying them in) keeps nothing frozen.
+            resolved_global, updated_projects = await save_global_config(
+                daemon.db, agent_patch, apply_to_all_projects=True
             )
-            raw_global = dict(existing_global.payload) if existing_global is not None else {}
-            patch_delta: dict[str, Any] = {}
-            if not agent_target or agent_target in ("default", "defaults", "*"):
-                existing_defaults = dict(raw_global.get("agent_defaults") or {})
-                existing_defaults.update(settings_patch)
-                raw_global["agent_defaults"] = existing_defaults
-                patch_delta["agent_defaults"] = dict(settings_patch)
-                target_label = "agent_defaults"
-            else:
-                overrides_map = normalize_config_keys(dict(raw_global.get("agent_overrides") or {}))
-                existing_ov = dict(overrides_map.get(agent_target) or {})
-                existing_ov.update(settings_patch)
-                overrides_map[agent_target] = existing_ov
-                raw_global["agent_overrides"] = overrides_map
-                patch_delta["agent_overrides"] = {agent_target: dict(settings_patch)}
-                target_label = agent_target
-            resolved_global = load_project_config(raw_global)
-            await repo.upsert_store_item(
-                daemon.db,
-                kind=StoreItemKind.config_preset,
-                name="global-defaults",
-                description="Global default settings applied across Conclave repositories.",
-                tags=["global", "defaults"],
-                payload=raw_global,
-                built_in=False,
-            )
-            for proj in await repo.list_projects(daemon.db):
-                proj_merged = deep_merge(proj.config, patch_delta)
-                proj_resolved = load_project_config(proj_merged)
-                await repo.update_project_config(daemon.db, proj.id, proj_merged)
-                updated_proj = await _require_project(daemon, proj.id)
-                await daemon.bus.emit(
-                    type=EventType.project_updated,
-                    project_id=proj.id,
-                    payload={
-                        "project": updated_proj.model_dump(mode="json"),
-                        "config": proj_resolved.model_dump(mode="json"),
-                    },
-                )
+            await _emit_projects_updated(daemon, updated_projects)
             return {
                 "project_id": "global",
                 "target": target_label,
@@ -2522,21 +2508,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             }
 
         project = await _require_project(daemon, raw_pid)
-        raw_cfg = normalize_config_keys(dict(project.config))
-        if not agent_target or agent_target in ("default", "defaults", "*"):
-            existing_defaults = dict(raw_cfg.get("agent_defaults") or {})
-            existing_defaults.update(settings_patch)
-            raw_cfg["agent_defaults"] = existing_defaults
-            target_label = "agent_defaults"
-        else:
-            overrides_map = normalize_config_keys(dict(raw_cfg.get("agent_overrides") or {}))
-            existing_ov = dict(overrides_map.get(agent_target) or {})
-            existing_ov.update(settings_patch)
-            overrides_map[agent_target] = existing_ov
-            raw_cfg["agent_overrides"] = overrides_map
-            target_label = agent_target
-        resolved = load_project_config(raw_cfg)
-        await repo.update_project_config(daemon.db, project.id, raw_cfg)
+        resolved = await save_project_config(daemon.db, project, agent_patch)
         updated_proj = await _require_project(daemon, project.id)
         await daemon.bus.emit(
             type=EventType.project_updated,

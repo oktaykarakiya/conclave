@@ -26,9 +26,23 @@ class ProjectModeUpdate(BaseModel):
 
 class ConfigPatch(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
+    unset: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description=(
+            "Dotted paths (e.g. 'agent_overrides.reviewer.model') removed from the target layer "
+            "before config is applied, so they inherit again."
+        ),
+    )
     default_branch: str | None = None
     name: str | None = None
-    apply_to_all_projects: bool = True
+    apply_to_all_projects: bool = Field(
+        default=False,
+        description=(
+            "Global patches only: also remove the patched and unset keys from every project's "
+            "stored delta, so every project inherits the new global value."
+        ),
+    )
 
 
 class WorkflowUpdate(BaseModel):

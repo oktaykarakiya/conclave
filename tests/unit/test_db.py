@@ -88,10 +88,10 @@ async def _seed_candidate(
 
 async def test_migrations_apply(db: Database) -> None:
     version = await db.fetchval("SELECT MAX(version) FROM schema_version")
-    assert version == 12
+    assert version == 13
     # idempotent: re-running connect/migrate does not error or duplicate
     await db._apply_migrations()
-    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 12
+    assert await db.fetchval("SELECT COUNT(*) FROM schema_version") == 13
 
 
 async def test_migration_failure_is_atomic(
@@ -102,12 +102,12 @@ async def test_migration_failure_is_atomic(
 
     Otherwise the partial DDL is committed but the version isn't bumped, so the next boot
     replays the same migration and wedges on a duplicate-column error. The fixture DB is
-    already at version 12; we inject a v13 migration whose first statement succeeds (creates
+    already at version 13; we inject a v14 migration whose first statement succeeds (creates
     a probe table) and whose second fails — ``stabilization_reason`` was already added by
     migration 7, so re-adding it raises a duplicate-column error — which is exactly that wedge.
     """
     failing = Migration(
-        version=13,
+        version=14,
         name="injected_failure",
         sql=(
             "CREATE TABLE atomic_probe (id INTEGER PRIMARY KEY);\n"
@@ -120,7 +120,7 @@ async def test_migration_failure_is_atomic(
         await db._apply_migrations()
 
     # Version did not advance past the last good migration...
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 12
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 13
     # ...and the partial DDL (the probe table from the first statement) was rolled back.
     assert (
         await db.fetchval(
@@ -133,12 +133,12 @@ async def test_migration_failure_is_atomic(
 async def test_migration_8_bug_candidate_ledger_schema(db: Database) -> None:
     """Migration 8 reshapes bug_candidates into the 7-state ledger and extends coverage.
 
-    A fresh DB is at version 12. The old two-field status model (status DEFAULT 'candidate'
+    A fresh DB is at version 13. The old two-field status model (status DEFAULT 'candidate'
     plus a separate ``reproduced`` boolean) is gone, replaced by a single permissive
     ``status`` TEXT defaulting to 'discovered', alongside the reproduction/consensus columns;
     coverage gains priority + examined_count.
     """
-    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 12
+    assert await db.fetchval("SELECT MAX(version) FROM schema_version") == 13
 
     cols = {r["name"]: r for r in await db.fetchall("PRAGMA table_info(bug_candidates)")}
     # New columns are present...
@@ -220,7 +220,7 @@ async def test_migration_8_recreates_seeded_bug_candidates(
         monkeypatch.setattr("conclave.db.database.MIGRATIONS", MIGRATIONS)
         await database._apply_migrations()
 
-        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 12
+        assert await database.fetchval("SELECT MAX(version) FROM schema_version") == 13
         v8_cols = {
             r["name"] for r in await database.fetchall("PRAGMA table_info(bug_candidates)")
         }

@@ -77,8 +77,10 @@ class Database:
         cur = await conn.execute("SELECT COALESCE(MAX(version), 0) AS v FROM schema_version")
         row = await cur.fetchone()
         current = int(row["v"]) if row is not None else 0
+        pending = await self._pending_data_migrations()
         for mig in sorted(MIGRATIONS, key=lambda m: m.version):
-            if mig.version <= current:
+            fresh = mig.version > current
+            if not fresh and mig.version not in pending:
                 continue
             # Apply the migration body AND its schema_version bump in one explicit
             # transaction so they land all-or-nothing: a failure partway rolls the partial
@@ -89,12 +91,33 @@ class Database:
             # would defeat the surrounding BEGIN — so we run each statement individually
             # inside transaction() (BEGIN / COMMIT on success / ROLLBACK on any error).
             async with self.transaction() as tx:
-                for stmt in _iter_sql_statements(mig.sql):
-                    await tx.execute(stmt)
-                await tx.execute(
-                    "INSERT INTO schema_version(version, name, applied_at) VALUES (?, ?, ?)",
-                    (mig.version, mig.name, now_iso()),
-                )
+                if fresh:
+                    for stmt in _iter_sql_statements(mig.sql):
+                        await tx.execute(stmt)
+                if mig.run is not None:
+                    # A Python data step runs on tx only (the lock is held) and clears the
+                    # pending marker its SQL set. A runner that predates data steps (an
+                    # in-place hot reload keeps the old Database method) applies the SQL and
+                    # records the version but leaves the marker, so the next start runs it.
+                    await mig.run(tx)
+                    await tx.execute(
+                        "DELETE FROM pending_data_migrations WHERE version = ?", (mig.version,)
+                    )
+                if fresh:
+                    await tx.execute(
+                        "INSERT INTO schema_version(version, name, applied_at) VALUES (?, ?, ?)",
+                        (mig.version, mig.name, now_iso()),
+                    )
+
+    async def _pending_data_migrations(self) -> set[int]:
+        """Versions whose Python data step was recorded but has not run yet."""
+        exists = await self.fetchval(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_data_migrations'"
+        )
+        if not exists:
+            return set()
+        rows = await self.fetchall("SELECT version FROM pending_data_migrations")
+        return {int(r["version"]) for r in rows}
 
     # --- query helpers (reads do not commit; writes serialize through the lock) ---
 

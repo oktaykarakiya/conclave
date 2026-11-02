@@ -138,11 +138,44 @@ async def test_loop_dispatches_task_queue_for_task_queue_mode() -> None:
     worker = _make_worker()
     project = _fake_project(ProjectMode.task_queue)
 
-    with patch("conclave.runtime.repo.get_project", new=AsyncMock(return_value=project)):
+    with (
+        patch("conclave.runtime.repo.get_project", new=AsyncMock(return_value=project)),
+        patch(
+            "conclave.runtime.resolve_project_config",
+            new=AsyncMock(return_value=ConclaveConfig()),
+        ),
+    ):
         await _run_one_loop_iteration(worker)
 
     worker._task_queue_tick.assert_awaited_once()  # type: ignore[attr-defined]
     worker._bug_fixer_tick.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_loop_uses_the_resolved_parallelism_for_an_empty_delta() -> None:
+    """An empty stored delta still runs a swarm when the resolved config (global) asks for it.
+
+    The parallelism comes from built-in -> global -> project, so a project storing nothing
+    must not short-circuit to single-flight.
+    """
+    worker = _make_worker()
+    project = _fake_project(ProjectMode.task_queue)
+    resolved = ConclaveConfig.model_validate({"execution": {"max_parallel_tasks": 3}})
+
+    async def _stop_after(*_a: object, **_k: object) -> None:
+        worker._stop.set()
+
+    worker._swarm_queue_tick = AsyncMock(side_effect=_stop_after)  # type: ignore[method-assign]
+    worker._task_queue_tick = AsyncMock(side_effect=_stop_after)  # type: ignore[method-assign]
+    resolve = AsyncMock(return_value=resolved)
+    with (
+        patch("conclave.runtime.repo.get_project", new=AsyncMock(return_value=project)),
+        patch("conclave.runtime.resolve_project_config", new=resolve),
+    ):
+        await worker._loop()
+
+    resolve.assert_awaited_once_with(worker._db, project)
+    worker._swarm_queue_tick.assert_awaited_once_with(3)  # type: ignore[attr-defined]
+    worker._task_queue_tick.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 async def test_loop_dispatches_bug_fixer_for_autonomous_mode() -> None:
@@ -245,7 +278,7 @@ async def test_bug_fixer_tick_runs_cycle_until_candidate_cap(
     cfg = ConclaveConfig.model_validate(
         {"bug_fixer": {"max_candidates": 2, "wall_clock_budget_minutes": 0}}
     )
-    monkeypatch.setattr("conclave.runtime.load_project_config", lambda _c: cfg)
+    monkeypatch.setattr("conclave.runtime.resolve_project_config", AsyncMock(return_value=cfg))
 
     calls = 0
 
@@ -281,7 +314,7 @@ async def test_bug_fixer_idle_cycle_does_not_count_against_cap(
     cfg = ConclaveConfig.model_validate(
         {"bug_fixer": {"max_candidates": 1, "wall_clock_budget_minutes": 0}}
     )
-    monkeypatch.setattr("conclave.runtime.load_project_config", lambda _c: cfg)
+    monkeypatch.setattr("conclave.runtime.resolve_project_config", AsyncMock(return_value=cfg))
     worker._bug_fixer.run_cycle = AsyncMock(  # type: ignore[method-assign]
         return_value=CycleResult(CycleOutcome.idle)
     )

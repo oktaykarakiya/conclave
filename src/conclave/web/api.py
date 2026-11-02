@@ -25,9 +25,15 @@ from ..config import (
     WorkflowGraph,
     build_default_workflow,
     config_schema,
+    create_project_with_config,
     deep_merge,
+    load_global_overrides,
     load_project_config,
     normalize_config_keys,
+    patched_branch,
+    resolve_project_config,
+    save_global_config,
+    save_project_config,
     workflow_templates,
 )
 from ..db import (
@@ -106,6 +112,16 @@ async def _require_task(daemon: Daemon, task_id: str) -> Task:
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+def _invalid_config(exc: ValueError) -> HTTPException:
+    """422 for a config write the resolver rejected (bad patch, unset path, or stored layer).
+
+    ``exc.json()`` rather than ``exc.errors()``: a validator's ``ctx`` holds the raised
+    exception object, which the JSON response could not serialize (a 500).
+    """
+    detail: Any = json.loads(exc.json()) if isinstance(exc, ValidationError) else str(exc)
+    return HTTPException(status_code=422, detail=detail)
 
 
 async def _require_planning_session(
@@ -265,12 +281,9 @@ async def create_project(
     if not (path / ".git").exists():
         raise HTTPException(status_code=400, detail=f"not a git repository: {path}")
 
+    # Only what the caller chose is stored; everything else is inherited (built-in -> global)
+    # when the config is resolved, and the server keeps just the delta.
     initial_cfg: dict[str, Any] = {}
-    global_preset = await repo.get_store_item_by_name(
-        daemon.db, StoreItemKind.config_preset, "global-defaults"
-    )
-    if global_preset is not None:
-        initial_cfg = deep_merge(initial_cfg, global_preset.payload)
     if body.config_preset:
         preset = await repo.get_store_item_by_name(
             daemon.db, StoreItemKind.config_preset, body.config_preset
@@ -295,25 +308,24 @@ async def create_project(
         initial_cfg["execution"] = exec_sec
 
     default_branch = body.default_branch.strip() or "main"
+    existing = await repo.get_project_by_path(daemon.db, str(path))
     exec_cfg = dict(initial_cfg.get("execution") or {})
-    if "target_branch" not in exec_cfg or default_branch != "main":
+    if existing is not None or "target_branch" not in exec_cfg or default_branch != "main":
         exec_cfg["target_branch"] = default_branch
     initial_cfg["execution"] = exec_cfg
 
-    existing = await repo.get_project_by_path(daemon.db, str(path))
     if existing is not None:
-        merged_cfg = deep_merge(existing.config, initial_cfg)
-        merged_exec = dict(merged_cfg.get("execution") or {})
-        merged_exec["target_branch"] = default_branch
-        merged_cfg["execution"] = merged_exec
-        updated = await repo.update_project(
-            daemon.db,
-            existing.id,
-            name=body.name.strip() or existing.name,
-            default_branch=default_branch,
-            config=merged_cfg,
-        )
-        assert updated is not None
+        try:
+            await save_project_config(
+                daemon.db,
+                existing,
+                initial_cfg,
+                name=body.name.strip() or existing.name,
+                default_branch=default_branch,
+            )
+        except ValueError as exc:
+            raise _invalid_config(exc) from exc
+        updated = await _require_project(daemon, existing.id)
         await daemon.start_worker(updated.id)
         await daemon.bus.emit(
             type=EventType.project_updated,
@@ -322,13 +334,16 @@ async def create_project(
         )
         return updated
 
-    project = await repo.create_project(
-        daemon.db,
-        name=body.name,
-        path=str(path),
-        default_branch=default_branch,
-        config=initial_cfg,
-    )
+    try:
+        project = await create_project_with_config(
+            daemon.db,
+            name=body.name,
+            path=str(path),
+            default_branch=default_branch,
+            patch=initial_cfg,
+        )
+    except ValueError as exc:
+        raise _invalid_config(exc) from exc
     await daemon.start_worker(project.id)
     created = await _require_project(daemon, project.id)
     await daemon.bus.emit(
@@ -357,11 +372,7 @@ async def detach_project(project_id: str, daemon: Daemon = Depends(get_daemon)) 
 
 @router.get("/config/global")
 async def get_global_config(daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
-    global_item = await repo.get_store_item_by_name(
-        daemon.db, StoreItemKind.config_preset, "global-defaults"
-    )
-    overrides = global_item.payload if global_item is not None else {}
-    return load_project_config(overrides).model_dump(mode="json")
+    return (await resolve_project_config(daemon.db, None)).model_dump(mode="json")
 
 
 @router.patch("/config/global")
@@ -369,62 +380,49 @@ async def get_global_config(daemon: Daemon = Depends(get_daemon)) -> dict[str, A
 async def patch_global_config(
     body: ConfigPatch, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
-    existing_item = await repo.get_store_item_by_name(
-        daemon.db, StoreItemKind.config_preset, "global-defaults"
-    )
-    base_payload = existing_item.payload if existing_item is not None else {}
-    patch_dict = normalize_config_keys(dict(body.config))
-    if body.default_branch:
-        exec_sec = dict(patch_dict.get("execution") or {})
-        exec_sec["target_branch"] = body.default_branch.strip()
-        patch_dict["execution"] = exec_sec
-    merged_global = deep_merge(base_payload, patch_dict)
-    try:
-        resolved = load_project_config(merged_global)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    """Merge ``config`` into the global layer (``unset`` paths are removed first).
 
-    await repo.upsert_store_item(
-        daemon.db,
-        kind=StoreItemKind.config_preset,
-        name="global-defaults",
-        description="Global default settings applied across Conclave repositories.",
-        tags=["global", "defaults"],
-        payload=merged_global,
-        built_in=False,
-    )
-    new_branch = (
-        body.default_branch.strip()
-        if body.default_branch and body.default_branch.strip()
-        else (
-            str(patch_dict["execution"]["target_branch"]).strip()
-            if isinstance(patch_dict.get("execution"), dict)
-            and patch_dict["execution"].get("target_branch")
-            else None
+    Every project inherits the change on its next resolution. ``apply_to_all_projects`` also
+    removes the patched and unset keys from each project's delta, so no project keeps its own.
+    """
+    patch_dict = normalize_config_keys(dict(body.config))
+    if body.default_branch and body.default_branch.strip():
+        patch_dict = deep_merge(
+            patch_dict, {"execution": {"target_branch": body.default_branch.strip()}}
         )
-    )
-    updated_projects: list[str] = []
-    if body.apply_to_all_projects:
-        for proj in await repo.list_projects(daemon.db):
-            proj_merged = deep_merge(proj.config, patch_dict)
-            await repo.update_project(
-                daemon.db,
-                proj.id,
-                default_branch=new_branch or proj.default_branch,
-                config=proj_merged,
-            )
-            updated_projects.append(proj.id)
+    try:
+        resolved, updated = await save_global_config(
+            daemon.db,
+            patch_dict,
+            unset=body.unset,
+            apply_to_all_projects=body.apply_to_all_projects,
+        )
+    except ValueError as exc:
+        raise _invalid_config(exc) from exc
     return {
         "ok": True,
         "global_config": resolved.model_dump(mode="json"),
-        "updated_projects": updated_projects,
+        "updated_projects": [proj.id for proj in updated],
     }
 
 
 @router.get("/projects/{project_id}/config")
-async def get_config(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
+async def get_config(
+    project_id: str,
+    layers: bool = Query(
+        False, description="Return {effective, global, project} instead of the effective config."
+    ),
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
     project = await _require_project(daemon, project_id)
-    return load_project_config(project.config).model_dump(mode="json")
+    effective = (await resolve_project_config(daemon.db, project)).model_dump(mode="json")
+    if not layers:
+        return effective
+    return {
+        "effective": effective,
+        "global": await load_global_overrides(daemon.db),
+        "project": project.config,
+    }
 
 
 @router.patch("/projects/{project_id}/config")
@@ -432,39 +430,40 @@ async def get_config(project_id: str, daemon: Daemon = Depends(get_daemon)) -> d
 async def patch_config(
     project_id: str, body: ConfigPatch, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, bool]:
+    """Merge ``config`` onto the project's effective config and store only the delta.
+
+    PATCH and PUT behave alike: a full document is a patch whose unchanged keys reduce to
+    nothing, and a key set to its inherited value stops being overridden. ``unset`` paths
+    are removed from the stored delta first, so they inherit again.
+    """
     project = await _require_project(daemon, project_id)
     incoming = normalize_config_keys(dict(body.config))
     if "default_branch" in incoming and not body.default_branch:
         raw_db = incoming.pop("default_branch")
         if isinstance(raw_db, str) and raw_db.strip():
             body.default_branch = raw_db.strip()
-    is_full_doc = {"execution", "experimental", "planning", "agents", "agent_defaults"} <= set(
-        incoming.keys()
-    )
-    merged_cfg = incoming if is_full_doc else deep_merge(project.config, incoming)
     new_default_branch: str | None = (
         body.default_branch.strip()
         if body.default_branch and body.default_branch.strip()
         else None
     )
+    if not new_default_branch:
+        # A patched target_branch moves the project's branch; restating it changes nothing.
+        new_default_branch = patched_branch(project, incoming)
     if new_default_branch:
-        exec_sec = dict(merged_cfg.get("execution") or {})
-        exec_sec["target_branch"] = new_default_branch
-        merged_cfg["execution"] = exec_sec
-    elif isinstance(incoming.get("execution"), dict) and incoming["execution"].get("target_branch"):
-        new_default_branch = str(incoming["execution"]["target_branch"]).strip()
+        incoming = deep_merge(incoming, {"execution": {"target_branch": new_default_branch}})
 
     try:
-        resolved = load_project_config(merged_cfg)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
-    await repo.update_project(
-        daemon.db,
-        project_id,
-        name=body.name.strip() if body.name and body.name.strip() else None,
-        default_branch=new_default_branch,
-        config=merged_cfg,
-    )
+        resolved = await save_project_config(
+            daemon.db,
+            project,
+            incoming,
+            unset=body.unset,
+            name=body.name.strip() if body.name and body.name.strip() else None,
+            default_branch=new_default_branch,
+        )
+    except ValueError as exc:
+        raise _invalid_config(exc) from exc
     updated_proj = await _require_project(daemon, project_id)
     await daemon.bus.emit(
         type=EventType.project_updated,
@@ -523,8 +522,7 @@ async def get_project_workflow(
     project_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
     project = await _require_project(daemon, project_id)
-    config = load_project_config(project.config)
-    return _workflow_payload(config)
+    return _workflow_payload(await resolve_project_config(daemon.db, project))
 
 
 @router.put("/projects/{project_id}/workflow")
@@ -532,30 +530,26 @@ async def update_project_workflow(
     project_id: str, body: WorkflowUpdate, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
     project = await _require_project(daemon, project_id)
-    raw_cfg = dict(project.config)
+    workflow = body.workflow
     if body.template_id is not None:
-        templates = workflow_templates(load_project_config(raw_cfg).agents)
+        config = await resolve_project_config(daemon.db, project)
+        templates = workflow_templates(config.agents)
         if body.template_id not in templates:
             raise HTTPException(
                 status_code=400,
                 detail=f"unknown workflow template: {body.template_id}",
             )
-        if body.template_id == "standard":
-            if body.workflow is not None:
-                raw_cfg["workflow"] = body.workflow.model_dump(mode="json")
-            else:
-                raw_cfg.pop("workflow", None)
-        else:
-            raw_cfg["workflow"] = templates[body.template_id].model_dump(mode="json")
-    elif body.workflow is not None:
-        raw_cfg["workflow"] = body.workflow.model_dump(mode="json")
-    else:
-        raw_cfg.pop("workflow", None)
+        if body.template_id != "standard":
+            workflow = templates[body.template_id]
+    # None derives the graph from the agents policy, even over a global custom workflow.
     try:
-        resolved = load_project_config(raw_cfg)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
-    await repo.update_project_config(daemon.db, project_id, raw_cfg)
+        resolved = await save_project_config(
+            daemon.db,
+            project,
+            {"workflow": workflow.model_dump(mode="json") if workflow is not None else None},
+        )
+    except ValueError as exc:
+        raise _invalid_config(exc) from exc
     wf_payload = _workflow_payload(resolved)
     updated_proj = await _require_project(daemon, project_id)
     await daemon.bus.emit(
@@ -1159,6 +1153,7 @@ async def get_task_diff(
     project = await _require_project(daemon, task.project_id)
     try:
         return await compute_task_diff(
+            daemon.db,
             daemon.home,
             project,
             task,
@@ -1401,10 +1396,10 @@ async def install_store_item(
     )
 
     if item.kind is StoreItemKind.workflow:
-        raw_cfg = dict(project.config)
-        raw_cfg["workflow"] = item.payload
-        resolved = load_project_config(raw_cfg)
-        await repo.update_project_config(daemon.db, project_id, raw_cfg)
+        try:
+            resolved = await save_project_config(daemon.db, project, {"workflow": item.payload})
+        except ValueError as exc:
+            raise _invalid_config(exc) from exc
         wf_dump = (resolved.workflow or build_default_workflow()).model_dump(mode="json")
         updated_proj = await _require_project(daemon, project_id)
         await daemon.bus.emit(
@@ -1424,9 +1419,10 @@ async def install_store_item(
         }
 
     if item.kind is StoreItemKind.config_preset:
-        merged = deep_merge(project.config, item.payload)
-        resolved = load_project_config(merged)
-        await repo.update_project_config(daemon.db, project_id, merged)
+        try:
+            resolved = await save_project_config(daemon.db, project, item.payload)
+        except ValueError as exc:
+            raise _invalid_config(exc) from exc
         updated_proj = await _require_project(daemon, project_id)
         await daemon.bus.emit(
             type=EventType.project_updated,

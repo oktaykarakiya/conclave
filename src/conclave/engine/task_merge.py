@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..config import load_project_config
+from ..config import resolve_project_config
 from ..db import Project, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventType
@@ -45,7 +45,7 @@ async def merge_task(
     if task.state != TaskState.done:
         raise TaskMergeError(f"task is {task.state}, not done", 409)
 
-    config = load_project_config(project.config)
+    config = await resolve_project_config(orchestrator._db, project)
     target = _resolve_target_branch(project, config)
     repo_path = Path(project.path)
 

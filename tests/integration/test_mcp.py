@@ -516,10 +516,14 @@ async def test_mcp_inplace_attach_hyphenated_store_keys_and_global_settings(
         p2 = json.loads(a2.json()["result"]["content"][0]["text"])
         assert p2["id"] == pid  # updated in-place without creating duplicate
         assert p2["default_branch"] == "staging"
-        assert p2["config"]["execution"]["target_branch"] == "staging"
+        # The branch lives in default_branch, which the project inherits as its target_branch.
+        assert "target_branch" not in p2["config"].get("execution", {})
+        p2_effective = (await client.get(f"/api/projects/{pid}/config")).json()
+        assert p2_effective["execution"]["target_branch"] == "staging"
         assert "architect-as-planner" in p2["config"]["agent_overrides"]
 
-        # 3. Update settings globally via MCP (without project_id) and verify propagation
+        # 3. Update settings globally via MCP (without project_id); apply_to_all_projects clears
+        # the patched keys from every project's delta so each one inherits the new value.
         global_patch = await client.post(
             "/mcp",
             json={
@@ -532,6 +536,7 @@ async def test_mcp_inplace_attach_hyphenated_store_keys_and_global_settings(
                         "target_branch": "release",
                         "parallel_reviewers": True,
                         "max_parallel_tasks": 6,
+                        "apply_to_all_projects": True,
                     },
                 },
             },
@@ -543,5 +548,8 @@ async def test_mcp_inplace_attach_hyphenated_store_keys_and_global_settings(
 
         proj_after = (await client.get(f"/api/projects/{pid}")).json()
         assert proj_after["default_branch"] == "release"
-        assert proj_after["config"]["execution"]["target_branch"] == "release"
+        assert "target_branch" not in proj_after["config"].get("execution", {})
+        effective = (await client.get(f"/api/projects/{pid}/config")).json()
+        assert effective["execution"]["target_branch"] == "release"
+        assert effective["execution"]["max_parallel_tasks"] == 6
 

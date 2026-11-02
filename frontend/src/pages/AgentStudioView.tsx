@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api } from "../api";
 import { WorkflowCanvas, autoLayoutWorkflow } from "../components/WorkflowCanvas";
+import { diffConfig } from "../configDiff";
 import type {
   AgentPersona,
   EdgeCondition,
@@ -665,8 +666,10 @@ export function AgentStudioView({ projectId }: { projectId?: string | null }) {
         ...config,
         agent_overrides: nextOverrides,
       };
-      await api.patchConfig(projectId, nextConfig);
-      setConfig(nextConfig);
+      // Send only the change: a cleared field becomes an unset path, so it inherits again.
+      const { patch, unset } = diffConfig(config, nextConfig);
+      await api.patchConfig(projectId, patch, undefined, unset);
+      setConfig(await api.getConfig(projectId));
       setOverrideSaveState("saved");
     } catch (e) {
       setOverrideSaveState("error");

@@ -17,7 +17,8 @@ from ..config import (
     WorkflowGraph,
     WorkflowNode,
     build_default_workflow,
-    load_project_config,
+    resolve_project_config,
+    save_project_config,
 )
 from ..config.graph import _agent_label
 from ..config.models import _DEFAULT_CONDITIONAL
@@ -209,7 +210,7 @@ async def evolve_project_workflow(
     if project is None:
         raise ValueError(f"project not found: {project_id}")
 
-    config = load_project_config(project.config)
+    config = await resolve_project_config(db, project)
     had_custom_workflow = config.workflow is not None
     base_graph = (
         config.workflow.model_copy(deep=True)
@@ -420,10 +421,8 @@ async def evolve_project_workflow(
     )
 
     if mutated:
-        raw_cfg = dict(project.config)
-        raw_cfg["workflow"] = evolved_graph.model_dump(mode="json")
-        await repo.update_project_config(db, project_id, raw_cfg)
         wf_dump = evolved_graph.model_dump(mode="json")
+        await save_project_config(db, project, {"workflow": wf_dump})
         evolution_payload: dict[str, Any] = {
             "project_id": project_id,
             "task_id": task_id,

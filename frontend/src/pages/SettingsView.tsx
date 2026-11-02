@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api";
+import { diffConfig, isEmptyDiff, isPlainObject } from "../configDiff";
 import type { Integrity, Quarantine } from "../types";
 import { Badge, Button, Card, Spinner, input } from "../ui";
 
@@ -18,6 +19,8 @@ export function SettingsView({
   projectId: string;
   onProjectDeleted?: () => void;
 }) {
+  // `loaded` is the effective config as fetched; saves send only the diff against it.
+  const [loaded, setLoaded] = useState<Record<string, unknown>>({});
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [rawJson, setRawJson] = useState("");
   const [quarantine, setQuarantine] = useState<Quarantine[]>([]);
@@ -59,6 +62,7 @@ export function SettingsView({
         api.quarantineIntegrity(projectId),
         api.mcpInfo().catch(() => null),
       ]);
+      setLoaded(cfg);
       setConfig(cfg);
       setRawJson(JSON.stringify(cfg, null, 2));
       setQuarantine(qList);
@@ -95,15 +99,31 @@ export function SettingsView({
     });
   }
 
+  /** Save only what `edited` changes against the loaded config, then show the fresh result. */
+  async function saveChanges(edited: Record<string, unknown>, keyPrefix: string, okText: string) {
+    const diff = diffConfig(loaded, edited);
+    if (isEmptyDiff(diff)) {
+      setNotice({ kind: "ok", text: "No changes to save." });
+      return;
+    }
+    await api.patchConfig(
+      projectId,
+      diff.patch,
+      `${keyPrefix}-${projectId}-${Date.now()}`,
+      diff.unset,
+    );
+    const fresh = await api.getConfig(projectId);
+    setLoaded(fresh);
+    setConfig(fresh);
+    setRawJson(JSON.stringify(fresh, null, 2));
+    setNotice({ kind: "ok", text: okText });
+  }
+
   async function saveStructured() {
     setSaving(true);
     setNotice(null);
     try {
-      await api.patchConfig(projectId, config, `cfg-${projectId}-${Date.now()}`);
-      const fresh = await api.getConfig(projectId);
-      setConfig(fresh);
-      setRawJson(JSON.stringify(fresh, null, 2));
-      setNotice({ kind: "ok", text: "Settings saved." });
+      await saveChanges(config, "cfg", "Settings saved.");
     } catch (e) {
       setNotice({ kind: "err", text: String(e) });
     } finally {
@@ -115,12 +135,11 @@ export function SettingsView({
     setSaving(true);
     setNotice(null);
     try {
-      const parsed = JSON.parse(rawJson) as Record<string, unknown>;
-      await api.patchConfig(projectId, parsed, `rawcfg-${projectId}-${Date.now()}`);
-      const fresh = await api.getConfig(projectId);
-      setConfig(fresh);
-      setRawJson(JSON.stringify(fresh, null, 2));
-      setNotice({ kind: "ok", text: "Raw configuration applied." });
+      const parsed: unknown = JSON.parse(rawJson);
+      if (!isPlainObject(parsed)) {
+        throw new Error("The configuration must be a JSON object.");
+      }
+      await saveChanges(parsed, "rawcfg", "Raw configuration applied.");
     } catch (e) {
       setNotice({ kind: "err", text: String(e) });
     } finally {
@@ -669,7 +688,8 @@ export function SettingsView({
           <div>
             <h2 className="text-sm font-semibold text-zinc-100">Advanced Configuration JSON</h2>
             <p className="text-xs text-zinc-500">
-              Inspect or edit the full resolved project configuration document directly.
+              Inspect or edit the effective configuration. Only what you change is stored for
+              this project; delete a key to inherit it from the global settings again.
             </p>
           </div>
           <Button variant="ghost" size="sm" onClick={() => setShowRawJson((v) => !v)}>

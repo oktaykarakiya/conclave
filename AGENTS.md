@@ -55,6 +55,7 @@ cd frontend && npm run build       # build SPA into src/conclave/web/static/
 ## Critical conventions
 
 - **Config is SQLite-backed and edited via the UI** — never introduce YAML/config files.
+- **Config is layered; projects store deltas**: effective = built-in → global (`global-defaults` preset) → project branch (`default_branch` as `execution.target_branch`) → project delta → `agent_overrides`. Resolve with `resolve_project_config` and write with `save_project_config` / `create_project_with_config` / `save_global_config` (`config/resolver.py`), which store only what differs from what the project inherits; never resolve config from `project.config` alone, write it directly, or copy global settings into a project.
 - **Never cut irreplaceable prompt content** (task request, plan, reviewer feedback, steer, planning prompt). Only recoverable bulk (diffs, gate/test and setup output) is fitted, via `engine/context_limits.py` under the `context.*` limits, with a visible marker and a `context_truncated` event.
 - **DB migrations are append-only**: add a new entry to the `MIGRATIONS` list in `src/conclave/db/migrations/`. Never edit an already-applied migration. The runner records `schema_version` atomically.
 - **Validate API inputs** — return 4xx, never 500 on bad input. Bound list endpoints.
