@@ -68,5 +68,6 @@ cd frontend && npm run build       # build SPA into src/conclave/web/static/
 
 - `tests/conftest.py` provides a `db` fixture (async, per-test SQLite in `tmp_path`).
 - Integration tests use `FakeProvider` from `tests/integration/fake_provider.py` — it returns deterministic JSON based on prompt keywords (e.g., `"reviewer"` → pass verdict, `"planner"` → plan JSON).
+- A test project without a test command fails its tasks with `no_test_command` before any dispatch: give it one (e.g. `execution.baseline_test_command: "echo ok"`), or `execution.allow_no_test_command: true` when the test is about something else.
 - `pytest-asyncio` mode is `auto`; `PYTHONPATH=src` (set in pyproject.toml).
 - Filterwarnings: errors on all warnings except `PytestUnraisableExceptionWarning` (benign asyncio subprocess GC race in per-test event loops).

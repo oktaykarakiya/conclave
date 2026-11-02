@@ -31,9 +31,10 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
 
 1. **Never let work land unreviewed.** Prefer `auto_merge: false`: read every change with
    `conclave_get_task_diff`, then `conclave_merge_task`. Or arm a human checkpoint before the merge.
-2. **A project without a test command has no gate.** Always set `execution.baseline_test_command`
-   (and `setup_command` when the repo needs an environment). Verify it passes on the target
-   branch first, or every task fails at baseline.
+2. **A project without a test command has no gate, so its tasks do not run.** Always set
+   `execution.baseline_test_command` (and `setup_command` when the repo needs an environment).
+   Without one, every task fails at once with reason `no_test_command`, before any agent runs
+   (§3). Verify the command passes on the target branch first, or every task fails at baseline.
 3. **Specs decide quality.** Precise, testable requests beat clever models (see §5).
 4. **Verify, don't assume.** Check each `agent.result`'s `model_reported` matches the model you
    configured; check the merged result yourself when it matters.
@@ -52,6 +53,18 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
    - `execution.target_branch`, `execution.auto_merge`, `execution.setup_command`,
      `execution.baseline_test_command`, `execution.require_full_green`,
      `execution.max_parallel_tasks`, `execution.review_rounds_max`
+   - `execution.allow_no_test_command` (default `false`): with `require_full_green` on and no test
+     command, a task with a developer fails with reason `no_test_command` before any worktree or
+     agent is spent; its summary names the fix. Set it to `true` only to run deliberately without
+     a gate (the gate then passes, and a `gate_skipped_no_tests` log event says it ran no tests).
+     Review-only workflows (no developer) and `require_full_green: false` are not affected.
+   - `execution.test_integrity` (`block` | `warn` | `off`, default `block`): after each developer
+     attempt Conclave checks, from git, whether the change deleted a pre-existing test file,
+     removed a test without adding it back elsewhere, or added a skip / xfail / todo / `.only`
+     marker to a pre-existing test file (Python and JS/TS). Findings go to every reviewer as a
+     `TEST INTEGRITY` section, a `test_integrity.flagged` event and the task's result summary. With
+     `block` a flagged change is never auto-merged, even with `auto_merge: true` (§8); `warn`
+     only flags; `off` skips the check.
    - `agent_defaults` (applies to every agent) and `agent_overrides.<agent>`:
      `model`, `effort`, `timeout_minutes`, `max_retries`, `compact_before_start`, `skills`
    - `experimental.planner_enabled`, `experimental.auto_planner_char_threshold`
@@ -122,10 +135,13 @@ session (§9) can produce the tree for you.
   `agent.result` (`ok`, `model_reported`, `cost_usd`, `error`), `agent.verdict`
   (`verdict`, `reason`), `pipeline.derived` (which reviewers will run), `node.started`,
   `node.waiting_for_approval`, `hitl.waiting`, `task.committed`, `task.merged`,
-  `task.failed` (payload `reason`), `task.done`. Skip `agent.output_chunk` (live output) unless
-  debugging. A `log` event with `stage: "context_truncated"` marks every cut of a diff or
-  gate/setup output in an agent's prompt (`block`, `field`, `original_chars`, `kept_chars`,
-  `agent`, `node_id`); there is none when nothing was cut.
+  `task.failed` (payload `reason`, e.g. `no_test_command`), `task.done`,
+  `test_integrity.flagged` (`findings` with `file`, `test`, `kind`; `attempt`; `mode`). Skip
+  `agent.output_chunk` (live output) unless debugging. A `log` event with
+  `stage: "gate_skipped_no_tests"` means the gate ran no tests (`allow_no_test_command`). A
+  `log` event with `stage: "context_truncated"` marks every cut of a diff or gate/setup output
+  in an agent's prompt (`block`, `field`, `original_chars`, `kept_chars`, `agent`, `node_id`);
+  there is none when nothing was cut.
 - `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review.
 - Typical timeline: setup + baseline test run, planner, developer, each reviewer in turn, the
   gate, commit. Poll every 15–60 s; long silences during planning or development are normal.
@@ -153,6 +169,18 @@ session (§9) can produce the tree for you.
   Conclave's guarded merge (conflicts leave everything untouched and return an error). If a
   change is not acceptable, do not merge it: create a follow-up task that states exactly what to
   fix, or cancel and rewrite the spec.
+- **Test-integrity flags.** A `test_integrity.flagged` event (and a `test integrity (...)` note in
+  the result summary) means the change took pre-existing coverage away: `deleted_file` (a test
+  file deleted or moved out of the suite), `removed_test` (a test removed and not added back
+  elsewhere in the change) or `skip_marker` (a skip, xfail, todo or focus marker added). Reviewers
+  are told to fail such a change unless the request asks for it, so the developer usually
+  restores the test on its next attempt. Under `block`, a flagged change that still passes ends
+  `done` with `merged=False` on its branch, even with `auto_merge: true`. Read the diff: merge it
+  with `conclave_merge_task` only if the removal or skip was intended (say so in the request next
+  time), otherwise create a follow-up task that restores the tests and fixes the code. The check
+  is conservative: a renamed test shows as a removed one. It reads test code and does not run it,
+  so a test config change that deselects tests, or a test switched off by control flow, is not
+  flagged; review those in the diff.
 - **Comparing models (bake-off)**: give each candidate its own project on its own clone, the
   same base commit, the same spec and the same reviewers; score with acceptance tests the agents
   never see, the gate, review rounds, diff quality, cost and time. Merge the better diff.
@@ -181,6 +209,11 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 - Attaching an already-attached path updates that project (§3).
 - A task that fails at **baseline** usually means the test or setup command is wrong for the
   target branch — fix the config, not the code.
+- A task that fails at once with reason `no_test_command` never ran an agent: set
+  `execution.baseline_test_command` (or `allow_no_test_command: true`) and approve it again
+  (`conclave_approve_task`).
+- A `done` task whose summary says `merged=False` and `not auto-merged` was held by
+  `test_integrity: block` (§8); it waits for you, not for the worker.
 - If a model's `model_reported` differs from the configured one, stop and investigate before
   trusting results (wrong engine, wrong model string, or routing problem).
 - Frequent `context_truncated` events mean diffs or test output exceed the limit (§3): agents can

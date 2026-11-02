@@ -285,6 +285,17 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "max_parallel_tasks": _prop("integer", "Optional max parallel tasks (1-16)."),
             "setup_command": _prop("string", "Optional worktree setup command."),
             "baseline_test_command": _prop("string", "Optional authoritative test gate command."),
+            "allow_no_test_command": _prop(
+                "boolean",
+                "Optional: run tasks without a test gate when no test command resolves "
+                "(default false: such a task fails before any agent runs).",
+            ),
+            "test_integrity": _prop(
+                "string",
+                "Optional test-integrity guard for deleted, removed or skipped pre-existing tests: "
+                "block (default; flag to reviewers, never auto-merge), warn (flag only) or off.",
+                enum=["block", "warn", "off"],
+            ),
             "wall_clock_budget_minutes": _prop(
                 "integer", "Optional task timeout budget in minutes."
             ),
@@ -1298,6 +1309,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             "max_parallel_tasks",
             "setup_command",
             "baseline_test_command",
+            "allow_no_test_command",
+            "test_integrity",
             "wall_clock_budget_minutes",
             "review_rounds_max",
             "stop_on_failure",

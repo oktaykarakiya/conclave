@@ -90,6 +90,9 @@ class FakeProvider:
     ``--dangerously-skip-permissions`` they *can* write to the worktree, so the fake writes
     a stray file and clobbers the developer's file when reviewing. It lets a test assert the
     orchestrator restores the reviewed tree before committing (ENG-2).
+
+    ``developer_deletes`` names a worktree file the developer deletes alongside its write, e.g.
+    a pre-existing test, so the test-integrity guard has something to flag.
     """
 
     def __init__(
@@ -100,12 +103,14 @@ class FakeProvider:
         filename: str = "FEATURE.txt",
         reviewer_tampers: bool = False,
         use_nested_plan: bool = False,
+        developer_deletes: str | None = None,
     ) -> None:
         self.developer_writes = developer_writes
         self.developer_content = developer_content
         self.filename = filename
         self.reviewer_tampers = reviewer_tampers
         self.use_nested_plan = use_nested_plan
+        self.developer_deletes = developer_deletes
         self.prompts: list[str] = []
         # Count post-mortem dispatches so failure-path tests can assert the wiring.
         self.post_mortem_calls = 0
@@ -181,6 +186,8 @@ class FakeProvider:
         # developer fallback
         if self.developer_writes and cwd is not None:
             (Path(cwd) / self.filename).write_text(self.developer_content, encoding="utf-8")
+        if self.developer_deletes and cwd is not None:
+            (Path(cwd) / self.developer_deletes).unlink(missing_ok=True)
         # Stream the result in chunks (with a newline) so on_chunk-driven live output is
         # exercised: this drives the runner's bounded agent_output emission.
         if on_chunk is not None:

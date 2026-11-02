@@ -74,7 +74,6 @@ from .orchestrator import Orchestrator
 from .repro import ReproTest, parse_repro_test
 from .repro_gate import ReproOutcome, reproduce_bug
 from .runner import AgentRunner
-from .test_integrity import collect_modified_or_deleted_tests
 from .verdict import parse_verdict
 from .worktree import WorktreeManager
 
@@ -444,10 +443,6 @@ class BugFixerController:
         return deferred
 
     # --- derivations --------------------------------------------------------
-
-    async def check_fix_test_integrity(self, worktree: Path, base_sha: str) -> list[str]:
-        """Return pre-existing test paths modified or deleted since ``base_sha``."""
-        return sorted(await collect_modified_or_deleted_tests(worktree, base_sha))
 
     def _worktree_manager(self, project: Project) -> WorktreeManager:
         """The shared per-project WorktreeManager (same root layout the orchestrator uses)."""

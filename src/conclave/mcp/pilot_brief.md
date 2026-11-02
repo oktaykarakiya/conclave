@@ -8,8 +8,10 @@ full guide once per session before acting.
 **Golden rules**
 - Never let work land unreviewed: prefer `auto_merge: false`, read every change with
   `conclave_get_task_diff`, then `conclave_merge_task` (or arm a checkpoint before the merge).
-- A project without a test command has no gate: always set `execution.baseline_test_command` and
-  verify it passes on the target branch first.
+- A project without a test command has no gate, so its tasks fail at once (`no_test_command`):
+  always set `execution.baseline_test_command` and verify it passes on the target branch first.
+- A change that deletes, removes or skips existing tests is flagged to the reviewers and, by
+  default, never auto-merged: read its diff before `conclave_merge_task`.
 - Specs decide quality: precise, testable requests beat clever models.
 - Verify, don't assume: check each `agent.result`'s `model_reported` against the model you
   configured, and check the merged result yourself when it matters.

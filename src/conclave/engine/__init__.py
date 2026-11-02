@@ -29,7 +29,10 @@ from .repro import ReproTest, parse_repro_test, repro_pathguard
 from .repro_gate import ReproOutcome, ReproResult, reproduce_bug, resolve_repro_test_path
 from .runner import AgentRunner, assemble_prompt
 from .test_integrity import (
-    collect_modified_or_deleted_tests,
+    FileChange,
+    IntegrityFinding,
+    collect_integrity_findings,
+    integrity_findings,
     is_test_path,
     modified_or_deleted_tests,
 )
@@ -43,8 +46,10 @@ __all__ = [
     "BugFixerController",
     "CycleOutcome",
     "CycleResult",
+    "FileChange",
     "GateResult",
     "HunterCandidate",
+    "IntegrityFinding",
     "Orchestrator",
     "ParsedVerdict",
     "ReproOutcome",
@@ -56,13 +61,14 @@ __all__ = [
     "assemble_prompt",
     "build_baseline_preamble",
     "check_grounding",
-    "collect_modified_or_deleted_tests",
+    "collect_integrity_findings",
     "derive_planner_nodes",
     "derive_review_nodes",
     "discover_bug",
     "evolve_project_workflow",
     "get_agent_pipeline",
     "ingest_coverage",
+    "integrity_findings",
     "is_parallel_review",
     "is_test_path",
     "modified_or_deleted_tests",

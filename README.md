@@ -30,7 +30,9 @@ even config).
 - **Grounded verification + green-gate** — reviewer/security/tester verdicts must cite evidence that
   exists in the actual diff (hallucinated findings are downgraded), and `ruff + mypy + pytest` must be
   green before anything merges. Per-worktree venv provisioning so reviewers and the gate share the
-  toolchain.
+  toolchain. A task with no test command fails instead of passing an empty gate, and a change that
+  deletes, removes or skips pre-existing tests is flagged to the reviewers and, by default, never
+  auto-merged.
 - **Hardened engine** — atomic SQLite transactions, dependency-ordered task claims, crash-safe task
   lifecycle, reviewer-retry with a "no merge without a real review" guard, and bounded resource use.
 

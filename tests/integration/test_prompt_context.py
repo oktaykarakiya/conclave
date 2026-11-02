@@ -79,10 +79,16 @@ async def _run_task(
     request: str = "add a feature file",
     use_planner: bool | None = None,
 ) -> tuple[Task, bool]:
-    """Attach ``tmp_path/repo`` with *config*, process one approved task, return it + result."""
+    """Attach ``tmp_path/repo`` with *config*, process one approved task, return it + result.
+
+    The repos here have no test suite, so a task without a ``baseline_test_command`` in *config*
+    runs ungated deliberately (``allow_no_test_command``) instead of failing up front.
+    """
+    execution = {"target_branch": "main", "allow_no_test_command": True}
+    execution.update(config.get("execution", {}))
     project = await repo.create_project(
         db, name="t", path=str(tmp_path / "repo"), default_branch="main",
-        config={"execution": {"target_branch": "main"}, **config},
+        config={**config, "execution": execution},
     )
     task = await repo.create_task(
         db, project_id=project.id, request=request, state=TaskState.approved,

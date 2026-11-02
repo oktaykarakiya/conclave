@@ -157,6 +157,28 @@ def test_context_char_limits_are_bounded(field: str, value: int) -> None:
     assert load_project_config({"context": {field: 1_000}}).context.model_dump()[field] == 1_000
 
 
+def test_gate_integrity_defaults() -> None:
+    cfg = ConclaveConfig()
+    assert cfg.execution.allow_no_test_command is False
+    assert cfg.execution.test_integrity == "block"
+
+
+def test_gate_integrity_fields_are_in_the_config_schema() -> None:
+    props = config_schema()["$defs"]["ExecutionSettings"]["properties"]
+    assert props["allow_no_test_command"]["type"] == "boolean"
+    assert props["allow_no_test_command"]["default"] is False
+    assert props["test_integrity"]["enum"] == ["block", "warn", "off"]
+    assert props["test_integrity"]["default"] == "block"
+
+
+def test_test_integrity_rejects_unknown_modes() -> None:
+    warn = load_project_config({"execution": {"test_integrity": "warn"}})
+    assert warn.execution.test_integrity == "warn"
+    with pytest.raises(ValidationError) as excinfo:
+        load_project_config({"execution": {"test_integrity": "strict"}})
+    assert excinfo.value.errors()[0]["loc"] == ("execution", "test_integrity")
+
+
 def test_context_is_in_the_config_schema() -> None:
     schema = config_schema()
     assert schema["properties"]["context"] == {"$ref": "#/$defs/ContextSettings"}

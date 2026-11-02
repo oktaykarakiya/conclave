@@ -23,6 +23,9 @@ from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 from conclave.runtime import Daemon
 from conclave.web import create_app
 
+# Execution settings for tests about stages other than the green gate: their throwaway repos have
+# no test suite, so they run without a test command deliberately (else no_test_command fails them).
+_UNGATED_EXECUTION = {"target_branch": "main", "allow_no_test_command": True}
 
 async def _init_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -32,6 +35,20 @@ async def _init_repo(path: Path) -> None:
     (path / "README.md").write_text("# test repo\n")
     await run_git(path, "add", "-A")
     await run_git(path, "commit", "-m", "initial commit")
+
+
+async def _attach_ungated(client: httpx.AsyncClient, repo_path: Path) -> str:
+    """Attach *repo_path* over REST with :data:`_UNGATED_EXECUTION`; return the project id."""
+    created = await client.post(
+        "/api/projects", json={"name": "t", "path": str(repo_path), "default_branch": "main"}
+    )
+    assert created.status_code == 200
+    project_id = str(created.json()["id"])
+    patched = await client.patch(
+        f"/api/projects/{project_id}/config", json={"config": {"execution": _UNGATED_EXECUTION}}
+    )
+    assert patched.status_code == 200
+    return project_id
 
 
 async def _worktree_paths(repo_path: Path) -> set[Path]:
@@ -77,7 +94,7 @@ async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> No
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -119,7 +136,7 @@ async def test_commit_rejected_by_pre_commit_hook_fails_task_and_preserves_work(
     _, base = await run_git(repo_path, "rev-parse", "main")
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -185,7 +202,7 @@ async def test_passing_pre_commit_hook_runs_and_commit_merges(
     )
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -220,7 +237,7 @@ async def test_nothing_to_commit_skips_commit_even_with_failing_hook(
     _install_pre_commit_hook(repo_path, "#!/bin/sh\nexit 1\n")
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="no-op change", state=TaskState.approved
@@ -248,7 +265,7 @@ async def test_dispatch_emits_live_agent_output_events(db: Database, tmp_path: P
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     config = load_project_config(project.config)
     runner = AgentRunner(db, EventBus(db), FakeProvider(), project.id, config)
@@ -331,7 +348,7 @@ async def test_reviewer_edits_are_not_committed(db: Database, tmp_path: Path) ->
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -368,7 +385,7 @@ async def test_review_all_empty_reviewers_record_unknown_and_block(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -400,7 +417,7 @@ async def test_exception_mid_process_task_fails_task_and_cleans_worktree(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -438,7 +455,7 @@ async def test_crash_recovery_returns_in_progress_to_approved(db: Database, tmp_
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     await repo.create_task(db, project_id=project.id, request="x", state=TaskState.approved)
     claimed = await repo.claim_next_approved(db, project.id)
@@ -463,7 +480,7 @@ async def test_crash_recovery_reblocks_descendants(db: Database, tmp_path: Path)
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
 
     # A failed parent with an approved child — the vulnerable state.
@@ -530,7 +547,7 @@ async def test_notification_fires_on_task_done(
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
         config={
-            "execution": {"target_branch": "main"},
+            "execution": _UNGATED_EXECUTION,
             "notifications": {"webhook_url": "http://example.test/hook"},
         },
     )
@@ -608,7 +625,7 @@ async def test_no_notification_when_unconfigured(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved,
@@ -630,7 +647,7 @@ async def test_notification_failure_does_not_affect_task(
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
         config={
-            "execution": {"target_branch": "main"},
+            "execution": _UNGATED_EXECUTION,
             "notifications": {"webhook_url": "http://example.test/hook"},
         },
     )
@@ -792,7 +809,7 @@ async def test_gc_runs_without_baseline(db: Database, tmp_path: Path) -> None:
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
         config={
-            "execution": {"target_branch": "main", "retention_events_max": 100},
+            "execution": {**_UNGATED_EXECUTION, "retention_events_max": 100},
         },
     )
     # No baseline_test_command => _baseline returns "" without running tests or a snapshot.
@@ -836,7 +853,7 @@ async def test_merge_conflict_detected_by_merge(db: Database, tmp_path: Path) ->
     await _init_repo(repo_path)
     _project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
 
     # Create a feature branch with a commit modifying FEATURE.txt.
@@ -867,7 +884,7 @@ async def test_merge_conflict_marks_task_failed_and_preserves_branch(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -924,7 +941,7 @@ async def test_merge_locks_pruned_after_merge(db: Database, tmp_path: Path) -> N
     await _init_repo(repo_path)
     _project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
 
     # A feature branch that fast-forwards main (main is not the checked-out branch, so
@@ -957,7 +974,7 @@ async def test_concurrent_merges_share_lock_then_prune(db: Database, tmp_path: P
     await _init_repo(repo_path)
     _project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
 
     orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
@@ -1081,7 +1098,7 @@ async def test_setup_timeout_seconds_from_config_is_passed_to_run_shell(
         db, name="t", path=str(repo_path), default_branch="main",
         config={
             "execution": {
-                "target_branch": "main",
+                **_UNGATED_EXECUTION,
                 "setup_command": "mkdir -p .venv && echo ok",
                 "setup_timeout_seconds": 42,
             },
@@ -1131,7 +1148,7 @@ async def test_no_venv_guidance_when_setup_does_not_create_venv(
         db, name="t", path=str(repo_path), default_branch="main",
         config={
             "execution": {
-                "target_branch": "main",
+                **_UNGATED_EXECUTION,
                 # This setup_command succeeds but does not create a .venv directory.
                 "setup_command": "echo 'provisioning done'",
             },
@@ -1169,7 +1186,7 @@ async def test_mid_attempt_timeout(
         db, name="t", path=str(repo_path), default_branch="main",
         config={
             "execution": {
-                "target_branch": "main",
+                **_UNGATED_EXECUTION,
                 # Any positive budget enables the check; the monkeypatch overrides it.
                 "wall_clock_budget_minutes": 1,
             },
@@ -1244,7 +1261,7 @@ async def test_steer_injected_into_next_dispatch_then_cleared(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved,
@@ -1305,7 +1322,7 @@ async def test_cancel_in_progress_task_sets_cancelled_and_cleans_worktree(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved,
@@ -1346,7 +1363,7 @@ async def test_cancel_event_checked_between_stages(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": {"target_branch": "main"}},
+        config={"execution": _UNGATED_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved,
@@ -1424,7 +1441,7 @@ async def test_cancel_on_final_attempt_lands_in_cancelled_not_failed(
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
         config={
-            "execution": {"target_branch": "main"},
+            "execution": _UNGATED_EXECUTION,
             "agent_overrides": {"developer": {"max_retries": 1}},
         },
     )
@@ -1610,12 +1627,7 @@ async def test_cancel_via_api_endpoint(
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         try:
-            created = await client.post(
-                "/api/projects",
-                json={"name": "t", "path": str(repo_path), "default_branch": "main"},
-            )
-            assert created.status_code == 200
-            project_id = created.json()["id"]
+            project_id = await _attach_ungated(client, repo_path)
 
             task = await client.post(
                 f"/api/projects/{project_id}/tasks",
@@ -1760,12 +1772,7 @@ async def test_steer_via_api_endpoint_injects_into_in_flight_task(
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         try:
-            created = await client.post(
-                "/api/projects",
-                json={"name": "t", "path": str(repo_path), "default_branch": "main"},
-            )
-            assert created.status_code == 200
-            project_id = created.json()["id"]
+            project_id = await _attach_ungated(client, repo_path)
 
             task = await client.post(
                 f"/api/projects/{project_id}/tasks",

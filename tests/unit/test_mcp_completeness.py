@@ -9,6 +9,7 @@ from typing import Any
 from conclave.db import CheckpointStatus, Database, StoreItemKind, TaskState
 from conclave.db import repositories as repo
 from conclave.events import EventType
+from conclave.mcp.server import handle_mcp_message
 from conclave.mcp.tools import MCP_TOOLS, _opt_bool, _opt_int, _opt_str, call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, Provider, ResolvedProfile
 from conclave.runtime import Daemon
@@ -75,8 +76,74 @@ def test_null_safe_helpers_and_tool_schemas() -> None:
         "agent_defaults",
         "agent_overrides",
         "workflow",
+        "allow_no_test_command",
+        "test_integrity",
     ):
         assert expected_field in patch_props, f"missing {expected_field} in conclave_patch_config"
+    assert patch_props["allow_no_test_command"]["type"] == "boolean"
+    assert patch_props["test_integrity"]["enum"] == ["block", "warn", "off"]
+
+
+async def test_patch_config_round_trips_the_gate_integrity_fields(
+    db: Database, tmp_path: Path
+) -> None:
+    """Both fields are settable via ``config.execution`` and via the explicit parameters."""
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    git_repo = tmp_path / "repo"
+    (git_repo / ".git").mkdir(parents=True)
+    pid = (
+        await call_mcp_tool(daemon, "conclave_attach_project", {"name": "p", "path": str(git_repo)})
+    )["id"]
+
+    before = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert before["execution"]["allow_no_test_command"] is False
+    assert before["execution"]["test_integrity"] == "block"
+
+    await call_mcp_tool(
+        daemon,
+        "conclave_patch_config",
+        {"project_id": pid, "config": {"execution": {"allow_no_test_command": True,
+                                                    "test_integrity": "warn"}}},
+    )
+    via_config = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert via_config["execution"]["allow_no_test_command"] is True
+    assert via_config["execution"]["test_integrity"] == "warn"
+
+    await call_mcp_tool(
+        daemon,
+        "conclave_patch_config",
+        {"project_id": pid, "allow_no_test_command": False, "test_integrity": "off"},
+    )
+    via_params = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert via_params["execution"]["allow_no_test_command"] is False
+    assert via_params["execution"]["test_integrity"] == "off"
+
+
+async def test_patch_config_rejects_an_unknown_test_integrity_mode(
+    db: Database, tmp_path: Path
+) -> None:
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    git_repo = tmp_path / "repo"
+    (git_repo / ".git").mkdir(parents=True)
+    pid = (
+        await call_mcp_tool(daemon, "conclave_attach_project", {"name": "p", "path": str(git_repo)})
+    )["id"]
+
+    response = await handle_mcp_message(
+        daemon,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "conclave_patch_config",
+                "arguments": {"project_id": pid, "test_integrity": "strict"},
+            },
+        },
+    )
+    assert response is not None and response["result"]["isError"] is True
+    config = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert config["execution"]["test_integrity"] == "block"  # the bad patch was not stored
 
 
 async def test_mcp_null_arguments_do_not_produce_none_strings_or_type_error(

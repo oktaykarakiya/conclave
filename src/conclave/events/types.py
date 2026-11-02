@@ -34,6 +34,7 @@ class EventType(StrEnum):
     # attempts / gate
     attempt_started = "attempt.started"
     attempt_failed = "attempt.failed"
+    test_integrity_flagged = "test_integrity.flagged"
     baseline_snapshot = "baseline.snapshot"
     node_started = "node.started"
     node_completed = "node.completed"

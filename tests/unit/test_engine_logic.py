@@ -174,6 +174,81 @@ def test_test_command_returns_none_when_neither() -> None:
     assert _test_command(config, {"commands": {}}) is None
 
 
+def test_test_command_treats_a_blank_command_as_unset() -> None:
+    """A blank command would run as a no-op that always passes the gate."""
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _test_command
+
+    config = ConclaveConfig()
+    config.execution.baseline_test_command = "   "
+    assert _test_command(config, None) is None
+    assert _test_command(config, {"commands": {"test": "pytest -q"}}) == "pytest -q"
+
+
+# --- _missing_test_command ----------------------------------------------------
+
+
+def test_missing_test_command_without_any_test_command() -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _missing_test_command
+
+    assert _missing_test_command(ConclaveConfig(), None) is True
+
+
+def test_missing_test_command_resolves_repo_knowledge_and_config() -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _missing_test_command
+
+    assert _missing_test_command(ConclaveConfig(), {"commands": {"test": "pytest -q"}}) is False
+    config = ConclaveConfig()
+    config.execution.baseline_test_command = "pytest -q"
+    assert _missing_test_command(config, None) is False
+
+
+def test_missing_test_command_respects_the_explicit_choices() -> None:
+    from conclave.config import ConclaveConfig
+    from conclave.engine.orchestrator import _missing_test_command
+
+    ungated = ConclaveConfig()
+    ungated.execution.require_full_green = False
+    assert _missing_test_command(ungated, None) is False
+    allowed = ConclaveConfig()
+    allowed.execution.allow_no_test_command = True
+    assert _missing_test_command(allowed, None) is False
+
+
+def test_missing_test_command_spares_flows_without_a_developer() -> None:
+    from conclave.config import (
+        ConclaveConfig,
+        NodeKind,
+        WorkflowEdge,
+        WorkflowGraph,
+        WorkflowNode,
+    )
+    from conclave.engine.orchestrator import _missing_test_command
+
+    review_only = ConclaveConfig(
+        workflow=WorkflowGraph(
+            nodes=[
+                WorkflowNode(id="reviewer", kind=NodeKind.reviewer, agent="reviewer"),
+                WorkflowNode(id="gate", kind=NodeKind.gate),
+            ],
+            edges=[WorkflowEdge(id="e1", source="reviewer", target="gate")],
+        )
+    )
+    assert _missing_test_command(review_only, None) is False
+    with_developer = ConclaveConfig(
+        workflow=WorkflowGraph(
+            nodes=[
+                WorkflowNode(id="developer", kind=NodeKind.developer, agent="developer"),
+                WorkflowNode(id="gate", kind=NodeKind.gate),
+            ],
+            edges=[WorkflowEdge(id="e1", source="developer", target="gate")],
+        )
+    )
+    assert _missing_test_command(with_developer, None) is True
+
+
 # --- _check_commands ---------------------------------------------------------
 
 

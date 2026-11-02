@@ -10,7 +10,7 @@ web UI's config forms, so the UI is the sole editor — no hand-edited YAML.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -159,6 +159,20 @@ class ExecutionSettings(BaseModel):
     )
     require_full_green: bool = Field(
         default=True, description="Require zero failing suites (minus governed Quarantine)."
+    )
+    allow_no_test_command: bool = Field(
+        default=False,
+        description=(
+            "Run tasks without a test gate when no test command resolves. When false (and "
+            "require_full_green is on) such a task fails before any agent runs."
+        ),
+    )
+    test_integrity: Literal["block", "warn", "off"] = Field(
+        default="block",
+        description=(
+            "Flag pre-existing tests a change deletes, removes or skips to the reviewers. block: "
+            "a flagged change is never auto-merged; warn: flag only; off: no check."
+        ),
     )
     setup_timeout_seconds: int = Field(
         default=900,

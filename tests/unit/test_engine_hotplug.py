@@ -186,6 +186,7 @@ async def test_process_task_hotplugs_config_mid_task(
             "execution": {
                 "baseline_test_command": "",
                 "require_full_green": True,
+                "allow_no_test_command": True,
                 "auto_merge": True,
             },
             "experimental": {"planner_enabled": False},

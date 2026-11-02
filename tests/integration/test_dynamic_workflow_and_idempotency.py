@@ -142,7 +142,11 @@ async def test_step_level_checkpoints_persisted_and_resumed_after_crash(
         path=str(repo_path),
         default_branch="main",
         config={
-            "execution": {"target_branch": "main", "parallel_reviewers": True},
+            "execution": {
+                "target_branch": "main",
+                "parallel_reviewers": True,
+                "allow_no_test_command": True,
+            },
         },
     )
     task = await repo.create_task(
@@ -215,6 +219,12 @@ async def test_pause_after_node_and_source_branch_pr_review(
         )
         assert proj_res.status_code == 200
         pid = proj_res.json()["id"]
+        # The throwaway repo has no test suite: run ungated deliberately.
+        patched = await client.patch(
+            f"/api/projects/{pid}/config",
+            json={"config": {"execution": {"allow_no_test_command": True}}},
+        )
+        assert patched.status_code == 200
 
         # Configure 'reviewer' node with pause_after=True via MCP tool
         await client.post(

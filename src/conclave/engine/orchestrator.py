@@ -16,7 +16,8 @@ import logging
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,11 @@ from .graph_executor import (
 )
 from .memory import AttemptMemory
 from .runner import AgentRunner
+from .test_integrity import (
+    IntegrityFinding,
+    collect_integrity_findings,
+    integrity_prompt_section,
+)
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
 from .workflow_evolver import evolve_project_workflow
 from .worktree import WorktreeManager
@@ -57,6 +63,18 @@ _REVIEWER_RETRY_BACKOFF_S = 3.0
 # Bound on git's combined output captured in the result summary when a task commit fails,
 # so a noisy hook cannot bloat the task row while its diagnostic tail stays visible.
 _COMMIT_OUTPUT_TAIL_CHARS = 500
+
+# Result summary of a task stopped because no test command resolves: a green gate that runs no
+# tests proves nothing, so the operator must configure one or opt out explicitly.
+_NO_TEST_COMMAND_SUMMARY = (
+    "no test command: the green gate would run no tests, so the task stopped before any agent "
+    "ran. Set execution.baseline_test_command (and execution.setup_command if the tests need an "
+    "environment), or set execution.allow_no_test_command: true to run deliberately without a "
+    "gate."
+)
+
+# Test-integrity findings listed in a result summary; the test_integrity.flagged event has all.
+_INTEGRITY_NOTE_MAX_FINDINGS = 20
 
 _NECESSITY_YAGNI_RULE = (
     "NECESSITY & YAGNI CHECK: Verify that every change is strictly necessary to fix a "
@@ -614,6 +632,17 @@ class Orchestrator:
             },
         )
 
+        # The test command is known from the config alone, so a task whose green gate would run
+        # no tests stops here: no worktree, setup, baseline or agent dispatch is spent. A config
+        # error must not evolve the workflow, so this returns before the main try (as a failed
+        # worktree setup does) and sends the terminal notification itself.
+        if _missing_test_command(config, None):
+            await self._fail_early(
+                task, wm, task_branch, _NO_TEST_COMMAND_SUMMARY, reason="no_test_command"
+            )
+            await self._notify_terminal(project.id, task.id, config)
+            return False
+
         try:
             worktree = await wm.create(task.id, checkout_branch, task_branch)
         except Exception as exc:
@@ -798,6 +827,9 @@ class Orchestrator:
             failed = False
             timed_out = False
             gate_failed_after_review = False
+            # Test-integrity findings of the last checked attempt, and the mode they ran under.
+            integrity: list[IntegrityFinding] = []
+            integrity_mode = "off"
 
             while attempts < max_retries:
                 config = await self._refresh_task_config(project.id, runner, config)
@@ -1101,13 +1133,33 @@ class Orchestrator:
 
                 config = await self._refresh_task_config(project.id, runner, config)
                 budget = config.execution.wall_clock_budget_minutes
+                # Test integrity: which pre-existing tests this attempt deleted, removed or
+                # skipped, read from git (never the fitted prompt diff) before the reviewers run,
+                # since they can write to the worktree. The index holds the reviewed tree here.
+                integrity_mode = config.execution.test_integrity if has_enabled_developer else "off"
+                integrity = (
+                    await collect_integrity_findings(worktree, checkpoint)
+                    if integrity_mode != "off"
+                    else []
+                )
+                if integrity:
+                    await self._bus.emit(
+                        type=EventType.test_integrity_flagged,
+                        project_id=project.id,
+                        task_id=task.id,
+                        payload={
+                            "findings": [asdict(finding) for finding in integrity],
+                            "attempt": attempts,
+                            "mode": integrity_mode,
+                        },
+                    )
                 # One fitted diff per limit for this attempt, shared by the reviewers and the
                 # post-gate nodes, so each actual cut is made and reported once.
                 diff_cache: dict[BulkLimit, str] = {}
                 failed, feedback, review_timed_out = await self._review(
                     runner, task, project.id, worktree, full_diff, attempts, config, knowledge,
                     rules, started, budget, cancel_event=cancel_event, diff_cmd=diff_cmd,
-                    diff_cache=diff_cache,
+                    diff_cache=diff_cache, integrity_section=integrity_prompt_section(integrity),
                 )
                 if review_timed_out:
                     timed_out = True
@@ -1197,6 +1249,22 @@ class Orchestrator:
                     for cmd in check_commands:
                         gate_commands.append(("check/lint", cmd))
 
+                    if not gate_commands and has_enabled_developer:
+                        # Reached with execution.allow_no_test_command (or once the test command
+                        # was removed mid-task): the gate passes, but never silently.
+                        await self._bus.emit(
+                            type=EventType.log,
+                            project_id=project.id,
+                            task_id=task.id,
+                            payload={
+                                "stage": "gate_skipped_no_tests",
+                                "attempt": attempts,
+                                "message": (
+                                    "no test command is configured, so the green gate ran "
+                                    "no tests"
+                                ),
+                            },
+                        )
                     if gate_commands:
                         # Cooperative cancellation — check before the gate (which may be slow).
                         if cancel_event is not None and cancel_event.is_set():
@@ -1477,10 +1545,12 @@ class Orchestrator:
                     cancel_event=cancel_event,
                 )
                 return await self._finish_failure(
-                    task, wm, task_branch, timed_out, attempts
+                    task, wm, task_branch, timed_out, attempts,
+                    integrity=integrity, integrity_mode=integrity_mode,
                 )
             return await self._finish_success(
-                task, wm, task_branch, repo_path, target_branch, worktree, config, attempts
+                task, wm, task_branch, repo_path, target_branch, worktree, config, attempts,
+                integrity=integrity, integrity_mode=integrity_mode,
             )
         except Exception:
             logger.exception("Unhandled exception processing task %s", task.id)
@@ -2085,12 +2155,14 @@ class Orchestrator:
         grounding_diff: str | None = None,
         diff_cmd: str,
         diff_cache: dict[BulkLimit, str] | None = None,
+        integrity_section: str = "",
     ) -> tuple[bool, str, bool]:
         """Review the current diff through the derived agent pipeline.
 
         Each reviewer's prompt carries ``current_diff`` fitted to that reviewer's bulk limit;
         *diff_cmd* is the command that reproduces the full diff in the worktree, and readers
-        sharing *diff_cache* share each cut.
+        sharing *diff_cache* share each cut. *integrity_section* (the attempt's TEST INTEGRITY
+        findings, if any) follows the diff in every reviewer prompt, whole.
 
         Returns ``(failed, feedback, timed_out)``. ``timed_out`` is ``True`` when the
         wall-clock budget was exceeded mid-review — the caller must abort the task, not
@@ -2123,9 +2195,10 @@ class Orchestrator:
         all_summaries: list[str] = []
 
         async def _with_diff(n: WorkflowNode) -> str:
-            """*base_prompt* plus the diff fitted for reviewer *n* (nothing to show if blank)."""
+            """*base_prompt* plus the diff fitted for reviewer *n* (nothing to show if blank),
+            then the whole *integrity_section*."""
             if not current_diff.strip():
-                return base_prompt
+                return base_prompt + integrity_section
             diff = await self._fit_bulk(
                 task, config, current_diff,
                 block="diff",
@@ -2134,7 +2207,7 @@ class Orchestrator:
                 node=n,
                 cache=diff_cache,
             )
-            return f"{base_prompt}\n\nDIFF:\n```diff\n{diff}\n```"
+            return f"{base_prompt}\n\nDIFF:\n```diff\n{diff}\n```{integrity_section}"
 
         if is_parallel_review(config) and len(review_nodes) > 1:
             if cancel_event is not None and cancel_event.is_set():
@@ -2415,12 +2488,23 @@ class Orchestrator:
         worktree: Path,
         config: ConclaveConfig,
         attempts: int,
+        *,
+        integrity: Sequence[IntegrityFinding] = (),
+        integrity_mode: str = "off",
     ) -> bool:
+        """Commit the reviewed work, then merge it when ``execution.auto_merge`` allows.
+
+        A change with test-integrity findings under ``block`` mode is never merged here: it ends
+        ``done`` on its committed branch for a human to review and merge.
+        """
+        note = _integrity_note(integrity, integrity_mode)
         has_merge_node = config.workflow is None or any(
             n.enabled and n.kind.value == "merge" for n in config.workflow.nodes
         )
         if not has_merge_node:
-            summary_msg = f"completed in {attempts} attempt(s); review/submitter workflow finished"
+            summary_msg = (
+                f"completed in {attempts} attempt(s); review/submitter workflow finished{note}"
+            )
             await repo.finalize_task(
                 self._db,
                 task.id,
@@ -2463,7 +2547,7 @@ class Orchestrator:
                 summary = (
                     f"commit failed (exit {commit_rc}); work preserved uncommitted in "
                     f"worktree {worktree} on branch {task_branch}:\n"
-                    f"{commit_out.strip()[-_COMMIT_OUTPUT_TAIL_CHARS:]}"
+                    f"{commit_out.strip()[-_COMMIT_OUTPUT_TAIL_CHARS:]}{note}"
                 )
                 await repo.save_task_checkpoint(
                     self._db,
@@ -2503,7 +2587,8 @@ class Orchestrator:
             payload={"branch": task_branch},
         )
 
-        if config.execution.auto_merge:
+        held = bool(integrity) and integrity_mode == "block"
+        if config.execution.auto_merge and not held:
             merge_result = await self._merge(repo_path, target_branch, task_branch, task.id)
             if merge_result is MergeResult.success:
                 await self._bus.emit(
@@ -2515,7 +2600,9 @@ class Orchestrator:
                 # Real merge conflict: task work committed but cannot be merged.
                 # Mark failed, KEEP the branch so the work is preserved, and emit
                 # a loud failure event so the operator can resolve it manually.
-                summary = f"merge conflict into {target_branch}; branch {task_branch} preserved"
+                summary = (
+                    f"merge conflict into {target_branch}; branch {task_branch} preserved{note}"
+                )
                 await repo.finalize_task(
                     self._db, task.id, state=TaskState.failed, result_summary=summary,
                 )
@@ -2535,7 +2622,9 @@ class Orchestrator:
                 # MergeResult.error — transient infra error (e.g. concurrent ref
                 # advance the retry couldn't resolve). Mark failed but preserve the
                 # branch so nothing is lost.
-                summary = f"merge error into {target_branch}; branch {task_branch} preserved"
+                summary = (
+                    f"merge error into {target_branch}; branch {task_branch} preserved{note}"
+                )
                 await repo.finalize_task(
                     self._db, task.id, state=TaskState.failed, result_summary=summary,
                 )
@@ -2574,11 +2663,16 @@ class Orchestrator:
             },
         )
 
+        if held and config.execution.auto_merge:
+            note += (
+                "; not auto-merged: review it with conclave_get_task_diff, then merge it with "
+                "conclave_merge_task or the UI"
+            )
         # One transaction: flip state→done and write the result summary together so the
         # lifecycle row is never observed half-updated.
         await repo.finalize_task(
             self._db, task.id, state=TaskState.done,
-            result_summary=f"completed in {attempts} attempt(s); merged={merged}",
+            result_summary=f"completed in {attempts} attempt(s); merged={merged}{note}",
         )
         await self._bus.emit(
             type=EventType.task_done, project_id=task.project_id, task_id=task.id,
@@ -2589,15 +2683,24 @@ class Orchestrator:
         return True
 
     async def _finish_failure(
-        self, task: Task, wm: WorktreeManager, task_branch: str, timed_out: bool, attempts: int
+        self,
+        task: Task,
+        wm: WorktreeManager,
+        task_branch: str,
+        timed_out: bool,
+        attempts: int,
+        *,
+        integrity: Sequence[IntegrityFinding] = (),
+        integrity_mode: str = "off",
     ) -> bool:
         reason = "timeout" if timed_out else "max_retries"
+        note = _integrity_note(integrity, integrity_mode)
         # One transaction: fail the task, record why, and block its descendants together so
         # a crash can't leave the task failed while children stay claimable. Announce only
         # once the transition is durably committed.
         blocked = await repo.finalize_task(
             self._db, task.id, state=TaskState.failed,
-            result_summary=f"failed ({reason}) after {attempts} attempt(s)",
+            result_summary=f"failed ({reason}) after {attempts} attempt(s){note}",
             block_children=True,
         )
         await self._bus.emit(
@@ -2678,8 +2781,15 @@ class Orchestrator:
             logger.warning("post-mortem failed for task %s", task.id, exc_info=True)
 
     async def _fail_early(
-        self, task: Task, wm: WorktreeManager, task_branch: str, message: str
+        self,
+        task: Task,
+        wm: WorktreeManager,
+        task_branch: str,
+        message: str,
+        *,
+        reason: str | None = None,
     ) -> bool:
+        """Fail *task* with *message* as its summary; the event's reason is *reason*, else it."""
         # One transaction: fail + record the reason + block descendants atomically, then
         # announce once it is durably committed.
         blocked = await repo.finalize_task(
@@ -2688,7 +2798,7 @@ class Orchestrator:
         )
         await self._bus.emit(
             type=EventType.task_failed, project_id=task.project_id, task_id=task.id,
-            payload={"reason": message},
+            payload={"reason": reason or message},
         )
         if blocked:
             logger.info("blocked %d descendant tasks after %s failed early", blocked, task.id)
@@ -2847,6 +2957,45 @@ def _find_workflow_node(
     return None
 
 
+def _has_enabled_developer(config: ConclaveConfig) -> bool:
+    """Whether a developer runs: the default flow, or a workflow with an enabled developer.
+
+    The same predicate as the ``dev_node_cfg`` lookups in :meth:`Orchestrator.process_task`.
+    """
+    if config.workflow is None:
+        return True
+    return _find_workflow_node(config, "developer", "developer") is not None or any(
+        n.enabled and n.kind.value == "developer" for n in config.workflow.nodes
+    )
+
+
+def _missing_test_command(config: ConclaveConfig, knowledge: dict[str, Any] | None) -> bool:
+    """Whether a task must fail before any dispatch because its green gate would run no tests.
+
+    Only when the gate is required and not explicitly waived, and only for flows with a
+    developer: a review-only flow changes nothing, and its gate is informational.
+    """
+    execution = config.execution
+    return (
+        execution.require_full_green
+        and not execution.allow_no_test_command
+        and _test_command(config, knowledge) is None
+        and _has_enabled_developer(config)
+    )
+
+
+def _integrity_note(findings: Sequence[IntegrityFinding], mode: str) -> str:
+    """The result-summary suffix recording test-integrity *findings* (``""`` when none)."""
+    if not findings:
+        return ""
+    shown = ", ".join(finding.label() for finding in findings[:_INTEGRITY_NOTE_MAX_FINDINGS])
+    note = f"; test integrity ({mode}): {len(findings)} finding(s): {shown}"
+    hidden = len(findings) - _INTEGRITY_NOTE_MAX_FINDINGS
+    if hidden > 0:
+        note += f" +{hidden} more (see the test_integrity.flagged event)"
+    return note
+
+
 def wm_merge_path(repo_path: Path, target_branch: str, task_id: str) -> Path:
     """Deterministic merge-worktree path unique per (repo, target, task).
 
@@ -2913,8 +3062,10 @@ def _read_project_rules(worktree: Path, repo_path: Path | None = None) -> str:
 
 
 def _test_command(config: ConclaveConfig, knowledge: dict[str, Any] | None) -> str | None:
-    if config.execution.baseline_test_command:
-        return config.execution.baseline_test_command
+    # A blank command would run as a no-op that always passes, so it counts as unset.
+    command = config.execution.baseline_test_command
+    if command and command.strip():
+        return command
     if knowledge:
         commands = knowledge.get("commands")
         if isinstance(commands, dict):

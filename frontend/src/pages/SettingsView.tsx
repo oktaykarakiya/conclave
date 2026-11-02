@@ -280,6 +280,39 @@ export function SettingsView({
           </label>
 
           <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">Test Integrity Guard</span>
+            <select
+              className={input}
+              value={String(execution.test_integrity ?? "block")}
+              onChange={(e) => updateSection("execution", "test_integrity", e.target.value)}
+            >
+              <option value="block">block: flag to reviewers, never auto-merge</option>
+              <option value="warn">warn: flag to reviewers only</option>
+              <option value="off">off</option>
+            </select>
+            <span className="block text-[11px] text-zinc-500">
+              Flags pre-existing tests a change deletes, removes or skips.
+            </span>
+          </label>
+
+          <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2 hover:border-zinc-700">
+            <input
+              type="checkbox"
+              checked={Boolean(execution.allow_no_test_command ?? false)}
+              onChange={(e) =>
+                updateSection("execution", "allow_no_test_command", e.target.checked)
+              }
+              className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-indigo-500"
+            />
+            <span className="space-y-0.5">
+              <span className="block text-xs text-zinc-300">Run without a test command</span>
+              <span className="block text-[11px] text-zinc-500">
+                Off: a task with no test command fails before any agent runs.
+              </span>
+            </span>
+          </label>
+
+          <label className="block space-y-1">
             <span className="text-xs font-medium text-zinc-400">
               Parallel Swarm Sessions (1 = single-flight, up to 16)
             </span>

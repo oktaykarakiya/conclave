@@ -43,6 +43,12 @@ async def test_full_cycle_via_api(db: Database, tmp_path: Path) -> None:
             )
             assert created.status_code == 200, created.text
             project_id = created.json()["id"]
+            # A real (trivial) gate, so the full cycle runs baseline and green-gate too.
+            patched = await client.patch(
+                f"/api/projects/{project_id}/config",
+                json={"config": {"execution": {"baseline_test_command": "echo ok"}}},
+            )
+            assert patched.status_code == 200, patched.text
 
             task = await client.post(
                 f"/api/projects/{project_id}/tasks",
