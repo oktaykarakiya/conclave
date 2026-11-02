@@ -220,6 +220,62 @@ async def test_attach_stores_only_the_preset_values_that_differ(
     }
 
 
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+async def test_attaching_an_attached_path_is_refused_and_changes_nothing(
+    surface: str, client: httpx.AsyncClient, daemon: Daemon, db: Database, tmp_path: Path
+) -> None:
+    await repo.upsert_store_item(
+        db,
+        kind=StoreItemKind.config_preset,
+        name="team",
+        payload={"execution": {"max_parallel_tasks": 4}},
+    )
+    path = _repo_dir(tmp_path, "shared")
+    created = await client.post(
+        "/api/projects",
+        json={
+            "name": "acme-main",
+            "path": str(path),
+            "default_branch": "dev",
+            "config_preset": "team",
+        },
+    )
+    assert created.status_code == 200, created.text
+    pid = created.json()["id"]
+    query = "SELECT * FROM projects WHERE id = ?"
+    row = dict(await db.fetchone(query, (pid,)))
+    events = await repo.list_events(db, project_id=pid)
+
+    second = {
+        "name": "acme-second",
+        "default_branch": "staging",
+        "workflow_template": "fast_track",
+        "max_parallel_tasks": 2,
+    }
+    if surface == "rest":
+        res = await client.post("/api/projects", json={**second, "path": str(path)})
+        assert res.status_code == 409, res.text
+        message = res.json()["detail"]
+    else:  # MCP, spelled with a trailing slash
+        is_error, message = await _mcp(
+            daemon, "conclave_attach_project", {**second, "path": f"{path}/"}
+        )
+        assert is_error is True
+    for part in (pid, "acme-main", "conclave_patch_config", f"PATCH /api/projects/{pid}/config"):
+        assert part in message, message
+    assert "clone" in message
+
+    assert dict(await db.fetchone(query, (pid,))) == row
+    assert await repo.list_events(db, project_id=pid) == events
+    assert [p.id for p in await repo.list_projects(db)] == [pid]
+
+    other = await client.post(
+        "/api/projects", json={"name": "other", "path": str(_repo_dir(tmp_path, "other"))}
+    )
+    assert other.status_code == 200, other.text
+    assert other.json()["id"] != pid
+
+
 # --- project writes store minimal deltas -------------------------------------
 
 

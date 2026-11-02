@@ -105,6 +105,9 @@ class OpenCodeCliProvider:
         for attempt_idx in range(_MAX_DISPATCH_ATTEMPTS):
             if attempt_idx > 0:
                 await asyncio.sleep(_TRANSIENT_RETRY_DELAY_S + random.random() * 0.25)
+            # Never start a run once cancelled, so a transient or empty run is not retried.
+            if cancel_event is not None and cancel_event.is_set():
+                return AgentResult(ok=False, error="cancelled", cancelled=True)
             attempt_args = list(base_args)
             if resume_session_id:
                 attempt_args += ["--session", resume_session_id]
@@ -177,7 +180,7 @@ class OpenCodeCliProvider:
                 drive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await drive_task
-                return AgentResult(ok=False, error="cancelled")
+                return AgentResult(ok=False, error="cancelled", cancelled=True)
 
             if drive_task in done:
                 raw = drive_task.result()

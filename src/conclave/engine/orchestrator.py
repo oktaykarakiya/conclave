@@ -473,6 +473,8 @@ class Orchestrator:
         target_node_id: str | None = None,
     ) -> dict[str, Any] | None:
         """If *node_id* or its outgoing connector requires human approval, pause and wait."""
+        if cancel_event is not None and cancel_event.is_set():
+            return {"status": "cancelled"}
         should_pause, edge_id = self._should_pause_after_node(
             task.id, node_id, config, target_node_id
         )
@@ -856,6 +858,9 @@ class Orchestrator:
                     timed_out = True
                     failed = True
                     break
+                # Cooperative cancellation — never start another attempt once cancelled.
+                if cancel_event is not None and cancel_event.is_set():
+                    return await self._finish_cancelled(task, wm, task_branch)
                 attempts += 1
                 failed = False
                 await self._bus.emit(
@@ -1069,6 +1074,9 @@ class Orchestrator:
                                 "status": "failed",
                             },
                         )
+                        # A developer run stopped by a cancel is not a failed attempt to retry.
+                        if cancel_event is not None and cancel_event.is_set():
+                            return await self._finish_cancelled(task, wm, task_branch)
                         await self._bus.emit(
                             type=EventType.attempt_failed,
                             project_id=project.id,
@@ -1161,6 +1169,9 @@ class Orchestrator:
                     rules, started, budget, cancel_event=cancel_event, diff_cmd=diff_cmd,
                     diff_cache=diff_cache, integrity_section=integrity_prompt_section(integrity),
                 )
+                # Cooperative cancellation — a review cut short by a cancel is not a failed attempt.
+                if cancel_event is not None and cancel_event.is_set():
+                    return await self._finish_cancelled(task, wm, task_branch)
                 if review_timed_out:
                     timed_out = True
                     failed = True
@@ -1282,6 +1293,10 @@ class Orchestrator:
                             gate = await run_tests(
                                 worktree, cmd, timeout_seconds=gate_timeout
                             )
+                            # Cooperative cancellation — no infra re-run, next command or
+                            # failed attempt once cancelled while the gate ran.
+                            if cancel_event is not None and cancel_event.is_set():
+                                return await self._finish_cancelled(task, wm, task_branch)
                             if not gate.passed:
                                 if pass_through_flow:
                                     gate_notes.append(_GateNote(label, cmd, gate))
@@ -1931,7 +1946,9 @@ class Orchestrator:
           * any non-empty text is returned too — usable-but-unparseable output is not a
             transient infra failure (the caller records it as a non-blocking 'unknown').
         Only a response with no verdict AND no text (genuine empty/timeout/CLI-missing) is
-        retried with the existing backoff. ``parsed`` is seeded so it is never unbound.
+        retried with the existing backoff, and never once cancelled: a dispatch that ended
+        because of cancellation, or any response after the task was cancelled, is returned
+        as is. ``parsed`` is seeded so it is never unbound.
         """
         result = AgentResult(ok=False, error="not dispatched")
         parsed = ParsedVerdict()
@@ -1959,6 +1976,8 @@ class Orchestrator:
             parsed = parse_verdict(result.text)
             if parsed.source != "none" or result.text.strip():
                 return result, parsed
+            if result.cancelled or (cancel_event is not None and cancel_event.is_set()):
+                return result, parsed
             if attempt < _REVIEWER_DISPATCH_RETRIES:
                 logger.info(
                     "reviewer %s returned no usable response (try %d/%d); retrying",
@@ -1981,6 +2000,7 @@ class Orchestrator:
         config: ConclaveConfig,
         grounding_diff: str | None = None,
         pass_through: bool = False,
+        cancel_event: asyncio.Event | None = None,
     ) -> ParsedVerdict:
         agent = node.agent or node.id
         effective_diff = grounding_diff if grounding_diff is not None else current_diff
@@ -2070,6 +2090,7 @@ class Orchestrator:
             node.id,
             attempt,
             config,
+            cancel_event=cancel_event,
             artifact={"agent": agent, "verdict": verdict.verdict, "reason": verdict.reason},
             target_node_id="gate" if (cp_ok or pass_through) else "developer",
         )
@@ -2294,6 +2315,7 @@ class Orchestrator:
                     config=config,
                     grounding_diff=effective_diff,
                     pass_through=pass_through,
+                    cancel_event=cancel_event,
                 )
                 all_summaries.append(
                     f"- {agent.upper()} ({verdict.verdict.upper()}): {verdict.reason}"
@@ -2381,6 +2403,8 @@ class Orchestrator:
                     runner, agent, reviewer_prompt, task, worktree, knowledge, rules,
                     cancel_event=cancel_event, node=node,
                 )
+                if cancel_event is not None and cancel_event.is_set():
+                    return True, "cancelled", False
                 verdict = await self._record_reviewer_verdict(
                     node,
                     result,
@@ -2393,6 +2417,7 @@ class Orchestrator:
                     config=config,
                     grounding_diff=effective_diff,
                     pass_through=pass_through,
+                    cancel_event=cancel_event,
                 )
                 all_summaries.append(
                     f"- {agent.upper()} ({verdict.verdict.upper()}): {verdict.reason}"

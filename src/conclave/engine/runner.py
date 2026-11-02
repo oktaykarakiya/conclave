@@ -206,6 +206,9 @@ class AgentRunner:
         )
         full_prompt = assemble_prompt(system, repo_knowledge, project_rules, prompt, skills=skills)
 
+        # Once cancelled, no dispatch starts: no agent.dispatched, provider run or usage row.
+        if cancel_event is not None and cancel_event.is_set():
+            return AgentResult(ok=False, error="cancelled", cancelled=True)
         await self._bus.emit(
             type=EventType.agent_dispatched,
             project_id=self._project_id,

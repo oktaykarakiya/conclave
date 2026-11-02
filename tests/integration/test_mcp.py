@@ -441,7 +441,7 @@ async def test_observability_compaction_and_agent_config(
         assert pq_info["size_bytes"] > 0
 
 
-async def test_mcp_inplace_attach_hyphenated_store_keys_and_global_settings(
+async def test_mcp_attach_hyphenated_store_keys_refuses_reattach_and_global_settings(
     db: Database, tmp_path: Path
 ) -> None:
     repo_path = tmp_path / "acme-repo"
@@ -482,7 +482,7 @@ async def test_mcp_inplace_attach_hyphenated_store_keys_and_global_settings(
         ov_keys = set(pub_item["payload"]["agent_overrides"].keys())
         assert ov_keys == {"architect-as-planner", "test-architect", "repo-analyst"}
 
-        # 2. Attach project on 'main', then re-attach in-place to update default_branch
+        # 2. Attach the project with the preset on 'staging'
         a1 = await client.post(
             "/mcp",
             json={
@@ -494,15 +494,23 @@ async def test_mcp_inplace_attach_hyphenated_store_keys_and_global_settings(
                     "arguments": {
                         "name": "acme",
                         "path": str(repo_path),
-                        "default_branch": "main",
+                        "default_branch": "staging",
+                        "config_preset": "acme-quality-argon",
                     },
                 },
             },
         )
         p1 = json.loads(a1.json()["result"]["content"][0]["text"])
         pid = p1["id"]
-        assert p1["default_branch"] == "main"
+        assert p1["default_branch"] == "staging"
+        # The branch lives in default_branch, which the project inherits as its target_branch.
+        assert "target_branch" not in p1["config"].get("execution", {})
+        p1_effective = (await client.get(f"/api/projects/{pid}/config")).json()
+        assert p1_effective["execution"]["target_branch"] == "staging"
+        assert "architect-as-planner" in p1["config"]["agent_overrides"]
 
+        # Attaching the same path again is refused, names the project and changes nothing.
+        row = dict(await db.fetchone("SELECT * FROM projects WHERE id = ?", (pid,)))
         a2 = await client.post(
             "/mcp",
             json={
@@ -514,20 +522,15 @@ async def test_mcp_inplace_attach_hyphenated_store_keys_and_global_settings(
                     "arguments": {
                         "name": "acme-updated",
                         "path": str(repo_path),
-                        "default_branch": "staging",
-                        "config_preset": "acme-quality-argon",
+                        "default_branch": "main",
                     },
                 },
             },
         )
-        p2 = json.loads(a2.json()["result"]["content"][0]["text"])
-        assert p2["id"] == pid  # updated in-place without creating duplicate
-        assert p2["default_branch"] == "staging"
-        # The branch lives in default_branch, which the project inherits as its target_branch.
-        assert "target_branch" not in p2["config"].get("execution", {})
-        p2_effective = (await client.get(f"/api/projects/{pid}/config")).json()
-        assert p2_effective["execution"]["target_branch"] == "staging"
-        assert "architect-as-planner" in p2["config"]["agent_overrides"]
+        refused = a2.json()["result"]
+        assert refused["isError"] is True
+        assert pid in refused["content"][0]["text"]
+        assert dict(await db.fetchone("SELECT * FROM projects WHERE id = ?", (pid,))) == row
 
         # 3. Update settings globally via MCP (without project_id); apply_to_all_projects clears
         # the patched keys from every project's delta so each one inherits the new value.

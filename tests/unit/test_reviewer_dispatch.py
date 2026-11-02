@@ -4,10 +4,13 @@
 extracted, not on the provider's ``result.ok`` success-hint heuristic. A parseable verdict
 whose process exited non-zero must be accepted on the first try (no wasted re-dispatch),
 while a genuinely empty/timeout response must be retried up to the limit before giving up.
+A dispatch that ended because of cancellation, or any dispatch once the task is cancelled, is
+never retried.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import cast
 
@@ -82,3 +85,38 @@ async def test_empty_dispatch_retries_to_limit_then_no_verdict(
     assert verdict.source == "none"
     assert verdict.verdict == "unknown"
     assert result.text == ""
+
+
+async def test_cancelled_dispatch_is_never_retried(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A dispatch the operator stopped carries no verdict and no text, like an outage, but it
+    # must end the reviewer at once instead of being dispatched again.
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    runner = _FakeRunner([AgentResult(ok=False, error="cancelled", cancelled=True)])
+    orch = _orchestrator(db, tmp_path)
+
+    result, _ = await orch._dispatch_reviewer(
+        cast(AgentRunner, runner), "reviewer", "review please", _task(), tmp_path, "", ""
+    )
+
+    assert runner.calls == 1
+    assert result.cancelled is True
+
+
+async def test_no_retry_once_the_task_is_cancelled(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An empty response that came back as the task was cancelled is not retried either.
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    runner = _FakeRunner([AgentResult(ok=False, text="", error="timeout")])
+    orch = _orchestrator(db, tmp_path)
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+
+    await orch._dispatch_reviewer(
+        cast(AgentRunner, runner), "reviewer", "review please", _task(), tmp_path, "", "",
+        cancel_event=cancel_event,
+    )
+
+    assert runner.calls == 1

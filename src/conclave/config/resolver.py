@@ -482,6 +482,16 @@ async def create_project_with_config(
     )
 
 
+def already_attached_message(project: Project) -> str:
+    """Why an attach of *project*'s path was refused (it changes nothing), and what to do."""
+    return (
+        f"{project.path} is already attached as project {project.id} ({project.name!r}); "
+        "nothing was changed. To change that project's settings or name, use "
+        f"conclave_patch_config (config, name) or PATCH /api/projects/{project.id}/config. "
+        "To run another configuration on this repository, attach a separate clone of it."
+    )
+
+
 async def save_global_config(
     db: Database,
     patch: dict[str, Any] | None = None,

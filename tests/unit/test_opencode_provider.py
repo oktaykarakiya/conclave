@@ -7,11 +7,15 @@ Fixtures mirror real ``opencode run --format json`` output: one JSON event per l
 
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from conclave.config import ArgMode
+from conclave.providers import AgentResult, opencode_cli
 from conclave.providers.opencode_cli import OpenCodeCliProvider, _parse_events
 from conclave.providers.profiles import ResolvedProfile
 
@@ -239,3 +243,87 @@ async def test_run_agent_retries_transient_connection_error_and_resumes_session(
     assert "VERDICT: pass" in result.text
     assert "--session ses_resume_99" in result.text
     assert state_file.read_text() == "2"
+
+
+def _fake_opencode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, body: str) -> str:
+    """Install a fake ``opencode`` running *body* after it reads the prompt; return its path."""
+    fake = tmp_path / name
+    fake.write_text(
+        "#!/usr/bin/env python3\nimport json, sys, time\nsys.stdin.buffer.read()\n" + body
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr("conclave.providers.opencode_cli._OPENCODE_BIN", str(fake))
+    return str(fake)
+
+
+def _count_spawns(monkeypatch: pytest.MonkeyPatch, script: str) -> list[str]:
+    """Record each process started for *script* (directly, or through Python on Windows)."""
+    spawns: list[str] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def counting_spawn(
+        program: Any, *args: Any, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        if script in (program, *args):
+            spawns.append(script)
+        return await spawn(program, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", counting_spawn)
+    return spawns
+
+
+async def test_cancel_kills_the_run_and_flags_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_opencode(tmp_path, monkeypatch, "fake_opencode_slow.py", "time.sleep(5)\n")
+    cancel_event = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.3, cancel_event.set)
+    started = time.monotonic()
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+        prompt="hello",
+        timeout_seconds=30,
+        cancel_event=cancel_event,
+    )
+
+    assert result.cancelled is True
+    assert result.ok is False
+    assert time.monotonic() - started < 4  # killed, not waited for (the CLI sleeps 5 s)
+
+
+async def test_cancelled_run_is_not_retried_even_if_output_looks_transient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "fake_opencode_dropped.py",
+        "err = {'type': 'error', 'error': {'data': {'message': "
+        "'Cannot connect to API: Unable to connect'}}}\n"
+        "sys.stdout.write(json.dumps(err) + '\\n')\n"
+        "sys.exit(1)\n",
+    )
+    cancel_event = asyncio.Event()
+    parse = opencode_cli._parse_events
+
+    def parse_as_the_stop_lands(
+        raw: str, exit_code: int | None, model_hint: str | None = None
+    ) -> AgentResult:
+        cancel_event.set()  # the operator stops the task just as this run ends
+        return parse(raw, exit_code, model_hint=model_hint)
+
+    monkeypatch.setattr(opencode_cli, "_parse_events", parse_as_the_stop_lands)
+    monkeypatch.setattr(opencode_cli, "_TRANSIENT_RETRY_DELAY_S", 0.0)
+    spawns = _count_spawns(monkeypatch, fake)
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+        prompt="hello",
+        timeout_seconds=30,
+        cancel_event=cancel_event,
+    )
+
+    assert len(spawns) == 1
+    assert result.cancelled is True
+    assert result.ok is False

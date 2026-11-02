@@ -33,6 +33,8 @@ class AgentResult(BaseModel):
     cache_creation_tokens: int | None = None
     exit_code: int | None = None
     error: str | None = None
+    # The dispatch ended because its cancel event was set: never retry or continue after it.
+    cancelled: bool = False
     session_id: str | None = None
     reasoning_tokens: int | None = None
     tool_calls_count: int = 0

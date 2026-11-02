@@ -17,6 +17,7 @@ from ..config import (
     WorkflowEdge,
     WorkflowGraph,
     WorkflowNode,
+    already_attached_message,
     build_default_workflow,
     create_project_with_config,
     deep_merge,
@@ -220,7 +221,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "conclave_attach_project",
         "Attach a local git repository to Conclave and start its background worker. The "
         "project stores only the branch, preset, template and parallelism chosen here and "
-        "inherits everything else from the global settings.",
+        "inherits everything else from the global settings. A path that is already attached "
+        "is refused with an error naming that project, and nothing changes: change it with "
+        "conclave_patch_config (config, name), or attach a separate clone of the repository "
+        "to run another configuration.",
         {
             "name": _prop("string", "Display name for the project."),
             "path": _prop("string", "Absolute path to the local git repository."),
@@ -1371,6 +1375,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             raise McpToolError(f"path is not a directory: {path}")
         if not (path / ".git").exists():
             raise McpToolError(f"not a git repository: {path}")
+        existing = await repo.get_project_by_path(daemon.db, str(path))
+        if existing is not None:
+            raise McpToolError(already_attached_message(existing))
 
         # Only what the caller chose is stored; everything else is inherited (built-in ->
         # global) when the config is resolved, and the server keeps just the delta.
@@ -1400,29 +1407,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             )
             initial_cfg["execution"] = exec_sec
 
-        existing = await repo.get_project_by_path(daemon.db, str(path))
         exec_cfg = dict(initial_cfg.get("execution") or {})
-        if existing is not None or "target_branch" not in exec_cfg or default_branch != "main":
+        if "target_branch" not in exec_cfg or default_branch != "main":
             exec_cfg["target_branch"] = default_branch
         initial_cfg["execution"] = exec_cfg
-
-        if existing is not None:
-            await save_project_config(
-                daemon.db,
-                existing,
-                initial_cfg,
-                name=proj_name or existing.name,
-                default_branch=default_branch,
-            )
-            updated_existing = await _require_project(daemon, existing.id)
-            await daemon.start_worker(updated_existing.id)
-            proj_json = updated_existing.model_dump(mode="json")
-            await daemon.bus.emit(
-                type=EventType.project_updated,
-                project_id=updated_existing.id,
-                payload={"project": proj_json},
-            )
-            return proj_json
 
         project = await create_project_with_config(
             daemon.db,

@@ -99,6 +99,9 @@ class _BugFixerProvider:
     of ``"pass"``/``"decline"`` yields a fenced JSON verdict; ``"abstain"`` yields prose with NO
     parseable verdict; ``"error"`` yields ``ok=False`` (a failed dispatch). An agent absent from the
     map defaults to ``"pass"``. ``consensus_calls`` / ``developer_calls`` count those dispatches.
+
+    ``cancel_during_repro`` sets the cancel event the repro synthesis dispatch receives, as an
+    operator stop landing while that reply comes back (the reply is still returned).
     """
 
     def __init__(
@@ -107,10 +110,12 @@ class _BugFixerProvider:
         repro_block: str = _REPRO_BLOCK,
         fix_succeeds: bool = True,
         consensus_verdicts: dict[str, str] | None = None,
+        cancel_during_repro: bool = False,
     ) -> None:
         self._repro_block = repro_block
         self._fix_succeeds = fix_succeeds
         self._consensus_verdicts = consensus_verdicts or {}
+        self._cancel_during_repro = cancel_during_repro
         self.consensus_calls = 0
         self.developer_calls = 0
 
@@ -138,6 +143,8 @@ class _BugFixerProvider:
     ) -> AgentResult:
         # Reproduction-test synthesis (controller-issued, before any worktree write).
         if "Write ONE focused test" in prompt:
+            if self._cancel_during_repro and cancel_event is not None:
+                cancel_event.set()
             return AgentResult(ok=True, text=self._repro_block, model_reported="fake", cost_usd=0.0)
         # Decline-consensus round (controller-issued, read-only — must NOT touch the worktree).
         if "Before we AUTO-FIX it autonomously" in prompt:
@@ -480,21 +487,22 @@ async def test_decline_consensus_cancel_aborts_round_without_declining(
     """A cancel set before the round makes every reviewer ABSTAIN — never a manufactured decline.
 
     Honouring ``cancel_event`` between dispatches must not look like a unanimous decline: with the
-    event already set, no reviewer is polled, the round abstains, and the candidate is NOT routed to
-    a human by the consensus gate (the fix path is reached, where the wired task cancellation owns
-    the stop).
+    event set (here while the repro reply comes back, so the cycle still reaches the round), no
+    reviewer is polled, the round abstains, and the candidate is NOT routed to a human by the
+    consensus gate (the fix path is reached, where the wired task cancellation owns the stop).
     """
     provider = _BugFixerProvider(
         consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "decline"},
+        cancel_during_repro=True,
     )
     project, config, controller = await _make(db, tmp_path, provider)
     candidate = await _seed_candidate(db, project)
     _patch_discovery(monkeypatch, candidate)
 
     cancel = asyncio.Event()
-    cancel.set()
     result = await controller.run_cycle(project, config, cancel_event=cancel)
 
+    assert cancel.is_set()
     assert provider.consensus_calls == 0  # no reviewer was dispatched
     # The consensus gate did NOT route to a human (cancellation is not a decline).
     assert result.outcome is not CycleOutcome.declined

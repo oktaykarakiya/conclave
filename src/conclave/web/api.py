@@ -23,6 +23,7 @@ from ..agents import DEFAULT_PERSONAS
 from ..config import (
     ConclaveConfig,
     WorkflowGraph,
+    already_attached_message,
     build_default_workflow,
     config_schema,
     create_project_with_config,
@@ -338,6 +339,9 @@ async def create_project(
         raise HTTPException(status_code=400, detail=f"path is not a directory: {path}")
     if not (path / ".git").exists():
         raise HTTPException(status_code=400, detail=f"not a git repository: {path}")
+    existing = await repo.get_project_by_path(daemon.db, str(path))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=already_attached_message(existing))
 
     # Only what the caller chose is stored; everything else is inherited (built-in -> global)
     # when the config is resolved, and the server keeps just the delta.
@@ -366,31 +370,10 @@ async def create_project(
         initial_cfg["execution"] = exec_sec
 
     default_branch = body.default_branch.strip() or "main"
-    existing = await repo.get_project_by_path(daemon.db, str(path))
     exec_cfg = dict(initial_cfg.get("execution") or {})
-    if existing is not None or "target_branch" not in exec_cfg or default_branch != "main":
+    if "target_branch" not in exec_cfg or default_branch != "main":
         exec_cfg["target_branch"] = default_branch
     initial_cfg["execution"] = exec_cfg
-
-    if existing is not None:
-        try:
-            await save_project_config(
-                daemon.db,
-                existing,
-                initial_cfg,
-                name=body.name.strip() or existing.name,
-                default_branch=default_branch,
-            )
-        except ValueError as exc:
-            raise _invalid_config(exc) from exc
-        updated = await _require_project(daemon, existing.id)
-        await daemon.start_worker(updated.id)
-        await daemon.bus.emit(
-            type=EventType.project_updated,
-            project_id=updated.id,
-            payload={"project": updated.model_dump(mode="json")},
-        )
-        return updated
 
     try:
         project = await create_project_with_config(

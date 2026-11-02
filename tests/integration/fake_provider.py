@@ -93,6 +93,10 @@ class FakeProvider:
 
     ``developer_deletes`` names a worktree file the developer deletes alongside its write, e.g.
     a pre-existing test, so the test-integrity guard has something to flag.
+
+    ``cancel_during`` (``"developer"`` or ``"reviewer"``) makes that dispatch run until the
+    operator stops it: it sets ``dispatch_blocked``, waits for its cancel event, and then ends
+    as a real provider's killed run does.
     """
 
     def __init__(
@@ -104,6 +108,7 @@ class FakeProvider:
         reviewer_tampers: bool = False,
         use_nested_plan: bool = False,
         developer_deletes: str | None = None,
+        cancel_during: str | None = None,
     ) -> None:
         self.developer_writes = developer_writes
         self.developer_content = developer_content
@@ -111,9 +116,17 @@ class FakeProvider:
         self.reviewer_tampers = reviewer_tampers
         self.use_nested_plan = use_nested_plan
         self.developer_deletes = developer_deletes
+        self.cancel_during = cancel_during
+        self.dispatch_blocked = asyncio.Event()
         self.prompts: list[str] = []
         # Count post-mortem dispatches so failure-path tests can assert the wiring.
         self.post_mortem_calls = 0
+
+    async def _run_until_cancelled(self, cancel_event: asyncio.Event | None) -> AgentResult:
+        assert cancel_event is not None, "cancel_during needs a dispatch with a cancel event"
+        self.dispatch_blocked.set()
+        await cancel_event.wait()
+        return AgentResult(ok=False, error="cancelled", cancelled=True)
 
     async def run_agent(
         self,
@@ -145,6 +158,8 @@ class FakeProvider:
                 cost_usd=0.0,
             )
         if "Review the changes made for this task" in prompt:
+            if self.cancel_during == "reviewer":
+                return await self._run_until_cancelled(cancel_event)
             if self.reviewer_tampers and cwd is not None:
                 # A reviewer that writes despite only being asked to review: drop a stray
                 # file and clobber the developer's output. The orchestrator must discard
@@ -184,6 +199,8 @@ class FakeProvider:
                 ok=True, text=_PLANNING_APPROVED, model_reported="fake", cost_usd=0.0,
             )
         # developer fallback
+        if self.cancel_during == "developer":
+            return await self._run_until_cancelled(cancel_event)
         if self.developer_writes and cwd is not None:
             (Path(cwd) / self.filename).write_text(self.developer_content, encoding="utf-8")
         if self.developer_deletes and cwd is not None:

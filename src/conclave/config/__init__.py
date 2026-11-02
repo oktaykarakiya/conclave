@@ -36,6 +36,7 @@ from .models import (
 )
 from .resolver import (
     GLOBAL_DEFAULTS_PRESET,
+    already_attached_message,
     apply_global_overrides,
     apply_project_overrides,
     config_delta,
@@ -88,6 +89,7 @@ __all__ = [
     "WorkflowGraph",
     "WorkflowNode",
     "agent_schema",
+    "already_attached_message",
     "apply_global_overrides",
     "apply_project_overrides",
     "build_default_workflow",

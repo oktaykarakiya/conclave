@@ -52,10 +52,11 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
 ## 3. Setting up a project
 
 1. `conclave_attach_project(name, path, default_branch)`. **Attaching a path that is already
-   attached updates that project** (it is not a duplicate): to run two configurations against
-   one repository, attach separate clones. The project stores only what you choose here (its
-   branch, `config_preset`, `workflow_template`, `max_parallel_tasks`); everything else is
-   inherited from the global settings (see "Settings layers" below).
+   attached is refused and changes nothing**: the `isError` names that project's id and name.
+   Change that project with `conclave_patch_config` (`config`, `name`); to run two
+   configurations against one repository, attach separate clones. The project stores only what
+   you choose here (its branch, `config_preset`, `workflow_template`, `max_parallel_tasks`);
+   everything else is inherited from the global settings (see "Settings layers" below).
 2. `conclave_patch_config(project_id, config={...})` merges into the project's settings
    (`conclave_get_config` shows the effective result; `conclave_get_workflow` the graph). Key
    fields:
@@ -313,7 +314,8 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   read the keys before indexing.
 - Event lists are paged (§6); a single call is not the full history.
 - Tool errors come back with `isError: true` and a text message; they are not exceptions.
-- Attaching an already-attached path updates that project (§3).
+- Attaching an already-attached path is refused with `isError` and changes nothing; change that
+  project with `conclave_patch_config` (§3).
 - Settings are layered (§3): a global change reaches every project that does not override that
   key, on its next task. To see where a value comes from, call `conclave_get_config` with
   `include_layers: true`.
@@ -363,7 +365,7 @@ group for the first time.
 
 ### Projects & config
 - `conclave_list_projects` — see which repositories are attached before picking a `project_id`.
-- `conclave_attach_project` — attach a local git repo (re-attaching a path updates it); it
+- `conclave_attach_project` — attach a local git repo (an already-attached path is refused); it
   stores only the settings chosen at attach.
 - `conclave_detach_project` — remove a project, stop its worker, and clean in-progress worktrees.
 - `conclave_get_project_status` — check whether a project's worker is paused or running.

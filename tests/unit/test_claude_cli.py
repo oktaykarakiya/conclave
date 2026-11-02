@@ -6,9 +6,12 @@ import asyncio
 import os
 import time
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from conclave.config import ArgMode
-from conclave.providers import ClaudeCliProvider, ResolvedProfile
+from conclave.providers import AgentResult, ClaudeCliProvider, ResolvedProfile, claude_cli
 
 # A fake "claude" that echoes the routed model back via the JSON envelope, so we can
 # prove the composed environment actually reaches the child process.
@@ -30,12 +33,36 @@ time.sleep(5)
 print("late")
 """
 
+# A fake "claude" whose run ends like a dropped API connection, which the provider retries.
+_TRANSIENT_CLI = """#!/usr/bin/env python3
+import sys
+sys.stdin.read()
+print("ECONNRESET")
+sys.exit(1)
+"""
+
 
 def _make_cli(tmp_path: Path, body: str, name: str = "fake_claude.py") -> str:
     script = tmp_path / name
     script.write_text(body, encoding="utf-8")
     script.chmod(0o755)
     return str(script)
+
+
+def _count_spawns(monkeypatch: pytest.MonkeyPatch, script: str) -> list[str]:
+    """Record each process started for *script* (directly, or through Python on Windows)."""
+    spawns: list[str] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def counting_spawn(
+        program: Any, *args: Any, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        if script in (program, *args):
+            spawns.append(script)
+        return await spawn(program, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", counting_spawn)
+    return spawns
 
 
 async def test_env_routing_reaches_subprocess(tmp_path: Path) -> None:
@@ -127,6 +154,47 @@ time.sleep(300)
         raise AssertionError(
             f"Grandchild process {child_pid} still alive after timeout kill"
         )
+
+
+async def test_cancel_kills_the_run_and_flags_the_result(tmp_path: Path) -> None:
+    cli = _make_cli(tmp_path, _SLOW_CLI, name="slow.py")
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+    cancel_event = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.3, cancel_event.set)
+    started = time.monotonic()
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=30, cancel_event=cancel_event
+    )
+
+    assert result.cancelled is True
+    assert result.ok is False
+    assert time.monotonic() - started < 4  # killed, not waited for (the CLI sleeps 5 s)
+
+
+async def test_cancelled_run_is_not_retried_even_if_output_looks_transient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli = _make_cli(tmp_path, _TRANSIENT_CLI, name="transient.py")
+    cancel_event = asyncio.Event()
+    parse = claude_cli._parse_envelope
+
+    def parse_as_the_stop_lands(raw: str, exit_code: int | None) -> AgentResult:
+        cancel_event.set()  # the operator stops the task just as this run ends
+        return parse(raw, exit_code)
+
+    monkeypatch.setattr(claude_cli, "_parse_envelope", parse_as_the_stop_lands)
+    monkeypatch.setattr(claude_cli, "_CLAUDE_TRANSIENT_RETRY_DELAY_S", 0.0)
+    spawns = _count_spawns(monkeypatch, cli)
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=30, cancel_event=cancel_event
+    )
+
+    assert len(spawns) == 1
+    assert result.cancelled is True
+    assert result.ok is False
 
 
 async def test_cli_not_found() -> None:

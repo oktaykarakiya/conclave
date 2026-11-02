@@ -105,6 +105,9 @@ class ClaudeCliProvider:
         for attempt_idx in range(_CLAUDE_MAX_ATTEMPTS):
             if attempt_idx > 0:
                 await asyncio.sleep(_CLAUDE_TRANSIENT_RETRY_DELAY_S)
+            # Never start a run once cancelled, so a transient-looking failure is not retried.
+            if cancel_event is not None and cancel_event.is_set():
+                return AgentResult(ok=False, error="cancelled", cancelled=True)
             try:
                 proc = await asyncio.create_subprocess_exec(
                     exec_bin,
@@ -181,7 +184,7 @@ class ClaudeCliProvider:
                 drive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await drive_task
-                return AgentResult(ok=False, error="cancelled")
+                return AgentResult(ok=False, error="cancelled", cancelled=True)
 
             # --- drive completed normally ---
             if drive_task in done:

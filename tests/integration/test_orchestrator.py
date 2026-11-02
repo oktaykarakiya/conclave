@@ -16,6 +16,7 @@ from conclave.config import load_project_config
 from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
+from conclave.engine.gate import GateResult
 from conclave.engine.orchestrator import _check_budget
 from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
@@ -1538,6 +1539,237 @@ async def test_cancel_on_final_attempt_lands_in_cancelled_not_failed(
     types = {e.type for e in events}
     assert "task.cancelled" in types
     assert "task.failed" not in types
+
+
+async def _cancel_mid_dispatch(db: Database, tmp_path: Path, provider: FakeProvider) -> None:
+    """Cancel a task as the operator does while *provider*'s ``cancel_during`` dispatch runs,
+    then check the task stopped there: nothing was dispatched, attempted or retried after the
+    cancel, and it ended ``cancelled`` with its worktree removed."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+    cancel_event = asyncio.Event()
+    orchestrator._cancel_events[task.id] = cancel_event  # in flight, as the worker registers it
+    running = asyncio.create_task(orchestrator.process_task(claimed, cancel_event=cancel_event))
+
+    await asyncio.wait_for(provider.dispatch_blocked.wait(), timeout=30)
+    cut = int(await db.fetchval("SELECT MAX(id) FROM events"))
+    assert orchestrator.request_cancel(task.id) is True
+    assert await asyncio.wait_for(running, timeout=30) is False
+
+    after_cancel = [e.type for e in await repo.list_events(db, task_id=task.id, after_id=cut)]
+    for event_type in ("agent.dispatched", "attempt.started", "attempt.failed", "node.started"):
+        assert event_type not in after_cancel, after_cancel
+    assert after_cancel.count("task.cancelled") == 1
+    every = [e.type for e in await repo.list_events(db, task_id=task.id, limit=10_000)]
+    assert every.count("attempt.started") == 1
+    assert "task.failed" not in every
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.cancelled
+    worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    assert worktree_path.resolve() not in await _worktree_paths(repo_path)
+
+
+async def test_cancel_during_reviewer_dispatch_is_not_retried(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without the backoff a regression (a retried reviewer) fails fast instead of slowly.
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    provider = FakeProvider(cancel_during="reviewer")
+
+    await _cancel_mid_dispatch(db, tmp_path, provider)
+
+    assert sum("Review the changes made for this task" in p for p in provider.prompts) == 1
+
+
+async def test_cancel_during_developer_dispatch_starts_no_new_attempt(
+    db: Database, tmp_path: Path
+) -> None:
+    provider = FakeProvider(cancel_during="developer")
+
+    await _cancel_mid_dispatch(db, tmp_path, provider)
+
+    assert sum("You are the developer agent of" in p for p in provider.prompts) == 1
+    assert not any("Review the changes made for this task" in p for p in provider.prompts)
+
+
+async def test_cancel_during_the_gate_stops_before_its_infra_rerun(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main", "baseline_test_command": "pytest -q"}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    cancel_event = asyncio.Event()
+    test_runs: list[str | None] = []
+
+    async def gate_times_out_as_the_cancel_lands(
+        worktree: Path, command: str | None, **kwargs: object
+    ) -> GateResult:
+        test_runs.append(command)
+        if len(test_runs) == 1:  # the baseline snapshot
+            return GateResult(passed=True, exit_code=0, output="")
+        cancel_event.set()  # the operator stops the task while the gate runs
+        return GateResult(passed=False, exit_code=124, output="", outcome="timed_out")
+
+    monkeypatch.setattr(
+        "conclave.engine.orchestrator.run_tests", gate_times_out_as_the_cancel_lands
+    )
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    assert await orchestrator.process_task(claimed, cancel_event=cancel_event) is False
+
+    assert len(test_runs) == 2  # the baseline and one gate run: an infra outcome is not re-run
+    events = [e.type for e in await repo.list_events(db, task_id=task.id, limit=10_000)]
+    assert "attempt.failed" not in events
+    assert events.count("task.cancelled") == 1
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.cancelled
+
+
+async def test_cancel_during_a_reviewer_approval_wait_records_no_operator_pass(
+    db: Database, tmp_path: Path
+) -> None:
+    fail = '```json\n{"verdict": "fail", "reason": "missing tests", "evidence": []}\n```'
+
+    class _FailingReviews(FakeProvider):
+        async def run_agent(
+            self,
+            *,
+            profile: ResolvedProfile,
+            prompt: str,
+            timeout_seconds: int,
+            cwd: Path | None = None,
+            on_chunk: OnChunk | None = None,
+            cancel_event: asyncio.Event | None = None,
+        ) -> AgentResult:
+            if "Review the changes made for this task" in prompt:
+                return AgentResult(ok=True, text=fail, model_reported="fake")
+            return await super().run_agent(
+                profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+                on_chunk=on_chunk, cancel_event=cancel_event,
+            )
+
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION, "agents": {"mandatory": ["reviewer"]}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    bus = EventBus(db)
+    orchestrator = Orchestrator(db, bus, _FailingReviews(), tmp_path / "home")
+    cancel_event = asyncio.Event()
+    orchestrator._cancel_events[task.id] = cancel_event
+    orchestrator.set_hitl_checkpoint(task.id, "reviewer", True)
+    with bus.subscribe(task_id=task.id, types=["hitl.waiting"]) as waiting:
+        running = asyncio.create_task(
+            orchestrator.process_task(claimed, cancel_event=cancel_event)
+        )
+        hitl = await asyncio.wait_for(anext(waiting), timeout=30)
+    assert hitl.payload["node_id"] == "reviewer"
+    assert orchestrator.request_cancel(task.id) is True
+    assert await asyncio.wait_for(running, timeout=30) is False
+
+    # The cancel ended the wait: it is not an operator override of the reviewer's verdict.
+    assert [(v.verdict, v.source) for v in await repo.list_verdicts(db, task.id)] == [
+        ("fail", "json")
+    ]
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.cancelled
+
+
+async def test_a_node_reached_after_a_cancel_does_not_wait_for_approval(
+    db: Database, tmp_path: Path
+) -> None:
+    class _CancelAsTheDeveloperFinishes(FakeProvider):
+        async def run_agent(
+            self,
+            *,
+            profile: ResolvedProfile,
+            prompt: str,
+            timeout_seconds: int,
+            cwd: Path | None = None,
+            on_chunk: OnChunk | None = None,
+            cancel_event: asyncio.Event | None = None,
+        ) -> AgentResult:
+            result = await super().run_agent(
+                profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+                on_chunk=on_chunk, cancel_event=cancel_event,
+            )
+            if "You are the developer agent of" in prompt and cancel_event is not None:
+                cancel_event.set()
+            return result
+
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved,
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    orchestrator = Orchestrator(
+        db, EventBus(db), _CancelAsTheDeveloperFinishes(), tmp_path / "home"
+    )
+    orchestrator.set_hitl_checkpoint(task.id, "developer", True)
+    cancel_event = asyncio.Event()
+
+    assert await orchestrator.process_task(claimed, cancel_event=cancel_event) is False
+
+    types = [e.type for e in await repo.list_events(db, task_id=task.id, limit=10_000)]
+    assert "hitl.waiting" not in types
+    assert "node.waiting_for_approval" not in types
+    assert types.count("task.cancelled") == 1
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert final.state is TaskState.cancelled
+
+
+async def test_runner_starts_no_dispatch_once_cancelled(db: Database, tmp_path: Path) -> None:
+    project = await repo.create_project(
+        db, name="t", path=str(tmp_path), default_branch="main", config={}
+    )
+    provider = FakeProvider()
+    runner = AgentRunner(db, EventBus(db), provider, project.id, load_project_config({}))
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+
+    result = await runner.run(
+        agent="developer", prompt="add a feature file", worktree=tmp_path,
+        cancel_event=cancel_event,
+    )
+
+    assert result.cancelled is True
+    assert result.ok is False
+    assert provider.prompts == []
+    assert await repo.list_events(db, project_id=project.id) == []
 
 
 async def test_cancel_non_in_progress_task_via_api(
