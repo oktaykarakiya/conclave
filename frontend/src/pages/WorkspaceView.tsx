@@ -136,7 +136,6 @@ const BUG_SEVERITY_COLORS: Record<string, string> = {
 const MAX_STREAM_ROWS = 300;
 const INDENT_STEP = 14;
 const INDENT_MAX = 42;
-const DEFAULT_MODEL_ID = "google/gemini-2.5-flash-lite";
 
 const TASK_LIFECYCLE_EVENTS = new Set([
   "task.created",
@@ -174,15 +173,9 @@ export function WorkspaceView({
   const [composerFocused, setComposerFocused] = useState(false);
   const [autoRun, setAutoRun] = useState(true);
   const [swarmConcurrency, setSwarmConcurrency] = useState<number>(4);
-  const [defaultModel, setDefaultModel] = useState<string>(DEFAULT_MODEL_ID);
-  const [availableModels, setAvailableModels] = useState<string[]>([
-    DEFAULT_MODEL_ID,
-    "google/gemini-3.1-flash-lite-preview",
-    "google/gemini-2.5-flash",
-    "google/gemini-2.5-pro",
-    "deepseek/deepseek-chat",
-    "anthropic/claude-sonnet-4-5",
-  ]);
+  // Both come from the project's settings (GET /api/models?project_id=…); "" = engine default.
+  const [defaultModel, setDefaultModel] = useState<string>("");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [projectMode, setProjectMode] = useState<ProjectMode>(
     project.mode === "autonomous_bug_fixer" ? "autonomous_bug_fixer" : "task_queue",
@@ -246,25 +239,21 @@ export function WorkspaceView({
     status: streamStatus,
   } = useStream(projectId);
 
-  // Load recommended model catalog once
+  // Load the model catalog the project's settings offer (and its configured default)
   useEffect(() => {
     api
-      .listModels()
+      .listModels(projectId)
       .then((catalog) => {
-        if (catalog.default_model) {
-          setDefaultModel(catalog.default_model);
-        }
-        if (Array.isArray(catalog.models) && catalog.models.length > 0) {
-          const ids = catalog.models
-            .map((m) => (typeof m === "string" ? m : m.id))
-            .filter(Boolean);
-          if (ids.length > 0) setAvailableModels(ids);
-        }
+        const ids = Array.isArray(catalog.models)
+          ? catalog.models.map((m) => (typeof m === "string" ? m : m.id)).filter(Boolean)
+          : [];
+        setDefaultModel(catalog.default_model ?? "");
+        setAvailableModels(catalog.default_model ? ids : ["", ...ids]);
       })
       .catch(() => {
-        /* fallback to default google/gemini-2.5-flash-lite */
+        /* keep the current picker contents */
       });
-  }, []);
+  }, [projectId]);
 
   // Load project workflow graph for Mini-DAG
   useEffect(() => {
@@ -1120,7 +1109,7 @@ export function WorkspaceView({
                   >
                     {availableModels.map((m) => (
                       <option key={m} value={m}>
-                        {m}
+                        {m || "engine default"}
                       </option>
                     ))}
                   </select>
@@ -1158,7 +1147,7 @@ export function WorkspaceView({
               )}
               {composerMode === "plan" && (
                 <span className="hidden text-[11px] text-zinc-500 xl:inline">
-                  5-agent panel debate · {defaultModel}
+                  5-agent panel debate · {defaultModel || "engine default"}
                 </span>
               )}
               <Button

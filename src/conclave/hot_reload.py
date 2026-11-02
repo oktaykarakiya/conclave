@@ -60,7 +60,8 @@ _EXPLICIT_MODULE_RANKS: dict[str, tuple[int, int]] = {
     "conclave.providers.profiles": (8, 1),
     "conclave.providers.claude_cli": (8, 2),
     "conclave.providers.opencode_cli": (8, 3),
-    "conclave.providers.router": (8, 4),
+    "conclave.providers.effort": (8, 4),
+    "conclave.providers.router": (8, 5),
     "conclave.providers": (8, 99),
     # bootstrap
     "conclave.bootstrap": (9, 0),

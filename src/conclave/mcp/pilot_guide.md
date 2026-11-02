@@ -24,13 +24,14 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
   again after review. Verdicts from reviewers are **grounded**: claims must cite evidence that
   exists in the diff, or they are downgraded.
 - **Branches**: each task gets `<branch_prefix><task_id>` (default `conclave/<id>`) from the
-  project's `execution.target_branch`. With `auto_merge` on, a green task merges itself; with it
-  off, the task ends `done` on its committed branch and **you** merge it.
+  project's `execution.target_branch`. `auto_merge` is off by default: a green task ends `done`
+  on its committed branch and **you** merge it. With `auto_merge` on, a green task merges itself.
 
 ## 2. Golden rules
 
-1. **Never let work land unreviewed.** Prefer `auto_merge: false`: read every change with
-   `conclave_get_task_diff`, then `conclave_merge_task`. Or arm a human checkpoint before the merge.
+1. **Never let work land unreviewed.** `auto_merge` is off by default; keep it off: read every
+   change with `conclave_get_task_diff`, then `conclave_merge_task`. If you turn it on, arm a human
+   checkpoint before the merge.
 2. **A project without a test command has no gate, so its tasks do not run.** Always set
    `execution.baseline_test_command` (and `setup_command` when the repo needs an environment).
    Without one, every task fails at once with reason `no_test_command`, before any agent runs
@@ -52,7 +53,8 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
 2. `conclave_patch_config(project_id, config={...})` merges into the project's settings
    (`conclave_get_config` shows the effective result; `conclave_get_workflow` the graph). Key
    fields:
-   - `execution.target_branch`, `execution.auto_merge`, `execution.setup_command`,
+   - `execution.target_branch`, `execution.auto_merge` (default `false`: a green task ends
+     `done` on its branch, unmerged), `execution.setup_command`,
      `execution.baseline_test_command`, `execution.require_full_green`,
      `execution.max_parallel_tasks`, `execution.review_rounds_max`
    - `execution.allow_no_test_command` (default `false`): with `require_full_green` on and no test
@@ -69,7 +71,14 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      only flags; `off` skips the check.
    - `agent_defaults` (applies to every agent) and `agent_overrides.<agent>`:
      `model`, `effort`, `timeout_minutes`, `max_retries`, `compact_before_start`, `skills`
-   - `experimental.planner_enabled`, `experimental.auto_planner_char_threshold`
+   - `experimental.planner_enabled`, `experimental.auto_planner_char_threshold` (default `0`: the
+     planner runs for every task; a task's `use_planner` wins either way)
+   - `ui.model_choices` (default `[]`): the models the UI pickers offer. Empty offers a built-in
+     list limited to the engines available on this host; models the settings already use (agent
+     defaults, overrides, workflow nodes) are always offered. `GET /api/models?project_id=<id>`
+     returns that project's list and its `agent_defaults.model` as `default_model`.
+   - `system.hot_reload_watch` (default `false`): daemon-wide, so only the global settings count
+     (a project value is stored but ignored). See §10.
    - `context.bulk_max_chars` (default 200000), `context.compaction_enabled` (default `false`),
      `context.compaction_max_chars` (default 60000); both limits accept 1000–2000000. Agents always
      get the task request, plan, reviewer feedback, steer and planning prompt whole. Only
@@ -84,7 +93,14 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      `context.compaction_enabled` instead, set it to `null` with `conclave_patch_config`
      (`conclave_configure_agent` ignores null values).
 3. Personas: `conclave_list_agents` / `conclave_upsert_agent(name, role, persona_md, project_id)`.
-   A persona with `project_id` overrides the global one for that project only.
+   A persona with `project_id` overrides the global one for that project only. The built-in
+   planning personas (`planner`, `architect-as-planner`, `pm`, `test-architect`) are
+   research-first: read the code, verify the current official docs of every library, API, CLI
+   and service the plan relies on (with web search/fetch tools when available), cite sources
+   (URL or `path:line`) and mark anything unverified as `ASSUMPTION`; the planner's JSON plan
+   format is unchanged. Seeding only inserts missing personas, so an existing install keeps the
+   ones stored in its database: to adopt a new built-in, `conclave_delete_agent(name)` without
+   `project_id` resets that global persona to the built-in.
 
 ### Settings layers
 - The effective config is built from layers, later ones winning: built-in defaults → global
@@ -129,17 +145,24 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
   `claude-code/default`) runs on the **Claude Code** CLI with its own login.
 - A model without `/` and without the `claude-code/` prefix is ignored by opencode (it uses its
   own default) — always use a full model string.
-- `effort` (`low` | `medium` | `high` | `xhigh` | `max`) is passed to the engine; engines and
-  models support different subsets (some only `low`/`high`/`max`). Prefer the highest level the
-  target model supports for quality-critical roles.
+- `effort` (`low` | `medium` | `high` | `xhigh` | `max`) is passed to the engine. Unset (the
+  default) means **auto**, the highest sensible level for the engine: `xhigh` on Claude Code
+  (`max` only when you set it), and on opencode the highest variant the model reports
+  (`opencode models <provider> --verbose`, read once per provider and cached; no variant flag
+  when none is known). Models support different subsets (some only `low`/`high`/`max`): an
+  explicit level the model lacks is clamped to the nearest one it has (the lower one on a tie),
+  with one `log` event `stage: "effort_clamped"` (§6), and never fails the dispatch. Claude Code
+  also falls back on its own when a model lacks the level passed, without a Conclave event. To
+  go back to auto, unset the field: `conclave_patch_config(unset: ["agent_defaults.effort"])`
+  (or `agent_overrides.<agent>.effort`).
 - Only configure models whose engine and credentials actually work on this host; a quick
   low-cost task is the cheapest way to confirm a new model string end to end.
 
 ## 4. Choosing models per node (generic strategy)
 
-- **Planning** (rare, shapes everything): the strongest reasoning model available, high effort.
-  Instruct planners to read the code and verify current official docs before planning, and to
-  cite sources in the plan.
+- **Planning** (every task by default, shapes everything): the strongest reasoning model
+  available, high effort. The built-in planning personas already read the code, verify current
+  official docs and cite sources (§3); a custom planner persona should do the same.
 - **Developer** (most tool calls, most tokens): pick by measurement (§8). A strong, cheap model
   is often as correct as the most expensive one on well-specified tasks; reserve the strongest
   for large, cross-cutting or architectural changes.
@@ -158,9 +181,10 @@ A good request is a contract the reviewers and the gate can check:
 - **constraints**: what must not change, what to reuse instead of duplicating, safety rules
   (e.g. read-only, never bypass hooks);
 - **tests to add** and the **quality gate** command that must stay green.
-Long requests are fine (they automatically trigger the planner). Set `use_planner: true` to force
-planning. Prefer several small dependent tasks (`parent_task_id`) over one giant task; a planning
-session (§9) can produce the tree for you.
+Long requests are fine. The planner runs for every task by default
+(`experimental.auto_planner_char_threshold: 0`); set `use_planner: false` on a task to skip it, or
+raise the threshold so that only longer requests are planned. Prefer several small dependent tasks
+(`parent_task_id`) over one giant task; a planning session (§9) can produce the tree for you.
 
 ## 6. Running and monitoring
 
@@ -168,7 +192,8 @@ session (§9) can produce the tree for you.
   `conclave_get_task(task_id)` (the task is under the `task` key) for state and `result_summary`.
 - `conclave_get_task_events(task_id, after_id)` returns events in **pages**: loop, passing the
   last seen `id` as `after_id`, until the page is empty. Useful types:
-  `task.started`, `plan.artifact`, `attempt.started`, `agent.dispatched` (configured model),
+  `task.started`, `plan.artifact`, `attempt.started`, `agent.dispatched` (configured `model`,
+  and `effort`: the level it runs with after auto and clamping, `null` when no flag is passed),
   `agent.result` (`ok`, `model_reported`, `cost_usd`, `error`), `agent.verdict`
   (`verdict`, `reason`), `pipeline.derived` (which reviewers will run), `node.started`,
   `node.waiting_for_approval`, `hitl.waiting`, `task.committed`, `task.merged`,
@@ -178,7 +203,9 @@ session (§9) can produce the tree for you.
   `stage: "gate_skipped_no_tests"` means the gate ran no tests (`allow_no_test_command`). A
   `log` event with `stage: "context_truncated"` marks every cut of a diff or gate/setup output
   in an agent's prompt (`block`, `field`, `original_chars`, `kept_chars`, `agent`, `node_id`);
-  there is none when nothing was cut.
+  there is none when nothing was cut. A `log` event with `stage: "effort_clamped"` marks a
+  dispatch whose explicit effort the model does not support (`requested`, `used`, `model`,
+  `agent`, `node_id`); the dispatch ran with `used`.
 - `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review.
 - Typical timeline: setup + baseline test run, planner, developer, each reviewer in turn, the
   gate, commit. Poll every 15–60 s; long silences during planning or development are normal.
@@ -233,9 +260,17 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 
 - Develop on a separate branch (not the branch the running daemon is checked out on) and promote
   to the stable branch only when the gate is green.
-- The daemon may hot-reload its own code when files in its checkout change; avoid editing that
-  checkout while tasks run. `conclave_get_reload_status` / `conclave_reload_system` show and
-  control reloads.
+- The file watcher is off by default: the daemon reloads its own code only when asked, with
+  `conclave_reload_system` (or **Reload now** on the Settings page), which waits until no task
+  runs unless `force: true`. To reload automatically when files in its checkout change, turn on
+  `system.hot_reload_watch` in the global settings
+  (`conclave_patch_config(config={"system": {"hot_reload_watch": true}})` without `project_id`).
+  It is read live, so no restart is needed, and a project value is ignored. With it on, avoid
+  editing that checkout while tasks run.
+- `conclave_get_reload_status` shows `watcher_enabled`, `reload_pending` and `changed_files`
+  without reloading.
+- A hot reload keeps the running daemon objects (the watcher loop, the engine router), so a change
+  to them takes effect after a restart; restart the daemon once after deploying such a change.
 
 ## 11. Pitfalls and response shapes
 
@@ -260,8 +295,12 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 - A task that fails at once with reason `no_test_command` never ran an agent: set
   `execution.baseline_test_command` (or `allow_no_test_command: true`) and approve it again
   (`conclave_approve_task`).
-- A `done` task whose summary says `merged=False` and `not auto-merged` was held by
-  `test_integrity: block` (§8); it waits for you, not for the worker.
+- A `done` task whose summary says `merged=False` waits for you: `auto_merge` is off by default,
+  so a green task stays on its branch until you read the diff and call `conclave_merge_task`. To
+  merge automatically again, set `execution.auto_merge: true` in the global settings or per
+  project. With `not auto-merged` in the summary, `test_integrity: block` held it even though
+  `auto_merge` is on (§8). The autonomous bug-fixer follows the same setting: with it off, a
+  candidate whose fix task ends `done` is marked fixed while the fix waits on its branch.
 - If a model's `model_reported` differs from the configured one, stop and investigate before
   trusting results (wrong engine, wrong model string, or routing problem).
 - Frequent `context_truncated` events mean diffs or test output exceed the limit (§3): agents can

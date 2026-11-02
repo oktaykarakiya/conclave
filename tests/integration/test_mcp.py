@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import httpx
+import pytest
 from fake_provider import FakeProvider
 from httpx import ASGITransport
 
@@ -299,9 +301,14 @@ async def test_global_store_and_parallel_swarm_execution(
 
 
 async def test_observability_compaction_and_agent_config(
-    db: Database, tmp_path: Path
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from conclave.observability import export_interaction_logs_to_parquet
+
+    # Both engines "installed", whatever this host has: the built-in model list offers only
+    # the models of available engines.
+    monkeypatch.setenv("CONCLAVE_OPENCODE_BIN", sys.executable)
+    monkeypatch.setenv("CONCLAVE_CLAUDE_BIN", sys.executable)
 
     repo_path = tmp_path / "obs-repo"
     await _init_repo(repo_path)

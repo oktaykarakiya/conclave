@@ -4,8 +4,10 @@ A portable, web-driven **autonomous AI coding team** you can attach to any git r
 
 Conclave drives **opencode** (headless) through a proven loop —
 **plan → develop → multi-agent review → grounded verdict → green-gate → commit & merge** —
-fully autonomously, controlled entirely from a web UI (you never edit files in the repo, not
-even config).
+autonomously, controlled entirely from a web UI (you never edit files in the repo, not even
+config). Out of the box it favours correctness over speed and cost: every task is planned, agents
+reason at the highest level their model supports, and a green task waits on its branch until you
+merge it (turn on **auto-merge** in Settings to let it merge itself).
 
 > **Two engines.** Agents run on **opencode** (default) or the **Claude Code** CLI, chosen per
 > agent by its model: `provider/model` (e.g. `deepseek/deepseek-flash`) runs on opencode,
@@ -65,7 +67,10 @@ Then start Conclave:
 Every agent defaults to **DeepSeek V4.1 Flash** (`deepseek/deepseek-flash`), so a DeepSeek key in
 opencode is all you need. Change models in the UI (**Config → agent defaults**, or per agent): e.g.
 `claude-code/opus` for the planner, or `openai/gpt-6.1-sol-pro` for a reviewer. A model
-without a `/` is ignored by opencode (its own default is used).
+without a `/` is ignored by opencode (its own default is used). Reasoning effort is automatic
+unless you set one: the highest variant the model reports on opencode, `xhigh` on Claude Code; a
+level the model lacks is clamped to the nearest one it has. The planner runs before every task
+(raise **Planner threshold** in Settings to plan only longer requests).
 
 Then, entirely in the web UI:
 
@@ -73,8 +78,10 @@ Then, entirely in the web UI:
    by an `AGENTS.md` (generate it with opencode's `/init`), which opencode reads natively when agents
    run.
 2. **Plan or create a task** — use *Agent-ception* to decompose a big goal, or create a task directly;
-   approve it (or auto-approve) and watch the team on the **Live** tab: develop → grounded review →
-   green-gate → commit → merge into your target branch.
+   approve it (or auto-approve) and watch the team on the **Live** tab: plan → develop → grounded
+   review → green-gate → commit to the task's branch.
+3. **Review and merge** — read the task's diff and merge it into your target branch, or turn on
+   auto-merge so green tasks merge themselves.
 
 Conclave never touches your working tree: each task runs in an isolated git *worktree* under
 `~/.local/share/conclave/` (override with `CONCLAVE_HOME`). Host/port via `CONCLAVE_HOST` /

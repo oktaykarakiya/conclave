@@ -30,6 +30,8 @@ from .models import (
     NotificationSettings,
     PlanningSettings,
     ProtectedSettings,
+    SystemSettings,
+    UiSettings,
     Verdict,
 )
 from .resolver import (
@@ -78,6 +80,8 @@ __all__ = [
     "OutputContract",
     "PlanningSettings",
     "ProtectedSettings",
+    "SystemSettings",
+    "UiSettings",
     "Verdict",
     "WorkflowEdge",
     "WorkflowGraph",

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
+import pytest
 import pytest_asyncio
 from fake_provider import FakeProvider
 from httpx import ASGITransport
 
 from conclave.bootstrap import seed_global_defaults
+from conclave.config import create_project_with_config, save_global_config, workflow_templates
 from conclave.db import Database
 from conclave.db import repositories as repo
 from conclave.db.models import TaskState
@@ -872,3 +875,113 @@ async def test_bug_fixer_mode_and_ledger_endpoints(
 
     bad = await client.post(f"/api/projects/{pid}/mode", json={"mode": "nonsense"})
     assert bad.status_code == 422
+
+
+# --- GET /api/models: the model pickers' catalog comes from the settings ------------------
+
+_CATALOG_KEYS = {
+    "default_model",
+    "models",
+    "recommended_models",
+    "efforts",
+    "effort_variants",
+    "cli_agents",
+    "skills",
+    "skill_templates",
+    "engines",
+}
+
+
+def _engines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, opencode: bool, claude: bool
+) -> None:
+    """Make each engine's binary present (the test interpreter) or missing on this "host"."""
+    monkeypatch.setenv(
+        "CONCLAVE_OPENCODE_BIN", sys.executable if opencode else str(tmp_path / "no-opencode")
+    )
+    monkeypatch.setenv(
+        "CONCLAVE_CLAUDE_BIN", sys.executable if claude else str(tmp_path / "no-claude")
+    )
+
+
+async def test_models_default_and_list_follow_global_and_project_settings(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _engines(monkeypatch, tmp_path, opencode=True, claude=True)
+    builtins = (await client.get("/api/models")).json()["models"]
+    assert builtins[0] == "deepseek/deepseek-flash"
+    assert "claude-code/opus" in builtins
+
+    await save_global_config(db, {"agent_defaults": {"model": "g/global"}})
+    workflow = workflow_templates()["fast_track"].model_dump(mode="json")
+    workflow["nodes"][0]["model"] = "w/node"
+    project = await create_project_with_config(
+        db,
+        name="p",
+        path=str(tmp_path / "p"),
+        default_branch="main",
+        patch={
+            "agent_defaults": {"model": "p/proj"},
+            "agent_overrides": {"reviewer": {"model": "o/reviewer"}, "tester": {"effort": "high"}},
+            "workflow": workflow,
+        },
+    )
+
+    glob = (await client.get("/api/models")).json()
+    assert set(glob) == _CATALOG_KEYS
+    assert glob["default_model"] == "g/global"
+    assert glob["models"] == [*builtins, "g/global"]
+    assert glob["recommended_models"] == glob["models"]
+    assert glob["engines"]["available"] == {"opencode": True, "claude": True}
+    assert "xhigh" in glob["efforts"]
+
+    proj = (await client.get("/api/models", params={"project_id": project.id})).json()
+    assert set(proj) == _CATALOG_KEYS
+    assert proj["default_model"] == "p/proj"
+    # Every model the settings use is offered, so a picker never hides a configured one.
+    assert proj["models"] == [*builtins, "p/proj", "o/reviewer", "w/node"]
+
+    missing = await client.get("/api/models", params={"project_id": "no-such-project"})
+    assert missing.status_code == 404
+
+
+async def test_models_offers_the_configured_choices_whatever_the_engines(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _engines(monkeypatch, tmp_path, opencode=True, claude=False)
+    await save_global_config(db, {"ui": {"model_choices": ["x/only", "claude-code/opus"]}})
+    project = await create_project_with_config(
+        db,
+        name="p",
+        path=str(tmp_path / "p"),
+        default_branch="main",
+        patch={"ui": {"model_choices": ["p/one"]}},
+    )
+
+    glob = (await client.get("/api/models")).json()
+    assert glob["models"] == ["x/only", "claude-code/opus", "deepseek/deepseek-flash"]
+    proj = (await client.get("/api/models", params={"project_id": project.id})).json()
+    assert proj["models"] == ["p/one", "deepseek/deepseek-flash"]
+
+
+@pytest.mark.parametrize(
+    ("opencode", "claude"), [(True, True), (True, False), (False, True), (False, False)]
+)
+async def test_models_fallback_lists_only_the_engines_on_this_host(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    opencode: bool,
+    claude: bool,
+) -> None:
+    _engines(monkeypatch, tmp_path, opencode=opencode, claude=claude)
+    data = (await client.get("/api/models")).json()
+
+    assert data["engines"]["available"] == {"opencode": opencode, "claude": claude}
+    claude_models = [m for m in data["models"] if m.startswith("claude-code/")]
+    other_models = [m for m in data["models"] if not m.startswith("claude-code/")]
+    assert bool(claude_models) is claude
+    # The configured default (an opencode model) is always offered; other opencode models
+    # only when opencode is installed.
+    assert other_models[0] == "deepseek/deepseek-flash"
+    assert (len(other_models) > 1) is opencode

@@ -55,13 +55,13 @@ def test_builtin_defaults_apply_when_no_layer_sets_anything() -> None:
 
 
 def test_global_layer_sits_between_builtin_and_project() -> None:
-    global_layer = {"execution": {"review_rounds_max": 7, "auto_merge": False}}
+    global_layer = {"execution": {"review_rounds_max": 7, "auto_merge": True}}
     project_layer = {"execution": {"review_rounds_max": 9}}
 
     cfg = load_layered_config(global_layer, project_layer)
 
     assert cfg.execution.review_rounds_max == 9  # project wins over global
-    assert cfg.execution.auto_merge is False  # global wins over built-in
+    assert cfg.execution.auto_merge is True  # global wins over built-in
     assert cfg.execution.wall_clock_budget_minutes == 720  # built-in fills the rest
 
 
@@ -328,7 +328,7 @@ def test_patch_leaf_paths() -> None:
 
 NORMALISE_GLOBAL: dict[str, Any] = {
     "execution": {"target_branch": "develop", "review_rounds_max": 6},
-    "experimental": {"auto_planner_char_threshold": 0},
+    "experimental": {"auto_planner_char_threshold": 250},
     "agent_defaults": {"model": "g/default", "effort": "high"},
     "agent_overrides": {"reviewer": {"model": "g/reviewer"}},
 }
@@ -344,7 +344,7 @@ LEGACY_SHAPES: dict[str, dict[str, Any]] = {
     "frozen_full_document": _frozen_full_document(),
     "partial_delta": {
         "execution": {"target_branch": "develop", "max_parallel_tasks": 4},
-        "experimental": {"auto_planner_char_threshold": 0},
+        "experimental": {"auto_planner_char_threshold": 250},
     },
     "agent_overrides": {
         "agent_defaults": {"model": "g/default", "timeout_minutes": 30},

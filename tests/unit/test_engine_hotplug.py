@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from conclave.agents.personas import DEFAULT_PERSONAS
-from conclave.config import ConclaveConfig, load_project_config, resolve_agent
+import pytest
+
+from conclave.agents.personas import _RESEARCH_FIRST, DEFAULT_PERSONAS
+from conclave.config import AgentRole, ConclaveConfig, load_project_config, resolve_agent
 from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine.gitio import run_git, run_shell
@@ -37,6 +39,67 @@ def test_seed_personas_include_necessity_and_yagni_verification() -> None:
         assert "Necessity & YAGNI Verification" in persona_md
         assert "strictly necessary" in persona_md
         assert "redundant or speculative" in persona_md
+
+
+_PLANNING_PERSONAS = ("planner", "architect-as-planner", "pm", "test-architect")
+
+# The planner's JSON plan contract, byte for byte, as the orchestrator parses it.
+_PLANNER_JSON_CONTRACT = """Output EXACTLY one JSON block and nothing else:
+```json
+{
+  "approach": "one paragraph",
+  "files_to_touch": ["relative/path.ext"],
+  "files_to_NOT_touch": ["pre-broken/test.ext"],
+  "tests_to_add": ["short description"],
+  "risks": ["risk + mitigation"],
+  "acceptance_criteria": ["observable empirical check"]
+}
+```
+"""
+
+
+@pytest.mark.parametrize("name", _PLANNING_PERSONAS)
+def test_planning_personas_are_research_first(name: str) -> None:
+    role, persona_md = DEFAULT_PERSONAS[name]
+    assert role is AgentRole.planning
+    for marker in (
+        "Research First (MANDATORY",
+        "Read the code",
+        "AGENTS.md or README",
+        "current official documentation",
+        "web search and fetch tools",
+        "Cite your sources",
+        "ASSUMPTION",
+        "Never invent an API",
+    ):
+        assert marker in persona_md, f"{name} lacks {marker!r}"
+    # Before the persona's own output section, which keeps the last word.
+    assert persona_md.index("Research First") < persona_md.rindex("\nOutput ")
+
+
+def test_planner_keeps_its_json_plan_contract_verbatim_and_last() -> None:
+    _, planner_md = DEFAULT_PERSONAS["planner"]
+    assert planner_md.endswith(_PLANNER_JSON_CONTRACT)
+    assert planner_md.count("```json") == 1  # sources go inside the fields, not a new block
+    assert "add no keys" in planner_md
+
+
+def test_research_first_text_never_steers_the_fake_provider() -> None:
+    """FakeProvider picks a role by substring: the new text must not match another role."""
+    added = (_RESEARCH_FIRST, DEFAULT_PERSONAS["planner"][1])
+    for discriminator in (
+        "Produce a structured plan",
+        "Post-Mortem Agent",
+        "Review the changes made for this task",
+        "Planning Facilitator Agent",
+        "Architect Agent",
+        "Tester Agent",
+        "Security Agent",
+        "Senior Reviewer Agent",
+        "Risk Agent",
+    ):
+        for text in added:
+            assert discriminator not in text
 
 
 def test_build_developer_prompt_includes_necessity_and_yagni_check() -> None:

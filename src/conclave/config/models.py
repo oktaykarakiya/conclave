@@ -10,9 +10,9 @@ web UI's config forms, so the UI is the sole editor — no hand-edited YAML.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from .graph import WorkflowGraph
 
@@ -88,7 +88,12 @@ class AgentSettings(BaseModel):
         ),
     )
     effort: Effort | None = Field(
-        default=None, description="Reasoning effort/variant tier, or unset."
+        default=None,
+        description=(
+            "Reasoning effort/variant tier. None = auto: xhigh on Claude Code, the model's "
+            "highest reported variant on opencode, no flag when unknown. A level the model does "
+            "not support is clamped to the nearest one it does (the lower one on a tie)."
+        ),
     )
     cli_agent: str | None = Field(
         default=None,
@@ -144,7 +149,13 @@ class ExecutionSettings(BaseModel):
         ),
     )
     stop_on_failure: bool = Field(default=False)
-    auto_merge: bool = Field(default=True, description="Fast-forward/merge into target on success.")
+    auto_merge: bool = Field(
+        default=False,
+        description=(
+            "Merge a green task into the target branch automatically. Off: the task ends done "
+            "on its committed branch, and a human or pilot merges it (conclave_merge_task)."
+        ),
+    )
     setup_command: str | None = Field(
         default=None,
         description=(
@@ -199,7 +210,14 @@ class ExperimentalSettings(BaseModel):
     cross_attempt_memory_entries: int = Field(default=5, ge=0, le=50)
     persistent_baseline_cache: bool = True
     planner_enabled: bool = True
-    auto_planner_char_threshold: int = Field(default=400, ge=0)
+    auto_planner_char_threshold: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Minimum request length (chars) that runs the optional planner node. 0 plans every "
+            "task; a task's use_planner wins either way."
+        ),
+    )
     post_mortem_enabled: bool = True
 
 
@@ -465,6 +483,42 @@ class NotificationSettings(BaseModel):
     )
 
 
+class SystemSettings(BaseModel):
+    """Daemon-wide settings. Only the global layer counts: a project value is stored but
+    ignored, because there is one daemon for every project."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hot_reload_watch: bool = Field(
+        default=False,
+        description=(
+            "Daemon-wide (global settings only): reload Conclave in place when its own source "
+            "files change, once no task runs. Read live, no restart needed. Manual reloads "
+            "work either way."
+        ),
+    )
+
+
+# One offered model string (e.g. "deepseek/deepseek-flash", "claude-code/opus").
+ModelChoice = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class UiSettings(BaseModel):
+    """What the web UI offers; it changes no dispatch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_choices: list[ModelChoice] = Field(
+        default_factory=list,
+        max_length=200,
+        description=(
+            "Models the model pickers offer. Empty: the built-in list, limited to the engines "
+            "available on this host. Models set in agent settings or workflow nodes are always "
+            "offered."
+        ),
+    )
+
+
 class ProtectedSettings(BaseModel):
     """Paths agents must never modify. ``.env*`` and ``.git`` are an enforced floor
     (see :func:`conclave.config.resolver.effective_protected`); users may add, not remove."""
@@ -500,6 +554,8 @@ class ConclaveConfig(BaseModel):
     bug_fixer: BugFixerPolicy = Field(default_factory=BugFixerPolicy)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
     protected: ProtectedSettings = Field(default_factory=ProtectedSettings)
+    system: SystemSettings = Field(default_factory=SystemSettings)
+    ui: UiSettings = Field(default_factory=UiSettings)
     agent_defaults: AgentSettings = Field(default_factory=AgentSettings)
     agent_overrides: dict[str, dict[str, object]] = Field(default_factory=dict)
     workflow: WorkflowGraph | None = Field(

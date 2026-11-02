@@ -108,7 +108,7 @@ async def test_blank_test_command_counts_as_none(db: Database, tmp_path: Path) -
 async def test_allow_no_test_command_runs_ungated_and_says_so(
     db: Database, tmp_path: Path
 ) -> None:
-    config = {"execution": {"allow_no_test_command": True}}
+    config = {"execution": {"allow_no_test_command": True, "auto_merge": True}}
     _, _, task, ok = await _run(db, tmp_path, FakeProvider(), config)
 
     assert ok is True and task.state is TaskState.done

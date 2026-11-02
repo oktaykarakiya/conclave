@@ -129,7 +129,7 @@ async def test_a_global_change_reaches_projects_without_touching_their_rows(
 
     res = await client.patch(
         "/api/config/global",
-        json={"config": {"execution": {"review_rounds_max": 11, "auto_merge": False}}},
+        json={"config": {"execution": {"review_rounds_max": 11, "auto_merge": True}}},
     )
     assert res.status_code == 200, res.text
     assert res.json()["updated_projects"] == []
@@ -137,10 +137,10 @@ async def test_a_global_change_reaches_projects_without_touching_their_rows(
     assert await _raw_rows(db) == rows_before  # byte-identical project rows
     plain_cfg = (await client.get(f"/api/projects/{plain.id}/config")).json()
     assert plain_cfg["execution"]["review_rounds_max"] == 11
-    assert plain_cfg["execution"]["auto_merge"] is False
+    assert plain_cfg["execution"]["auto_merge"] is True
     pinned_cfg = await resolve_project_config(db, pinned)
     assert pinned_cfg.execution.review_rounds_max == 3  # the project override still wins
-    assert pinned_cfg.execution.auto_merge is False
+    assert pinned_cfg.execution.auto_merge is True
 
 
 async def test_a_project_without_overrides_is_builtin_plus_global(
@@ -200,7 +200,7 @@ async def test_attach_stores_only_the_preset_values_that_differ(
         kind=StoreItemKind.config_preset,
         name="team",
         payload={
-            "execution": {"max_parallel_tasks": 1, "review_rounds_max": 7, "auto_merge": False}
+            "execution": {"max_parallel_tasks": 1, "review_rounds_max": 7, "auto_merge": True}
         },
     )
 
@@ -215,7 +215,7 @@ async def test_attach_stores_only_the_preset_values_that_differ(
     )
     assert created.status_code == 200, created.text
     assert created.json()["config"] == {
-        "execution": {"auto_merge": False},
+        "execution": {"auto_merge": True},
         "workflow": workflow_templates()["fast_track"].model_dump(mode="json"),
     }
 
@@ -415,7 +415,7 @@ async def test_global_patches_leave_project_rows_alone_by_default(
     client: httpx.AsyncClient, daemon: Daemon, db: Database, tmp_path: Path
 ) -> None:
     await _project(db, tmp_path, "a", {"execution": {"review_rounds_max": 3}})
-    await _project(db, tmp_path, "b", {"execution": {"auto_merge": False}})
+    await _project(db, tmp_path, "b", {"execution": {"auto_merge": True}})
     rows_before = await _raw_rows(db)
 
     res = await client.patch(
@@ -443,7 +443,7 @@ async def test_apply_to_all_projects_clears_the_patched_keys_from_every_project(
             "agent_defaults": {"model": "p/a"},
         },
     )
-    b = await _project(db, tmp_path, "b", {"execution": {"auto_merge": False}})
+    b = await _project(db, tmp_path, "b", {"execution": {"auto_merge": True}})
 
     res = await client.patch(
         "/api/config/global",
@@ -459,7 +459,7 @@ async def test_apply_to_all_projects_clears_the_patched_keys_from_every_project(
     b_row = await repo.get_project(db, b.id)
     assert a_row is not None and b_row is not None
     assert a_row.config == {"agent_defaults": {"model": "p/a"}}
-    assert b_row.config == {"execution": {"auto_merge": False}}
+    assert b_row.config == {"execution": {"auto_merge": True}}
     assert (a_row.default_branch, b_row.default_branch) == ("release", "release")
     effective = await resolve_project_config(db, a_row)
     assert effective.execution.review_rounds_max == 9
@@ -472,7 +472,7 @@ async def test_apply_to_all_projects_clears_the_patched_keys_from_every_project(
     )
     assert is_error is False
     assert await _stored(db, a.id) == {}
-    assert await _stored(db, b.id) == {"execution": {"auto_merge": False}}
+    assert await _stored(db, b.id) == {"execution": {"auto_merge": True}}
 
 
 async def test_global_configure_agent_clears_the_field_in_every_project(
@@ -547,7 +547,7 @@ async def test_layers_are_inspectable_over_rest_and_mcp(
 
 LEGACY_GLOBAL: dict[str, Any] = {
     "execution": {"target_branch": "develop", "review_rounds_max": 6},
-    "experimental": {"auto_planner_char_threshold": 0},
+    "experimental": {"auto_planner_char_threshold": 250},
     "agent_defaults": {"model": "g/default", "effort": "high"},
     "agent_overrides": {"reviewer": {"model": "g/reviewer"}},
 }
@@ -560,7 +560,7 @@ LEGACY_ROWS: dict[str, dict[str, Any]] = {
     "frozen_on_develop": _FROZEN,
     "partial": {
         "execution": {"target_branch": "develop", "max_parallel_tasks": 4},
-        "experimental": {"auto_planner_char_threshold": 0},
+        "experimental": {"auto_planner_char_threshold": 250},
     },
     "agents": {
         "agent_defaults": {"model": "g/default", "timeout_minutes": 30},

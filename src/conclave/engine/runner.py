@@ -19,7 +19,13 @@ from ..db import Database
 from ..db import repositories as repo
 from ..events import EventBus, EventType
 from ..observability.parquet_sync import log_agent_interaction
-from ..providers import AgentResult, Provider, ResolvedProfile
+from ..providers import (
+    AgentResult,
+    EffortChoice,
+    Provider,
+    ResolvedProfile,
+    resolve_dispatch_effort,
+)
 
 logger = logging.getLogger("conclave.engine.runner")
 
@@ -28,6 +34,25 @@ logger = logging.getLogger("conclave.engine.runner")
 # event per tiny provider chunk (which would flood the bus and every subscriber's queue)
 # while still delivering near-real-time output to the Live tab.
 _STREAM_FLUSH_BYTES = 1024
+
+
+def effort_clamped_payload(
+    choice: EffortChoice, model: str | None, agent: str, *, node_id: str
+) -> dict[str, object]:
+    """Payload of the ``log`` event a dispatch emits when its explicit effort was clamped."""
+    return {
+        "stage": "effort_clamped",
+        "requested": choice.requested,
+        "used": choice.used,
+        "model": model,
+        "agent": agent,
+        "node_id": node_id,
+        # The Live tab renders log rows as "[stage] message".
+        "message": (
+            f"{agent}: {model or 'the default model'} does not support effort "
+            f"{choice.requested}; using {choice.used or 'no effort flag'}"
+        ),
+    }
 
 
 def assemble_prompt(
@@ -163,9 +188,18 @@ class AgentRunner:
             else list(settings.skills)
         )
         thinking = thinking_override if thinking_override is not None else settings.thinking
+        choice = await resolve_dispatch_effort(self._provider, model, effort)
+        if choice.clamped:
+            await self._bus.emit(
+                type=EventType.log,
+                project_id=self._project_id,
+                task_id=task_id,
+                agent=agent,
+                payload=effort_clamped_payload(choice, model, agent, node_id=node_id or agent),
+            )
         profile = self._resolve_profile(
             model,
-            effort,
+            choice.used,
             cli_agent=cli_agent,
             thinking=thinking,
             pure=settings.pure,
@@ -180,6 +214,7 @@ class AgentRunner:
             payload={
                 "profile": profile.name,
                 "model": profile.model,
+                "effort": profile.effort,
                 "cwd": str(worktree),
                 "node_id": node_id or agent,
             },

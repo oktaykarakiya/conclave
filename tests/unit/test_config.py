@@ -39,10 +39,10 @@ def test_deep_merge_recurses_dicts_and_replaces_scalars_and_lists() -> None:
 
 def test_project_overrides_apply() -> None:
     cfg = load_project_config(
-        {"execution": {"target_branch": "vibes", "auto_merge": False}}
+        {"execution": {"target_branch": "vibes", "auto_merge": True}}
     )
     assert cfg.execution.target_branch == "vibes"
-    assert cfg.execution.auto_merge is False
+    assert cfg.execution.auto_merge is True
     # untouched keys keep defaults
     assert cfg.execution.wall_clock_budget_minutes == 720
 
@@ -131,6 +131,62 @@ def test_config_schema_is_renderable() -> None:
     assert "execution" in schema["properties"]
     # nested models are referenced/defined for the UI to render
     assert "$defs" in schema
+
+
+# --- quality-first defaults ----------------------------------------------------------
+
+
+def test_quality_first_defaults() -> None:
+    cfg = ConclaveConfig()
+    assert cfg.execution.auto_merge is False  # a green task waits on its branch
+    assert cfg.experimental.auto_planner_char_threshold == 0  # every task is planned
+    assert cfg.agent_defaults.effort is None  # auto: highest sensible per engine
+    assert cfg.system.hot_reload_watch is False
+    assert cfg.ui.model_choices == []
+
+
+def test_quality_first_settings_are_in_the_config_schema() -> None:
+    schema = config_schema()
+    assert {"system", "ui"} <= schema["properties"].keys()
+    defs = schema["$defs"]
+    assert defs["ExecutionSettings"]["properties"]["auto_merge"]["default"] is False
+    threshold = defs["ExperimentalSettings"]["properties"]["auto_planner_char_threshold"]
+    assert (threshold["default"], threshold["minimum"]) == (0, 0)
+    watch = defs["SystemSettings"]["properties"]["hot_reload_watch"]
+    assert (watch["type"], watch["default"]) == ("boolean", False)
+    choices = defs["UiSettings"]["properties"]["model_choices"]
+    assert (choices["type"], choices["items"]["type"], choices["maxItems"]) == (
+        "array", "string", 200
+    )
+
+
+def test_new_sections_validate_their_values() -> None:
+    cfg = load_project_config(
+        {
+            "system": {"hot_reload_watch": True},
+            "ui": {"model_choices": [" deepseek/deepseek-flash ", "claude-code/opus"]},
+        }
+    )
+    assert cfg.system.hot_reload_watch is True
+    assert cfg.ui.model_choices == ["deepseek/deepseek-flash", "claude-code/opus"]
+    for bad in (
+        {"system": {"hot_reload_watch": "maybe"}},
+        {"system": {"watch": True}},
+        {"ui": {"model_choices": "claude-code/opus"}},
+        {"ui": {"model_choices": ["  "]}},
+        {"ui": {"model_choices": ["m" * 201]}},
+    ):
+        with pytest.raises(ValidationError):
+            load_project_config(bad)
+
+
+def test_builtin_config_presets_keep_auto_merge_on() -> None:
+    from conclave.bootstrap import _BUILT_IN_CONFIG_PRESETS
+
+    assert len(_BUILT_IN_CONFIG_PRESETS) == 4
+    for name, (_, _, payload) in _BUILT_IN_CONFIG_PRESETS.items():
+        assert payload["execution"]["auto_merge"] is True, name
+        assert load_project_config(payload).execution.auto_merge is True, name
 
 
 # --- context (prompt bulk limits) --------------------------------------------

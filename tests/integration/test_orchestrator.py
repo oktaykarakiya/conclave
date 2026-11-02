@@ -26,6 +26,8 @@ from conclave.web import create_app
 # Execution settings for tests about stages other than the green gate: their throwaway repos have
 # no test suite, so they run without a test command deliberately (else no_test_command fails them).
 _UNGATED_EXECUTION = {"target_branch": "main", "allow_no_test_command": True}
+# For tests that exercise the merge itself: auto_merge is off by default.
+_MERGING_EXECUTION = {**_UNGATED_EXECUTION, "auto_merge": True}
 
 async def _init_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -94,7 +96,7 @@ async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> No
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": _UNGATED_EXECUTION},
+        config={"execution": _MERGING_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -117,6 +119,44 @@ async def test_happy_path_commits_and_merges(db: Database, tmp_path: Path) -> No
 
     types = {e.type for e in await repo.list_events(db, task_id=task.id)}
     assert {"task.started", "task.committed", "task.merged", "task.done"} <= types
+
+
+async def test_default_settings_plan_every_task_and_leave_the_merge_to_a_human(
+    db: Database, tmp_path: Path
+) -> None:
+    """Quality-first built-ins: even a short request is planned, and a green task ends done on
+    its committed branch for a human to merge (auto_merge is off)."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"baseline_test_command": "echo ok"}},
+    )
+    request = "add a file"
+    assert len(request) == 10
+    task = await repo.create_task(
+        db, project_id=project.id, request=request, state=TaskState.approved
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    done = await repo.get_task(db, task.id)
+    assert done is not None and done.state is TaskState.done
+    assert done.result_summary == "completed in 1 attempt(s); merged=False"
+    assert any("Produce a structured plan" in p for p in provider.prompts)
+    assert done.plan == {"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}
+    types = {e.type for e in await repo.list_events(db, task_id=task.id)}
+    assert {"plan.artifact", "task.committed", "task.done"} <= types
+    assert "task.merged" not in types
+
+    code, _ = await run_git(repo_path, "show", "main:FEATURE.txt")
+    assert code != 0  # the target branch is untouched
+    code, out = await run_git(repo_path, "show", f"conclave/{task.id}:FEATURE.txt")
+    assert code == 0 and "done" in out
 
 
 async def test_commit_rejected_by_pre_commit_hook_fails_task_and_preserves_work(
@@ -202,7 +242,7 @@ async def test_passing_pre_commit_hook_runs_and_commit_merges(
     )
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": _UNGATED_EXECUTION},
+        config={"execution": _MERGING_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -237,7 +277,7 @@ async def test_nothing_to_commit_skips_commit_even_with_failing_hook(
     _install_pre_commit_hook(repo_path, "#!/bin/sh\nexit 1\n")
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": _UNGATED_EXECUTION},
+        config={"execution": _MERGING_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="no-op change", state=TaskState.approved
@@ -348,7 +388,7 @@ async def test_reviewer_edits_are_not_committed(db: Database, tmp_path: Path) ->
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": _UNGATED_EXECUTION},
+        config={"execution": _MERGING_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved
@@ -884,7 +924,7 @@ async def test_merge_conflict_marks_task_failed_and_preserves_branch(
     await _init_repo(repo_path)
     project = await repo.create_project(
         db, name="t", path=str(repo_path), default_branch="main",
-        config={"execution": _UNGATED_EXECUTION},
+        config={"execution": _MERGING_EXECUTION},
     )
     task = await repo.create_task(
         db, project_id=project.id, request="add a feature file", state=TaskState.approved

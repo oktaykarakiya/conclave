@@ -108,6 +108,13 @@ export const api = {
   patchConfig: (id: string, config: unknown, idempotencyKey?: string, unset?: string[]) =>
     req<unknown>("PATCH", `/api/projects/${id}/config`, { config, unset }, idempotencyKey),
   configSchema: () => req<Record<string, unknown>>("GET", "/api/config/schema"),
+  /** Merge `config` into the global layer; `unset` paths are removed from it first. */
+  patchGlobalConfig: (config: unknown, unset?: string[]) =>
+    req<{ ok: boolean; global_config: Record<string, unknown>; updated_projects: string[] }>(
+      "PATCH",
+      "/api/config/global",
+      { config, unset },
+    ),
   mcpInfo: () =>
     req<{
       mcp_url: string;
@@ -338,7 +345,9 @@ export const api = {
     }>("GET", `/api/projects/${projectId}/swarms/${encodeURIComponent(swarmId)}`),
 
   // Model & Skill Catalog
-  listModels: () => req<ModelCatalog>("GET", "/api/models"),
+  /** The model pickers' catalog, from the project's settings (global when omitted). */
+  listModels: (projectId?: string) =>
+    req<ModelCatalog>("GET", `/api/models${qs({ project_id: projectId })}`),
 
   // Context Compaction
   compactTask: (taskId: string) =>
@@ -398,6 +407,7 @@ export const api = {
       frontend_stale: boolean;
       discoverable_modules: number;
       version: string;
+      watcher_enabled: boolean;
     }>("GET", "/api/system/reload-status"),
   reloadSystem: (force = false) =>
     req<{

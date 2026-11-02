@@ -63,8 +63,8 @@ from ..engine.task_merge import TaskMergeError, merge_task
 from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
-from ..providers import CLAUDE_CODE_PREFIX, engine_status
-from ..runtime import Daemon
+from ..providers import CLAUDE_CODE_PREFIX, Engine, engine_status, resolve_engine
+from ..runtime import Daemon, reload_status_report
 from ..verification import quarantine_integrity
 from .deps import get_daemon
 from .schemas import (
@@ -140,10 +140,9 @@ async def _require_planning_session(
 
 # --- meta -------------------------------------------------------------------
 
-_DEFAULT_MODEL = "deepseek/deepseek-flash"  # DeepSeek V4.1 Flash; keep in sync with AgentSettings
-
-_RECOMMENDED_MODELS: list[str] = [
-    _DEFAULT_MODEL,  # supersedes deepseek-v4-pro, which is intentionally not offered
+# Offered when ui.model_choices is empty, limited to the engines available on this host.
+_BUILTIN_MODEL_CHOICES: list[str] = [
+    "deepseek/deepseek-flash",  # supersedes deepseek-v4-pro, which is intentionally not offered
     "google/gemini-2.5-flash-lite",
     "google/gemini-3.1-flash-lite-preview",
     "google/gemini-2.5-flash",
@@ -195,7 +194,7 @@ async def health() -> dict[str, str]:
 async def get_system_reload_status(
     daemon: Daemon = Depends(get_daemon),
 ) -> dict[str, Any]:
-    return daemon.reload_status()
+    return await reload_status_report(daemon)
 
 
 @router.post("/system/reload")
@@ -213,18 +212,48 @@ async def get_config_schema() -> dict[str, Any]:
     return config_schema()
 
 
+def _configured_models(config: ConclaveConfig) -> list[str]:
+    """Every model string *config* dispatches with: agent defaults, overrides, workflow nodes."""
+    found: list[str | None] = [config.agent_defaults.model]
+    for override in config.agent_overrides.values():
+        model = override.get("model")
+        found.append(model if isinstance(model, str) else None)
+    if config.workflow is not None:
+        found.extend(node.model for node in config.workflow.nodes)
+    return [m.strip() for m in found if m and m.strip()]
+
+
 @router.get("/models")
-async def get_models_catalog(daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
+async def get_models_catalog(
+    project_id: str | None = Query(
+        None, description="Project whose settings decide the default and offered models."
+    ),
+    daemon: Daemon = Depends(get_daemon),
+) -> dict[str, Any]:
+    """The model pickers' catalog, from the resolved config (the project's, else global).
+
+    ``ui.model_choices`` is offered when set, else the built-in list for the engines this host
+    has; every model the config already uses is added so a picker never hides one.
+    """
+    project = await _require_project(daemon, project_id) if project_id else None
+    config = await resolve_project_config(daemon.db, project)
+    engines = engine_status(daemon.provider)
+    offered = list(config.ui.model_choices) or [
+        model
+        for model in _BUILTIN_MODEL_CHOICES
+        if engines["available"].get(str(resolve_engine(model, Engine.opencode)[0]), False)
+    ]
+    models = list(dict.fromkeys([*offered, *_configured_models(config)]))
     return {
-        "default_model": _DEFAULT_MODEL,
-        "models": list(_RECOMMENDED_MODELS),
-        "recommended_models": list(_RECOMMENDED_MODELS),
+        "default_model": config.agent_defaults.model,
+        "models": models,
+        "recommended_models": list(models),
         "efforts": list(_EFFORT_VARIANTS),
         "effort_variants": list(_EFFORT_VARIANTS),
         "cli_agents": list(_CLI_AGENTS),
         "skills": list(_SKILL_TEMPLATES),
         "skill_templates": list(_SKILL_TEMPLATES),
-        "engines": engine_status(daemon.provider),
+        "engines": engines,
     }
 
 

@@ -248,7 +248,8 @@ export interface SwarmBatchResponse {
 }
 
 export interface ModelCatalog {
-  default_model: string;
+  /** agent_defaults.model of the resolved settings; null = the engine's own default. */
+  default_model: string | null;
   models: { id: string; label?: string; provider?: string; tier?: string }[];
   efforts: string[];
   cli_agents: string[];

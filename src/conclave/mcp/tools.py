@@ -51,7 +51,7 @@ from ..engine.workflow_evolver import evolve_project_workflow
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..providers import engine_status
-from ..runtime import Daemon
+from ..runtime import Daemon, reload_status_report
 from ..verification import quarantine_integrity
 
 PILOT_GUIDE_URI = "conclave://guide/pilot"
@@ -270,8 +270,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     _tool(
         "conclave_patch_config",
         "Update configuration settings (target_branch, default_branch, execution, experimental, "
-        "context, planning, agents, bug_fixer, notifications, protected, agent_defaults, "
-        "agent_overrides, workflow) per-repository or globally across Conclave. A project "
+        "context, planning, agents, bug_fixer, notifications, protected, system, ui, "
+        "agent_defaults, agent_overrides, workflow) per-repository or globally across Conclave. "
+        "system is daemon-wide and only counts in the global settings. A project "
         "stores only what differs from what it inherits (built-in -> global): a key set to the "
         "inherited value, or listed in unset, inherits again.",
         {
@@ -305,7 +306,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "Optional target integration branch (syncs target_branch and default_branch).",
             ),
             "branch_prefix": _prop("string", "Optional per-task branch prefix."),
-            "auto_merge": _prop("boolean", "Optional auto-merge toggle on green gate."),
+            "auto_merge": _prop(
+                "boolean",
+                "Optional auto-merge toggle on green gate (default false: a green task ends done "
+                "on its branch; merge it with conclave_merge_task).",
+            ),
             "require_full_green": _prop("boolean", "Optional green-gate requirement toggle."),
             "parallel_reviewers": _prop("boolean", "Optional parallel reviewers toggle."),
             "max_parallel_tasks": _prop("integer", "Optional max parallel tasks (1-16)."),
@@ -344,7 +349,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "boolean", "Optional persistent baseline cache toggle."
             ),
             "auto_planner_char_threshold": _prop(
-                "integer", "Optional character threshold for auto-planner."
+                "integer",
+                "Optional minimum request length (chars) that runs the planner (default 0: every "
+                "task; a task's use_planner wins).",
             ),
             "cross_attempt_memory_entries": _prop(
                 "integer", "Optional max cross-attempt memory entries (0-50)."
@@ -377,6 +384,21 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "protected": {
                 "type": "object",
                 "description": "Optional ProtectedPaths overrides.",
+            },
+            "system": {
+                "type": "object",
+                "description": (
+                    "Optional SystemSettings overrides, daemon-wide (global settings only; a "
+                    "project value is ignored): hot_reload_watch (default false) reloads "
+                    "Conclave when its source files change."
+                ),
+            },
+            "ui": {
+                "type": "object",
+                "description": (
+                    "Optional UiSettings overrides: model_choices, the models the UI pickers "
+                    "offer (empty: the built-in list for the engines on this host)."
+                ),
             },
             "agent_defaults": {
                 "type": "object",
@@ -975,7 +997,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
             ),
             "effort": _prop(
                 "string",
-                "Reasoning effort/variant tier.",
+                "Reasoning effort/variant tier. Unset is auto: xhigh on Claude Code, the model's "
+                "highest variant on opencode; a level the model lacks is clamped (an "
+                "effort_clamped log event). To go back to auto, unset it with "
+                "conclave_patch_config.",
                 enum=["low", "medium", "high", "xhigh", "max"],
             ),
             "cli_agent": _prop(
@@ -1058,8 +1083,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_reload_status",
-        "Get current quiescent hot-reload status, pending state, and module coverage without "
-        "triggering a reload.",
+        "Get current quiescent hot-reload status, pending state, changed files, module coverage "
+        "and watcher_enabled (the global system.hot_reload_watch setting) without triggering a "
+        "reload.",
         {},
     ),
     _tool(
@@ -1390,6 +1416,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             "bug_fixer",
             "notifications",
             "protected",
+            "system",
+            "ui",
             "agent_defaults",
             "agent_overrides",
             "workflow",
@@ -2607,7 +2635,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         return stats
 
     if name == "conclave_get_reload_status":
-        return daemon.reload_status()
+        return await reload_status_report(daemon)
 
     if name == "conclave_reload_system":
         force = _opt_bool(args, "force", False)

@@ -6,8 +6,9 @@ an isolated worktree. You are the pilot: you choose the work, the agents, and wh
 full guide once per session before acting.
 
 **Golden rules**
-- Never let work land unreviewed: prefer `auto_merge: false`, read every change with
-  `conclave_get_task_diff`, then `conclave_merge_task` (or arm a checkpoint before the merge).
+- Never let work land unreviewed: `auto_merge` is off by default, so a green task waits on its
+  branch. Read every change with `conclave_get_task_diff`, then `conclave_merge_task` (if you turn
+  auto-merge on, arm a checkpoint before the merge).
 - A project without a test command has no gate, so its tasks fail at once (`no_test_command`):
   always set `execution.baseline_test_command` and verify it passes on the target branch first.
 - A change that deletes, removes or skips existing tests is flagged to the reviewers and, by

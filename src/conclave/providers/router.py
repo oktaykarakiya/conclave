@@ -16,6 +16,7 @@ default rather than failing the dispatch.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 from dataclasses import replace
@@ -26,8 +27,18 @@ from typing import Any
 from ..config import ArgMode
 from .base import AgentResult, OnChunk, Provider
 from .claude_cli import ClaudeCliProvider
+from .effort import (
+    CLAUDE_CODE_AUTO_EFFORT,
+    CLAUDE_CODE_EFFORTS,
+    EffortChoice,
+    OpencodeVariants,
+    VariantLookup,
+    choose_effort,
+)
 from .opencode_cli import OpenCodeCliProvider
 from .profiles import ResolvedProfile
+
+logger = logging.getLogger("conclave.providers.router")
 
 CLAUDE_CODE_PREFIX = "claude-code/"
 
@@ -82,9 +93,37 @@ def resolve_engine(model: str | None, default: Engine) -> tuple[Engine, str | No
     return Engine.claude, (None if "/" in model else model)
 
 
+async def resolve_dispatch_effort(
+    provider: Provider, model: str | None, requested: str | None
+) -> EffortChoice:
+    """The effort one dispatch of *model* runs with on *provider* (see :mod:`.effort`).
+
+    The engine is picked by :func:`resolve_engine`, as for the dispatch itself. opencode
+    variants come from the provider's ``variants`` lookup (an :class:`EngineRouter` has one,
+    test doubles do not); a failing lookup counts as unknown, so it never fails a dispatch.
+    """
+    wanted = str(requested) if requested else None
+    engine, engine_model = resolve_engine(model, getattr(provider, "default", Engine.opencode))
+    if engine == Engine.claude:
+        return choose_effort(wanted, CLAUDE_CODE_EFFORTS, auto=CLAUDE_CODE_AUTO_EFFORT)
+    supported: frozenset[str] | None = None
+    # Duck-typed, not isinstance: a hot reload re-creates the classes under a live router.
+    variants = getattr(provider, "variants", None)
+    if variants is not None and engine_model and "/" in engine_model:
+        try:
+            supported = await variants.lookup(engine_model)
+        except Exception:
+            logger.warning("variant lookup failed for %s", engine_model, exc_info=True)
+    return choose_effort(wanted, supported)
+
+
 class EngineRouter:
     """A :class:`~conclave.providers.base.Provider` that delegates each dispatch to the
-    opencode or Claude Code provider according to :func:`resolve_engine`."""
+    opencode or Claude Code provider according to :func:`resolve_engine`.
+
+    ``variants`` reports the reasoning variants of opencode models, for
+    :func:`resolve_dispatch_effort`; by default it asks the opencode CLI (cached per provider).
+    """
 
     def __init__(
         self,
@@ -93,11 +132,13 @@ class EngineRouter:
         opencode: OpenCodeCliProvider | None = None,
         claude: ClaudeCliProvider | None = None,
         claude_bin: str | None = None,
+        variants: VariantLookup | None = None,
     ) -> None:
         self.default = default
         self._opencode = opencode or OpenCodeCliProvider()
         self._claude = claude or ClaudeCliProvider()
         self._claude_bin = claude_bin or _CLAUDE_BIN
+        self.variants: VariantLookup = variants or OpencodeVariants()
 
     async def run_agent(
         self,

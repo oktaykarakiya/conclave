@@ -25,10 +25,11 @@ from ..db.planning_models import (
     PlanningTaskNode,
 )
 from ..engine.orchestrator import _read_project_rules
+from ..engine.runner import effort_clamped_payload
 from ..engine.verdict import parse_verdict
 from ..events import EventBus, EventType
 from ..observability.parquet_sync import log_agent_interaction
-from ..providers import AgentResult, Provider, ResolvedProfile
+from ..providers import AgentResult, Provider, ResolvedProfile, resolve_dispatch_effort
 from .prompts import (
     APPROVAL_AGENTS,
     DISCUSSION_AGENTS,
@@ -556,11 +557,22 @@ class PlanningOrchestrator:
 
             cfg = await resolve_project_config(self._db, project)
             settings = resolve_agent(cfg, agent_name)
+            choice = await resolve_dispatch_effort(self._provider, settings.model, settings.effort)
+            if choice.clamped:
+                await self._bus.emit(
+                    type=EventType.log,
+                    project_id=session.project_id,
+                    planning_session_id=session_id,
+                    agent=agent_name,
+                    payload=effort_clamped_payload(
+                        choice, settings.model, agent_name, node_id=f"planning_{agent_name}"
+                    ),
+                )
             profile = ResolvedProfile(
                 name="opencode",
                 arg_mode=ArgMode.inherit,
                 model=settings.model,
-                effort=str(settings.effort) if settings.effort else None,
+                effort=choice.used,
                 cli_agent=settings.cli_agent,
                 thinking=settings.thinking,
                 pure=settings.pure,

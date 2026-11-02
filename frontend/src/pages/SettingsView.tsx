@@ -12,6 +12,14 @@ function asRecord(v: unknown): Record<string, unknown> {
   return {};
 }
 
+/** ui.model_choices as the textarea shows it: one model per line. */
+function modelChoicesText(cfg: Record<string, unknown>): string {
+  const choices = asRecord(cfg.ui).model_choices;
+  return Array.isArray(choices) ? choices.map(String).join("\n") : "";
+}
+
+type ReloadStatus = Awaited<ReturnType<typeof api.reloadStatus>>;
+
 export function SettingsView({
   projectId,
   onProjectDeleted,
@@ -23,6 +31,8 @@ export function SettingsView({
   const [loaded, setLoaded] = useState<Record<string, unknown>>({});
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [rawJson, setRawJson] = useState("");
+  // Raw textarea text, so typing a newline is not normalised away before the next model.
+  const [modelChoices, setModelChoices] = useState("");
   const [quarantine, setQuarantine] = useState<Quarantine[]>([]);
   const [integrity, setIntegrity] = useState<Integrity | null>(null);
   const [loading, setLoading] = useState(true);
@@ -52,22 +62,29 @@ export function SettingsView({
   } | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
+  // Global (daemon-wide) settings: the hot-reload watcher and a manual reload
+  const [reloadInfo, setReloadInfo] = useState<ReloadStatus | null>(null);
+  const [globalBusy, setGlobalBusy] = useState(false);
+
   const loadAll = useCallback(async () => {
     setLoading(true);
     setNotice(null);
     try {
-      const [cfg, qList, qHealth, mcp] = await Promise.all([
+      const [cfg, qList, qHealth, mcp, reload] = await Promise.all([
         api.getConfig(projectId),
         api.listQuarantine(projectId),
         api.quarantineIntegrity(projectId),
         api.mcpInfo().catch(() => null),
+        api.reloadStatus().catch(() => null),
       ]);
       setLoaded(cfg);
       setConfig(cfg);
       setRawJson(JSON.stringify(cfg, null, 2));
+      setModelChoices(modelChoicesText(cfg));
       setQuarantine(qList);
       setIntegrity(qHealth);
       setMcpInfo(mcp);
+      setReloadInfo(reload);
     } catch (e) {
       setNotice({ kind: "err", text: String(e) });
     } finally {
@@ -83,6 +100,7 @@ export function SettingsView({
   const experimental = asRecord(config.experimental);
   const context = asRecord(config.context);
   const notifications = asRecord(config.notifications);
+  const agentDefaults = asRecord(config.agent_defaults);
 
   function updateSection(section: string, key: string, value: unknown) {
     setConfig((prev) => {
@@ -116,6 +134,7 @@ export function SettingsView({
     setLoaded(fresh);
     setConfig(fresh);
     setRawJson(JSON.stringify(fresh, null, 2));
+    setModelChoices(modelChoicesText(fresh));
     setNotice({ kind: "ok", text: okText });
   }
 
@@ -144,6 +163,43 @@ export function SettingsView({
       setNotice({ kind: "err", text: String(e) });
     } finally {
       setSaving(false);
+    }
+  }
+
+  /** Toggle the daemon-wide watcher in the global layer (never written into projects). */
+  async function setHotReloadWatch(enabled: boolean) {
+    setGlobalBusy(true);
+    setNotice(null);
+    try {
+      await api.patchGlobalConfig({ system: { hot_reload_watch: enabled } });
+      setReloadInfo(await api.reloadStatus());
+      setNotice({
+        kind: "ok",
+        text: `Hot-reload watcher ${enabled ? "on" : "off"} for the whole daemon.`,
+      });
+    } catch (e) {
+      setNotice({ kind: "err", text: String(e) });
+    } finally {
+      setGlobalBusy(false);
+    }
+  }
+
+  async function reloadNow() {
+    setGlobalBusy(true);
+    setNotice(null);
+    try {
+      const res = await api.reloadSystem(false);
+      setReloadInfo(await api.reloadStatus());
+      setNotice({
+        kind: "ok",
+        text: res.reloaded
+          ? `Reloaded ${res.modules_reloaded} modules (reload #${res.reload_count}).`
+          : "Reload deferred: it runs as soon as no task is in flight.",
+      });
+    } catch (e) {
+      setNotice({ kind: "err", text: String(e) });
+    } finally {
+      setGlobalBusy(false);
     }
   }
 
@@ -331,6 +387,43 @@ export function SettingsView({
             </span>
           </label>
 
+          <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2 hover:border-zinc-700">
+            <input
+              type="checkbox"
+              checked={Boolean(execution.auto_merge ?? false)}
+              onChange={(e) => updateSection("execution", "auto_merge", e.target.checked)}
+              className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-indigo-500"
+            />
+            <span className="space-y-0.5">
+              <span className="block text-xs text-zinc-300">Auto-merge on green</span>
+              <span className="block text-[11px] text-zinc-500">
+                Off (default): a green task ends done on its branch; you read the diff and merge.
+              </span>
+            </span>
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">
+              Planner threshold (request chars)
+            </span>
+            <input
+              type="number"
+              min={0}
+              className={input}
+              value={Number(experimental.auto_planner_char_threshold ?? 0)}
+              onChange={(e) =>
+                updateSection(
+                  "experimental",
+                  "auto_planner_char_threshold",
+                  Math.max(0, Number(e.target.value) || 0),
+                )
+              }
+            />
+            <span className="block text-[11px] text-zinc-500">
+              0 (default) plans every task; a task's own planner choice wins.
+            </span>
+          </label>
+
           <label className="block space-y-1">
             <span className="text-xs font-medium text-zinc-400">
               Parallel Swarm Sessions (1 = single-flight, up to 16)
@@ -391,12 +484,6 @@ export function SettingsView({
           {[
             {
               section: "execution",
-              key: "auto_merge",
-              label: "Auto-merge on green",
-              val: Boolean(execution.auto_merge ?? true),
-            },
-            {
-              section: "execution",
               key: "require_full_green",
               label: "Require green gate",
               val: Boolean(execution.require_full_green ?? true),
@@ -445,6 +532,63 @@ export function SettingsView({
               <span>{item.label}</span>
             </label>
           ))}
+        </div>
+
+        <div className="space-y-3 border-t border-zinc-800/70 pt-3">
+          <div>
+            <h3 className="text-xs font-semibold text-zinc-300">Agents & models</h3>
+            <p className="text-[11px] text-zinc-500">
+              Defaults for every agent of this project; Agent Studio overrides them per agent.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-zinc-400">Reasoning effort</span>
+              <select
+                className={input}
+                value={typeof agentDefaults.effort === "string" ? agentDefaults.effort : ""}
+                onChange={(e) =>
+                  updateSection("agent_defaults", "effort", e.target.value || null)
+                }
+              >
+                <option value="">Auto (highest sensible per engine)</option>
+                {["low", "medium", "high", "xhigh", "max"].map((level) => (
+                  <option key={level} value={level}>
+                    {level}
+                  </option>
+                ))}
+              </select>
+              <span className="block text-[11px] text-zinc-500">
+                Auto: xhigh on Claude Code, the model's top variant on opencode; others are clamped.
+              </span>
+            </label>
+
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-zinc-400">
+                Model picker choices (one per line)
+              </span>
+              <textarea
+                rows={4}
+                className={`${input} font-mono`}
+                value={modelChoices}
+                onChange={(e) => {
+                  setModelChoices(e.target.value);
+                  updateSection(
+                    "ui",
+                    "model_choices",
+                    e.target.value
+                      .split("\n")
+                      .map((line) => line.trim())
+                      .filter(Boolean),
+                  );
+                }}
+                placeholder={"deepseek/deepseek-flash\nclaude-code/opus"}
+              />
+              <span className="block text-[11px] text-zinc-500">
+                Empty: the built-in list for this host's engines. Models in use are always offered.
+              </span>
+            </label>
+          </div>
         </div>
 
         <div className="space-y-3 border-t border-zinc-800/70 pt-3">
@@ -682,7 +826,47 @@ export function SettingsView({
         </Card>
       )}
 
-      {/* Section 4: Advanced Raw JSON & Danger Zone */}
+      {/* Section 4: Global (daemon-wide) settings */}
+      <Card className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-3">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-100">Global settings (all projects)</h2>
+            <p className="text-xs text-zinc-500">
+              Daemon-wide: stored in the global settings and applied to every project at once.
+            </p>
+          </div>
+          <Button variant="default" size="sm" onClick={reloadNow} disabled={globalBusy}>
+            {globalBusy ? "Working…" : "Reload now"}
+          </Button>
+        </div>
+
+        <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2 hover:border-zinc-700">
+          <input
+            type="checkbox"
+            checked={Boolean(reloadInfo?.watcher_enabled)}
+            disabled={globalBusy || reloadInfo === null}
+            onChange={(e) => void setHotReloadWatch(e.target.checked)}
+            className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-indigo-500"
+          />
+          <span className="space-y-0.5">
+            <span className="block text-xs text-zinc-300">Hot-reload watcher</span>
+            <span className="block text-[11px] text-zinc-500">
+              Off (default): Conclave reloads its own code only when you press Reload now.
+            </span>
+          </span>
+        </label>
+
+        {reloadInfo && (
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-zinc-500">
+            <span>Watcher: {reloadInfo.watcher_enabled ? "on" : "off"}</span>
+            <span>Reload pending: {reloadInfo.reload_pending ? "yes" : "no"}</span>
+            <span>Changed files since last reload: {reloadInfo.changed_files.length}</span>
+            <span>Reloads: {reloadInfo.reload_count}</span>
+          </div>
+        )}
+      </Card>
+
+      {/* Section 5: Advanced Raw JSON & Danger Zone */}
       <Card className="space-y-3">
         <div className="flex items-center justify-between">
           <div>

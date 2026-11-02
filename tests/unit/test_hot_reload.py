@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from httpx import ASGITransport
 
 import conclave
+from conclave.config import save_global_config
 from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.events import EventType
@@ -21,7 +23,7 @@ from conclave.hot_reload import (
 )
 from conclave.mcp.tools import call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, Provider, ResolvedProfile
-from conclave.runtime import Daemon, ProjectWorker
+from conclave.runtime import Daemon, ProjectWorker, reload_status_report
 from conclave.web import create_app
 
 
@@ -70,6 +72,8 @@ def test_discover_conclave_modules_covers_100_percent_in_topological_order() -> 
     assert idx["conclave.db"] < idx["conclave.verification.quarantine"]
     assert idx["conclave.verification"] < idx["conclave.observability.parquet_sync"]
     assert idx["conclave.observability"] < idx["conclave.providers.base"]
+    assert idx["conclave.providers.opencode_cli"] < idx["conclave.providers.effort"]
+    assert idx["conclave.providers.effort"] < idx["conclave.providers.router"]
     assert idx["conclave.providers"] < idx["conclave.bootstrap"]
     assert idx["conclave.bootstrap"] < idx["conclave.engine.orchestrator"]
     assert idx["conclave.engine.graph_executor"] < idx["conclave.engine.orchestrator"]
@@ -211,6 +215,7 @@ async def test_api_and_mcp_reload_endpoints_and_spa_no_cache(
         status_data = status_res.json()
         assert status_data["quiescent"] is True
         assert status_data["reload_pending"] is False
+        assert status_data["watcher_enabled"] is False  # manual reloads work with it off
         assert status_data["discoverable_modules"] >= 35
 
         reload_res = await client.post("/api/system/reload", json={"force": False})
@@ -243,3 +248,95 @@ def test_reloader_file_snapshot_detects_modifications(tmp_path: Path) -> None:
     mod_file.write_text("X = 222\n", encoding="utf-8")
     changed = reloader.changed_files()
     assert "src/conclave/sample.py" in changed
+
+
+# --- the file watcher: off by default, a live global setting --------------------------
+
+
+def _record_reloads(daemon: Daemon, monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Replace the daemon's reload with a recorder (and pretend a source file changed)."""
+    reloads: list[bool] = []
+
+    async def _reload_now(*, force: bool = False) -> dict[str, Any]:
+        reloads.append(force)
+        daemon.reloader.reload_pending = False
+        return {"reloaded": True}
+
+    monkeypatch.setattr(daemon, "reload_now", _reload_now)
+    monkeypatch.setattr(daemon.reloader, "changed_files", lambda: ["src/conclave/runtime.py"])
+    return reloads
+
+
+async def test_watcher_reloads_on_changes_only_while_the_global_setting_is_on(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    reloads = _record_reloads(daemon, monkeypatch)
+
+    await daemon._watch_reload_tick()  # off by default: a changed file does nothing
+    assert reloads == [] and daemon.reloader.reload_pending is False
+
+    # Daemon-wide: a project-level value is stored but ignored.
+    await repo.create_project(
+        db,
+        name="p",
+        path=str(tmp_path),
+        default_branch="main",
+        config={"system": {"hot_reload_watch": True}},
+    )
+    await daemon._watch_reload_tick()
+    assert reloads == [] and daemon.reloader.reload_pending is False
+
+    # Turned on in the global settings at runtime: the next tick reloads, no restart needed.
+    await save_global_config(db, {"system": {"hot_reload_watch": True}})
+    await daemon._watch_reload_tick()
+    assert reloads == [False]
+
+    # While a task runs it defers instead of reloading under it.
+    daemon.orchestrator._cancel_events["busy"] = asyncio.Event()
+    await daemon._watch_reload_tick()
+    assert reloads == [False] and daemon.reloader.reload_pending is True
+
+    # Turned off again: changes are ignored once more.
+    daemon.orchestrator._cancel_events.clear()
+    daemon.reloader.reload_pending = False
+    await save_global_config(db, {"system": {"hot_reload_watch": False}})
+    await daemon._watch_reload_tick()
+    assert reloads == [False]
+
+
+async def test_a_pending_manual_reload_runs_with_the_watcher_off(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    reloads = _record_reloads(daemon, monkeypatch)
+
+    daemon.request_reload(reason="manual")
+    await daemon._watch_reload_tick()
+
+    assert reloads == [False]
+    assert daemon.reloader.reload_pending is False
+
+
+async def test_reload_status_reports_whether_the_watcher_is_enabled(
+    db: Database, tmp_path: Path
+) -> None:
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        for enabled in (False, True):
+            if enabled:
+                res = await c.patch(
+                    "/api/config/global", json={"config": {"system": {"hot_reload_watch": True}}}
+                )
+                assert res.status_code == 200, res.text
+                assert res.json()["updated_projects"] == []  # global layer only
+                glob = (await c.get("/api/config/global")).json()
+                assert glob["system"]["hot_reload_watch"] is True
+            assert (await reload_status_report(daemon))["watcher_enabled"] is enabled
+            rest = await c.get("/api/system/reload-status")
+            assert rest.status_code == 200 and rest.json()["watcher_enabled"] is enabled
+            mcp = await call_mcp_tool(daemon, "conclave_get_reload_status", {})
+            assert mcp["watcher_enabled"] is enabled
+            assert mcp["reload_count"] == 0  # reading the status never reloads

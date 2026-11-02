@@ -6,6 +6,10 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import httpx
+import pytest
+from httpx import ASGITransport
+
 from conclave.config import resolve_agent, resolve_project_config
 from conclave.db import CheckpointStatus, Database, StoreItemKind, TaskState
 from conclave.db import repositories as repo
@@ -14,6 +18,7 @@ from conclave.mcp.server import handle_mcp_message
 from conclave.mcp.tools import MCP_TOOLS, _opt_bool, _opt_int, _opt_str, call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, Provider, ResolvedProfile
 from conclave.runtime import Daemon
+from conclave.web import create_app
 
 
 class _StubProvider(Provider):
@@ -74,6 +79,8 @@ def test_null_safe_helpers_and_tool_schemas() -> None:
         "bug_fixer",
         "notifications",
         "protected",
+        "system",
+        "ui",
         "agent_defaults",
         "agent_overrides",
         "workflow",
@@ -82,6 +89,9 @@ def test_null_safe_helpers_and_tool_schemas() -> None:
     ):
         assert expected_field in patch_props, f"missing {expected_field} in conclave_patch_config"
     assert patch_props["allow_no_test_command"]["type"] == "boolean"
+    assert patch_props["system"]["type"] == patch_props["ui"]["type"] == "object"
+    assert "default false" in patch_props["auto_merge"]["description"]
+    assert "default 0" in patch_props["auto_planner_char_threshold"]["description"]
     assert patch_props["test_integrity"]["enum"] == ["block", "warn", "off"]
     assert patch_props["unset"] == {
         "type": "array",
@@ -480,3 +490,110 @@ async def test_delete_agent_cleans_up_global_store_item_and_create_task_parent_i
     assert child["parent_task_id"] == parent["id"]
     children = await repo.get_child_tasks(db, parent["id"])
     assert [c.id for c in children] == [child["id"]]
+
+
+# --- quality-first settings over MCP and REST ------------------------------------------
+
+
+async def _attached(daemon: Daemon, tmp_path: Path) -> str:
+    git_repo = tmp_path / "repo"
+    (git_repo / ".git").mkdir(parents=True)
+    attached = await call_mcp_tool(
+        daemon, "conclave_attach_project", {"name": "p", "path": str(git_repo)}
+    )
+    return str(attached["id"])
+
+
+async def test_patch_config_round_trips_the_quality_first_settings(
+    db: Database, tmp_path: Path
+) -> None:
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    pid = await _attached(daemon, tmp_path)
+
+    before = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert before["execution"]["auto_merge"] is False
+    assert before["experimental"]["auto_planner_char_threshold"] == 0
+    assert before["agent_defaults"]["effort"] is None
+    assert before["system"] == {"hot_reload_watch": False}
+    assert before["ui"] == {"model_choices": []}
+
+    # system: daemon-wide, set in the global settings via config and via the section arg
+    await call_mcp_tool(
+        daemon,
+        "conclave_patch_config",
+        {"project_id": "global", "config": {"system": {"hot_reload_watch": True}}},
+    )
+    glob = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": "global"})
+    assert glob["system"]["hot_reload_watch"] is True
+    await call_mcp_tool(daemon, "conclave_patch_config", {"system": {"hot_reload_watch": False}})
+    glob = await call_mcp_tool(daemon, "conclave_get_config", {})
+    assert glob["system"]["hot_reload_watch"] is False
+
+    # ui.model_choices on a project, via config and via the section arg
+    await call_mcp_tool(
+        daemon,
+        "conclave_patch_config",
+        {"project_id": pid, "config": {"ui": {"model_choices": ["a/one", " b/two "]}}},
+    )
+    cfg = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert cfg["ui"]["model_choices"] == ["a/one", "b/two"]
+    await call_mcp_tool(
+        daemon, "conclave_patch_config", {"project_id": pid, "ui": {"model_choices": ["c/three"]}}
+    )
+    cfg = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert cfg["ui"]["model_choices"] == ["c/three"]
+
+    # auto_merge and the planner threshold via their own params
+    await call_mcp_tool(
+        daemon,
+        "conclave_patch_config",
+        {"project_id": pid, "auto_merge": True, "auto_planner_char_threshold": 400},
+    )
+    cfg = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert cfg["execution"]["auto_merge"] is True
+    assert cfg["experimental"]["auto_planner_char_threshold"] == 400
+
+    # effort: an explicit level, then unset back to auto
+    await call_mcp_tool(
+        daemon, "conclave_configure_agent", {"project_id": pid, "effort": "max"}
+    )
+    cfg = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert cfg["agent_defaults"]["effort"] == "max"
+    await call_mcp_tool(
+        daemon, "conclave_patch_config", {"project_id": pid, "unset": ["agent_defaults.effort"]}
+    )
+    cfg = await call_mcp_tool(daemon, "conclave_get_config", {"project_id": pid})
+    assert cfg["agent_defaults"]["effort"] is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"system": {"hot_reload_watch": "maybe"}},
+        {"system": {"watch_files": True}},
+        {"ui": {"model_choices": "claude-code/opus"}},
+    ],
+    ids=["not-a-bool", "unknown-key", "not-a-list"],
+)
+async def test_bad_quality_first_values_are_rejected_over_mcp_and_rest(
+    db: Database, tmp_path: Path, bad: dict[str, Any]
+) -> None:
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    response = await handle_mcp_message(
+        daemon,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "conclave_patch_config", "arguments": {"config": bad}},
+        },
+    )
+    assert response is not None and response["result"]["isError"] is True
+
+    app = create_app(daemon, manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.patch("/api/config/global", json={"config": bad})
+    assert res.status_code == 422
+
+    glob = await resolve_project_config(db, None)  # nothing bad was stored
+    assert glob.system.hot_reload_watch is False and glob.ui.model_choices == []

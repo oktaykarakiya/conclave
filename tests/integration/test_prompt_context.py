@@ -206,7 +206,9 @@ async def test_oversized_diff_reaches_every_reviewer_fitted_with_one_event(
     task, ok = await _run_task(
         db, tmp_path, provider,
         {
-            "execution": {"target_branch": "main", "parallel_reviewers": parallel},
+            "execution": {
+                "target_branch": "main", "parallel_reviewers": parallel, "auto_merge": True
+            },
             "context": {"bulk_max_chars": 1_000},
         },
     )
@@ -243,6 +245,7 @@ async def test_compaction_for_one_agent_only_fits_only_that_agents_bulk(
     task, ok = await _run_task(
         db, tmp_path, provider,
         {
+            "execution": {"auto_merge": True},
             "context": {"compaction_max_chars": 1_000},
             "agent_overrides": {"security": {"compact_before_start": True}},
         },

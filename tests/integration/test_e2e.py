@@ -43,10 +43,15 @@ async def test_full_cycle_via_api(db: Database, tmp_path: Path) -> None:
             )
             assert created.status_code == 200, created.text
             project_id = created.json()["id"]
-            # A real (trivial) gate, so the full cycle runs baseline and green-gate too.
+            # A real (trivial) gate, so the full cycle runs baseline and green-gate too, and
+            # auto-merge (off by default), so it ends with the merge.
             patched = await client.patch(
                 f"/api/projects/{project_id}/config",
-                json={"config": {"execution": {"baseline_test_command": "echo ok"}}},
+                json={
+                    "config": {
+                        "execution": {"baseline_test_command": "echo ok", "auto_merge": True}
+                    }
+                },
             )
             assert patched.status_code == 200, patched.text
 

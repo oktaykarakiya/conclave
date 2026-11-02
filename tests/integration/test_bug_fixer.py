@@ -174,13 +174,14 @@ async def _make(
     """Stand up a repo + project + orchestrator + controller, with the gate wired to real pytest."""
     repo_path = tmp_path / "repo"
     await _init_repo(repo_path)
-    # Pin the project's test command so the green-gate (and the repro gate) run real pytest.
+    # Pin the project's test command so the green-gate (and the repro gate) run real pytest, and
+    # auto-merge (off by default) so a successful fix lands in the checkout.
     project = await repo.create_project(
         db,
         name="t",
         path=str(repo_path),
         default_branch="main",
-        config={"execution": {"baseline_test_command": _pytest_command()}},
+        config={"execution": {"baseline_test_command": _pytest_command(), "auto_merge": True}},
     )
     config = load_project_config(project.config)
     bus = EventBus(db)

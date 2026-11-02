@@ -38,6 +38,23 @@ from .util import new_id
 logger = logging.getLogger("conclave.runtime")
 
 
+async def hot_reload_watch_enabled(db: Database) -> bool:
+    """Whether the daemon's file watcher may reload on source changes.
+
+    Daemon-wide, so only the global settings count; a project's ``system`` value is ignored.
+    """
+    return (await resolve_project_config(db, None)).system.hot_reload_watch
+
+
+async def reload_status_report(daemon: Daemon) -> dict[str, Any]:
+    """The hot-reload status plus ``watcher_enabled`` (the global ``system.hot_reload_watch``).
+
+    A module function rather than a :class:`Daemon` method: a hot reload keeps the running
+    daemon instance, so the reloaded web and MCP layers must not rely on new methods on it.
+    """
+    return {**daemon.reload_status(), "watcher_enabled": await hot_reload_watch_enabled(daemon.db)}
+
+
 class ProjectWorker:
     def __init__(
         self,
@@ -281,19 +298,27 @@ class Daemon:
             watch_task.add_done_callback(self._bg_tasks.discard)
 
     async def _watch_reload_loop(self) -> None:
-        """Background file-watcher loop that auto-triggers quiescent hot-reload on disk edits."""
+        """Background loop: run a pending reload, and watch the source files when enabled."""
         while True:
             try:
                 await asyncio.sleep(3.0)
-                if self.reloader.reload_pending or self.reloader.changed_files():
-                    if self.is_quiescent():
-                        await self.reload_now()
-                    else:
-                        self.reloader.reload_pending = True
+                await self._watch_reload_tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.warning("hot-reload watcher error", exc_info=True)
+
+    async def _watch_reload_tick(self) -> None:
+        """Run a pending reload once quiescent, and reload on changed source files only while
+        the global ``system.hot_reload_watch`` setting is on (read on every tick)."""
+        if not self.reloader.reload_pending and not (
+            await hot_reload_watch_enabled(self.db) and self.reloader.changed_files()
+        ):
+            return
+        if self.is_quiescent():
+            await self.reload_now()
+        else:
+            self.reloader.reload_pending = True
 
     async def shutdown(self) -> None:
         # 1. Stop per-project workers so no new tasks are claimed.
