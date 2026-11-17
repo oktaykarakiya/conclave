@@ -8,7 +8,13 @@ A run refused for a usage limit or billing is reported as ``AgentResult.quota`` 
 :func:`_detect_quota`: the stream's latest ``rate_limit_info`` refuses requests, the last
 assistant message's top-level ``error`` is ``rate_limit`` or ``billing_error``, or, for CLIs that
 report no rate limits, the short final text is the CLI's own limit wording. The latest
-``rate_limit_info`` of the stream is kept as ``AgentResult.rate_limit_info``.
+``rate_limit_info`` of the stream is kept as ``AgentResult.rate_limit_info``. A run stopped by
+its timeout, or because a refusing ``rate_limit_info`` stayed the latest for
+:data:`_QUOTA_STOP_GRACE_S` while the run went on, is parsed from what it streamed so far: a
+usage limit found there is reported as ``quota``, not as a timeout.
+
+When one session ends several turns in a stream (a background task that finished after the
+answer wakes it again), their per-turn counts are summed, see :func:`_merge_results`.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +78,12 @@ _LIMIT_TEXT = re.compile(
     r"|(?:claude (?:ai )?)?usage limit reached\b|you(?:'|\u2019)ve hit your (?:usage )?limit\b)"
 )
 _LIMIT_TEXT_MAX_CHARS = 300
+# How long a run may go on after the latest rate_limit_info refused its requests (the CLI waiting
+# or retrying inside the run) before it is stopped and reported as a usage limit.
+_QUOTA_STOP_GRACE_S = 120.0
+# An isolated worker runs every Bash command in the foreground (no background tasks): one that
+# names no timeout of its own gets at most this long.
+_BASH_DEFAULT_TIMEOUT_S = 20 * 60
 
 # Provider-controlled env vars that must NOT leak from the parent process into
 # inherit/flag-mode dispatches. In env-mode, build_invocation reintroduces them.
@@ -119,7 +132,9 @@ class ClaudeCliProvider:
         env = {
             k: v for k, v in os.environ.items() if k not in _PROVIDER_ENV_KEYS
         }
-        env.update(invocation.env)
+        if profile.isolated:
+            env.update(_bash_timeout_env(timeout_seconds))
+        env.update(invocation.env)  # last, so the profile's extra_env wins
 
         exec_bin, exec_args = _resolve_cli_exec(profile.cli, list(invocation.args))
         last_result: AgentResult | None = None
@@ -144,17 +159,21 @@ class ClaudeCliProvider:
             except FileNotFoundError:
                 return AgentResult(ok=False, error=f"CLI not found: {profile.cli!r}")
 
-            async def drive(p: asyncio.subprocess.Process = proc) -> str:
+            # Everything the run streams. Kept outside drive() so a stopped run can still be
+            # parsed; safe to share, since only one coroutine runs at a time.
+            output: list[str] = []
+            watch = _RefusalWatch()
+
+            async def drive(
+                p: asyncio.subprocess.Process = proc,
+                parts: list[str] = output,
+                refusals: _RefusalWatch = watch,
+            ) -> str:
                 assert p.stdin is not None
                 assert p.stdout is not None
                 # Capture narrowed types so mypy sees them inside the inner coroutines.
                 stdin = p.stdin
                 stdout = p.stdout
-
-                # Shared mutable list — safe in CPython asyncio since only one coroutine
-                # runs at a time (no true parallelism); await gather() joins before we
-                # read it below.
-                parts: list[str] = []
 
                 async def _write_stdin() -> None:
                     """Drain the prompt into stdin and close it to signal EOF."""
@@ -170,6 +189,7 @@ class ClaudeCliProvider:
                             break
                         text = chunk.decode("utf-8", errors="replace")
                         parts.append(text)
+                        refusals.feed(text)
                         if on_chunk is not None:
                             await on_chunk(text)
 
@@ -181,39 +201,30 @@ class ClaudeCliProvider:
                 return "".join(parts)
 
             drive_task = asyncio.create_task(drive())
+            # A run can go on after a usage limit refused it (the CLI waiting or retrying inside
+            # it): stop it once the refusal outlasts the grace period, not at the agent timeout.
+            refusal_task = asyncio.create_task(watch.outlasts(_QUOTA_STOP_GRACE_S))
             cancel_wait_task: asyncio.Task[None] | None = None
-
+            waiting: list[asyncio.Task[Any]] = [drive_task, refusal_task]
             if cancel_event is not None:
                 cancel_wait_task = asyncio.create_task(_wait_cancel(cancel_event))
-                done, _pending = await asyncio.wait(
-                    [drive_task, cancel_wait_task],
-                    timeout=timeout_seconds,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            else:
-                done, _pending = await asyncio.wait(
-                    [drive_task],
-                    timeout=timeout_seconds,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                waiting.append(cancel_wait_task)
+            done, _pending = await asyncio.wait(
+                waiting, timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
+            )
 
             # --- cancellation won the race ---
             if cancel_wait_task is not None and cancel_wait_task in done:
                 await _kill_process_group(proc.pid)
                 with contextlib.suppress(ProcessLookupError):
                     await proc.wait()
-                drive_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await drive_task
+                await _cancel_tasks(drive_task, refusal_task)
                 return AgentResult(ok=False, error="cancelled", cancelled=True)
 
             # --- drive completed normally ---
             if drive_task in done:
+                await _cancel_tasks(refusal_task, cancel_wait_task)
                 raw: str = drive_task.result()
-                if cancel_wait_task is not None:
-                    cancel_wait_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await cancel_wait_task
                 last_result = _parse_envelope(raw, proc.returncode)
                 # A usage limit is not a dropped connection: re-running it at once would be
                 # refused again. The shared dispatch path waits for the reset instead.
@@ -227,18 +238,16 @@ class ClaudeCliProvider:
                     continue
                 return last_result
 
-            # --- timeout: neither completed in time ---
+            # --- timeout, or a refusal that outlasted the grace period ---
             await _kill_process_group(proc.pid)
             with contextlib.suppress(ProcessLookupError):
                 await proc.wait()
-            drive_task.cancel()
-            if cancel_wait_task is not None:
-                cancel_wait_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await drive_task
-            if cancel_wait_task is not None:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await cancel_wait_task
+            await _cancel_tasks(drive_task, refusal_task, cancel_wait_task)
+            # A usage limit the run reported before it was stopped is a usage limit, not a
+            # timeout: the shared dispatch path waits for the reset and resumes the session.
+            stopped = _parse_envelope("".join(output), proc.returncode)
+            if stopped.quota is not None:
+                return stopped
             return AgentResult(ok=False, error=f"timed out after {timeout_seconds}s")
 
         assert last_result is not None
@@ -329,7 +338,8 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
 class _StreamScan:
     """What :func:`_scan_stream` collects from a ``stream-json`` run."""
 
-    result: dict[str, Any] | None = None  # the last ``result`` event
+    # The last ``result`` event, with the per-turn counts of earlier ones of its session added
+    result: dict[str, Any] | None = None
     session_id: str | None = None  # the last session id any event carried
     rate_limit: dict[str, Any] | None = None  # the latest ``rate_limit_info``
     error: str | None = None  # the top-level ``error`` of the last assistant message, if any
@@ -339,7 +349,9 @@ class _StreamScan:
 def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> _StreamScan:
     """Walk ``stream-json`` lines: tally ``tool_use`` blocks into *tool_breakdown*, keep the last
     ``result`` event (``None`` when the stream never produced one, e.g. a killed process or
-    non-JSON output — the caller then keeps the raw text) and the rate-limit signals."""
+    non-JSON output — the caller then keeps the raw text) and the rate-limit signals. A
+    ``result`` that follows one of the same session is merged with it (:func:`_merge_results`):
+    a session woken for another turn after its answer ends each turn with its own."""
     scan = _StreamScan()
     for line in raw.splitlines():
         line = line.strip()
@@ -356,7 +368,11 @@ def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> _StreamScan:
             scan.session_id = sid
         etype = obj.get("type")
         if etype == "result":
-            scan.result = obj
+            previous = scan.result
+            if previous is not None and previous.get("session_id") == obj.get("session_id"):
+                scan.result = _merge_results(previous, obj)
+            else:
+                scan.result = obj
         elif etype == "rate_limit_event":
             info = obj.get("rate_limit_info")
             if isinstance(info, dict):
@@ -385,6 +401,102 @@ def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> _StreamScan:
     return scan
 
 
+# The per-turn counts of a ``result`` event, summed over the turns of one session.
+_SUMMED_RESULT_KEYS: tuple[str, ...] = ("num_turns", "duration_ms")
+_SUMMED_USAGE_KEYS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _merge_results(earlier: dict[str, Any], latest: dict[str, Any]) -> dict[str, Any]:
+    """One ``result`` event for two turns of a session: a copy of the *latest*, with the per-turn
+    counts (``num_turns``, ``duration_ms`` and the ``usage`` tokens) summed. The text,
+    ``is_error``, session id and the CLI's running totals (``total_cost_usd``,
+    ``duration_api_ms``) stay the latest's. ``modelUsage`` is a running total too, so it is not
+    summed: the latest's, plus any model only the earlier one names, so the reported models cover
+    every model behind the summed tokens."""
+    merged = {**latest, **_summed(earlier, latest, _SUMMED_RESULT_KEYS)}
+    earlier_usage, latest_usage = _mapping(earlier.get("usage")), _mapping(latest.get("usage"))
+    if earlier_usage or latest_usage:
+        merged["usage"] = {
+            **latest_usage,
+            **_summed(earlier_usage, latest_usage, _SUMMED_USAGE_KEYS),
+        }
+    models = {**_mapping(earlier.get("modelUsage")), **_mapping(latest.get("modelUsage"))}
+    if models:
+        merged["modelUsage"] = models
+    return merged
+
+
+def _summed(a: dict[str, Any], b: dict[str, Any], keys: tuple[str, ...]) -> dict[str, int]:
+    """For each of *keys* that *a* or *b* holds as an integer, the sum of those integers."""
+    totals: dict[str, int] = {}
+    for key in keys:
+        values = [value for value in (a.get(key), b.get(key)) if isinstance(value, int)]
+        if values:
+            totals[key] = sum(values)
+    return totals
+
+
+def _mapping(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+class _RefusalWatch:
+    """Follows a run's stream as it arrives, for a usage limit that refuses its requests.
+
+    :meth:`feed` takes each chunk of output and reads every complete line once (a partial line
+    waits for the rest of it). The watch is armed while the latest ``rate_limit_info`` refuses
+    requests (:func:`_refuses`); a newer one that does not refuse disarms it, the rule
+    :func:`_detect_quota` applies to the whole stream.
+    """
+
+    def __init__(self) -> None:
+        self._partial: list[str] = []  # the current line so far
+        self._armed = asyncio.Event()
+        self._since = 0.0  # time.monotonic() when the watch was last armed
+
+    def feed(self, text: str) -> None:
+        start = 0
+        while (end := text.find("\n", start)) >= 0:
+            self._partial.append(text[start:end])
+            self._read_line("".join(self._partial))
+            self._partial.clear()
+            start = end + 1
+        if start < len(text):
+            self._partial.append(text[start:])
+
+    def _read_line(self, line: str) -> None:
+        if "rate_limit_event" not in line:  # most lines are other events: skip parsing them
+            return
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
+            return
+        info = event.get("rate_limit_info")
+        if not isinstance(info, dict):
+            return
+        if not _refuses(info):
+            self._armed.clear()
+        elif not self._armed.is_set():
+            self._since = time.monotonic()
+            self._armed.set()
+
+    async def outlasts(self, grace: float) -> None:
+        """Return once the watch has stayed armed for *grace* seconds."""
+        while True:
+            await self._armed.wait()
+            since = self._since
+            await asyncio.sleep(max(since + grace - time.monotonic(), 0.0))
+            if self._armed.is_set() and self._since == since:
+                return
+
+
 def _detect_quota(scan: _StreamScan, text: str) -> QuotaExhausted | None:
     """The usage limit or billing refusal a run ended on, or ``None``.
 
@@ -399,8 +511,12 @@ def _detect_quota(scan: _StreamScan, text: str) -> QuotaExhausted | None:
       carry none) and the short final text is the CLI's own limit message.
 
     The reset time is the latest reset of the limiting windows (:func:`_limit_window`) of the
-    refusing info, else (for a rate limit, not a billing refusal) of the latest info, else the
-    legacy text's epoch, else unknown.
+    refusing info (status ``rejected``), else (for a rate limit, not a billing refusal) of the
+    latest info when its status is ``allowed_warning``, else the legacy text's epoch, else unknown
+    (the gate then waits ``execution.quota_retry_minutes``). A latest info that is ``allowed``, or
+    a rejected limit that paid extra usage serves, leaves the windows usable: a request refused
+    then hit a short burst limit, and the window's reset, possibly hours away, is not the time to
+    resume.
     """
     final = text.strip()
     limit_text = (
@@ -414,9 +530,14 @@ def _detect_quota(scan: _StreamScan, text: str) -> QuotaExhausted | None:
         return None
     kind: QuotaKind = error_kind or "rate_limit"
     window, resets_at = _limit_window(refusing)
-    if resets_at is None and kind == "rate_limit":
-        latest_window, resets_at = _limit_window(scan.rate_limit)
-        window = window or latest_window
+    latest = scan.rate_limit
+    if (
+        resets_at is None
+        and kind == "rate_limit"
+        and latest is not None
+        and latest.get("status") == "allowed_warning"
+    ):
+        window, resets_at = _limit_window(latest)
     if resets_at is None and limit_text is not None and limit_text["epoch"]:
         resets_at = epoch_to_utc(int(limit_text["epoch"]))
     # The engine's own words: the limit text, else the refused message, else the result's text
@@ -476,6 +597,17 @@ def _as_int(value: object) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _bash_timeout_env(timeout_seconds: int) -> dict[str, str]:
+    """The Bash timeouts of an isolated dispatch, whose commands all run in the foreground: a
+    command may ask for up to the dispatch's whole timeout (``BASH_MAX_TIMEOUT_MS``), and one that
+    names none gets the smaller of :data:`_BASH_DEFAULT_TIMEOUT_S` and that timeout
+    (``BASH_DEFAULT_TIMEOUT_MS``)."""
+    return {
+        "BASH_MAX_TIMEOUT_MS": str(timeout_seconds * 1000),
+        "BASH_DEFAULT_TIMEOUT_MS": str(min(timeout_seconds, _BASH_DEFAULT_TIMEOUT_S) * 1000),
+    }
+
+
 def _resolve_cli_exec(cli: str, args: list[str]) -> tuple[str, list[str]]:
     """On Windows, invoke ``.py`` CLI scripts through ``sys.executable`` if present,
     and resolve PATH commands (preferring native ``.exe`` over ``.cmd`` shims)."""
@@ -526,6 +658,17 @@ async def _kill_process_group(pid: int | None) -> None:
             os.kill(pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError, SystemError):
         pass
+
+
+async def _cancel_tasks(*tasks: asyncio.Task[Any] | None) -> None:
+    """Cancel each task that is still running, then wait for every one of them to end."""
+    for task in tasks:
+        if task is not None:
+            task.cancel()
+    for task in tasks:
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 async def _wait_cancel(event: asyncio.Event) -> None:

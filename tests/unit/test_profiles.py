@@ -6,17 +6,39 @@ import pytest
 
 from conclave.config import ArgMode
 from conclave.providers import ResolvedProfile, build_invocation
+from conclave.providers.profiles import ISOLATED_WORKER_TOOLS
 
 _BASE_ARGS = ["--print", "--output-format", "stream-json", "--verbose"]
 _BASE = ["--dangerously-skip-permissions", *_BASE_ARGS]  # with the default cli_flags
+_TOOLS = (
+    "Task,Bash,Read,Edit,Write,NotebookEdit,WebFetch,WebSearch,ToolSearch,"
+    "Glob,Grep,LSP,TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite,PowerShell"
+)
 _ISOLATION = [
     "--strict-mcp-config",
     "--setting-sources",
     "project,local",
     "--disable-slash-commands",
     "--exclude-dynamic-system-prompt-sections",
+    "--tools",
+    _TOOLS,
 ]
 _MEMORY_VAR = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+_BACKGROUND_VAR = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
+_CRON_VAR = "CLAUDE_CODE_DISABLE_CRON"
+_ISOLATION_ENV = {_MEMORY_VAR: "1", _BACKGROUND_VAR: "1", _CRON_VAR: "1"}
+
+# The built-in tools the system/init event of an isolated planner dispatch listed (Claude Code
+# 2.1.326, worker isolation without a tool allowlist): the ones a coding task needs, and the ones
+# that reach beyond the task (other sessions, the account, the worktree, background work).
+_NEEDED_TOOLS = {
+    "Task", "Bash", "Read", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "ToolSearch"
+}
+_UNWANTED_TOOLS = {
+    "CronCreate", "CronDelete", "CronList", "DesignSync", "EnterWorktree", "ExitWorktree",
+    "ListAgents", "Monitor", "PushNotification", "RemoteTrigger", "ReportFindings",
+    "ScheduleWakeup", "SendMessage", "TaskStop", "Workflow",
+}
 
 # The next three tests pin isolated=False: they are the invocation as it was before worker
 # isolation, which a non-isolated profile must still produce byte for byte.
@@ -82,7 +104,18 @@ def test_profiles_are_isolated_by_default() -> None:
     assert profile.isolated is True
     inv = build_invocation(profile)
     assert inv.args == [*_BASE, *_ISOLATION]
-    assert inv.env == {_MEMORY_VAR: "1"}
+    assert inv.env == _ISOLATION_ENV
+
+
+def test_an_isolated_worker_gets_only_the_allowed_built_in_tools() -> None:
+    args = build_invocation(ResolvedProfile(name="x", arg_mode=ArgMode.inherit)).args
+
+    assert args.count("--tools") == 1
+    tools = args[args.index("--tools") + 1].split(",")
+    assert tools == list(ISOLATED_WORKER_TOOLS)
+    assert len(set(tools)) == len(tools)
+    # Of the tools a worker had before the allowlist, exactly the ones a coding task needs stay.
+    assert set(tools) & (_NEEDED_TOOLS | _UNWANTED_TOOLS) == _NEEDED_TOOLS
 
 
 def test_isolated_flag_mode_orders_cli_flags_base_isolation_then_model_and_effort() -> None:
@@ -105,7 +138,7 @@ def test_isolated_flag_mode_orders_cli_flags_base_isolation_then_model_and_effor
         "--effort",
         "max",
     ]
-    assert inv.env == {_MEMORY_VAR: "1"}
+    assert inv.env == _ISOLATION_ENV
 
 
 def test_isolated_env_mode_adds_isolation_to_the_deepseek_recipe() -> None:
@@ -130,7 +163,7 @@ def test_isolated_env_mode_adds_isolation_to_the_deepseek_recipe() -> None:
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
         "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
         "CLAUDE_CODE_EFFORT_LEVEL": "max",
-        _MEMORY_VAR: "1",
+        **_ISOLATION_ENV,
     }
 
 
@@ -151,20 +184,23 @@ def test_isolation_only_adds_its_flags_and_env(mode: ArgMode) -> None:
 
     on_args, on_env = build(True)
     off_args, off_env = build(False)
-    # Not isolated: none of the isolation flags or the variable, and never an MCP config.
+    # Not isolated: none of the isolation flags (no tool allowlist) or variables, and never an
+    # MCP config.
     assert not set(_ISOLATION) & set(off_args)
-    assert _MEMORY_VAR not in off_env
+    assert "--tools" not in off_args
+    assert not set(_ISOLATION_ENV) & set(off_env)
     assert "--mcp-config" not in on_args + off_args
-    # Isolated: the same invocation plus the flags right after the base args, plus the variable.
+    # Isolated: the same invocation plus the flags right after the base args, plus the variables.
     assert on_args == [*off_args[: len(_BASE)], *_ISOLATION, *off_args[len(_BASE) :]]
-    assert on_env == {**off_env, _MEMORY_VAR: "1"}
+    assert on_env == {**off_env, **_ISOLATION_ENV}
 
 
-def test_extra_env_overrides_the_isolation_env() -> None:
+@pytest.mark.parametrize("var", sorted(_ISOLATION_ENV))
+def test_extra_env_overrides_the_isolation_env(var: str) -> None:
     inv = build_invocation(
-        ResolvedProfile(name="x", arg_mode=ArgMode.inherit, extra_env={_MEMORY_VAR: "0"})
+        ResolvedProfile(name="x", arg_mode=ArgMode.inherit, extra_env={var: "0"})
     )
-    assert inv.env == {_MEMORY_VAR: "0"}
+    assert inv.env == {**_ISOLATION_ENV, var: "0"}  # the other switches stay on
     assert inv.args == [*_BASE, *_ISOLATION]  # the flags stay
 
 

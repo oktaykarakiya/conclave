@@ -9,7 +9,8 @@ profile composes the exact CLI args + environment for a dispatch:
 - ``env``     — ``ANTHROPIC_*`` / ``CLAUDE_CODE_*`` env routing (DeepSeek et al.).
 
 An ``isolated`` profile (the default; ``execution.worker_isolation``) also keeps the operator's
-own Claude Code setup out of the dispatch (see ``_ISOLATION_ARGS``).
+own Claude Code setup out of the dispatch, limits it to the built-in tools a coding task needs
+and turns off background tasks (see ``_ISOLATION_ARGS`` and ``ISOLATED_WORKER_TOOLS``).
 
 ``build_invocation`` is pure and the most heavily tested function here.
 """
@@ -25,20 +26,71 @@ from ..config import ArgMode
 _BASE_ARGS: tuple[str, ...] = ("--print", "--output-format", "stream-json", "--verbose")
 _DEFAULT_CLI_FLAGS: tuple[str, ...] = ("--dangerously-skip-permissions",)
 
+# The built-in tools an isolated worker gets (``--tools``, names as of Claude Code 2.1.326; every
+# built-in left out is removed). The nine a coding task needs: Task (the CLI's alias of the Agent
+# tool, for subagents), Bash, Read, Edit, Write, NotebookEdit, WebFetch, WebSearch, ToolSearch.
+# Then the CLI's read/search and todo tools, which on Linux and macOS are only there when named:
+# Glob, Grep, LSP (inactive unless the repository's own settings enable a code-intelligence
+# plugin), TaskCreate, TaskGet, TaskList, TaskUpdate, TodoWrite; and PowerShell, Bash's
+# counterpart on Windows (absent elsewhere), which ``--tools`` would remove there. Left out:
+# - CronCreate, CronDelete, CronList, ScheduleWakeup: schedule prompts that wake the session
+#   after its final answer;
+# - ListAgents, SendMessage: reach other Claude sessions on the machine, the operator's own
+#   included;
+# - RemoteTrigger: creates and runs scheduled cloud agents on the account;
+# - PushNotification: notifies the account's owner;
+# - DesignSync: reads and writes the account's Claude Design projects;
+# - Workflow: starts background multi-agent workflows;
+# - Monitor: a background watcher, which CLAUDE_CODE_DISABLE_BACKGROUND_TASKS leaves on;
+# - TaskStop: stops background tasks, which an isolated worker cannot start;
+# - EnterWorktree, ExitWorktree: leave the task's worktree;
+# - ReportFindings: hands findings to a host UI instead of the final text Conclave reads;
+# - every other built-in: needs a person at the terminal, an MCP server, skills or a claude.ai
+#   feature.
+ISOLATED_WORKER_TOOLS: tuple[str, ...] = (
+    "Task",
+    "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "ToolSearch",
+    "Glob",
+    "Grep",
+    "LSP",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "TodoWrite",
+    "PowerShell",
+)
+
 # Worker isolation (Claude Code 2.1.101+). No MCP server starts: --strict-mcp-config ignores
 # every configured server and no --mcp-config is passed. Only the repository's project/local
 # settings load, so user settings and the plugins and hooks they enable stay out. No skills or
 # slash commands. Per-machine sections (cwd, env info, git status) move from the system prompt
 # into the first user message, so the system prompt is the same in every worktree and caches
-# across dispatches. The environment variable turns auto-memory off.
+# across dispatches. Only the ISOLATED_WORKER_TOOLS built-ins are available.
 _ISOLATION_ARGS: tuple[str, ...] = (
     "--strict-mcp-config",
     "--setting-sources",
     "project,local",
     "--disable-slash-commands",
     "--exclude-dynamic-system-prompt-sections",
+    "--tools",
+    ",".join(ISOLATED_WORKER_TOOLS),
 )
-_DISABLE_AUTO_MEMORY_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+# Auto-memory off. No background tasks or cron jobs: a ``--print`` run waits for them and wakes
+# the session for another turn after its final answer (the provider sets the Bash timeouts so
+# long commands still run in the foreground).
+_ISOLATION_ENV: dict[str, str] = {
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_CODE_DISABLE_CRON": "1",
+}
 
 
 @dataclass(frozen=True)
@@ -83,7 +135,7 @@ def build_invocation(profile: ResolvedProfile) -> Invocation:
 
     if profile.isolated:
         args += _ISOLATION_ARGS
-        env[_DISABLE_AUTO_MEMORY_ENV] = "1"
+        env.update(_ISOLATION_ENV)
     if profile.resume_session_id:
         args += ["--resume", profile.resume_session_id]
 

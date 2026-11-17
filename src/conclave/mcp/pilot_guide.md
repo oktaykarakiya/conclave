@@ -77,21 +77,34 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      `block` a flagged change is never auto-merged, even with `auto_merge: true` (§8); `warn`
      only flags; `off` skips the check.
    - `execution.worker_isolation` (default `true`): Claude Code workers (`claude-code/<model>`)
-     run without this host's own Claude Code setup. An isolated worker still gets the built-in
-     tools, the repository's `.claude/settings.json` and `.claude/settings.local.json`, managed
-     settings, its login and `--dangerously-skip-permissions`. It gets no MCP servers (neither
-     the repository's `.mcp.json` nor Conclave's own), no user settings
-     (`~/.claude/settings.json`, so not their `model`, `env`, `apiKeyHelper`, hooks or enabled
-     plugins), no skills or slash commands, and no auto-memory, which every worktree of a
-     repository shares: a worker that is not isolated reads and writes your own memory for that
-     repository. Per-machine prompt sections (working directory, environment, git status) move
-     into the first user message, so the system prompt is the same in every worktree and caches
-     across dispatches. Isolation removes MCP tools only: a worker can still reach the daemon's
-     HTTP API from its shell. It needs Claude Code 2.1.101 or later. A CLI older than 2.1.98
-     rejects a flag, and the dispatch fails with that error in `agent.result.error`; 2.1.98 to
-     2.1.100 accept the flags but can delete Claude Code conversation history older than 30 days
-     when user settings are not loaded. opencode workers are not affected. Set it to `false` for
-     a project whose workers need any of that setup (§11).
+     run without this host's own Claude Code setup, with only the built-in tools a coding task
+     needs. An isolated worker gets the tools `Task` (subagents), `Bash`, `Read`, `Edit`,
+     `Write`, `NotebookEdit`, `WebFetch`, `WebSearch`, `ToolSearch`, `Glob`, `Grep`, `LSP`, the
+     todo tools (`TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`, `TodoWrite`) and, on Windows,
+     `PowerShell` (Claude Code's `--tools`). No other built-in tool: it cannot message other
+     Claude sessions on the host (`ListAgents`, `SendMessage`), schedule or trigger agents
+     (`CronCreate`, `ScheduleWakeup`, `RemoteTrigger`), push notifications, start workflows,
+     watch in the background (`Monitor`) or leave its worktree (`EnterWorktree`,
+     `ExitWorktree`). Background tasks and cron jobs are off
+     (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, `CLAUDE_CODE_DISABLE_CRON=1`), so nothing wakes
+     a session for another paid turn after its answer. Long commands run in the foreground
+     instead: a Bash call may ask for up to the agent's timeout (`BASH_MAX_TIMEOUT_MS`), and one
+     that names no timeout stops after 20 minutes, or the agent's timeout when that is shorter
+     (`BASH_DEFAULT_TIMEOUT_MS`). It also gets the repository's `.claude/settings.json` and
+     `.claude/settings.local.json`, managed settings, its login and
+     `--dangerously-skip-permissions`. It gets no MCP servers (neither the repository's
+     `.mcp.json` nor Conclave's own), no user settings (`~/.claude/settings.json`, so not their
+     `model`, `env`, `apiKeyHelper`, hooks or enabled plugins), no skills or slash commands, and
+     no auto-memory, which every worktree of a repository shares: a worker that is not isolated
+     reads and writes your own memory for that repository. Per-machine prompt sections (working
+     directory, environment, git status) move into the first user message, so the system prompt
+     is the same in every worktree and caches across dispatches. A worker can still reach the
+     daemon's HTTP API from its shell. It needs Claude Code 2.1.101 or later. A CLI older than
+     2.1.98 rejects a flag, and the dispatch fails with that error in `agent.result.error`;
+     2.1.98 to 2.1.100 accept the flags but can delete Claude Code conversation history older
+     than 30 days when user settings are not loaded. opencode workers are not affected. To opt
+     out, for a project whose workers need any of that setup, another tool or background tasks,
+     set `execution.worker_isolation: false` (§11).
    - `agent_defaults` (applies to every agent) and `agent_overrides.<agent>`:
      `model`, `effort`, `timeout_minutes`, `max_retries`, `compact_before_start`, `skills`
    - `experimental.planner_enabled`, `experimental.auto_planner_char_threshold` (default `0`: the
@@ -247,12 +260,17 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   fix-ups, post-mortem, planning-session turns, the bug fixer's hunter, repro and consensus
   agents, and a swarm's decomposition. A Claude Code account that goes on past its limit on paid
   extra usage (its rate-limit info then reads `rejected` with `isUsingOverage` or
-  `overageInUse`) is still served, so nothing waits.
+  `overageInUse`) is still served, so nothing waits. A Claude Code run that reported a refused
+  limit but does not end is stopped 2 minutes later (or at the agent's timeout, if sooner) and
+  waits the same way; it is never failed as a timeout.
 - A wait lasts until the reported reset plus a minute, or `execution.quota_retry_minutes`
   (default 15, 1 to 1440) when the engine gives no reset time; a dispatch refused again waits
-  again, with no cap. There is one gate per engine account, `claude-code` for every Claude Code
-  dispatch and `opencode/<provider>` (e.g. `opencode/deepseek`) per opencode model provider:
-  while it is closed, every dispatch on that account, in every project, waits for it.
+  again, with no cap. A Claude Code request refused while its rate-limit info still reads
+  `allowed` (or extra usage serves it) hit a short burst limit, not an exhausted window, so it
+  waits `quota_retry_minutes`, not until the window's reset. There is one gate per engine
+  account, `claude-code` for every Claude Code dispatch and `opencode/<provider>` (e.g.
+  `opencode/deepseek`) per opencode model provider: while it is closed, every dispatch on that
+  account, in every project, waits for it.
 - The interrupted session is continued (Claude Code `--resume`, opencode `--session`) with a
   short continuation prompt; without a session, or when the engine no longer has it, the
   original prompt runs again.
@@ -394,8 +412,11 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 - If a model's `model_reported` differs from the configured one, stop and investigate before
   trusting results (wrong engine, wrong model string, or routing problem).
 - Claude Code workers are isolated by default (§3): a worker that needs an MCP server, a skill or
-  slash command, a user plugin, or a user-level setting (such as an `env` block or `apiKeyHelper`
-  in `~/.claude/settings.json`) does not get it. Turn isolation off for that project:
+  slash command, a user plugin, a user-level setting (such as an `env` block or `apiKeyHelper`
+  in `~/.claude/settings.json`), a built-in tool outside the allowlist or a background task does
+  not get it. A Bash command it runs without a timeout of its own stops after 20 minutes instead
+  of moving to the background (the agent may ask for up to its `timeout_minutes`). Turn
+  isolation off for that project:
   `conclave_patch_config` with `config: {"execution": {"worker_isolation": false}}`. Do the same
   on a host with an administrator's `managed-mcp.json`: Claude Code refuses `--strict-mcp-config`
   there and exits at startup, so every isolated dispatch fails.

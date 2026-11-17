@@ -21,7 +21,7 @@ from conclave.providers import (
     claude_cli,
     dispatch_with_quota,
 )
-from conclave.providers.claude_cli import _parse_envelope
+from conclave.providers.claude_cli import _parse_envelope, _scan_stream
 
 # A fake "claude" that echoes the routed model back via the JSON envelope, so we can
 # prove the composed environment actually reaches the child process.
@@ -95,14 +95,43 @@ def _capture_spawns(
     return spawns
 
 
+_TOOLS = (
+    "Task,Bash,Read,Edit,Write,NotebookEdit,WebFetch,WebSearch,ToolSearch,"
+    "Glob,Grep,LSP,TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite,PowerShell"
+)
 _ISOLATION_FLAGS = [
     "--strict-mcp-config",
     "--setting-sources",
     "project,local",
     "--disable-slash-commands",
     "--exclude-dynamic-system-prompt-sections",
+    "--tools",
+    _TOOLS,
 ]
 _BASE_ARGS = ["--print", "--output-format", "stream-json", "--verbose"]
+_SWITCHES = ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "CLAUDE_CODE_DISABLE_CRON")
+_BASH_TIMEOUTS = ("BASH_MAX_TIMEOUT_MS", "BASH_DEFAULT_TIMEOUT_MS")
+
+
+def _recording_cli(tmp_path: Path) -> tuple[str, Path]:
+    """A fake "claude" that records the args it was started with, and the isolation and Bash
+    timeout variables of its environment, in the returned file."""
+    record = tmp_path / "started.json"
+    keys = ["CLAUDE_CODE_DISABLE_AUTO_MEMORY", *_SWITCHES, *_BASH_TIMEOUTS]
+    body = f"""#!/usr/bin/env python3
+import json, os, sys
+sys.stdin.read()
+with open({str(record)!r}, "w", encoding="utf-8") as f:
+    env = {{key: os.environ[key] for key in {keys!r} if key in os.environ}}
+    json.dump({{"argv": sys.argv[1:], "env": env}}, f)
+print(json.dumps({{"type": "result", "is_error": False, "result": "ok", "session_id": "s-r"}}))
+"""
+    return _make_cli(tmp_path, body, name="recording.py"), record
+
+
+def _started(record: Path) -> tuple[list[str], dict[str, str]]:
+    started = json.loads(record.read_text(encoding="utf-8"))
+    return started["argv"], started["env"]
 
 
 async def test_isolated_dispatch_passes_the_isolation_flags_and_env(
@@ -128,6 +157,7 @@ async def test_isolated_dispatch_passes_the_isolation_flags_and_env(
     ]
     assert "--mcp-config" not in args
     assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert {var: env[var] for var in _SWITCHES} == dict.fromkeys(_SWITCHES, "1")
 
 
 @pytest.mark.parametrize("parent_value", [None, "0"])
@@ -136,8 +166,9 @@ async def test_unisolated_dispatch_passes_no_isolation(
 ) -> None:
     cli = _make_cli(tmp_path, _FAKE_CLI)
     spawns = _capture_spawns(monkeypatch, cli)
-    # This suite may itself run inside an isolated worker, which has the variable set.
-    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    # This suite may itself run inside an isolated worker, which has the variables set.
+    for var in ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", *_SWITCHES, *_BASH_TIMEOUTS):
+        monkeypatch.delenv(var, raising=False)
     if parent_value is not None:
         monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", parent_value)
     profile = ResolvedProfile(
@@ -151,6 +182,78 @@ async def test_unisolated_dispatch_passes_no_isolation(
     assert args == ["--dangerously-skip-permissions", *_BASE_ARGS, "--model", "opus"]
     # Untouched: absent stays absent, and a parent's own value is inherited as before.
     assert env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == parent_value
+    assert not {*_SWITCHES, *_BASH_TIMEOUTS} & set(env)
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "bash_max", "bash_default"),
+    [(1800, "1800000", "1200000"), (600, "600000", "600000")],
+)
+async def test_an_isolated_dispatch_runs_the_allowed_tools_in_the_foreground_up_to_its_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_seconds: int,
+    bash_max: str,
+    bash_default: str,
+) -> None:
+    cli, record = _recording_cli(tmp_path)
+    for var in (*_SWITCHES, *_BASH_TIMEOUTS):
+        monkeypatch.setenv(var, "0")  # the parent's values lose
+    profile = ResolvedProfile(name="claude-code", arg_mode=ArgMode.flag, model="opus", cli=cli)
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=timeout_seconds
+    )
+
+    assert result.ok
+    argv, env = _started(record)
+    assert argv.count("--tools") == 1 and argv[argv.index("--tools") + 1] == _TOOLS
+    assert env == {
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+        "CLAUDE_CODE_DISABLE_CRON": "1",
+        "BASH_MAX_TIMEOUT_MS": bash_max,
+        "BASH_DEFAULT_TIMEOUT_MS": bash_default,
+    }
+
+
+async def test_an_unisolated_dispatch_gets_no_tool_allowlist_switches_or_bash_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli, record = _recording_cli(tmp_path)
+    # This suite may itself run inside an isolated worker, which has the variables set.
+    for var in ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", *_SWITCHES, *_BASH_TIMEOUTS):
+        monkeypatch.delenv(var, raising=False)
+    profile = ResolvedProfile(
+        name="claude-code", arg_mode=ArgMode.flag, model="opus", cli=cli, isolated=False
+    )
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=1800
+    )
+
+    assert result.ok
+    argv, env = _started(record)
+    assert "--tools" not in argv
+    assert env == {}
+
+
+async def test_the_profile_extra_env_overrides_the_derived_bash_timeouts(
+    tmp_path: Path,
+) -> None:
+    cli, record = _recording_cli(tmp_path)
+    overrides = {"BASH_MAX_TIMEOUT_MS": "7200000", "BASH_DEFAULT_TIMEOUT_MS": "60000"}
+    profile = ResolvedProfile(
+        name="claude-code", arg_mode=ArgMode.flag, model="opus", cli=cli, extra_env=overrides
+    )
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=1800
+    )
+
+    assert result.ok
+    _argv, env = _started(record)
+    assert {var: env[var] for var in _BASH_TIMEOUTS} == overrides
 
 
 async def test_env_routing_reaches_subprocess(tmp_path: Path) -> None:
@@ -461,7 +564,7 @@ def test_the_rejected_window_that_resets_last_decides_the_reset() -> None:
 
 def test_an_assistant_rate_limit_error_takes_the_reset_from_an_earlier_rate_limit_info() -> None:
     raw = _stream(
-        _rate_limit_event("allowed"),
+        _rate_limit_event("allowed_warning"),  # the window is nearly used up
         _refused("rate_limit", "You've hit your limit · resets 3pm"),
         _result("You've hit your limit · resets 3pm", is_error=True),
     )
@@ -474,6 +577,36 @@ def test_an_assistant_rate_limit_error_takes_the_reset_from_an_earlier_rate_limi
     assert result.quota.resets_at == datetime.fromtimestamp(_RESETS_AT, UTC)
     assert result.quota.window == "five_hour"
     assert result.quota.message == "You've hit your limit · resets 3pm"
+
+
+@pytest.mark.parametrize(
+    ("event", "window", "resets_at"),
+    [
+        # The windows are not exhausted: a short burst limit, so the gate's retry wait applies.
+        (_rate_limit_event("allowed"), None, None),
+        (_rate_limit_event("rejected", five_hour="rejected", isUsingOverage=True), None, None),
+        # The window is nearly used up, or refuses requests: its reset is when they resume.
+        (_rate_limit_event("allowed_warning"), "five_hour", _RESETS_AT),
+        (_rate_limit_event("rejected", five_hour="rejected"), "five_hour", _RESETS_AT),
+    ],
+    ids=["allowed", "rejected-on-extra-usage", "allowed_warning", "rejected"],
+)
+def test_a_refused_request_resumes_at_a_window_reset_only_when_the_window_limits(
+    event: dict[str, Any], window: str | None, resets_at: int | None
+) -> None:
+    raw = _stream(
+        event,
+        _refused("rate_limit", "API Error: Rate limited"),
+        _result("API Error: Rate limited", is_error=True),
+    )
+
+    quota = _parse_envelope(raw, 1).quota
+
+    assert quota is not None and quota.kind == "rate_limit"
+    assert quota.window == window
+    assert quota.resets_at == (
+        datetime.fromtimestamp(resets_at, UTC) if resets_at is not None else None
+    )
 
 
 def test_a_refusal_without_a_result_event_keeps_the_session_and_the_message() -> None:
@@ -720,3 +853,229 @@ async def test_a_session_to_resume_is_passed_as_resume(
     (args, _env), = spawns
     at = args.index("--resume")
     assert args[at + 1] == "s-7" and args.index("--model") > at
+
+
+# --- several result events in one stream ------------------------------------------------------
+# A background task that ends after the answer wakes the session for another turn, which ends in
+# a result event of its own. total_cost_usd, duration_api_ms and modelUsage are running totals of
+# the session; num_turns, duration_ms and the usage tokens count one turn.
+
+_ANSWER_TURN: dict[str, Any] = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": "VERDICT: pass",
+    "session_id": "ses-1",
+    "num_turns": 102,
+    "duration_ms": 610_000,
+    "duration_api_ms": 540_000,
+    "total_cost_usd": 1.85,
+    "usage": {
+        "input_tokens": 1_200,
+        "output_tokens": 120_495,
+        "cache_read_input_tokens": 4_800_000,
+        "cache_creation_input_tokens": 95_000,
+        "service_tier": "standard",
+    },
+    "modelUsage": {
+        "claude-opus-5-5": {"outputTokens": 119_000, "costUSD": 1.8},
+        "claude-haiku-4-5": {"outputTokens": 1_495, "costUSD": 0.05},
+    },
+}
+_WAKE_UP_TURN: dict[str, Any] = {
+    **_ANSWER_TURN,
+    "result": "VERDICT: pass (the background test run passed too)",
+    "num_turns": 1,
+    "duration_ms": 60_000,
+    "duration_api_ms": 600_000,
+    "total_cost_usd": 2.26,
+    "usage": {
+        "input_tokens": 30,
+        "output_tokens": 8_620,
+        "cache_read_input_tokens": 210_000,
+        "cache_creation_input_tokens": 4_000,
+        "service_tier": "standard",
+    },
+    "modelUsage": {"claude-opus-5-5": {"outputTokens": 127_620, "costUSD": 2.21}},
+}
+
+
+def test_two_results_of_one_session_sum_turns_and_tokens_and_keep_the_last_cost() -> None:
+    raw = _stream(_ANSWER_TURN, _WAKE_UP_TURN)
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.num_turns == 103
+    assert result.output_tokens == 129_115
+    assert result.input_tokens == 1_230
+    assert result.cache_read_tokens == 5_010_000
+    assert result.cache_creation_tokens == 99_000
+    assert result.cost_usd == 2.26  # a running total: the last one
+    assert result.ok is True and result.error is None and result.quota is None
+    assert result.text == _WAKE_UP_TURN["result"]
+    assert result.session_id == "ses-1"
+    # Every model behind the summed tokens, a model only the earlier result names included.
+    assert result.model_reported == "claude-opus-5-5, claude-haiku-4-5"
+    merged = _scan_stream(raw, {}).result
+    assert merged is not None
+    assert merged["duration_ms"] == 670_000  # per turn: summed
+    assert merged["duration_api_ms"] == 600_000  # a running total: the last one
+    assert merged["usage"]["service_tier"] == "standard"
+    assert merged["modelUsage"] == {
+        "claude-opus-5-5": _WAKE_UP_TURN["modelUsage"]["claude-opus-5-5"],
+        "claude-haiku-4-5": _ANSWER_TURN["modelUsage"]["claude-haiku-4-5"],
+    }
+
+
+@pytest.mark.parametrize("last_is_error", [False, True])
+def test_the_last_result_decides_the_outcome(last_is_error: bool) -> None:
+    raw = _stream(
+        {**_ANSWER_TURN, "is_error": not last_is_error},
+        {**_WAKE_UP_TURN, "is_error": last_is_error},
+    )
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.ok is not last_is_error
+    assert result.text == _WAKE_UP_TURN["result"]
+    assert result.num_turns == 103
+
+
+def test_a_wake_up_turn_that_hits_the_limit_is_a_quota() -> None:
+    limit = "You've hit your limit · resets 3pm"
+    raw = _stream(_ANSWER_TURN, {**_WAKE_UP_TURN, "is_error": True, "result": limit})
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.quota is not None and result.quota.message == limit
+    assert result.num_turns == 103 and result.output_tokens == 129_115
+
+
+def test_a_result_of_another_session_replaces_the_earlier_one() -> None:
+    raw = _stream(_ANSWER_TURN, {**_WAKE_UP_TURN, "session_id": "ses-2"})
+
+    result = _parse_envelope(raw, 0)
+
+    assert (result.num_turns, result.output_tokens, result.cost_usd) == (1, 8_620, 2.26)
+    assert result.session_id == "ses-2"
+    assert result.model_reported == "claude-opus-5-5"
+
+
+def test_a_single_result_is_read_as_it_is() -> None:
+    raw = _stream(_ANSWER_TURN)
+
+    result = _parse_envelope(raw, 0)
+
+    assert _scan_stream(raw, {}).result == _ANSWER_TURN
+    assert (result.num_turns, result.input_tokens, result.output_tokens) == (102, 1_200, 120_495)
+    assert (result.cache_read_tokens, result.cache_creation_tokens) == (4_800_000, 95_000)
+    assert result.cost_usd == 1.85
+    assert result.model_reported == "claude-opus-5-5, claude-haiku-4-5"
+
+
+# --- a usage limit the run does not end on ------------------------------------------------------
+# Claude Code can go on after a refused request (waiting, or retrying inside the run) until the
+# agent timeout kills it. The limit it reported is still a usage limit.
+
+_INIT = {"type": "system", "subtype": "init", "session_id": "ses-1"}
+
+
+def _scripted_cli(tmp_path: Path, *steps: list[dict[str, Any]] | float) -> str:
+    """A fake "claude" that runs *steps* in order: a list of events is written in one flushed
+    write, a number sleeps that many seconds."""
+    body = f"""#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+for step in json.loads({json.dumps(steps)!r}):
+    if isinstance(step, list):
+        sys.stdout.write("".join(json.dumps(event) + "\\n" for event in step))
+        sys.stdout.flush()
+    else:
+        time.sleep(step)
+"""
+    return _make_cli(tmp_path, body, name="scripted.py")
+
+
+@pytest.mark.parametrize(
+    ("event", "kind"),
+    [
+        (_rate_limit_event("rejected", five_hour="rejected"), "rate_limit"),
+        (_refused("rate_limit", "API Error: Rate limited"), "rate_limit"),
+        (_refused("billing_error", "Credit balance is too low"), "billing"),
+    ],
+    ids=["rejected-rate-limit-event", "rate_limit-error", "billing_error"],
+)
+async def test_a_usage_limit_streamed_before_the_timeout_is_a_quota_not_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: dict[str, Any], kind: str
+) -> None:
+    cli = _scripted_cli(tmp_path, [_INIT, event], 30)
+    spawns = _count_spawns(monkeypatch, cli)
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=1)
+
+    assert len(spawns) == 1
+    assert result.ok is False
+    assert result.quota is not None and result.quota.kind == kind
+    assert result.session_id == "ses-1"  # the session the shared dispatch path resumes
+    assert "timed out" not in (result.error or "")
+
+
+async def test_a_refusal_the_run_goes_on_after_is_stopped_after_the_grace_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(claude_cli, "_QUOTA_STOP_GRACE_S", 0.2)
+    cli = _scripted_cli(tmp_path, [_INIT, _rate_limit_event("rejected", five_hour="rejected")], 30)
+    spawns = _count_spawns(monkeypatch, cli)
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+    started = time.monotonic()
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=30)
+
+    assert time.monotonic() - started < 10  # stopped, neither waited for nor timed out
+    assert len(spawns) == 1
+    assert result.ok is False
+    assert result.quota is not None and result.quota.kind == "rate_limit"
+    assert result.quota.window == "five_hour"
+    assert result.quota.resets_at == datetime.fromtimestamp(_RESETS_AT, UTC)
+    assert result.session_id == "ses-1"
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        [_INIT, _rate_limit_event("allowed_warning")],
+        # A newer info that does not refuse lifts the refusal: the run is served again.
+        [_INIT, _rate_limit_event("rejected", five_hour="rejected"), _rate_limit_event("allowed")],
+    ],
+    ids=["allowed_warning", "rejected-then-allowed"],
+)
+async def test_a_warning_or_a_lifted_refusal_leaves_the_run_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: list[dict[str, Any]]
+) -> None:
+    monkeypatch.setattr(claude_cli, "_QUOTA_STOP_GRACE_S", 0.05)
+    cli = _scripted_cli(tmp_path, first, 0.5, [_result("VERDICT: pass")])
+    spawns = _count_spawns(monkeypatch, cli)
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=30)
+
+    assert len(spawns) == 1
+    assert result.ok is True and result.quota is None and result.error is None
+    assert result.text == "VERDICT: pass"
+
+
+async def test_the_refusal_watch_reads_each_complete_line_across_chunks() -> None:
+    watch = claude_cli._RefusalWatch()
+    line = json.dumps(_rate_limit_event("rejected", five_hour="rejected"))
+    for at in range(0, len(line), 7):
+        watch.feed(line[at : at + 7])
+    with pytest.raises(TimeoutError):  # a line without its end is not read yet
+        await asyncio.wait_for(watch.outlasts(0.0), 0.1)
+
+    watch.feed("\n" + json.dumps(_INIT) + "\n")
+    await asyncio.wait_for(watch.outlasts(0.0), 1)  # armed by the refusing info
+
+    watch.feed(json.dumps(_rate_limit_event("allowed")) + "\n")
+    with pytest.raises(TimeoutError):  # disarmed by a newer info that does not refuse
+        await asyncio.wait_for(watch.outlasts(0.0), 0.1)

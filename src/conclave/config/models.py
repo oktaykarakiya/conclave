@@ -171,7 +171,10 @@ class ExecutionSettings(BaseModel):
         description=(
             "Run Claude Code workers without the host's own Claude Code setup: no MCP servers, "
             "no user-level settings (nor the plugins and hooks they enable), no skills or slash "
-            "commands, no auto-memory. The repository's project and local settings still apply. "
+            "commands, no auto-memory. Only the built-in tools a coding task needs (none that "
+            "message other sessions, schedule agents, send notifications, start workflows or "
+            "leave the worktree) and no background tasks: long commands run in the foreground, "
+            "up to the agent's timeout. The repository's project and local settings still apply. "
             "opencode workers are not affected."
         ),
     )
