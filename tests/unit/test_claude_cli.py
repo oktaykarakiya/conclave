@@ -65,6 +65,84 @@ def _count_spawns(monkeypatch: pytest.MonkeyPatch, script: str) -> list[str]:
     return spawns
 
 
+def _capture_spawns(
+    monkeypatch: pytest.MonkeyPatch, script: str
+) -> list[tuple[list[str], dict[str, str]]]:
+    """Record the CLI args (after *script*) and the ``env`` of each process started for
+    *script*, then start it for real."""
+    spawns: list[tuple[list[str], dict[str, str]]] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def capturing_spawn(
+        program: Any, *args: Any, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        argv = [str(a) for a in (program, *args)]
+        if script in argv:
+            spawns.append((argv[argv.index(script) + 1 :], dict(kwargs["env"])))
+        return await spawn(program, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_spawn)
+    return spawns
+
+
+_ISOLATION_FLAGS = [
+    "--strict-mcp-config",
+    "--setting-sources",
+    "project,local",
+    "--disable-slash-commands",
+    "--exclude-dynamic-system-prompt-sections",
+]
+_BASE_ARGS = ["--print", "--output-format", "stream-json", "--verbose"]
+
+
+async def test_isolated_dispatch_passes_the_isolation_flags_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli = _make_cli(tmp_path, _FAKE_CLI)
+    spawns = _capture_spawns(monkeypatch, cli)
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")  # the parent's value loses
+    profile = ResolvedProfile(
+        name="claude-code", arg_mode=ArgMode.flag, model="opus", cli=cli, isolated=True
+    )
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=30)
+
+    assert result.ok
+    ((args, env),) = spawns
+    assert args == [
+        "--dangerously-skip-permissions",
+        *_BASE_ARGS,
+        *_ISOLATION_FLAGS,
+        "--model",
+        "opus",
+    ]
+    assert "--mcp-config" not in args
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+
+
+@pytest.mark.parametrize("parent_value", [None, "0"])
+async def test_unisolated_dispatch_passes_no_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_value: str | None
+) -> None:
+    cli = _make_cli(tmp_path, _FAKE_CLI)
+    spawns = _capture_spawns(monkeypatch, cli)
+    # This suite may itself run inside an isolated worker, which has the variable set.
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    if parent_value is not None:
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", parent_value)
+    profile = ResolvedProfile(
+        name="claude-code", arg_mode=ArgMode.flag, model="opus", cli=cli, isolated=False
+    )
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=30)
+
+    assert result.ok
+    ((args, env),) = spawns
+    assert args == ["--dangerously-skip-permissions", *_BASE_ARGS, "--model", "opus"]
+    # Untouched: absent stays absent, and a parent's own value is inherited as before.
+    assert env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == parent_value
+
+
 async def test_env_routing_reaches_subprocess(tmp_path: Path) -> None:
     cli = _make_cli(tmp_path, _FAKE_CLI)
     profile = ResolvedProfile(

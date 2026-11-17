@@ -421,6 +421,21 @@ export function SettingsView({
             </span>
           </label>
 
+          <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2 hover:border-zinc-700">
+            <input
+              type="checkbox"
+              checked={Boolean(execution.worker_isolation ?? true)}
+              onChange={(e) => updateSection("execution", "worker_isolation", e.target.checked)}
+              className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-indigo-500"
+            />
+            <span className="space-y-0.5">
+              <span className="block text-xs text-zinc-300">Isolate Claude Code workers</span>
+              <span className="block text-[11px] text-zinc-500">
+                On (default): no MCP servers, user plugins or settings, skills or auto-memory.
+              </span>
+            </span>
+          </label>
+
           <label className="block space-y-1">
             <span className="text-xs font-medium text-zinc-400">
               Planner threshold (request chars)

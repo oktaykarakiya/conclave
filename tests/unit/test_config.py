@@ -227,6 +227,16 @@ def test_gate_integrity_fields_are_in_the_config_schema() -> None:
     assert props["test_integrity"]["default"] == "block"
 
 
+def test_worker_isolation_is_on_by_default_and_in_the_config_schema() -> None:
+    assert ConclaveConfig().execution.worker_isolation is True
+    assert load_project_config(
+        {"execution": {"worker_isolation": False}}
+    ).execution.worker_isolation is False
+    prop = config_schema()["$defs"]["ExecutionSettings"]["properties"]["worker_isolation"]
+    assert (prop["type"], prop["default"], prop["title"]) == ("boolean", True, "Worker Isolation")
+    assert "MCP" in prop["description"]
+
+
 def test_test_integrity_rejects_unknown_modes() -> None:
     warn = load_project_config({"execution": {"test_integrity": "warn"}})
     assert warn.execution.test_integrity == "warn"

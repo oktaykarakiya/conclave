@@ -8,6 +8,9 @@ profile composes the exact CLI args + environment for a dispatch:
 - ``flag``    — ``--model``/``--effort`` flags (native Claude / Anthropic-direct);
 - ``env``     — ``ANTHROPIC_*`` / ``CLAUDE_CODE_*`` env routing (DeepSeek et al.).
 
+An ``isolated`` profile (the default; ``execution.worker_isolation``) also keeps the operator's
+own Claude Code setup out of the dispatch (see ``_ISOLATION_ARGS``).
+
 ``build_invocation`` is pure and the most heavily tested function here.
 """
 
@@ -21,6 +24,21 @@ from ..config import ArgMode
 # final ``result`` event carries the result/usage/cost fields). stream-json needs --verbose.
 _BASE_ARGS: tuple[str, ...] = ("--print", "--output-format", "stream-json", "--verbose")
 _DEFAULT_CLI_FLAGS: tuple[str, ...] = ("--dangerously-skip-permissions",)
+
+# Worker isolation (Claude Code 2.1.101+). No MCP server starts: --strict-mcp-config ignores
+# every configured server and no --mcp-config is passed. Only the repository's project/local
+# settings load, so user settings and the plugins and hooks they enable stay out. No skills or
+# slash commands. Per-machine sections (cwd, env info, git status) move from the system prompt
+# into the first user message, so the system prompt is the same in every worktree and caches
+# across dispatches. The environment variable turns auto-memory off.
+_ISOLATION_ARGS: tuple[str, ...] = (
+    "--strict-mcp-config",
+    "--setting-sources",
+    "project,local",
+    "--disable-slash-commands",
+    "--exclude-dynamic-system-prompt-sections",
+)
+_DISABLE_AUTO_MEMORY_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
 
 
 @dataclass(frozen=True)
@@ -41,6 +59,7 @@ class ResolvedProfile:
     cli_agent: str | None = None
     thinking: bool = False
     pure: bool = False
+    isolated: bool = True  # worker isolation; secure by default
 
 
 @dataclass(frozen=True)
@@ -50,9 +69,18 @@ class Invocation:
 
 
 def build_invocation(profile: ResolvedProfile) -> Invocation:
-    """Compose the CLI args and environment overrides for a dispatch (pure)."""
+    """Compose the CLI args and environment overrides for a dispatch (pure).
+
+    Args come in this order: ``cli_flags``, the base args, the isolation flags (when
+    ``profile.isolated``), then ``--model``/``--effort`` (flag mode). Without isolation nothing
+    is added, so the args and environment are exactly those of a profile that predates it.
+    """
     args: list[str] = [*profile.cli_flags, *_BASE_ARGS]
     env: dict[str, str] = {}
+
+    if profile.isolated:
+        args += _ISOLATION_ARGS
+        env[_DISABLE_AUTO_MEMORY_ENV] = "1"
 
     if profile.arg_mode is ArgMode.flag:
         if profile.model:

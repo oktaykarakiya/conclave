@@ -97,6 +97,9 @@ class FakeProvider:
     ``cancel_during`` (``"developer"`` or ``"reviewer"``) makes that dispatch run until the
     operator stops it: it sets ``dispatch_blocked``, waits for its cancel event, and then ends
     as a real provider's killed run does.
+
+    Every dispatch is recorded: ``prompts`` holds its prompt and ``profiles`` the
+    :class:`ResolvedProfile` it was given (e.g. to assert ``isolated``).
     """
 
     def __init__(
@@ -119,6 +122,7 @@ class FakeProvider:
         self.cancel_during = cancel_during
         self.dispatch_blocked = asyncio.Event()
         self.prompts: list[str] = []
+        self.profiles: list[ResolvedProfile] = []
         # Count post-mortem dispatches so failure-path tests can assert the wiring.
         self.post_mortem_calls = 0
 
@@ -139,6 +143,7 @@ class FakeProvider:
         cancel_event: asyncio.Event | None = None,
     ) -> AgentResult:
         self.prompts.append(prompt)
+        self.profiles.append(profile)
         # --- orchestrator flows (matched FIRST) ---
         # These discriminators are unique to the orchestrator and never appear in planning
         # prompts. They must win over the planning-persona checks below, because the code

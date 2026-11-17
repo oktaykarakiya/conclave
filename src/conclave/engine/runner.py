@@ -310,7 +310,8 @@ class AgentRunner:
         opencode selects the model/provider and handles auth through its own config, so
         Conclave no longer looks up a stored Engine Profile. Only the per-agent model and
         effort overrides are carried through (``arg_mode=inherit`` adds no CLI flags; the
-        opencode provider ignores a model that is not an opencode-format ``provider/model``).
+        opencode provider ignores a model that is not an opencode-format ``provider/model``),
+        plus the project's ``execution.worker_isolation`` as ``isolated``.
         """
         return ResolvedProfile(
             name="opencode",
@@ -320,4 +321,5 @@ class AgentRunner:
             cli_agent=cli_agent,
             thinking=thinking,
             pure=pure,
+            isolated=self._config.execution.worker_isolation,
         )

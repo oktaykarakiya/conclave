@@ -153,6 +153,21 @@ async def test_router_keeps_opencode_profile_untouched() -> None:
     assert not cc.profiles
 
 
+@pytest.mark.parametrize("isolated", [True, False])
+async def test_router_keeps_worker_isolation_on_both_engines(isolated: bool) -> None:
+    router, oc, cc = _router(Engine.opencode)
+    for model in ("claude-code/opus", "deepseek/deepseek-flash"):
+        profile = ResolvedProfile(
+            name="opencode", arg_mode=ArgMode.inherit, model=model, isolated=isolated
+        )
+        await router.run_agent(profile=profile, prompt="p", timeout_seconds=5)
+    (claude_profile,) = cc.profiles
+    assert (claude_profile.name, claude_profile.model) == ("claude-code", "opus")
+    assert claude_profile.isolated is isolated
+    (opencode_profile,) = oc.profiles
+    assert opencode_profile.isolated is isolated
+
+
 async def test_router_claude_default_drops_opencode_model() -> None:
     router, oc, cc = _router(Engine.claude)
     await router.run_agent(

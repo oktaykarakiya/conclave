@@ -156,6 +156,15 @@ class ExecutionSettings(BaseModel):
             "on its committed branch, and a human or pilot merges it (conclave_merge_task)."
         ),
     )
+    worker_isolation: bool = Field(
+        default=True,
+        description=(
+            "Run Claude Code workers without the host's own Claude Code setup: no MCP servers, "
+            "no user-level settings (nor the plugins and hooks they enable), no skills or slash "
+            "commands, no auto-memory. The repository's project and local settings still apply. "
+            "opencode workers are not affected."
+        ),
+    )
     setup_command: str | None = Field(
         default=None,
         description=(

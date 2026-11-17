@@ -576,6 +576,7 @@ class PlanningOrchestrator:
                 cli_agent=settings.cli_agent,
                 thinking=settings.thinking,
                 pure=settings.pure,
+                isolated=cfg.execution.worker_isolation,
             )
             started_at = time.monotonic()
             dispatch_result: AgentResult | None = None
