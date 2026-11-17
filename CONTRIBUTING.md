@@ -11,6 +11,7 @@ code or documentation), you confirm that you wrote it or otherwise have the righ
 you grant the Licensor, Oktay Karakiya, a perpetual, worldwide, irrevocable, royalty-free license to
 use, modify, sublicense and relicense it under any terms, including the Business Source License,
 commercial licenses and the Change License named in `LICENSE`.
+Contributions are accepted only on these terms; if you do not agree, please do not submit one.
 
 ## Dev setup
 

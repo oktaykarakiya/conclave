@@ -7,16 +7,30 @@ Licensor:             Oktay Karakiya
 Licensed Work:        Conclave, every version published from the commit that
                       introduced this License onward. The Licensed Work is
                       (c) 2026 Oktay Karakiya.
-Additional Use Grant: You may make production use of the Licensed Work,
-                      provided that such use is:
-                      (a) by a natural person, for their own personal,
-                          non-commercial projects; or
-                      (b) by a non-profit organization or an accredited
-                          educational institution, for its non-commercial
-                          purposes.
-                      Any other production use, including any use by or on
-                      behalf of a for-profit organization, requires a
-                      commercial license from the Licensor.
+Additional Use Grant: You may make production use of the Licensed Work, free
+                      of charge and without a separate license, provided
+                      that:
+                      (a) within your organization, no more than three
+                          individuals use the Licensed Work or direct its
+                          work, including through a shared instance;
+                      (b) across your organization, the Licensed Work
+                          operates on no more than three source code
+                          repositories; and
+                      (c) you do not offer the Licensed Work, or a product
+                          or service whose value derives substantially from
+                          it, to third parties on a hosted, managed or
+                          embedded basis.
+                      Limits (a) and (b) do not apply to a natural person
+                      using the Licensed Work for their own personal
+                      projects, or to a non-profit organization or an
+                      accredited educational institution using it for its
+                      non-commercial purposes.
+                      "Your organization" means the legal entity on whose
+                      behalf you use the Licensed Work, together with every
+                      entity that controls, is controlled by, or is under
+                      common control with it.
+                      Any other production use requires a commercial
+                      license from the Licensor.
 Change Date:          Four years from the date the Licensed Work is published.
 Change License:       Apache License, Version 2.0
 
@@ -25,8 +39,9 @@ please contact the Licensor through https://github.com/oktaykarakiya/conclave.
 
 Notice
 
-Versions of Conclave published before the commit that introduced this License
-were released under the MIT License, and remain available under it.
+The Business Source License (this document, or the "License") is not an Open
+Source license. However, the Licensed Work will eventually be made available
+under an Open Source License, as stated in this License.
 
 Business Source License 1.1
 
