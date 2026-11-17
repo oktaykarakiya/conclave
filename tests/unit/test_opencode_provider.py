@@ -21,6 +21,18 @@ from conclave.providers import AgentResult, opencode_cli
 from conclave.providers.opencode_cli import OpenCodeCliProvider, _parse_events
 from conclave.providers.profiles import ResolvedProfile
 
+
+@pytest.fixture(autouse=True)
+def _no_mcp_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake CLIs below answer any argv as a run: keep an isolated dispatch's MCP discovery
+    (``opencode debug config``, covered in test_opencode_isolation.py) from starting them."""
+
+    async def no_servers(*args: Any, **kwargs: Any) -> tuple[str, ...]:
+        return ()
+
+    monkeypatch.setattr(opencode_cli, "_discover_mcp_servers", no_servers)
+
+
 # A representative single-step stream (captured from a real deepseek run).
 _STREAM = "\n".join(
     [

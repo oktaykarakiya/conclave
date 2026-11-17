@@ -102,9 +102,22 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      daemon's HTTP API from its shell. It needs Claude Code 2.1.101 or later. A CLI older than
      2.1.98 rejects a flag, and the dispatch fails with that error in `agent.result.error`;
      2.1.98 to 2.1.100 accept the flags but can delete Claude Code conversation history older
-     than 30 days when user settings are not loaded. opencode workers are not affected. To opt
-     out, for a project whose workers need any of that setup, another tool or background tasks,
-     set `execution.worker_isolation: false` (§11).
+     than 30 days when user settings are not loaded. An isolated opencode worker
+     (`provider/model`) gets no MCP servers, the repository's own included. opencode has no
+     switch for that: the first isolated dispatch in a worktree runs `opencode debug config`
+     there (about a second; the names are kept for that worktree until the daemon restarts) and
+     disables every server the resolved config names through `OPENCODE_CONFIG_CONTENT`
+     (`{"mcp": {"<name>": {"enabled": false}}}`, merged into the daemon's own value when that
+     is a JSON object). It loads no skills from `.claude/skills` or `.agents/skills`, the
+     user's or the repository's (`OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`,
+     `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`): only opencode's built-in skill and those in
+     opencode's own folders (`~/.config/opencode/skills`, the repository's `.opencode/skills`).
+     The rest of the global and the repository's opencode config (providers, model, agents,
+     commands, plugins, instructions) still applies. When the discovery fails, a warning in the
+     daemon log names why, and that dispatch keeps its MCP servers but still loads none of
+     those skills. To opt out, for a project whose workers need any of that setup (an MCP
+     server such as Playwright for UI tests, a skill), another tool or background tasks, set
+     `execution.worker_isolation: false` (§11).
    - `agent_defaults` (applies to every agent) and `agent_overrides.<agent>`:
      `model`, `effort`, `timeout_minutes`, `max_retries`, `compact_before_start`, `skills`
    - `experimental.planner_enabled`, `experimental.auto_planner_char_threshold` (default `0`: the
@@ -420,6 +433,11 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   `conclave_patch_config` with `config: {"execution": {"worker_isolation": false}}`. Do the same
   on a host with an administrator's `managed-mcp.json`: Claude Code refuses `--strict-mcp-config`
   there and exits at startup, so every isolated dispatch fails.
+- opencode workers are isolated by default too (§3): a worker that needs an MCP server from the
+  global or the repository's opencode config (for example Playwright, to drive a browser for UI
+  tests) or a skill from a `.claude/skills` or `.agents/skills` folder does not get it. Turn
+  isolation off for that project the same way (`"worker_isolation": false`), or move such a
+  skill to the repository's `.opencode/skills`, which isolated workers still load.
 - Frequent `context_truncated` events mean diffs or test output exceed the limit (§3): agents can
   still run the command named in the marker, but for whole-diff review raise
   `context.bulk_max_chars` (or `compaction_max_chars`), or make the task smaller or the test

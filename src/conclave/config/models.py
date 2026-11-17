@@ -169,13 +169,15 @@ class ExecutionSettings(BaseModel):
     worker_isolation: bool = Field(
         default=True,
         description=(
-            "Run Claude Code workers without the host's own Claude Code setup: no MCP servers, "
+            "Run workers without the host's own agent setup. Claude Code workers: no MCP servers, "
             "no user-level settings (nor the plugins and hooks they enable), no skills or slash "
             "commands, no auto-memory. Only the built-in tools a coding task needs (none that "
             "message other sessions, schedule agents, send notifications, start workflows or "
             "leave the worktree) and no background tasks: long commands run in the foreground, "
             "up to the agent's timeout. The repository's project and local settings still apply. "
-            "opencode workers are not affected."
+            "opencode workers: no MCP servers (every one their resolved config names, the "
+            "repository's own included, is disabled) and no skills from .claude or .agents "
+            "folders; the rest of the opencode config, the repository's included, still applies."
         ),
     )
     setup_command: str | None = Field(

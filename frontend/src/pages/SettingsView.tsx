@@ -429,9 +429,10 @@ export function SettingsView({
               className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-indigo-500"
             />
             <span className="space-y-0.5">
-              <span className="block text-xs text-zinc-300">Isolate Claude Code workers</span>
+              <span className="block text-xs text-zinc-300">Isolate workers</span>
               <span className="block text-[11px] text-zinc-500">
-                On (default): no MCP servers, user plugins or settings, skills or auto-memory.
+                On (default): no MCP servers and no .claude or .agents skills; Claude Code workers
+                also skip user plugins, settings, all skills and auto-memory.
               </span>
             </span>
           </label>

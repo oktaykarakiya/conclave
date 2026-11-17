@@ -12,6 +12,13 @@ opencode-format ``provider/model`` string.
 An ``error`` event refusing the request for a usage limit or balance (HTTP 402 or 429, or a
 balance / quota / rate-limit message) is reported as ``AgentResult.quota`` (never ok), with the
 reset time a 429's ``retry-after-ms`` or ``retry-after`` header gives.
+
+Every run gets an explicit environment: the daemon's own, then the worker isolation overrides of
+an isolated profile (``execution.worker_isolation``), then the profile's ``extra_env``, see
+:class:`OpenCodeCliProvider`. An isolated worker loads no skills from ``.claude`` or ``.agents``
+folders and starts no MCP server. opencode has no switch that turns every MCP server off, so the
+servers its resolved config names (``opencode debug config``) are each disabled through
+``OPENCODE_CONFIG_CONTENT``, which opencode merges over every other config source.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import asyncio
 import contextlib
 import email.utils
 import json
+import logging
 import os
 import random
 import re
@@ -37,8 +45,27 @@ from .claude_cli import (
 )
 from .profiles import ResolvedProfile
 
+logger = logging.getLogger("conclave.providers.opencode_cli")
+
 # The opencode binary; overridable for non-PATH installs (e.g. ~/.opencode/bin/opencode).
 _OPENCODE_BIN = os.environ.get("CONCLAVE_OPENCODE_BIN", "opencode")
+
+# Worker isolation: no skills from .claude/skills or .agents/skills (global or the repository's).
+# opencode's own skill folders and its built-in skill still load.
+_ISOLATION_ENV: dict[str, str] = {
+    "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+    "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+}
+# Config JSON that opencode merges over every other config source: isolation disables each MCP
+# server here ({"mcp": {name: {"enabled": false}}}, which keeps the server's definition).
+_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT"
+# `opencode debug config` takes about a second; one that hangs must not hold the dispatch.
+_MCP_DISCOVERY_TIMEOUT_S = 30.0
+# Worktrees whose MCP server names are kept per provider (the oldest is dropped first).
+_MCP_CACHE_MAX = 128
+# A failed discovery's warning quotes the end of its stderr, without terminal colour codes.
+_STDERR_TAIL_CHARS = 300
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 # Transient API / connection drop patterns that warrant an immediate ~1s retry
 # (and session resume when a sessionID was already assigned).
@@ -73,7 +100,30 @@ def _is_transient_error(result: AgentResult, raw: str = "") -> bool:
 
 
 class OpenCodeCliProvider:
-    """Runs agents by invoking the ``opencode`` CLI as a subprocess."""
+    """Runs agents by invoking the ``opencode`` CLI as a subprocess.
+
+    A dispatch's environment is passed explicitly (``env=``) and is the same for every attempt
+    of that dispatch, transient retries and resumes included. It is built in this order:
+
+    1. the daemon's environment (``os.environ`` at dispatch time);
+    2. when ``profile.isolated`` (``execution.worker_isolation``), the isolation overrides:
+       ``OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1``, ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1`` and,
+       when the resolved config has MCP servers, ``OPENCODE_CONFIG_CONTENT`` disabling each of
+       them. A daemon value of ``OPENCODE_CONFIG_CONTENT`` that is a JSON object is kept, with
+       the ``enabled: false`` entries merged over it; any other value is left unchanged (with a
+       warning) and the servers stay on;
+    3. ``profile.extra_env``, last, so a profile can override any variable above.
+
+    Without isolation the environment is 1 and 3 only, and the argv is the same either way. The
+    MCP server names come from ``opencode debug config``, run in the dispatch's ``cwd`` under
+    environment 1 and 3, at most once per dispatch and only on a cache miss: the names are kept
+    per (binary, ``cwd``) for this provider's lifetime, up to :data:`_MCP_CACHE_MAX` worktrees. A
+    failed discovery is logged and not kept; that dispatch runs without the skills but with its
+    MCP servers.
+    """
+
+    def __init__(self) -> None:
+        self._mcp_names: dict[tuple[str, str | None], tuple[str, ...]] = {}
 
     async def run_agent(
         self,
@@ -114,6 +164,11 @@ class OpenCodeCliProvider:
         if profile.pure:
             base_args += ["--pure"]
 
+        # Never start a discovery once cancelled (the first attempt would not start either).
+        if cancel_event is not None and cancel_event.is_set():
+            return AgentResult(ok=False, error="cancelled", cancelled=True)
+        env = await self._dispatch_env(profile, cwd)
+
         last_result: AgentResult | None = None
         resume_session_id: str | None = profile.resume_session_id
         for attempt_idx in range(_MAX_DISPATCH_ATTEMPTS):
@@ -133,6 +188,7 @@ class OpenCodeCliProvider:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    env=env,
                     cwd=str(cwd) if cwd is not None else None,
                     start_new_session=True,
                     **_WIN_SUBPROCESS_KW,
@@ -239,6 +295,147 @@ class OpenCodeCliProvider:
 
         assert last_result is not None
         return last_result
+
+    async def _dispatch_env(self, profile: ResolvedProfile, cwd: Path | None) -> dict[str, str]:
+        """The environment of a dispatch, built as the class docstring describes."""
+        env = dict(os.environ)
+        if profile.isolated:
+            names = await self._mcp_servers(cwd, {**env, **profile.extra_env})
+            env.update(_ISOLATION_ENV)
+            if names:
+                content = _disable_mcp(env.get(_CONFIG_CONTENT_ENV), names)
+                if content is not None:
+                    env[_CONFIG_CONTENT_ENV] = content
+        env.update(profile.extra_env)  # last, so a profile can override any variable above
+        return env
+
+    async def _mcp_servers(self, cwd: Path | None, env: dict[str, str]) -> tuple[str, ...] | None:
+        """The MCP server names of the opencode config a dispatch in *cwd* resolves: cached, or
+        discovered under *env* and then cached. ``None`` (logged) when discovery fails."""
+        key = (_OPENCODE_BIN, str(cwd) if cwd is not None else None)
+        cached = self._mcp_names.get(key)
+        if cached is not None:
+            return cached
+        try:
+            names = await _discover_mcp_servers(cwd, env)
+        except _McpDiscoveryError as exc:
+            logger.warning(
+                "MCP discovery (opencode debug config) failed in %s: %s; this dispatch keeps its "
+                "MCP servers",
+                cwd if cwd is not None else os.getcwd(),
+                exc,
+            )
+            return None
+        self._mcp_names[key] = names
+        while len(self._mcp_names) > _MCP_CACHE_MAX:
+            del self._mcp_names[next(iter(self._mcp_names))]
+        return names
+
+
+class _McpDiscoveryError(Exception):
+    """Why the MCP servers of a dispatch's opencode config could not be read."""
+
+
+async def _discover_mcp_servers(cwd: Path | None, env: dict[str, str]) -> tuple[str, ...]:
+    """The MCP server names ``opencode debug config`` reports when run in *cwd* under *env*
+    (see :func:`_mcp_server_names`). Raises :class:`_McpDiscoveryError` naming the cause when the
+    CLI cannot start, runs longer than :data:`_MCP_DISCOVERY_TIMEOUT_S`, exits non-zero or
+    prints anything else than such a config. The process group is killed on a timeout or a
+    cancellation."""
+    # The binary is read at call time, as for a dispatch, so an override applies at once.
+    exec_bin, exec_args = _resolve_cli_exec(_OPENCODE_BIN, ["debug", "config"])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exec_bin,
+            *exec_args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=str(cwd) if cwd is not None else None,
+            start_new_session=True,
+            **_WIN_SUBPROCESS_KW,
+        )
+    except OSError as exc:
+        raise _McpDiscoveryError(f"cannot start {_OPENCODE_BIN!r}: {exc}") from exc
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), _MCP_DISCOVERY_TIMEOUT_S)
+    except TimeoutError as exc:
+        raise _McpDiscoveryError(f"timed out after {_MCP_DISCOVERY_TIMEOUT_S:g}s") from exc
+    finally:
+        if proc.returncode is None:  # timed out or cancelled: leave no process behind
+            await _kill_process_group(proc.pid)
+            with contextlib.suppress(ProcessLookupError):
+                await proc.wait()
+    if proc.returncode != 0:
+        detail = " ".join(_ANSI_ESCAPE_RE.sub("", err.decode("utf-8", errors="replace")).split())
+        raise _McpDiscoveryError(
+            f"exit {proc.returncode}" + (f": {detail[-_STDERR_TAIL_CHARS:]}" if detail else "")
+        )
+    return _mcp_server_names(out.decode("utf-8", errors="replace"))
+
+
+def _mcp_server_names(text: str) -> tuple[str, ...]:
+    """The sorted MCP server names of an ``opencode debug config`` output (``()`` without any).
+
+    Only opencode 1.x entries are accepted: an object whose ``type`` is ``local`` or ``remote``,
+    or that has a boolean ``enabled``. Anything else raises :class:`_McpDiscoveryError`, so a
+    config format this provider does not know (such as servers under ``mcp.servers``) never
+    yields an ``OPENCODE_CONFIG_CONTENT`` that opencode would reject.
+    """
+    try:
+        config = json.loads(text)
+    except ValueError as exc:
+        raise _McpDiscoveryError(f"output is not JSON ({exc})") from exc
+    if not isinstance(config, dict):
+        raise _McpDiscoveryError("output is not a JSON object")
+    servers = config.get("mcp")
+    if servers is None:
+        return ()
+    if not isinstance(servers, dict):
+        raise _McpDiscoveryError("'mcp' is not an object")
+    for name, entry in servers.items():
+        if not isinstance(entry, dict) or not (
+            entry.get("type") in ("local", "remote") or isinstance(entry.get("enabled"), bool)
+        ):
+            raise _McpDiscoveryError(f"unrecognized 'mcp' entry {name!r}")
+    return tuple(sorted(servers))
+
+
+def _disable_mcp(existing: str | None, names: tuple[str, ...]) -> str | None:
+    """The ``OPENCODE_CONFIG_CONTENT`` that disables the MCP servers *names*: the daemon's own
+    value *existing* (a JSON object, or unset or empty) with ``{"mcp": {name: {"enabled":
+    false}}}`` merged over it. ``None``, with a warning, when *existing* is anything else: it is
+    then left unchanged, since it cannot be merged into."""
+    patch: dict[str, Any] = {"mcp": {name: {"enabled": False} for name in names}}
+    if not existing:  # opencode treats an empty value as unset
+        return json.dumps(patch)
+    try:
+        current = json.loads(existing)
+    except ValueError:
+        current = None
+    if not isinstance(current, dict):
+        logger.warning(
+            "%s in the daemon's environment is not a JSON object; it is left unchanged, so this "
+            "dispatch keeps its MCP servers",
+            _CONFIG_CONTENT_ENV,
+        )
+        return None
+    return json.dumps(_merged(current, patch))
+
+
+def _merged(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """*base* with *patch* merged over it: nested objects are merged, any other value of *patch*
+    replaces the one in *base*. Keys are kept exactly as they are."""
+    merged = dict(base)
+    for key, value in patch.items():
+        current = merged.get(key)
+        merged[key] = (
+            _merged(current, value)
+            if isinstance(current, dict) and isinstance(value, dict)
+            else value
+        )
+    return merged
 
 
 def _add(acc: int | None, value: object) -> int | None:
