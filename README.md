@@ -118,4 +118,14 @@ npx tsc --noEmit                              # strict TS
 
 ## License
 
-[MIT](./LICENSE) © Oktay Karakiya
+© Oktay Karakiya. Conclave is source-available under the
+[Business Source License 1.1](./LICENSE):
+
+- Free: personal, non-commercial projects by individuals; non-profit and educational use; and any
+  non-production use (evaluation, testing, development).
+- Commercial license required: any other production use, including use by or on behalf of a
+  for-profit organization. Contact the Licensor through this repository.
+- Each version converts to the Apache License 2.0 four years after it is published.
+
+Versions published before this license was introduced (up to and including commit `a7352d3`) were
+released under the MIT License and remain available under it.

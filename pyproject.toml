@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Portable, web-driven autonomous AI coding team — attachable to any repo."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = { text = "BUSL-1.1" }
 authors = [{ name = "Oktay Karakiya" }]
 keywords = ["ai", "agents", "autonomous", "coding-agent", "claude", "code-review", "fastapi"]
 classifiers = [
@@ -16,7 +16,7 @@ classifiers = [
     "Environment :: Web Environment",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Quality Assurance",

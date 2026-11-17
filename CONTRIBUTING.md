@@ -3,6 +3,15 @@
 Thanks for your interest! Conclave is a personal/self-hostable tool; contributions and issues are
 welcome.
 
+## Licensing of contributions
+
+Conclave is source-available under the [Business Source License 1.1](./LICENSE), with commercial
+licenses offered by the Licensor. By submitting a contribution (a pull request, patch or any other
+code or documentation), you confirm that you wrote it or otherwise have the right to submit it, and
+you grant the Licensor, Oktay Karakiya, a perpetual, worldwide, irrevocable, royalty-free license to
+use, modify, sublicense and relicense it under any terms, including the Business Source License,
+commercial licenses and the Change License named in `LICENSE`.
+
 ## Dev setup
 
 ```bash
