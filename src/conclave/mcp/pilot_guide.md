@@ -96,7 +96,9 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      `.mcp.json` nor Conclave's own), no user settings (`~/.claude/settings.json`, so not their
      `model`, `env`, `apiKeyHelper`, hooks or enabled plugins), no skills or slash commands, and
      no auto-memory, which every worktree of a repository shares: a worker that is not isolated
-     reads and writes your own memory for that repository. Per-machine prompt sections (working
+     reads and writes your own memory for that repository. It loads no `CLAUDE.md` or `AGENTS.md`
+     itself (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`): Conclave sends the project's rule files in its
+     prompt instead (see "Project rule files" below). Per-machine prompt sections (working
      directory, environment, git status) move into the first user message, so the system prompt
      is the same in every worktree and caches across dispatches. A worker can still reach the
      daemon's HTTP API from its shell. It needs Claude Code 2.1.101 or later. A CLI older than
@@ -209,6 +211,32 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
   (or `agent_overrides.<agent>.effort`).
 - Only configure models whose engine and credentials actually work on this host; a quick
   low-cost task is the cheapest way to confirm a new model string end to end.
+
+### Project rule files
+- Every agent prompt has a PROJECT RULES section built from the workspace-level `AGENTS.md` (in
+  the directory that holds the attached checkout) and the checkout's root rule file: the first of
+  `AGENTS.md`, `CONCLAVE.md` and `CLAUDE.md` that exists, even an empty one. A task reads them from
+  its worktree once; a planning turn reads them from the checkout.
+- The engines load rule files themselves too, so each dispatch gets only the files its engine does
+  not load, and every file reaches the model once:
+  - opencode (`provider/model`) loads the root `AGENTS.md`, or `CLAUDE.md` when there is no
+    `AGENTS.md`; Conclave leaves that file out. It sends it after all when opencode would skip it:
+    `CLAUDE.md` under `OPENCODE_DISABLE_CLAUDE_CODE` or `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT`,
+    any root file under `OPENCODE_DISABLE_PROJECT_CONFIG` (in the daemon's environment).
+  - An isolated Claude Code worker (`claude-code/<model>`, `execution.worker_isolation`) loads none
+    (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`) and gets them all: the workspace `AGENTS.md`, the root
+    rule file, the root `CLAUDE.md` when that is not the root rule file, and the files `CLAUDE.md`
+    imports with `@path`, each under a `# <path>` heading. Imports resolve as Claude Code resolves
+    them (relative to the importing file, at most four hops deep, not inside code), but only text
+    files inside the worktree: an absolute, `~` or outside path stays as written. Other memory
+    files no longer reach it: `.claude/CLAUDE.md`, `CLAUDE.local.md`, `.claude/rules/`,
+    `CLAUDE.md` files in subdirectories or above the worktree, the managed `CLAUDE.md` and the
+    `@path` imports of `AGENTS.md`. Move such rules into the root files, or turn isolation off.
+  - A Claude Code worker that is not isolated loads `CLAUDE.md` with its imports itself, so
+    Conclave leaves it out. It still gets `AGENTS.md`, which some Claude Code versions also load:
+    a duplicate accepted when isolation is off.
+- `CONCLAVE.md` is the Conclave-only rule file: no engine loads it, so every agent gets it from
+  Conclave. It is read only when the root has no `AGENTS.md`.
 
 ## 4. Choosing models per node (generic strategy)
 
@@ -426,8 +454,8 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   trusting results (wrong engine, wrong model string, or routing problem).
 - Claude Code workers are isolated by default (§3): a worker that needs an MCP server, a skill or
   slash command, a user plugin, a user-level setting (such as an `env` block or `apiKeyHelper`
-  in `~/.claude/settings.json`), a built-in tool outside the allowlist or a background task does
-  not get it. A Bash command it runs without a timeout of its own stops after 20 minutes instead
+  in `~/.claude/settings.json`), a built-in tool outside the allowlist, a background task or a
+  memory file other than the root rule files (§3, "Project rule files") does not get it. A Bash command it runs without a timeout of its own stops after 20 minutes instead
   of moving to the background (the agent may ask for up to its `timeout_minutes`). Turn
   isolation off for that project:
   `conclave_patch_config` with `config: {"execution": {"worker_isolation": false}}`. Do the same

@@ -5,7 +5,8 @@ no longer resolves an Engine Profile from the database — it uses a fixed ``ope
 profile carrying only the per-agent model/effort overrides. The runner assembles the
 full prompt (persona + repo knowledge + project rules + task), invokes the provider through
 the usage-limit wait (:func:`~conclave.providers.dispatch_with_quota`), records usage, and
-emits dispatch/result events.
+emits dispatch/result events. The project rules are chosen per dispatch, for the engine that runs
+it (:func:`~conclave.engine.project_rules.rules_for_dispatch`).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from ..providers import (
     dispatch_with_quota,
     resolve_dispatch_effort,
 )
+from .project_rules import ProjectRules, rules_for_dispatch
 
 logger = logging.getLogger("conclave.engine.runner")
 
@@ -280,7 +282,7 @@ class AgentRunner:
         task_id: str | None = None,
         worktree: Path,
         repo_knowledge: str = "",
-        project_rules: str = "",
+        project_rules: ProjectRules | None = None,
         cancel_event: asyncio.Event | None = None,
         node_id: str | None = None,
         model_override: str | None = None,
@@ -323,7 +325,12 @@ class AgentRunner:
             thinking=thinking,
             pure=settings.pure,
         )
-        full_prompt = assemble_prompt(system, repo_knowledge, project_rules, prompt, skills=skills)
+        rules = (
+            rules_for_dispatch(project_rules, self._provider, profile)
+            if project_rules is not None
+            else ""
+        )
+        full_prompt = assemble_prompt(system, repo_knowledge, rules, prompt, skills=skills)
 
         # Once cancelled, no dispatch starts: no agent.dispatched, provider run or usage row.
         if cancel_event is not None and cancel_event.is_set():

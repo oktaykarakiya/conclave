@@ -22,6 +22,7 @@ from conclave.engine.orchestrator import (
     _build_developer_prompt,
     _build_venv_guidance,
 )
+from conclave.engine.project_rules import ProjectRules
 from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
@@ -163,7 +164,7 @@ async def test_maybe_plan_prompt_includes_necessity_and_yagni_check(
         task,
         tmp_path,
         knowledge="",
-        rules="",
+        rules=ProjectRules(),
         baseline=None,
         config=config,
     )

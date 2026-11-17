@@ -17,7 +17,7 @@ import re
 import shutil
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -40,6 +40,7 @@ from .graph_executor import (
     resolve_workflow,
 )
 from .memory import AttemptMemory
+from .project_rules import ProjectRules, read_project_rules
 from .runner import AgentRunner
 from .test_integrity import (
     IntegrityFinding,
@@ -49,10 +50,6 @@ from .test_integrity import (
 from .verdict import ParsedVerdict, check_grounding, parse_verdict
 from .workflow_evolver import evolve_project_workflow
 from .worktree import WorktreeManager
-
-# opencode reads AGENTS.md natively, so it leads the project-rule fallback list. CLAUDE.md
-# and CONCLAVE.md remain supported for repos that still carry them.
-_PROJECT_RULE_FILES = ("AGENTS.md", "CONCLAVE.md", "CLAUDE.md")
 
 # A single reviewer dispatch can transiently return empty/non-ok (provider hiccup).
 # Retry it a few times before giving up, so one flaky call doesn't discard the
@@ -726,11 +723,12 @@ class Orchestrator:
             if cancel_event is not None and cancel_event.is_set():
                 return await self._finish_cancelled(task, wm, task_branch)
 
-            # Repo context now comes from AGENTS.md (read by opencode natively and surfaced
-            # through _read_project_rules), not Conclave's synthesized knowledge preamble.
+            # Repo context comes from the project rule files, not Conclave's synthesized
+            # knowledge preamble: read once here, and each dispatch gets the files its engine
+            # does not load natively (see project_rules).
             knowledge = ""
-            rules = _read_project_rules(worktree, repo_path=repo_path)
-            rules += self._build_venv_guidance(worktree, config, None)
+            rules = read_project_rules(worktree, repo_path=repo_path)
+            rules = replace(rules, extra=self._build_venv_guidance(worktree, config, None))
             test_command = _test_command(config, None)
             # Inject active quarantine exclusions so flaky quarantined tests
             # don't fail the baseline snapshot or the green-gate.
@@ -1706,7 +1704,7 @@ class Orchestrator:
         task: Task,
         worktree: Path,
         knowledge: str,
-        rules: str,
+        rules: ProjectRules,
         baseline: _Baseline | None,
         config: ConclaveConfig,
         *,
@@ -1943,7 +1941,7 @@ class Orchestrator:
         task: Task,
         worktree: Path,
         knowledge: str,
-        rules: str,
+        rules: ProjectRules,
         *,
         cancel_event: asyncio.Event | None = None,
         node: WorkflowNode | None = None,
@@ -2184,7 +2182,7 @@ class Orchestrator:
         attempt: int,
         config: ConclaveConfig,
         knowledge: str,
-        rules: str,
+        rules: ProjectRules,
         started: float,
         budget: float,
         *,
@@ -2759,7 +2757,7 @@ class Orchestrator:
         task: Task,
         worktree: Path,
         knowledge: str,
-        rules: str,
+        rules: ProjectRules,
         config: ConclaveConfig,
         feedback: str,
         attempts: int,
@@ -3088,24 +3086,6 @@ def _diff_stat(diff: str) -> str:
     adds = sum(1 for ln in lines if ln.startswith("+") and not ln.startswith("+++"))
     dels = sum(1 for ln in lines if ln.startswith("-") and not ln.startswith("---"))
     return f"{files} file(s), +{adds}/-{dels}"
-
-
-def _read_project_rules(worktree: Path, repo_path: Path | None = None) -> str:
-    sections: list[str] = []
-    if repo_path is not None and repo_path.parent != repo_path:
-        ws_agents = repo_path.parent / "AGENTS.md"
-        if ws_agents.is_file():
-            ws_text = ws_agents.read_text(encoding="utf-8", errors="replace").strip()
-            if ws_text:
-                sections.append(ws_text)
-    for name in _PROJECT_RULE_FILES:
-        candidate = worktree / name
-        if candidate.is_file():
-            local_text = candidate.read_text(encoding="utf-8", errors="replace")
-            if local_text.strip() and local_text.strip() not in sections:
-                sections.append(local_text)
-            break
-    return "\n\n".join(sections)
 
 
 def _test_command(config: ConclaveConfig, knowledge: dict[str, Any] | None) -> str | None:

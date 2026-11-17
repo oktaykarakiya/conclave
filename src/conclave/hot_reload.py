@@ -78,6 +78,7 @@ _EXPLICIT_MODULE_RANKS: dict[str, tuple[int, int]] = {
     "conclave.engine.graph_executor": (10, 8),
     "conclave.engine.workflow_evolver": (10, 9),
     "conclave.engine.compactor": (10, 10),
+    "conclave.engine.project_rules": (10, 10),  # imports no engine module; runner imports it
     "conclave.engine.runner": (10, 11),
     "conclave.engine.hunter": (10, 12),
     "conclave.engine.repro": (10, 13),

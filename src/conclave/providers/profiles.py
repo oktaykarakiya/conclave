@@ -10,7 +10,8 @@ profile composes the exact CLI args + environment for a dispatch:
 
 An ``isolated`` profile (the default; ``execution.worker_isolation``) also keeps the operator's
 own Claude Code setup out of the dispatch, limits it to the built-in tools a coding task needs
-and turns off background tasks (see ``_ISOLATION_ARGS`` and ``ISOLATED_WORKER_TOOLS``).
+and turns off background tasks and native rule-file loading (see ``_ISOLATION_ARGS``,
+``ISOLATED_WORKER_TOOLS`` and ``_ISOLATION_ENV``).
 
 ``build_invocation`` is pure and the most heavily tested function here.
 """
@@ -85,11 +86,13 @@ _ISOLATION_ARGS: tuple[str, ...] = (
 )
 # Auto-memory off. No background tasks or cron jobs: a ``--print`` run waits for them and wakes
 # the session for another turn after its final answer (the provider sets the Bash timeouts so
-# long commands still run in the foreground).
+# long commands still run in the foreground). No CLAUDE.md or AGENTS.md loading: Conclave sends
+# the project's rule files in the prompt instead, each once (``engine/project_rules.py``).
 _ISOLATION_ENV: dict[str, str] = {
     "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     "CLAUDE_CODE_DISABLE_CRON": "1",
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
 }
 
 

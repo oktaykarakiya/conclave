@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from conclave.config import ArgMode
@@ -26,7 +28,8 @@ _ISOLATION = [
 _MEMORY_VAR = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
 _BACKGROUND_VAR = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
 _CRON_VAR = "CLAUDE_CODE_DISABLE_CRON"
-_ISOLATION_ENV = {_MEMORY_VAR: "1", _BACKGROUND_VAR: "1", _CRON_VAR: "1"}
+_CLAUDE_MDS_VAR = "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
+_ISOLATION_ENV = {_MEMORY_VAR: "1", _BACKGROUND_VAR: "1", _CRON_VAR: "1", _CLAUDE_MDS_VAR: "1"}
 
 # The built-in tools the system/init event of an isolated planner dispatch listed (Claude Code
 # 2.1.326, worker isolation without a tool allowlist): the ones a coding task needs, and the ones
@@ -202,6 +205,18 @@ def test_extra_env_overrides_the_isolation_env(var: str) -> None:
     )
     assert inv.env == {**_ISOLATION_ENV, var: "0"}  # the other switches stay on
     assert inv.args == [*_BASE, *_ISOLATION]  # the flags stay
+
+
+def test_isolation_turns_native_rule_files_off_unless_extra_env_says_otherwise() -> None:
+    # Conclave sends an isolated worker's rule files itself (engine/project_rules.py), so Claude
+    # Code must load no CLAUDE.md or AGENTS.md of its own; without isolation it still does.
+    def env(**kwargs: object) -> dict[str, str]:
+        profile = ResolvedProfile(name="x", arg_mode=ArgMode.inherit)
+        return build_invocation(replace(profile, **kwargs)).env
+
+    assert env()[_CLAUDE_MDS_VAR] == "1"
+    assert _CLAUDE_MDS_VAR not in env(isolated=False)
+    assert env(extra_env={_CLAUDE_MDS_VAR: "0"})[_CLAUDE_MDS_VAR] == "0"
 
 
 def test_env_mode_haiku_defaults_to_model_without_subagent() -> None:

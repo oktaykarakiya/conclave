@@ -24,7 +24,7 @@ from ..db.planning_models import (
     PlanningSessionStatus,
     PlanningTaskNode,
 )
-from ..engine.orchestrator import _read_project_rules
+from ..engine.project_rules import read_project_rules, rules_for_dispatch
 from ..engine.runner import QuotaEvents, effort_clamped_payload
 from ..engine.verdict import parse_verdict
 from ..events import EventBus, EventType
@@ -553,29 +553,6 @@ class PlanningOrchestrator:
             turn = await repo.increment_planning_turn(self._db, session_id)
 
             project = await repo.get_project(self._db, session.project_id)
-            project_cwd: Path | None = None
-            context_parts: list[str] = [system_prompt]
-            persona = await repo.get_agent(self._db, agent_name, session.project_id)
-            if persona is not None and persona.persona_md.strip():
-                context_parts.append(f"AGENT PERSONA:\n{persona.persona_md.strip()}")
-            if project is not None and project.path:
-                project_cwd = Path(project.path)
-                rules = _read_project_rules(project_cwd, repo_path=project_cwd)
-                if rules:
-                    context_parts.append(f"PROJECT RULES:\n{rules}")
-            recent_tasks = await repo.list_tasks(self._db, session.project_id)
-            memory_lines = [
-                f"- [{t.state.value}] {t.title or t.request[:60]}: {t.result_summary}"
-                for t in recent_tasks[:5]
-                if t.result_summary
-            ]
-            if memory_lines:
-                context_parts.append(
-                    "RECENT PROJECT MEMORIES:\n" + "\n".join(memory_lines)
-                )
-            context_parts.append(user_message)
-            full_prompt = "\n\n".join(context_parts)
-
             cfg = await resolve_project_config(self._db, project)
             settings = resolve_agent(cfg, agent_name)
             choice = await resolve_dispatch_effort(self._provider, settings.model, settings.effort)
@@ -599,6 +576,31 @@ class PlanningOrchestrator:
                 pure=settings.pure,
                 isolated=cfg.execution.worker_isolation,
             )
+            project_cwd: Path | None = None
+            context_parts: list[str] = [system_prompt]
+            persona = await repo.get_agent(self._db, agent_name, session.project_id)
+            if persona is not None and persona.persona_md.strip():
+                context_parts.append(f"AGENT PERSONA:\n{persona.persona_md.strip()}")
+            if project is not None and project.path:
+                project_cwd = Path(project.path)
+                # The checkout's rule files, less those this turn's engine loads natively.
+                rules = rules_for_dispatch(
+                    read_project_rules(project_cwd, repo_path=project_cwd), self._provider, profile
+                )
+                if rules:
+                    context_parts.append(f"PROJECT RULES:\n{rules}")
+            recent_tasks = await repo.list_tasks(self._db, session.project_id)
+            memory_lines = [
+                f"- [{t.state.value}] {t.title or t.request[:60]}: {t.result_summary}"
+                for t in recent_tasks[:5]
+                if t.result_summary
+            ]
+            if memory_lines:
+                context_parts.append(
+                    "RECENT PROJECT MEMORIES:\n" + "\n".join(memory_lines)
+                )
+            context_parts.append(user_message)
+            full_prompt = "\n\n".join(context_parts)
             started_at = time.monotonic()
             dispatch_result: AgentResult | None = None
             try:

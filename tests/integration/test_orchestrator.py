@@ -18,6 +18,7 @@ from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
 from conclave.engine.gate import GateResult
 from conclave.engine.orchestrator import _check_budget
+from conclave.engine.project_rules import ProjectRules
 from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
@@ -436,8 +437,8 @@ async def test_review_all_empty_reviewers_record_unknown_and_block(
     orchestrator = Orchestrator(db, EventBus(db), _EmptyReviewerProvider(), tmp_path / "home")
 
     failed, feedback, review_timed_out = await orchestrator._review(
-        runner, task, project.id, repo_path, "diff --git a/x.py b/x.py\n", 1, config, "", "",
-        started=time.monotonic(), budget=0.0, diff_cmd="git diff --cached HEAD",
+        runner, task, project.id, repo_path, "diff --git a/x.py b/x.py\n", 1, config, "",
+        ProjectRules(), started=time.monotonic(), budget=0.0, diff_cmd="git diff --cached HEAD",
     )
 
     assert review_timed_out is False
