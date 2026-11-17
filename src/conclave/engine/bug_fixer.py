@@ -68,7 +68,7 @@ from ..config.models import BugFixerSessionConfig, DeclineConsensus
 from ..db import BugCandidate, BugStatus, Database, Project, Task, TaskOrigin, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType
-from ..providers import Provider
+from ..providers import Provider, QuotaGate
 from .discovery import discover_bug
 from .orchestrator import Orchestrator
 from .repro import ReproTest, parse_repro_test
@@ -129,6 +129,7 @@ class BugFixerController:
         self._bus: EventBus = orchestrator._bus
         self._provider: Provider = orchestrator._provider
         self._home: Path = orchestrator._home
+        self._quota_gate: QuotaGate = orchestrator._quota_gate
 
     async def run_cycle(
         self,
@@ -149,6 +150,7 @@ class BugFixerController:
         # (a) Discover — a genuinely new `discovered` candidate, or nothing to hunt this turn.
         candidate = await discover_bug(
             self._db, self._bus, self._provider, project, config, cancel_event=cancel_event,
+            quota_gate=self._quota_gate,
         )
         if candidate is None:
             return CycleResult(CycleOutcome.idle)
@@ -361,7 +363,9 @@ class BugFixerController:
         verdict maps to ``None`` (ABSTAIN). A reviewer crash is caught and logged best-effort so a
         single misbehaving dispatch can never crash the cycle.
         """
-        runner = AgentRunner(self._db, self._bus, self._provider, project.id, config)
+        runner = AgentRunner(
+            self._db, self._bus, self._provider, project.id, config, quota_gate=self._quota_gate
+        )
         prompt = _consensus_prompt(candidate, repro_path, repro_body)
         worktree = Path(project.path)
         verdicts: dict[str, str | None] = {}
@@ -421,7 +425,9 @@ class BugFixerController:
         the writer). A dispatch that errors or whose reply breaks the one-block contract yields
         ``None``, which the caller turns into a *deferred* candidate rather than a forced edge.
         """
-        runner = AgentRunner(self._db, self._bus, self._provider, project.id, config)
+        runner = AgentRunner(
+            self._db, self._bus, self._provider, project.id, config, quota_gate=self._quota_gate
+        )
         result = await runner.run(
             agent="repro",
             prompt=_repro_prompt(candidate),

@@ -25,11 +25,18 @@ from ..db.planning_models import (
     PlanningTaskNode,
 )
 from ..engine.orchestrator import _read_project_rules
-from ..engine.runner import effort_clamped_payload
+from ..engine.runner import QuotaEvents, effort_clamped_payload
 from ..engine.verdict import parse_verdict
 from ..events import EventBus, EventType
 from ..observability.parquet_sync import log_agent_interaction
-from ..providers import AgentResult, Provider, ResolvedProfile, resolve_dispatch_effort
+from ..providers import (
+    AgentResult,
+    Provider,
+    QuotaGate,
+    ResolvedProfile,
+    dispatch_with_quota,
+    resolve_dispatch_effort,
+)
 from .prompts import (
     APPROVAL_AGENTS,
     DISCUSSION_AGENTS,
@@ -67,10 +74,19 @@ class PlanningOrchestrator:
     approve it, creating real tasks in the task system.
     """
 
-    def __init__(self, db: Database, bus: EventBus, provider: Provider) -> None:
+    def __init__(
+        self,
+        db: Database,
+        bus: EventBus,
+        provider: Provider,
+        *,
+        quota_gate: QuotaGate | None = None,
+    ) -> None:
         self._db = db
         self._bus = bus
         self._provider = provider
+        # Turns wait out usage limits on the daemon's shared gate (a private one when none).
+        self._quota_gate = quota_gate if quota_gate is not None else QuotaGate()
         self._active_sessions: dict[str, asyncio.Task[None]] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         # Per-session lock ensures only one _agent_turn mutates a given session
@@ -145,7 +161,8 @@ class PlanningOrchestrator:
         if session.status == PlanningSessionStatus.active:
             context = await self._build_context(session_id)
             bg = asyncio.create_task(
-                self._agent_turn(session_id, _PLANNER, PLANNER_DISCUSSION, context)
+                self._agent_turn(session_id, _PLANNER, PLANNER_DISCUSSION, context),
+                name=_turn_task_name(session_id),
             )
             self._bg_tasks.add(bg)
             bg.add_done_callback(self._bg_tasks.discard)
@@ -322,12 +339,16 @@ class PlanningOrchestrator:
             self._db, session_id, PlanningSessionStatus.cancelled
         )
         bg = self._active_sessions.pop(session_id, None)
-        if bg is not None:
-            bg.cancel()
+        # The session's interjection turns stop too: one may be waiting hours for a usage limit.
+        turns = [t for t in self._bg_tasks if t.get_name() == _turn_task_name(session_id)]
+        for task in [bg, *turns]:
+            if task is None:
+                continue
+            task.cancel()
             # Wait for the task to actually unwind so it can't touch the DB after
             # we return (otherwise it races teardown / shutdown).
             with contextlib.suppress(asyncio.CancelledError):
-                await bg
+                await task
         self._session_locks.pop(session_id, None)
         await self._bus.emit(
             type=EventType.planning_session_cancelled,
@@ -581,11 +602,25 @@ class PlanningOrchestrator:
             started_at = time.monotonic()
             dispatch_result: AgentResult | None = None
             try:
-                result = await self._provider.run_agent(
+                # A usage limit is waited out here; cancel_session cancels the turn's task.
+                result = await dispatch_with_quota(
+                    self._provider,
+                    self._quota_gate,
                     profile=profile,
                     prompt=full_prompt,
                     timeout_seconds=900,  # 15 min/turn — opus-max does deep repo analysis here
+                    retry_minutes=cfg.execution.quota_retry_minutes,
                     cwd=project_cwd,
+                    listener=QuotaEvents(
+                        self._db,
+                        self._bus,
+                        self._quota_gate,
+                        cfg,
+                        project_id=session.project_id,
+                        agent=agent_name,
+                        node_id=f"planning_{agent_name}",
+                        planning_session_id=session_id,
+                    ),
                 )
             except Exception as exc:
                 logger.exception("agent %s failed for session %s", agent_name, session_id)
@@ -947,6 +982,11 @@ class PlanningOrchestrator:
 # ------------------------------------------------------------------
 # module helpers
 # ------------------------------------------------------------------
+
+
+def _turn_task_name(session_id: str) -> str:
+    """The name of a session's interjection-turn task, so cancel_session can find it."""
+    return f"planning-turn:{session_id}"
 
 
 def _extract_json_block(text: str) -> dict[str, Any] | None:

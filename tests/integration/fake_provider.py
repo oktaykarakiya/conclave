@@ -8,9 +8,12 @@ cwd to produce a real diff.
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 
-from conclave.providers import AgentResult, OnChunk, ResolvedProfile
+from conclave.providers import AgentResult, OnChunk, QuotaExhausted, ResolvedProfile
 
 _PASS = '```json\n{"verdict": "pass", "reason": "looks correct", "evidence": []}\n```'
 _PLAN = '```json\n{"approach": "create the file", "files_to_touch": ["FEATURE.txt"]}\n```'
@@ -72,6 +75,10 @@ _PLANNING_PLANNER_REFINE = """Thank you for the feedback. I've refined the task 
 }
 ```"""
 
+# The runner's system context for an agent without a seeded persona names the agent.
+_AGENT_NAME = re.compile(r"You are the (\S+) agent")
+_LIMIT_MESSAGE = "You've hit your limit"
+
 _PLANNING_APPROVED = (
     "The plan looks complete and well-structured.\n"
     '```json\n{"verdict": "pass", "reason": "complete and well-structured"}\n```'
@@ -100,6 +107,14 @@ class FakeProvider:
 
     Every dispatch is recorded: ``prompts`` holds its prompt and ``profiles`` the
     :class:`ResolvedProfile` it was given (e.g. to assert ``isolated``).
+
+    ``quota_once`` names roles (see :meth:`role_of`) whose first dispatch the engine refuses
+    for a five-hour rate limit (``AgentResult.quota``, session ``ses-q-<n>``) that resets at
+    ``quota_resets_at`` (unknown when ``None``); ``quota_hits`` lists the refused roles in
+    order. A dispatch that resumes such a session answers as the role it was refused on; a
+    resume of an unknown session fails the way the CLIs report it. ``fixup_content`` is
+    what the developer writes when its prompt carries a red gate's feedback (``"GATE is not
+    green"``), and ``hunter_text`` what the hunter answers (else it answers as the developer).
     """
 
     def __init__(
@@ -112,6 +127,10 @@ class FakeProvider:
         use_nested_plan: bool = False,
         developer_deletes: str | None = None,
         cancel_during: str | None = None,
+        quota_once: Iterable[str] = (),
+        quota_resets_at: datetime | None = None,
+        fixup_content: str | None = None,
+        hunter_text: str | None = None,
     ) -> None:
         self.developer_writes = developer_writes
         self.developer_content = developer_content
@@ -125,6 +144,33 @@ class FakeProvider:
         self.profiles: list[ResolvedProfile] = []
         # Count post-mortem dispatches so failure-path tests can assert the wiring.
         self.post_mortem_calls = 0
+        self.quota_once = set(quota_once)
+        self.quota_resets_at = quota_resets_at
+        self.fixup_content = fixup_content
+        self.hunter_text = hunter_text
+        self.quota_hits: list[str] = []
+        self._refused: dict[str, str] = {}  # session id -> the prompt the engine refused
+
+    @staticmethod
+    def role_of(prompt: str) -> str:
+        """The role a prompt dispatches: ``planner``, ``postmortem``, ``reviewer:<agent>``,
+        ``planning:planner``, ``planning:reviewer``, ``hunter``, ``fixup`` (a developer prompt
+        with a red gate's feedback) or ``developer``."""
+        agent = _AGENT_NAME.search(prompt)
+        if "Produce a structured plan" in prompt:
+            return "planner"
+        if "Post-Mortem Agent" in prompt:
+            return "postmortem"
+        if "Review the changes made for this task" in prompt:
+            return f"reviewer:{agent.group(1) if agent else '?'}"
+        if "Planning Facilitator Agent" in prompt:
+            return "planning:planner"
+        planning_reviewers = ("Architect", "Tester", "Security", "Senior Reviewer", "Risk")
+        if any(f"{name} Agent" in prompt for name in planning_reviewers):
+            return "planning:reviewer"
+        if agent is not None and agent.group(1) == "hunter":
+            return "hunter"
+        return "fixup" if "GATE is not green" in prompt else "developer"
 
     async def _run_until_cancelled(self, cancel_event: asyncio.Event | None) -> AgentResult:
         assert cancel_event is not None, "cancel_during needs a dispatch with a cancel event"
@@ -144,6 +190,39 @@ class FakeProvider:
     ) -> AgentResult:
         self.prompts.append(prompt)
         self.profiles.append(profile)
+        # --- usage limits: a refused role, and the resume of its session ---
+        if profile.resume_session_id is not None:
+            refused = self._refused.get(profile.resume_session_id)
+            if refused is None:
+                return AgentResult(
+                    ok=False,
+                    error=f"No conversation found with session ID: {profile.resume_session_id}",
+                )
+            prompt = refused  # the continued session answers the original request
+        role = self.role_of(prompt)
+        if role in self.quota_once:
+            self.quota_once.discard(role)
+            self.quota_hits.append(role)
+            session_id = f"ses-q-{len(self.quota_hits)}"
+            self._refused[session_id] = prompt
+            # Built here, not at import: a hot-reload test swaps the conclave classes in place.
+            limit = QuotaExhausted(
+                kind="rate_limit",
+                resets_at=self.quota_resets_at,
+                window="five_hour",
+                message=_LIMIT_MESSAGE,
+            )
+            return AgentResult(
+                ok=False,
+                text=_LIMIT_MESSAGE,
+                error=_LIMIT_MESSAGE,
+                quota=limit,
+                session_id=session_id,
+                model_reported="fake",
+                cost_usd=0.0,
+            )
+        if role == "hunter" and self.hunter_text is not None:
+            return AgentResult(ok=True, text=self.hunter_text, model_reported="fake")
         # --- orchestrator flows (matched FIRST) ---
         # These discriminators are unique to the orchestrator and never appear in planning
         # prompts. They must win over the planning-persona checks below, because the code
@@ -207,7 +286,12 @@ class FakeProvider:
         if self.cancel_during == "developer":
             return await self._run_until_cancelled(cancel_event)
         if self.developer_writes and cwd is not None:
-            (Path(cwd) / self.filename).write_text(self.developer_content, encoding="utf-8")
+            content = (
+                self.fixup_content
+                if self.fixup_content is not None and role == "fixup"
+                else self.developer_content
+            )
+            (Path(cwd) / self.filename).write_text(content, encoding="utf-8")
         if self.developer_deletes and cwd is not None:
             (Path(cwd) / self.developer_deletes).unlink(missing_ok=True)
         # Stream the result in chunks (with a newline) so on_chunk-driven live output is

@@ -231,12 +231,46 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   in an agent's prompt (`block`, `field`, `original_chars`, `kept_chars`, `agent`, `node_id`);
   there is none when nothing was cut. A `log` event with `stage: "effort_clamped"` marks a
   dispatch whose explicit effort the model does not support (`requested`, `used`, `model`,
-  `agent`, `node_id`); the dispatch ran with `used`.
+  `agent`, `node_id`); the dispatch ran with `used`. `quota.waiting` and `quota.resumed` mark a
+  dispatch waiting out a usage limit (see Usage limits below).
 - `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review.
 - Typical timeline: setup + baseline test run, planner, developer, each reviewer in turn, the
   gate, commit. Poll every 15–60 s; long silences during planning or development are normal.
 - Costs are reported per dispatch in `agent.result.cost_usd`. Subscription-backed engines
   report a notional cost that counts against plan limits, not money.
+
+### Usage limits
+- When an engine refuses work because a usage limit or the balance ran out (Claude Code's
+  five-hour or weekly limit, a provider's HTTP 402 or 429), the dispatch **waits, then resumes**
+  where it stopped. Nothing fails: no attempt or retry is spent, no plan is skipped, no reviewer
+  verdict becomes `unknown`. Every dispatch does this: planner, developer, each reviewer, gate
+  fix-ups, post-mortem, planning-session turns, the bug fixer's hunter, repro and consensus
+  agents, and a swarm's decomposition. A Claude Code account that goes on past its limit on paid
+  extra usage (its rate-limit info then reads `rejected` with `isUsingOverage` or
+  `overageInUse`) is still served, so nothing waits.
+- A wait lasts until the reported reset plus a minute, or `execution.quota_retry_minutes`
+  (default 15, 1 to 1440) when the engine gives no reset time; a dispatch refused again waits
+  again, with no cap. There is one gate per engine account, `claude-code` for every Claude Code
+  dispatch and `opencode/<provider>` (e.g. `opencode/deepseek`) per opencode model provider:
+  while it is closed, every dispatch on that account, in every project, waits for it.
+- The interrupted session is continued (Claude Code `--resume`, opencode `--session`) with a
+  short continuation prompt; without a session, or when the engine no longer has it, the
+  original prompt runs again.
+- Where to see it: the task's (or planning session's) `quota.waiting` event (`engine`, `key`,
+  `kind`: `rate_limit` | `billing`, `window`, `resets_at`, `resumes_at`, `message`, `agent`,
+  `node_id`) and `quota.resumed` (`engine`, `key`, `waited_seconds`, `resumed_session`);
+  `conclave_get_engine_quota` (REST `GET /api/engines/quota`) for every gate, until when, and
+  Claude Code's latest rate-limit windows (`rate_limit`); the UI's banner; and the webhook
+  (`notifications.webhook_url`) receives `quota.waiting` once per gate closing and project.
+- Waiting does not count against a task's `execution.wall_clock_budget_minutes` or an agent's
+  `timeout_minutes`. An autonomous bug-fixer session's own wall-clock cap still counts it.
+- To stop a wait, cancel as usual: `conclave_cancel_task` or `conclave_cancel_planning_session`
+  ends it at once. A daemon restart during a wait puts the task back to `approved`; it runs
+  again and waits again.
+- After the wait the task goes on as before: with `auto_merge: false` (the default) a green task
+  still stops at the merge step for you (`conclave_merge_task`).
+- `conclave_launch_swarm` with a `prompt` decomposes it inside the call, so the call blocks while
+  the planner's gate is closed; pass `units` instead.
 
 ## 7. Human in the loop
 
@@ -475,6 +509,7 @@ group for the first time.
 - `conclave_get_observability_stats` — read aggregated cost, token, and model stats.
 
 ### System
+- `conclave_get_engine_quota` — see which engine accounts wait for a usage limit, and until when.
 - `conclave_get_reload_status` — check hot-reload state without triggering one.
 - `conclave_reload_system` — hot-reload Conclave in place (defers while tasks run).
 - `conclave_get_pilot_guide` — re-read this guide, one section or all of it.

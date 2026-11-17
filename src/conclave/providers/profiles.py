@@ -60,6 +60,8 @@ class ResolvedProfile:
     thinking: bool = False
     pure: bool = False
     isolated: bool = True  # worker isolation; secure by default
+    # Continue this engine session instead of starting a new one (after a usage-limit wait).
+    resume_session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,8 +74,9 @@ def build_invocation(profile: ResolvedProfile) -> Invocation:
     """Compose the CLI args and environment overrides for a dispatch (pure).
 
     Args come in this order: ``cli_flags``, the base args, the isolation flags (when
-    ``profile.isolated``), then ``--model``/``--effort`` (flag mode). Without isolation nothing
-    is added, so the args and environment are exactly those of a profile that predates it.
+    ``profile.isolated``), ``--resume <id>`` (when ``profile.resume_session_id`` is set), then
+    ``--model``/``--effort`` (flag mode). Without isolation or a session to resume nothing is
+    added, so the args and environment are exactly those of a profile that predates them.
     """
     args: list[str] = [*profile.cli_flags, *_BASE_ARGS]
     env: dict[str, str] = {}
@@ -81,6 +84,8 @@ def build_invocation(profile: ResolvedProfile) -> Invocation:
     if profile.isolated:
         args += _ISOLATION_ARGS
         env[_DISABLE_AUTO_MEMORY_ENV] = "1"
+    if profile.resume_session_id:
+        args += ["--resume", profile.resume_session_id]
 
     if profile.arg_mode is ArgMode.flag:
         if profile.model:

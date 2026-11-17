@@ -26,7 +26,7 @@ from ..config import ConclaveConfig, WorkflowNode, resolve_agent, resolve_projec
 from ..db import CheckpointStatus, Database, Project, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType, build_notification_sink
-from ..providers import AgentResult, Provider
+from ..providers import AgentResult, Provider, QuotaGate
 from .baseline import build_baseline_preamble
 from .context_limits import BulkBlock, BulkLimit, fit_block, resolve_bulk_limit
 from .gate import GateResult, apply_quarantine, run_tests
@@ -122,12 +122,21 @@ class _GateNote:
 
 class Orchestrator:
     def __init__(
-        self, db: Database, bus: EventBus, provider: Provider, conclave_home: Path
+        self,
+        db: Database,
+        bus: EventBus,
+        provider: Provider,
+        conclave_home: Path,
+        *,
+        quota_gate: QuotaGate | None = None,
     ) -> None:
         self._db = db
         self._bus = bus
         self._provider = provider
         self._home = conclave_home
+        # Where every dispatch waits out a usage limit: the daemon's shared gate, so one limit
+        # hit holds back every task (and project) on that engine account until it resets.
+        self._quota_gate = quota_gate if quota_gate is not None else QuotaGate()
         # Serialize merges into the same target branch so two tasks merging
         # "main" concurrently can never race on a shared worktree path or
         # clobber each other's ref update. Reference-counted (see _merge) so the
@@ -618,7 +627,9 @@ class Orchestrator:
         repo_path = Path(project.path)
         self._repo_path = repo_path
         target_branch = _resolve_target_branch(project, config)
-        runner = AgentRunner(self._db, self._bus, self._provider, project.id, config)
+        runner = AgentRunner(
+            self._db, self._bus, self._provider, project.id, config, quota_gate=self._quota_gate
+        )
         wm = WorktreeManager(repo_path, self._home / "projects" / project.id / "worktrees")
         task_branch = f"{config.execution.branch_prefix}{task.id}"
 
@@ -798,7 +809,9 @@ class Orchestrator:
                 resolve_agent(config, "developer").max_retries if has_enabled_developer else 1
             )
             budget = config.execution.wall_clock_budget_minutes
-            started = time.monotonic()
+            # The budget's clock starts here and leaves out every usage-limit wait from here on
+            # (see _over_budget), so the waits before it are taken off its start.
+            started = time.monotonic() - runner.quota_waited_seconds()
 
             existing_cps = await repo.list_task_checkpoints(self._db, task.id)
             has_review_or_gate = {
@@ -854,7 +867,7 @@ class Orchestrator:
                     resolve_agent(config, "developer").max_retries if has_enabled_developer else 1
                 )
                 budget = config.execution.wall_clock_budget_minutes
-                if _check_budget(started, budget):
+                if _over_budget(runner, started, budget):
                     timed_out = True
                     failed = True
                     break
@@ -959,7 +972,7 @@ class Orchestrator:
                     # before launching the developer agent. The top-of-loop check catches
                     # inter-attempt overruns; this one catches a series of fast attempts
                     # whose cumulative setup (planning, baseline) ate the budget.
-                    if _check_budget(started, budget):
+                    if _over_budget(runner, started, budget):
                         timed_out = True
                         failed = True
                         break
@@ -1283,7 +1296,7 @@ class Orchestrator:
 
                         # HARD cap: abort before running the gate if the wall-clock
                         # budget has been exhausted.
-                        if _check_budget(started, budget):
+                        if _over_budget(runner, started, budget):
                             timed_out = True
                             failed = True
                             break
@@ -2236,7 +2249,7 @@ class Orchestrator:
         if is_parallel_review(config) and len(review_nodes) > 1:
             if cancel_event is not None and cancel_event.is_set():
                 return True, "cancelled", False
-            if _check_budget(started, budget):
+            if _over_budget(runner, started, budget):
                 return True, "Wall-clock budget exceeded during review.", True
 
             for node in review_nodes:
@@ -2357,7 +2370,7 @@ class Orchestrator:
                 # HARD cap: abort the review if the wall-clock budget has been exceeded
                 # before dispatching this reviewer. The orchestrator will fail the task
                 # as timed-out rather than retrying the attempt.
-                if _check_budget(started, budget):
+                if _over_budget(runner, started, budget):
                     return True, "Wall-clock budget exceeded during review.", True
 
                 agent = node.agent or node.id
@@ -3051,6 +3064,12 @@ def _check_budget(started: float, budget_minutes: float) -> bool:
     if budget_minutes <= 0:
         return False
     return (time.monotonic() - started) / 60.0 >= budget_minutes
+
+
+def _over_budget(runner: AgentRunner, started: float, budget_minutes: float) -> bool:
+    """:func:`_check_budget` for a task whose dispatches run on *runner*, leaving out the time
+    they spent waiting for a usage limit to reset: a wait never consumes the budget."""
+    return _check_budget(started + runner.quota_waited_seconds(), budget_minutes)
 
 
 def _diff_hint(diff_cmd: str) -> str:

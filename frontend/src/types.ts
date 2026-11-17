@@ -299,6 +299,22 @@ export interface SwarmBatchResponse {
   tasks: Task[];
 }
 
+/** One engine account's usage-limit gate (GET /api/engines/quota). While it is closed, every
+ * dispatch on that account waits until `resumes_at`, then resumes. */
+export interface EngineQuotaGate {
+  /** "claude-code", or "opencode/<provider>" (e.g. "opencode/deepseek"). */
+  key: string;
+  engine: string;
+  closed: boolean;
+  resumes_at: string | null;
+  kind: "rate_limit" | "billing" | null;
+  window: string | null;
+  resets_at: string | null;
+  message: string | null;
+  /** The latest rate_limit_info Claude Code reported (status, windows, reset times). */
+  rate_limit: Record<string, unknown> | null;
+}
+
 export interface ModelCatalog {
   /** agent_defaults.model of the resolved settings; null = the engine's own default. */
   default_model: string | null;

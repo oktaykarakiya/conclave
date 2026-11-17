@@ -498,6 +498,30 @@ export function SettingsView({
           </label>
 
           <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">
+              Usage-Limit Retry (minutes, 1 to 1440)
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              className={input}
+              value={Number(execution.quota_retry_minutes ?? 15)}
+              onChange={(e) =>
+                updateSection(
+                  "execution",
+                  "quota_retry_minutes",
+                  Math.max(1, Math.min(1440, Number(e.target.value) || 1)),
+                )
+              }
+            />
+            <span className="block text-[11px] text-zinc-500">
+              A dispatch refused for a usage limit or balance waits for the reset, then resumes;
+              this is how long it waits when the engine gives no reset time.
+            </span>
+          </label>
+
+          <label className="block space-y-1">
             <span className="text-xs font-medium text-zinc-400">Webhook Notification URL</span>
             <input
               className={input}

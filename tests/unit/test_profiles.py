@@ -185,3 +185,40 @@ def test_extra_env_overrides_last() -> None:
     )
     assert inv.env["ANTHROPIC_MODEL"] == "override"
     assert inv.env["FOO"] == "bar"
+
+
+def test_a_session_to_resume_adds_resume_after_isolation_and_before_the_model() -> None:
+    inv = build_invocation(
+        ResolvedProfile(
+            name="claude-code",
+            arg_mode=ArgMode.flag,
+            model="opus",
+            effort="xhigh",
+            resume_session_id="ses-123",
+        )
+    )
+    assert inv.args == [
+        *_BASE, *_ISOLATION, "--resume", "ses-123", "--model", "opus", "--effort", "xhigh"
+    ]
+
+
+@pytest.mark.parametrize("mode", list(ArgMode))
+@pytest.mark.parametrize("isolated", [True, False])
+def test_no_session_to_resume_leaves_the_invocation_unchanged(
+    mode: ArgMode, isolated: bool
+) -> None:
+    def build(**resume: str) -> tuple[list[str], dict[str, str]]:
+        inv = build_invocation(
+            ResolvedProfile(
+                name="p", arg_mode=mode, model="m", effort="high", isolated=isolated, **resume
+            )
+        )
+        return inv.args, inv.env
+
+    assert ResolvedProfile(name="p", arg_mode=mode).resume_session_id is None
+    plain_args, plain_env = build()
+    resumed_args, resumed_env = build(resume_session_id="s")
+    assert "--resume" not in plain_args
+    assert resumed_env == plain_env
+    at = resumed_args.index("--resume")
+    assert resumed_args[:at] + resumed_args[at + 2 :] == plain_args

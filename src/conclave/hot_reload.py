@@ -62,6 +62,7 @@ _EXPLICIT_MODULE_RANKS: dict[str, tuple[int, int]] = {
     "conclave.providers.opencode_cli": (8, 3),
     "conclave.providers.effort": (8, 4),
     "conclave.providers.router": (8, 5),
+    "conclave.providers.quota": (8, 6),
     "conclave.providers": (8, 99),
     # bootstrap
     "conclave.bootstrap": (9, 0),
@@ -565,7 +566,15 @@ class HotReloader:
             from .engine.bug_fixer import BugFixerController
             from .engine.orchestrator import Orchestrator
             from .planning.session import PlanningOrchestrator
+            from .providers import QuotaGate
             from .runtime import ProjectWorker
+
+            # Keep the daemon's one usage-limit gate (its closures and the waits on it) across
+            # the reload; a daemon started before the gate existed gets it here, once.
+            quota_gate = getattr(daemon, "quota_gate", None)
+            if quota_gate is None:
+                quota_gate = QuotaGate()
+                daemon.quota_gate = quota_gate
 
             old_orch = getattr(daemon, "orchestrator", None)
             if old_orch is not None and db is not None:
@@ -574,6 +583,7 @@ class HotReloader:
                     daemon.bus,
                     daemon.provider,
                     daemon.home,
+                    quota_gate=quota_gate,
                 )
                 new_orch._merge_locks = dict(getattr(old_orch, "_merge_locks", {}))
                 new_orch._merge_lock_refs = dict(getattr(old_orch, "_merge_lock_refs", {}))
@@ -595,6 +605,7 @@ class HotReloader:
                     daemon.db,
                     daemon.bus,
                     daemon.provider,
+                    quota_gate=quota_gate,
                 )
                 new_planning._active_sessions = dict(
                     getattr(old_planning, "_active_sessions", {})

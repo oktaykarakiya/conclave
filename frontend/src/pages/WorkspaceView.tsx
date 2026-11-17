@@ -3286,6 +3286,17 @@ function summarizeEvent(ev: EventRow): string {
       return `failed: ${String(p.reason ?? "unknown")}`;
     case "operator.steer":
       return `steer: ${String(p.message ?? p.text ?? "")}`;
+    case "quota.waiting": {
+      // A weekly limit resets days later, so the date is shown too.
+      const resumes =
+        typeof p.resumes_at === "string" ? new Date(p.resumes_at).toLocaleString() : "?";
+      const what = p.kind === "billing" ? "balance ran out" : "limit reached";
+      return `${String(p.agent ?? ev.agent ?? "agent")}: ${String(p.key ?? "engine")} ${what} — waiting until ${resumes}`;
+    }
+    case "quota.resumed":
+      return `${String(p.agent ?? ev.agent ?? "agent")}: resumed after ${Math.round(
+        Number(p.waited_seconds ?? 0),
+      )}s${p.resumed_session ? " (same session)" : ""}`;
     default:
       return Object.keys(p).length > 0 ? JSON.stringify(p) : ev.type;
   }
@@ -3310,7 +3321,7 @@ function eventColorClass(ev: EventRow): string {
   if (ev.type === "agent.dispatched" || ev.type.startsWith("attempt.")) {
     return "text-sky-300";
   }
-  if (ev.type === "operator.steer") {
+  if (ev.type === "operator.steer" || ev.type.startsWith("quota.")) {
     return "text-amber-300";
   }
   return "text-zinc-300";

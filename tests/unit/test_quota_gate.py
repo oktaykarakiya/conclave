@@ -1,0 +1,514 @@
+"""The usage-limit gate and the shared dispatch path that waits on it (``providers.quota``).
+
+Deterministic: every gate runs on a fake clock, and its sleep either advances that clock or
+blocks until the test moves it, so nothing ever waits for real.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from conclave.config import ArgMode
+from conclave.providers import (
+    CONTINUATION_PROMPT,
+    AgentResult,
+    Engine,
+    OnChunk,
+    QuotaExhausted,
+    QuotaGate,
+    QuotaWait,
+    ResolvedProfile,
+    WaitTracker,
+    dispatch_with_quota,
+    quota_key,
+)
+
+T0 = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
+
+
+def _limit() -> QuotaExhausted:
+    """Built per use, never at import: a hot-reload test swaps the conclave classes in place."""
+    return QuotaExhausted(kind="rate_limit", window="five_hour", message="You've hit your limit")
+
+
+class FakeClock:
+    """A UTC clock that only moves when a gate sleeps on it (by the time slept)."""
+
+    def __init__(self, start: datetime = T0) -> None:
+        self.current = start
+        self.slept: list[float] = []
+
+    def now(self) -> datetime:
+        return self.current
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.current += timedelta(seconds=seconds)
+        await asyncio.sleep(0)
+
+
+class SteppedClock:
+    """A clock whose sleepers block until the test moves it with :meth:`advance`."""
+
+    def __init__(self, start: datetime = T0) -> None:
+        self.current = start
+        self._moved = asyncio.Event()
+        self.sleepers = 0
+
+    def now(self) -> datetime:
+        return self.current
+
+    async def sleep(self, seconds: float) -> None:
+        moved = self._moved
+        self.sleepers += 1
+        try:
+            await moved.wait()
+        finally:
+            self.sleepers -= 1
+
+    def advance(self, delta: timedelta) -> None:
+        self.current += delta
+        moved, self._moved = self._moved, asyncio.Event()
+        moved.set()
+
+
+async def _settle() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def _profile(model: str | None = "deepseek/deepseek-flash") -> ResolvedProfile:
+    return ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit, model=model)
+
+
+# --- closing and reopening ---------------------------------------------------------------
+
+
+def test_a_reported_reset_closes_the_key_until_the_reset_plus_a_minute() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    resets_at = T0 + timedelta(hours=2)
+
+    reopens_at = gate.close(
+        "claude-code", "claude", QuotaExhausted(kind="rate_limit", resets_at=resets_at),
+        retry_minutes=15,
+    )
+
+    assert reopens_at == resets_at + timedelta(seconds=60)
+    wait = gate.pending("claude-code")
+    assert wait is not None and wait.resumes_at == reopens_at and wait.engine == "claude"
+    clock.current = reopens_at - timedelta(seconds=1)
+    assert gate.pending("claude-code") is not None
+    clock.current = reopens_at
+    assert gate.pending("claude-code") is None
+
+
+def test_without_a_reset_time_the_key_closes_for_the_retry_minutes() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+
+    reopens_at = gate.close(
+        "opencode/deepseek", "opencode", QuotaExhausted(kind="billing"), retry_minutes=15
+    )
+
+    assert reopens_at == T0 + timedelta(minutes=15)
+
+
+def test_a_reset_time_already_past_falls_back_to_the_retry_minutes() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    stale = QuotaExhausted(kind="rate_limit", resets_at=T0 - timedelta(minutes=5))
+
+    assert gate.close("claude-code", "claude", stale, retry_minutes=7) == T0 + timedelta(
+        minutes=7
+    )
+
+
+def test_a_closure_is_extended_but_never_shortened() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    late = QuotaExhausted(kind="rate_limit", resets_at=T0 + timedelta(hours=3), window="seven_day")
+    early = QuotaExhausted(kind="rate_limit", resets_at=T0 + timedelta(minutes=10))
+
+    first = gate.close("claude-code", "claude", late, retry_minutes=15)
+    assert gate.close("claude-code", "claude", early, retry_minutes=15) == first
+    wait = gate.pending("claude-code")
+    assert wait is not None and wait.quota.window == "seven_day"
+
+    later = QuotaExhausted(kind="rate_limit", resets_at=T0 + timedelta(hours=5))
+    assert gate.close("claude-code", "claude", later, retry_minutes=15) == (
+        T0 + timedelta(hours=5, seconds=60)
+    )
+
+
+def test_keys_are_isolated() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+
+    gate.close("claude-code", "claude", _limit(), retry_minutes=15)
+    assert gate.pending("opencode/deepseek") is None
+
+    gate.close("opencode/deepseek", "opencode", _limit(), retry_minutes=15)
+    assert gate.pending("opencode/openai") is None
+    assert gate.pending("opencode/deepseek") is not None
+
+
+@dataclass
+class _Router:
+    default: Engine
+
+
+@pytest.mark.parametrize(
+    ("model", "default", "expected"),
+    [
+        ("claude-code/opus", Engine.opencode, ("claude", "claude-code")),
+        ("claude-code/default", Engine.opencode, ("claude", "claude-code")),
+        (None, Engine.claude, ("claude", "claude-code")),
+        ("deepseek/deepseek-flash", Engine.opencode, ("opencode", "opencode/deepseek")),
+        ("deepseek/deepseek-reasoner", Engine.opencode, ("opencode", "opencode/deepseek")),
+        ("openai/gpt-5", Engine.opencode, ("opencode", "opencode/openai")),
+        (None, Engine.opencode, ("opencode", "opencode/default")),
+    ],
+)
+def test_quota_key_is_one_per_engine_account(
+    model: str | None, default: Engine, expected: tuple[str, str]
+) -> None:
+    assert quota_key(_Router(default), _profile(model)) == expected  # type: ignore[arg-type]
+
+
+# --- waiting -----------------------------------------------------------------------------
+
+
+async def test_two_waiters_are_released_together_when_the_key_reopens() -> None:
+    clock = SteppedClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    gate.close("claude-code", "claude", _limit(), retry_minutes=5)
+    first = asyncio.create_task(gate.wait("claude-code"))
+    second = asyncio.create_task(gate.wait("claude-code"))
+    await _settle()
+    assert clock.sleepers == 2
+
+    clock.advance(timedelta(minutes=4))
+    await _settle()
+    assert not first.done() and not second.done()
+
+    clock.advance(timedelta(minutes=1))
+    assert await asyncio.wait_for(asyncio.gather(first, second), 1) == [True, True]
+
+
+async def test_a_wait_sleeps_in_chunks_of_at_most_a_minute() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    gate.close(
+        "claude-code", "claude",
+        QuotaExhausted(kind="rate_limit", resets_at=T0 + timedelta(minutes=10)),
+        retry_minutes=15,
+    )
+
+    assert await gate.wait("claude-code") is True
+
+    assert clock.current == T0 + timedelta(minutes=11)
+    assert max(clock.slept) <= 60 and len(clock.slept) == 11
+
+
+async def test_a_cancel_ends_the_wait_at_once() -> None:
+    clock = FakeClock()  # never advances on its own: only a real sleep would end this wait
+    gate = QuotaGate(clock=clock.now)  # the real asyncio.sleep, in one-minute chunks
+    gate.close("claude-code", "claude", _limit(), retry_minutes=600)
+    cancel = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.05, cancel.set)
+    started = time.monotonic()
+
+    assert await gate.wait("claude-code", cancel) is False
+
+    assert time.monotonic() - started < 1
+
+
+async def test_claim_notification_is_true_once_per_closure_and_project() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    assert gate.claim_notification("claude-code", "p1") is False  # nothing is closed
+
+    gate.close("claude-code", "claude", _limit(), retry_minutes=5)
+    assert gate.claim_notification("claude-code", "p1") is True
+    assert gate.claim_notification("claude-code", "p1") is False
+    assert gate.claim_notification("claude-code", "p2") is True
+    gate.close("claude-code", "claude", _limit(), retry_minutes=10)  # extended: same closure
+    assert gate.claim_notification("claude-code", "p1") is False
+
+    clock.current += timedelta(minutes=11)
+    gate.close("claude-code", "claude", _limit(), retry_minutes=5)  # a new closure
+    assert gate.claim_notification("claude-code", "p1") is True
+
+
+def test_snapshot_reports_closed_gates_and_rate_limit_info() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    info = {"status": "allowed_warning", "resetsAt": 1794924600, "rateLimitType": "five_hour"}
+    gate.record_rate_limit("claude-code", "claude", info)
+    resets_at = T0 + timedelta(hours=1)
+    gate.close(
+        "opencode/deepseek", "opencode",
+        QuotaExhausted(kind="rate_limit", resets_at=resets_at, message="429"),
+        retry_minutes=15,
+    )
+
+    assert gate.snapshot() == [
+        {
+            "key": "claude-code",
+            "engine": "claude",
+            "closed": False,
+            "resumes_at": None,
+            "kind": None,
+            "window": None,
+            "resets_at": None,
+            "message": None,
+            "rate_limit": info,
+        },
+        {
+            "key": "opencode/deepseek",
+            "engine": "opencode",
+            "closed": True,
+            "resumes_at": (resets_at + timedelta(seconds=60)).isoformat(),
+            "kind": "rate_limit",
+            "window": None,
+            "resets_at": resets_at.isoformat(),
+            "message": "429",
+            "rate_limit": None,
+        },
+    ]
+    clock.current = resets_at + timedelta(minutes=2)
+    assert [row["closed"] for row in gate.snapshot()] == [False, False]
+
+
+def test_wait_tracker_counts_overlapping_waits_once() -> None:
+    clock = FakeClock()
+    waits = WaitTracker(clock.now)
+    with waits.waiting():
+        clock.current += timedelta(minutes=10)
+        with waits.waiting():  # a second reviewer waits for the same reset
+            clock.current += timedelta(minutes=20)
+        assert waits.seconds() == 30 * 60
+        clock.current += timedelta(minutes=5)
+    clock.current += timedelta(hours=1)  # not waiting
+    with waits.waiting():
+        clock.current += timedelta(minutes=1)
+
+    assert waits.seconds() == 36 * 60
+
+
+# --- the shared dispatch path ------------------------------------------------------------
+
+
+@dataclass
+class _Call:
+    profile: ResolvedProfile
+    prompt: str
+    at: datetime
+
+
+@dataclass
+class ScriptedProvider:
+    """Answers each dispatch with the next scripted result, recording the call and its time."""
+
+    clock: FakeClock | SteppedClock
+    script: list[AgentResult]
+    calls: list[_Call] = field(default_factory=list)
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        self.calls.append(_Call(profile, prompt, self.clock.now()))
+        return self.script.pop(0)
+
+
+@dataclass
+class RecordingListener:
+    events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    fail: bool = False
+
+    async def waiting(self, wait: QuotaWait, interrupted: AgentResult | None) -> None:
+        self.events.append(("waiting", {**wait.payload(), "interrupted": interrupted}))
+        if self.fail:
+            raise RuntimeError("listener broke")
+
+    async def resumed(
+        self, wait: QuotaWait, *, waited_seconds: float, resumed_session: bool
+    ) -> None:
+        self.events.append(
+            (
+                "resumed",
+                {"key": wait.key, "waited": waited_seconds, "resumed_session": resumed_session},
+            )
+        )
+        if self.fail:
+            raise RuntimeError("listener broke")
+
+
+def _refused(
+    session_id: str | None = "ses-1", quota: QuotaExhausted | None = None
+) -> AgentResult:
+    quota = quota if quota is not None else _limit()
+    return AgentResult(ok=False, error=quota.message, quota=quota, session_id=session_id)
+
+
+async def _dispatch(
+    provider: ScriptedProvider,
+    gate: QuotaGate,
+    *,
+    listener: RecordingListener | None = None,
+    waits: WaitTracker | None = None,
+    cancel_event: asyncio.Event | None = None,
+    model: str = "deepseek/deepseek-flash",
+) -> AgentResult:
+    return await dispatch_with_quota(
+        provider,  # type: ignore[arg-type]
+        gate,
+        profile=_profile(model),
+        prompt="the original task",
+        timeout_seconds=60,
+        retry_minutes=15,
+        cancel_event=cancel_event,
+        listener=listener,
+        waits=waits,
+    )
+
+
+async def test_a_limit_hit_waits_then_continues_the_reported_session() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    resets_at = T0 + timedelta(hours=1)
+    provider = ScriptedProvider(
+        clock,
+        [
+            _refused(quota=QuotaExhausted(kind="rate_limit", resets_at=resets_at, message="x")),
+            AgentResult(ok=True, text="done"),
+        ],
+    )
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert result.ok is True and result.text == "done"
+    first, resumed = provider.calls
+    assert (first.profile.resume_session_id, first.prompt) == (None, "the original task")
+    assert resumed.profile.resume_session_id == "ses-1"
+    assert resumed.prompt == CONTINUATION_PROMPT
+    assert resumed.at == resets_at + timedelta(seconds=60)
+    (kind, waiting), (_, done) = listener.events
+    assert kind == "waiting"
+    assert waiting["key"] == "opencode/deepseek" and waiting["engine"] == "opencode"
+    assert waiting["resumes_at"] == (resets_at + timedelta(seconds=60)).isoformat()
+    assert waiting["interrupted"] is not None and waiting["interrupted"].session_id == "ses-1"
+    assert done == {"key": "opencode/deepseek", "waited": 3660.0, "resumed_session": True}
+
+
+async def test_a_key_closed_by_another_dispatch_delays_this_one_until_it_reopens() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    reopens_at = gate.close("opencode/deepseek", "opencode", _limit(), retry_minutes=15)
+    provider = ScriptedProvider(clock, [AgentResult(ok=True, text="done")])
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert result.ok is True
+    (call,) = provider.calls
+    assert call.at >= reopens_at
+    assert call.profile.resume_session_id is None and call.prompt == "the original task"
+    assert [kind for kind, _ in listener.events] == ["waiting", "resumed"]
+    assert listener.events[0][1]["interrupted"] is None
+    assert listener.events[1][1]["resumed_session"] is False
+
+
+async def test_an_unknown_session_falls_back_to_the_original_prompt() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock,
+        [
+            _refused(),
+            AgentResult(ok=False, error="No conversation found with session ID: ses-1"),
+            AgentResult(ok=True, text="fresh"),
+        ],
+    )
+
+    result = await _dispatch(provider, gate)
+
+    assert result.text == "fresh"
+    _, resume, fresh = provider.calls
+    assert resume.profile.resume_session_id == "ses-1"
+    assert fresh.profile.resume_session_id is None and fresh.prompt == "the original task"
+
+
+async def test_a_second_limit_hit_waits_again() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock, [_refused(), _refused(), _refused(), AgentResult(ok=True, text="done")]
+    )
+    listener = RecordingListener()
+    waits = WaitTracker(clock.now)
+
+    result = await _dispatch(provider, gate, listener=listener, waits=waits)
+
+    assert result.ok is True
+    assert [kind for kind, _ in listener.events] == ["waiting", "resumed"] * 3
+    resumed = [c.profile.resume_session_id for c in provider.calls]
+    assert resumed == [None, "ses-1", "ses-1", "ses-1"]
+    assert waits.seconds() == 3 * 15 * 60
+
+
+async def test_a_cancel_during_the_wait_returns_cancelled_without_another_run() -> None:
+    clock = SteppedClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(clock, [_refused(), AgentResult(ok=True, text="never")])
+    cancel = asyncio.Event()
+    dispatch = asyncio.create_task(_dispatch(provider, gate, cancel_event=cancel))
+    await _settle()
+    assert clock.sleepers == 1
+
+    cancel.set()
+    result = await asyncio.wait_for(dispatch, 1)
+
+    assert result.cancelled is True and result.ok is False and result.error == "cancelled"
+    assert len(provider.calls) == 1
+
+
+async def test_a_failing_listener_never_breaks_the_dispatch() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(clock, [_refused(), AgentResult(ok=True, text="done")])
+
+    result = await _dispatch(provider, gate, listener=RecordingListener(fail=True))
+
+    assert result.ok is True
+
+
+async def test_allowed_warning_only_updates_the_rate_limit_info() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    info = {"status": "allowed_warning", "resetsAt": 1794924600, "rateLimitType": "seven_day"}
+    provider = ScriptedProvider(clock, [AgentResult(ok=True, text="done", rate_limit_info=info)])
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener, model="claude-code/opus")
+
+    assert result.ok is True and listener.events == [] and clock.slept == []
+    (row,) = gate.snapshot()
+    assert (row["key"], row["engine"]) == ("claude-code", "claude")
+    assert row["closed"] is False and row["rate_limit"] == info

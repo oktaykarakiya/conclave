@@ -3,6 +3,12 @@
 Spawns the CLI under the profile's composed args + environment, pipes the prompt via
 stdin (avoiding arg-length limits), optionally streams stdout chunks to ``on_chunk``,
 and parses the JSON envelope for the result text, reported model, cost, and turns.
+
+A run refused for a usage limit or billing is reported as ``AgentResult.quota`` (never ok), see
+:func:`_detect_quota`: the stream's latest ``rate_limit_info`` refuses requests, the last
+assistant message's top-level ``error`` is ``rate_limit`` or ``billing_error``, or, for CLIs that
+report no rate limits, the short final text is the CLI's own limit wording. The latest
+``rate_limit_info`` of the stream is kept as ``AgentResult.rate_limit_info``.
 """
 
 from __future__ import annotations
@@ -16,10 +22,12 @@ import shutil
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .base import AgentResult, OnChunk
+from .base import AgentResult, OnChunk, QuotaExhausted, QuotaKind, epoch_to_utc
 from .profiles import ResolvedProfile, build_invocation
 
 
@@ -50,6 +58,19 @@ _TRANSIENT_CONN_ERROR = re.compile(
 )
 _CLAUDE_TRANSIENT_RETRY_DELAY_S = 1.0
 _CLAUDE_MAX_ATTEMPTS = 3
+
+# An assistant message's top-level ``error`` for a refused request, and the quota kind it means.
+_QUOTA_ERRORS: dict[str, QuotaKind] = {"rate_limit": "rate_limit", "billing_error": "billing"}
+# Fallback for CLIs without the structured signals (a stream with no rate_limit_event at all):
+# the whole final text is the CLI's own limit message, e.g. "You've hit your limit · resets
+# 3pm", "usage limit reached · continues automatically when it resets", or the legacy
+# "Claude AI usage limit reached|<epoch>" (the epoch is the reset time). Only a short text that
+# starts with it counts, so an answer quoting the wording is never mistaken for a limit.
+_LIMIT_TEXT = re.compile(
+    r"(?i)^(?:claude (?:ai )?usage limit reached\|(?P<epoch>\d{9,13})"
+    r"|(?:claude (?:ai )?)?usage limit reached\b|you(?:'|\u2019)ve hit your (?:usage )?limit\b)"
+)
+_LIMIT_TEXT_MAX_CHARS = 300
 
 # Provider-controlled env vars that must NOT leak from the parent process into
 # inherit/flag-mode dispatches. In env-mode, build_invocation reintroduces them.
@@ -194,6 +215,10 @@ class ClaudeCliProvider:
                     with contextlib.suppress(asyncio.CancelledError):
                         await cancel_wait_task
                 last_result = _parse_envelope(raw, proc.returncode)
+                # A usage limit is not a dropped connection: re-running it at once would be
+                # refused again. The shared dispatch path waits for the reset instead.
+                if last_result.quota is not None:
+                    return last_result
                 # Match the outcome only, not the whole stream: tool output in the
                 # transcript (e.g. a test printing ECONNREFUSED) must not re-run the agent.
                 outcome = last_result.error or last_result.text
@@ -223,7 +248,8 @@ class ClaudeCliProvider:
 def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
     """Parse the CLI's output: a single ``--output-format json`` envelope, or the
     ``stream-json`` NDJSON stream whose final ``{"type": "result"}`` event carries the
-    same fields. Tool calls and the session id are collected from the stream events."""
+    same fields. Tool calls, the session id and the rate-limit signals are collected from the
+    stream events."""
     text = raw
     model_reported: str | None = None
     cost_usd: float | None = None
@@ -237,10 +263,12 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
         "cache_read_tokens": None,
         "cache_creation_tokens": None,
     }
+    scan = _StreamScan()
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        parsed = _scan_stream(raw, tool_breakdown)
+        scan = _scan_stream(raw, tool_breakdown)
+        parsed = scan.result
     if isinstance(parsed, dict):
         text = str(parsed.get("result", raw))
         is_error = parsed.get("is_error") is True
@@ -262,11 +290,21 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
             tokens["output_tokens"] = _as_int(usage.get("output_tokens"))
             tokens["cache_read_tokens"] = _as_int(usage.get("cache_read_input_tokens"))
             tokens["cache_creation_tokens"] = _as_int(usage.get("cache_creation_input_tokens"))
+    session_id = session_id or scan.session_id
 
-    ok = (exit_code == 0 or bool(_SUCCESS_HINT.search(text))) and not is_error
+    quota = _detect_quota(scan, text)
+    ok = (
+        (exit_code == 0 or bool(_SUCCESS_HINT.search(text)))
+        and not is_error
+        and quota is None
+    )
     error: str | None = None
     if not ok:
-        error = text.strip()[-500:] or f"claude exited with code {exit_code}"
+        error = (
+            text.strip()[-500:]
+            or (quota.message if quota is not None else "")
+            or f"claude exited with code {exit_code}"
+        )
     return AgentResult(
         ok=ok,
         text=text,
@@ -282,14 +320,27 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
         session_id=session_id,
         tool_calls_count=sum(tool_breakdown.values()),
         tool_breakdown=tool_breakdown,
+        quota=quota,
+        rate_limit_info=scan.rate_limit,
     )
 
 
-def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> dict[str, Any] | None:
-    """Walk ``stream-json`` lines: tally ``tool_use`` blocks into *tool_breakdown* and
-    return the last ``result`` event (``None`` when the stream never produced one, e.g.
-    a killed process or non-JSON output — the caller then keeps the raw text)."""
-    result: dict[str, Any] | None = None
+@dataclass
+class _StreamScan:
+    """What :func:`_scan_stream` collects from a ``stream-json`` run."""
+
+    result: dict[str, Any] | None = None  # the last ``result`` event
+    session_id: str | None = None  # the last session id any event carried
+    rate_limit: dict[str, Any] | None = None  # the latest ``rate_limit_info``
+    error: str | None = None  # the top-level ``error`` of the last assistant message, if any
+    error_text: str = ""  # that message's text
+
+
+def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> _StreamScan:
+    """Walk ``stream-json`` lines: tally ``tool_use`` blocks into *tool_breakdown*, keep the last
+    ``result`` event (``None`` when the stream never produced one, e.g. a killed process or
+    non-JSON output — the caller then keeps the raw text) and the rate-limit signals."""
+    scan = _StreamScan()
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -300,17 +351,125 @@ def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> dict[str, Any] | N
             continue
         if not isinstance(obj, dict):
             continue
+        sid = obj.get("session_id")
+        if isinstance(sid, str) and sid:
+            scan.session_id = sid
         etype = obj.get("type")
         if etype == "result":
-            result = obj
+            scan.result = obj
+        elif etype == "rate_limit_event":
+            info = obj.get("rate_limit_info")
+            if isinstance(info, dict):
+                scan.rate_limit = info
         elif etype == "assistant":
             message = obj.get("message")
             content = message.get("content") if isinstance(message, dict) else None
-            for block in content if isinstance(content, list) else []:
+            blocks = content if isinstance(content, list) else []
+            for block in blocks:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = str(block.get("name") or "tool")
                     tool_breakdown[name] = tool_breakdown.get(name, 0) + 1
-    return result
+            # Only the last assistant message's error counts: a run that went on after a
+            # refused request (a later message without one) was not stopped by it.
+            error = obj.get("error")
+            scan.error = error if isinstance(error, str) and error else None
+            scan.error_text = (
+                "".join(
+                    str(block.get("text") or "")
+                    for block in blocks
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ).strip()
+                if scan.error is not None
+                else ""
+            )
+    return scan
+
+
+def _detect_quota(scan: _StreamScan, text: str) -> QuotaExhausted | None:
+    """The usage limit or billing refusal a run ended on, or ``None``.
+
+    A run is refused when any of these holds:
+
+    - the stream's latest ``rate_limit_info`` refuses requests (:func:`_refuses`). Only the
+      latest counts: the CLI reports one on every turn, so an earlier ``rejected`` that a later
+      one replaced no longer stops anything;
+    - the last assistant message's top-level ``error`` is ``rate_limit`` or ``billing_error``
+      (``billing``);
+    - the stream reported no rate limits at all (an older CLI, or an account whose responses
+      carry none) and the short final text is the CLI's own limit message.
+
+    The reset time is the latest reset of the limiting windows (:func:`_limit_window`) of the
+    refusing info, else (for a rate limit, not a billing refusal) of the latest info, else the
+    legacy text's epoch, else unknown.
+    """
+    final = text.strip()
+    limit_text = (
+        _LIMIT_TEXT.match(final)
+        if scan.rate_limit is None and final and len(final) <= _LIMIT_TEXT_MAX_CHARS
+        else None
+    )
+    refusing = scan.rate_limit if _refuses(scan.rate_limit) else None
+    error_kind = _QUOTA_ERRORS.get(scan.error or "")
+    if refusing is None and error_kind is None and limit_text is None:
+        return None
+    kind: QuotaKind = error_kind or "rate_limit"
+    window, resets_at = _limit_window(refusing)
+    if resets_at is None and kind == "rate_limit":
+        latest_window, resets_at = _limit_window(scan.rate_limit)
+        window = window or latest_window
+    if resets_at is None and limit_text is not None and limit_text["epoch"]:
+        resets_at = epoch_to_utc(int(limit_text["epoch"]))
+    # The engine's own words: the limit text, else the refused message, else the result's text
+    # (never the raw stream a run without a result event leaves as its text).
+    message = (
+        (final if limit_text is not None else "")
+        or scan.error_text
+        or (final if scan.result is not None else "")
+        or ("billing error" if kind == "billing" else "usage limit reached")
+    )
+    return QuotaExhausted(
+        kind=kind, resets_at=resets_at, window=window, message=message[:_LIMIT_TEXT_MAX_CHARS]
+    )
+
+
+def _refuses(info: dict[str, Any] | None) -> bool:
+    """Whether a ``rate_limit_info`` says requests are refused: the CLI's own still-usable test
+    (``status != "rejected" || isUsingOverage || overageInUse``) fails. With ``isUsingOverage``
+    or ``overageInUse`` true, paid extra usage serves the requests past the rejected limit."""
+    return (
+        info is not None
+        and info.get("status") == "rejected"
+        and info.get("isUsingOverage") is not True
+        and info.get("overageInUse") is not True
+    )
+
+
+def _limit_window(info: dict[str, Any] | None) -> tuple[str | None, datetime | None]:
+    """``(window, resets_at)`` of a ``rate_limit_info``: its own ``rateLimitType`` and
+    ``resetsAt`` (the window that limits now), and, when its status is ``rejected``, every
+    rejected unified window too; of those, the one that resets last, since requests stay refused
+    until all of them have reset."""
+    if info is None:
+        return None, None
+    window_type = info.get("rateLimitType")
+    own_window = window_type if isinstance(window_type, str) and window_type else None
+    limiting: list[tuple[datetime, str | None]] = []
+    if (own_reset := epoch_to_utc(info.get("resetsAt"))) is not None:
+        limiting.append((own_reset, own_window))
+    windows = info.get("unifiedWindows")
+    if info.get("status") == "rejected" and isinstance(windows, dict):
+        limiting += [
+            (resets_at, str(name))
+            for name, window in windows.items()
+            if isinstance(window, dict)
+            and window.get("status") == "rejected"
+            and (resets_at := epoch_to_utc(window.get("resetsAt"))) is not None
+        ]
+    if not limiting:
+        return own_window, None
+    # The latest reset; on a tie, a window with a name.
+    resets_at, name = max(limiting, key=lambda candidate: (candidate[0], candidate[1] is not None))
+    return name, resets_at
 
 
 def _as_int(value: object) -> int | None:

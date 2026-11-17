@@ -8,7 +8,9 @@ Fixtures mirror real ``opencode run --format json`` output: one JSON event per l
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -327,3 +329,157 @@ async def test_cancelled_run_is_not_retried_even_if_output_looks_transient(
     assert len(spawns) == 1
     assert result.cancelled is True
     assert result.ok is False
+
+
+# --- usage limits ----------------------------------------------------------------------------
+# The error event opencode 1.19.5 emits (and exits 1) when DeepSeek answers HTTP 402.
+_BALANCE_EVENT = {
+    "type": "error",
+    "sessionID": "ses_402",
+    "error": {
+        "name": "APIError",
+        "data": {
+            "message": "Insufficient Balance (request_id: 7f3a)",
+            "statusCode": 402,
+            "isRetryable": False,
+            "responseHeaders": {"content-type": "application/json"},
+        },
+    },
+}
+_NOW = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
+
+
+def _rate_limited(headers: dict[str, str] | None = None) -> str:
+    data: dict[str, Any] = {"message": "Too Many Requests", "statusCode": 429, "isRetryable": True}
+    if headers is not None:
+        data["responseHeaders"] = headers
+    event = {"type": "error", "sessionID": "ses_429", "error": {"name": "APIError", "data": data}}
+    return json.dumps(event) + "\n"
+
+
+def test_parse_events_reports_402_insufficient_balance_as_billing() -> None:
+    result = _parse_events(json.dumps(_BALANCE_EVENT) + "\n", exit_code=1, now=_NOW)
+
+    assert result.ok is False
+    assert result.quota is not None
+    assert result.quota.kind == "billing"
+    assert result.quota.resets_at is None
+    assert result.quota.message == "Insufficient Balance (request_id: 7f3a)"
+    assert result.session_id == "ses_402"
+    assert result.error == "Insufficient Balance (request_id: 7f3a)"
+
+
+@pytest.mark.parametrize(
+    ("headers", "after"),
+    [
+        ({"retry-after": "30"}, timedelta(seconds=30)),
+        ({"Retry-After-Ms": "1500"}, timedelta(milliseconds=1500)),
+        ({"retry-after": "Tue, 17 Nov 2026 12:05:00 GMT"}, timedelta(minutes=5)),
+        (None, None),
+        ({"content-type": "application/json"}, None),
+    ],
+)
+def test_parse_events_reports_429_with_the_retry_after_reset(
+    headers: dict[str, str] | None, after: timedelta | None
+) -> None:
+    result = _parse_events(_rate_limited(headers), exit_code=1, now=_NOW)
+
+    assert result.ok is False
+    assert result.quota is not None and result.quota.kind == "rate_limit"
+    assert result.quota.resets_at == (_NOW + after if after is not None else None)
+    assert result.session_id == "ses_429"
+
+
+@pytest.mark.parametrize(
+    ("message", "kind"),
+    [
+        ("You exceeded your current quota, please check your plan", "billing"),
+        ("Rate limit reached for requests", "rate_limit"),
+    ],
+)
+def test_parse_events_reads_the_quota_from_the_message_without_a_status(
+    message: str, kind: str
+) -> None:
+    event = {"type": "error", "error": {"name": "APIError", "data": {"message": message}}}
+
+    quota = _parse_events(json.dumps(event), exit_code=1, now=_NOW).quota
+
+    assert quota is not None and quota.kind == kind
+
+
+def test_parse_events_other_errors_are_not_a_quota() -> None:
+    event = {"type": "error", "error": {"data": {"message": "Bad Request", "statusCode": 400}}}
+
+    result = _parse_events(json.dumps(event), exit_code=1)
+
+    assert result.ok is False and result.quota is None
+
+
+async def test_a_quota_error_is_spawned_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "fake_opencode_402.py",
+        f"sys.stdout.write(json.dumps({_BALANCE_EVENT!r}) + '\\n')\nsys.exit(1)\n",
+    )
+    monkeypatch.setattr(opencode_cli, "_TRANSIENT_RETRY_DELAY_S", 0.0)
+    spawns = _count_spawns(monkeypatch, fake)
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+        prompt="hello",
+        timeout_seconds=30,
+    )
+
+    assert len(spawns) == 1  # neither the transient nor the empty-output retry re-runs it
+    assert result.quota is not None and result.quota.kind == "billing"
+    assert result.session_id == "ses_402"
+
+
+async def test_a_session_to_resume_is_passed_as_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "fake_opencode_args.py",
+        "ev = {'type': 'text', 'part': {'type': 'text', 'text': ' '.join(sys.argv[1:])}}\n"
+        "sys.stdout.write(json.dumps(ev) + '\\n')\n",
+    )
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(
+            name="opencode", arg_mode=ArgMode.inherit, resume_session_id="ses_77"
+        ),
+        prompt="go on",
+        timeout_seconds=30,
+    )
+
+    args = result.text.split()
+    assert args[args.index("--session") + 1] == "ses_77"
+
+
+async def test_resuming_an_unknown_session_is_not_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "fake_opencode_unknown.py",
+        "sys.stdout.write('Error: Session not found\\n')\nsys.exit(1)\n",
+    )
+    monkeypatch.setattr(opencode_cli, "_TRANSIENT_RETRY_DELAY_S", 0.0)
+    spawns = _count_spawns(monkeypatch, fake)
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(
+            name="opencode", arg_mode=ArgMode.inherit, resume_session_id="ses_gone"
+        ),
+        prompt="go on",
+        timeout_seconds=30,
+    )
+
+    assert len(spawns) == 1
+    assert result.ok is False and "Session not found" in (result.error or "")

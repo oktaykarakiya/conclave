@@ -17,6 +17,8 @@ full guide once per session before acting.
 - Verify, don't assume: check each `agent.result`'s `model_reported` against the model you
   configured, and check the merged result yourself when it matters.
 - One change at a time per area: tasks touching the same files should run and merge sequentially.
+- A usage limit or empty balance fails nothing: dispatches wait for the reset, then resume
+  (`quota.waiting` events, `conclave_get_engine_quota`); cancel a task to stop its wait.
 - Measure model choices on your own tasks, not by reputation.
 
 **Full guide**
