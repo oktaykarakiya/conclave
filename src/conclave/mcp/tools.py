@@ -62,7 +62,7 @@ from ..engine.workflow_evolver import (
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..providers import engine_status
-from ..runtime import Daemon, reload_status_report
+from ..runtime import Daemon, engine_quota_report, reload_status_report
 from ..verification import quarantine_integrity
 
 PILOT_GUIDE_URI = "conclave://guide/pilot"
@@ -1134,6 +1134,15 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "Get current quiescent hot-reload status, pending state, changed files, module coverage "
         "and watcher_enabled (the global system.hot_reload_watch setting) without triggering a "
         "reload.",
+        {},
+    ),
+    _tool(
+        "conclave_get_engine_quota",
+        "Get each engine account's usage-limit gate: gates[] with key (claude-code, or "
+        "opencode/<provider>), engine, closed, resumes_at, kind (rate_limit or billing), window, "
+        "resets_at, message, and rate_limit (the latest rate-limit info Claude Code reported: "
+        "status, windows with utilization and reset times). While a gate is closed, every "
+        "dispatch on that account waits and then resumes; nothing fails.",
         {},
     ),
     _tool(
@@ -2805,6 +2814,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     if name == "conclave_get_reload_status":
         return await reload_status_report(daemon)
+
+    if name == "conclave_get_engine_quota":
+        return engine_quota_report(daemon)
 
     if name == "conclave_reload_system":
         force = _opt_bool(args, "force", False)

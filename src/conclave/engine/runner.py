@@ -3,8 +3,9 @@
 opencode owns model/provider selection and auth through its own config, so a dispatch
 no longer resolves an Engine Profile from the database — it uses a fixed ``opencode``
 profile carrying only the per-agent model/effort overrides. The runner assembles the
-full prompt (persona + repo knowledge + project rules + task), invokes the provider,
-records usage, and emits dispatch/result events.
+full prompt (persona + repo knowledge + project rules + task), invokes the provider through
+the usage-limit wait (:func:`~conclave.providers.dispatch_with_quota`), records usage, and
+emits dispatch/result events.
 """
 
 from __future__ import annotations
@@ -17,13 +18,17 @@ from pathlib import Path
 from ..config import ArgMode, ConclaveConfig, Effort, resolve_agent
 from ..db import Database
 from ..db import repositories as repo
-from ..events import EventBus, EventType
+from ..events import EventBus, EventType, build_notification_sink
 from ..observability.parquet_sync import log_agent_interaction
 from ..providers import (
     AgentResult,
     EffortChoice,
     Provider,
+    QuotaGate,
+    QuotaWait,
     ResolvedProfile,
+    WaitTracker,
+    dispatch_with_quota,
     resolve_dispatch_effort,
 )
 
@@ -34,6 +39,10 @@ logger = logging.getLogger("conclave.engine.runner")
 # event per tiny provider chunk (which would flood the bus and every subscriber's queue)
 # while still delivering near-real-time output to the Live tab.
 _STREAM_FLUSH_BYTES = 1024
+
+# Webhook deliveries of quota.waiting run beside the wait (a slow webhook must not delay a
+# cancel); the set keeps each task referenced until it finishes.
+_NOTIFICATIONS: set[asyncio.Task[None]] = set()
 
 
 def effort_clamped_payload(
@@ -138,7 +147,109 @@ class _OutputStreamer:
             )
 
 
+class QuotaEvents:
+    """Reports one dispatch's usage-limit waits (a :class:`~conclave.providers.QuotaListener`).
+
+    Emits ``quota.waiting`` and ``quota.resumed`` on the task, or the planning session (neither:
+    a project-level dispatch such as the bug fixer's), POSTs ``quota.waiting`` to the configured
+    webhook once per closure and project, and, with *record_usage*, adds a usage row for each run
+    a limit interrupted (the tokens it used are spent all the same).
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        bus: EventBus,
+        gate: QuotaGate,
+        config: ConclaveConfig,
+        *,
+        project_id: str,
+        agent: str,
+        node_id: str,
+        task_id: str | None = None,
+        planning_session_id: str | None = None,
+        record_usage: bool = False,
+    ) -> None:
+        self._db = db
+        self._bus = bus
+        self._gate = gate
+        self._config = config
+        self._project_id = project_id
+        self._agent = agent
+        self._node_id = node_id
+        self._task_id = task_id
+        self._planning_session_id = planning_session_id
+        self._record_usage = record_usage
+
+    async def waiting(self, wait: QuotaWait, interrupted: AgentResult | None) -> None:
+        if interrupted is not None and self._record_usage:
+            await repo.add_usage(
+                self._db,
+                agent=self._agent,
+                project_id=self._project_id,
+                task_id=self._task_id,
+                model_reported=interrupted.model_reported,
+                cost_usd=interrupted.cost_usd,
+                num_turns=interrupted.num_turns,
+                input_tokens=interrupted.input_tokens,
+                output_tokens=interrupted.output_tokens,
+                cache_read_tokens=interrupted.cache_read_tokens,
+                cache_creation_tokens=interrupted.cache_creation_tokens,
+            )
+        payload = {**wait.payload(), "agent": self._agent, "node_id": self._node_id}
+        await self._emit(EventType.quota_waiting, payload)
+        if not self._gate.claim_notification(wait.key, self._project_id):
+            return
+        sink = build_notification_sink(self._config)
+        if sink is not None:
+            notification = asyncio.create_task(
+                sink.notify(
+                    {
+                        "event": str(EventType.quota_waiting),
+                        "project_id": self._project_id,
+                        "task_id": self._task_id,
+                        "planning_session_id": self._planning_session_id,
+                        **payload,
+                    }
+                )
+            )
+            _NOTIFICATIONS.add(notification)
+            notification.add_done_callback(_NOTIFICATIONS.discard)
+
+    async def resumed(
+        self, wait: QuotaWait, *, waited_seconds: float, resumed_session: bool
+    ) -> None:
+        await self._emit(
+            EventType.quota_resumed,
+            {
+                "engine": wait.engine,
+                "key": wait.key,
+                "waited_seconds": round(waited_seconds, 1),
+                "resumed_session": resumed_session,
+                "agent": self._agent,
+                "node_id": self._node_id,
+            },
+        )
+
+    async def _emit(self, type_: EventType, payload: dict[str, object]) -> None:
+        await self._bus.emit(
+            type=type_,
+            project_id=self._project_id,
+            task_id=self._task_id,
+            planning_session_id=self._planning_session_id,
+            agent=self._agent,
+            payload=payload,
+        )
+
+
 class AgentRunner:
+    """Dispatches the agents of one task (or one project-level job).
+
+    Dispatches wait out usage limits on *quota_gate*, the daemon's shared gate (a private one
+    when none is given), and the runner adds up the time they waited (:meth:`quota_waited_seconds`)
+    so the task's wall-clock budget can leave it out.
+    """
+
     def __init__(
         self,
         db: Database,
@@ -146,12 +257,20 @@ class AgentRunner:
         provider: Provider,
         project_id: str,
         config: ConclaveConfig,
+        *,
+        quota_gate: QuotaGate | None = None,
     ) -> None:
         self._db = db
         self._bus = bus
         self._provider = provider
         self._project_id = project_id
         self._config = config
+        self._quota_gate = quota_gate if quota_gate is not None else QuotaGate()
+        self._quota_waits = WaitTracker(self._quota_gate.now)
+
+    def quota_waited_seconds(self) -> float:
+        """Seconds this runner's dispatches spent waiting for a usage limit (overlaps once)."""
+        return self._quota_waits.seconds()
 
     async def run(
         self,
@@ -226,13 +345,28 @@ class AgentRunner:
             self._bus, self._project_id, task_id, agent, node_id=node_id or agent
         )
         started_at = time.monotonic()
-        result = await self._provider.run_agent(
+        result = await dispatch_with_quota(
+            self._provider,
+            self._quota_gate,
             profile=profile,
             prompt=full_prompt,
             timeout_seconds=settings.timeout_minutes * 60,
+            retry_minutes=self._config.execution.quota_retry_minutes,
             cwd=worktree,
             on_chunk=stream.feed,
             cancel_event=cancel_event,
+            listener=QuotaEvents(
+                self._db,
+                self._bus,
+                self._quota_gate,
+                self._config,
+                project_id=self._project_id,
+                agent=agent,
+                node_id=node_id or agent,
+                task_id=task_id,
+                record_usage=True,
+            ),
+            waits=self._quota_waits,
         )
         duration_seconds = max(0.0, time.monotonic() - started_at)
         await stream.flush()

@@ -1,6 +1,7 @@
 import type {
   AgentPersona,
   BugCandidate,
+  EngineQuotaGate,
   EventRow,
   Integrity,
   InteractionLog,
@@ -429,6 +430,8 @@ export const api = {
       "POST",
       "/api/observability/export-parquet",
     ),
+  /** Usage-limit gates per engine account: a closed gate's dispatches wait until resumes_at. */
+  engineQuota: () => req<{ gates: EngineQuotaGate[] }>("GET", "/api/engines/quota"),
   reloadStatus: () =>
     req<{
       reload_count: number;

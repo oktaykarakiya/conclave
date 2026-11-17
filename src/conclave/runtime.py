@@ -32,7 +32,7 @@ from .engine import AgentRunner, BugFixerController, Orchestrator, SessionBudget
 from .events import EventBus, EventType
 from .hot_reload import HotReloader
 from .planning.session import PlanningOrchestrator
-from .providers import Provider
+from .providers import Provider, QuotaGate
 from .util import new_id
 
 logger = logging.getLogger("conclave.runtime")
@@ -53,6 +53,16 @@ async def reload_status_report(daemon: Daemon) -> dict[str, Any]:
     daemon instance, so the reloaded web and MCP layers must not rely on new methods on it.
     """
     return {**daemon.reload_status(), "watcher_enabled": await hot_reload_watch_enabled(daemon.db)}
+
+
+def engine_quota_report(daemon: Daemon) -> dict[str, Any]:
+    """Every engine account's usage-limit gate (closed or not, until when and why) and the latest
+    rate-limit info it reported: the REST and MCP view of the daemon's :class:`QuotaGate`.
+
+    A module function for the same hot-reload reason as :func:`reload_status_report`.
+    """
+    gate: QuotaGate | None = getattr(daemon, "quota_gate", None)
+    return {"gates": gate.snapshot() if gate is not None else []}
 
 
 class ProjectWorker:
@@ -263,10 +273,15 @@ class Daemon:
         self.bus = EventBus(db)
         self.reloader = HotReloader()
         self.app: Any = None
-        self.orchestrator = Orchestrator(db, self.bus, provider, home)
+        # One usage-limit gate for every dispatch of every project: a limit hit on an engine
+        # account holds back all of its dispatches until the limit resets.
+        self.quota_gate = QuotaGate()
+        self.orchestrator = Orchestrator(db, self.bus, provider, home, quota_gate=self.quota_gate)
         self.orchestrator._reloader = self.reloader
         self.orchestrator._daemon = self
-        self.planning_orchestrator = PlanningOrchestrator(db, self.bus, provider)
+        self.planning_orchestrator = PlanningOrchestrator(
+            db, self.bus, provider, quota_gate=self.quota_gate
+        )
         self._workers: dict[str, ProjectWorker] = {}
         self._bg_tasks: set[asyncio.Task[None]] = set()
         self._workers_enabled = workers_enabled
@@ -445,7 +460,9 @@ class Daemon:
 
         resolved_units: list[dict[str, Any]] = list(units or [])
         if not resolved_units and prompt and prompt.strip():
-            runner = AgentRunner(self.db, self.bus, self.provider, project_id, config)
+            runner = AgentRunner(
+                self.db, self.bus, self.provider, project_id, config, quota_gate=self.quota_gate
+            )
             decompose_prompt = (
                 f"Break this mass-change objective into {effective_concurrency} independent, "
                 "non-overlapping work units so a swarm of dedicated agents can execute them in "

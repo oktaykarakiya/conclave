@@ -34,6 +34,9 @@ class EventType(StrEnum):
     # attempts / gate
     attempt_started = "attempt.started"
     attempt_failed = "attempt.failed"
+    # usage limits: a dispatch waits for the engine's limit to reset, then resumes
+    quota_waiting = "quota.waiting"
+    quota_resumed = "quota.resumed"
     test_integrity_flagged = "test_integrity.flagged"
     baseline_snapshot = "baseline.snapshot"
     node_started = "node.started"

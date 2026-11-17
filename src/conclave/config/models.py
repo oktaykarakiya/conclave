@@ -136,6 +136,16 @@ class ExecutionSettings(BaseModel):
     wall_clock_budget_minutes: int = Field(
         default=720, ge=0, description="Hard cap on a single task's retry loop. 0 disables."
     )
+    quota_retry_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=1440,
+        description=(
+            "How long a dispatch waits before trying again when an engine refuses it for a usage "
+            "limit or balance without saying when the limit resets. With a reset time it waits "
+            "until then (plus a minute)."
+        ),
+    )
     review_rounds_max: int = Field(default=20, ge=1, le=50)
     parallel_reviewers: bool = Field(default=False)
     max_parallel_tasks: int = Field(

@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from conclave.config import ArgMode
-from conclave.providers import AgentResult, ClaudeCliProvider, ResolvedProfile, claude_cli
+from conclave.providers import (
+    AgentResult,
+    ClaudeCliProvider,
+    QuotaGate,
+    ResolvedProfile,
+    claude_cli,
+    dispatch_with_quota,
+)
+from conclave.providers.claude_cli import _parse_envelope
 
 # A fake "claude" that echoes the routed model back via the JSON envelope, so we can
 # prove the composed environment actually reaches the child process.
@@ -359,3 +369,354 @@ async def test_parts_concatenation_with_echo_fake(tmp_path: Path) -> None:
     # envelope suffix is intact, and the echoed characters appear in order.
     assert '"result": "echo-ok"' in result.text
     assert result.text.replace("\r\n", "\n").endswith("}\n")
+
+
+# --- usage limits ----------------------------------------------------------------------------
+# The stream-json shapes Claude Code 2.1.326 emits (rate_limit_event on every turn; an assistant
+# message's top-level "error" when a request is refused) and the result event that ends a run.
+
+_RESETS_AT = 1794924600  # epoch seconds
+_SEVEN_DAY_RESETS_AT = 1795388400
+
+
+def _rate_limit_event(
+    status: str, *, five_hour: str = "allowed", **info: object
+) -> dict[str, Any]:
+    """A rate_limit_event; *info* overrides or adds rate_limit_info fields."""
+    return {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": status,
+            "resetsAt": _RESETS_AT,
+            "rateLimitType": "five_hour",
+            "overageStatus": "rejected",
+            "isUsingOverage": False,
+            "unifiedWindows": {
+                "five_hour": {"utilization": 1.0, "resetsAt": _RESETS_AT, "status": five_hour},
+                "seven_day": {
+                    "utilization": 0.27,
+                    "resetsAt": _SEVEN_DAY_RESETS_AT,
+                    "status": "allowed",
+                },
+            },
+            **info,
+        },
+        "session_id": "ses-1",
+        "uuid": "u-1",
+    }
+
+
+def _result(text: str, *, is_error: bool = False) -> dict[str, Any]:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": is_error,
+        "result": text,
+        "session_id": "ses-1",
+        "num_turns": 1,
+        "total_cost_usd": 0.0,
+    }
+
+
+def _stream(*events: dict[str, Any]) -> str:
+    init = {"type": "system", "subtype": "init", "session_id": "ses-1"}
+    return "\n".join(json.dumps(e) for e in (init, *events)) + "\n"
+
+
+def _refused(error: str, text: str) -> dict[str, Any]:
+    return {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": text}]},
+        "error": error,
+        "session_id": "ses-1",
+    }
+
+
+def test_a_rejected_rate_limit_event_is_a_quota_even_with_exit_zero() -> None:
+    raw = _stream(
+        _rate_limit_event("rejected", five_hour="rejected"),
+        _result("Done, I have finished the task."),  # no is_error, and a success hint
+    )
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.ok is False
+    assert result.quota is not None
+    assert result.quota.kind == "rate_limit"
+    assert result.quota.window == "five_hour"
+    assert result.quota.resets_at == datetime.fromtimestamp(_RESETS_AT, UTC)
+    assert result.session_id == "ses-1"
+    assert result.rate_limit_info is not None and result.rate_limit_info["status"] == "rejected"
+
+
+def test_the_rejected_window_that_resets_last_decides_the_reset() -> None:
+    event = _rate_limit_event("rejected", five_hour="rejected")
+    event["rate_limit_info"]["unifiedWindows"]["seven_day"]["status"] = "rejected"
+
+    quota = _parse_envelope(_stream(event, _result("x", is_error=True)), 1).quota
+
+    assert quota is not None and quota.window == "seven_day"
+    assert quota.resets_at == datetime.fromtimestamp(_SEVEN_DAY_RESETS_AT, UTC)
+
+
+def test_an_assistant_rate_limit_error_takes_the_reset_from_an_earlier_rate_limit_info() -> None:
+    raw = _stream(
+        _rate_limit_event("allowed"),
+        _refused("rate_limit", "You've hit your limit · resets 3pm"),
+        _result("You've hit your limit · resets 3pm", is_error=True),
+    )
+
+    result = _parse_envelope(raw, 1)
+
+    assert result.ok is False
+    assert result.quota is not None
+    assert result.quota.kind == "rate_limit"
+    assert result.quota.resets_at == datetime.fromtimestamp(_RESETS_AT, UTC)
+    assert result.quota.window == "five_hour"
+    assert result.quota.message == "You've hit your limit · resets 3pm"
+
+
+def test_a_refusal_without_a_result_event_keeps_the_session_and_the_message() -> None:
+    raw = _stream(_refused("rate_limit", "usage limit reached · continues automatically"))
+
+    result = _parse_envelope(raw, 1)
+
+    assert result.quota is not None and result.quota.resets_at is None
+    assert result.quota.message == "usage limit reached · continues automatically"
+    assert result.session_id == "ses-1"
+
+
+def test_a_billing_error_is_a_billing_quota_without_a_rate_limit_reset() -> None:
+    raw = _stream(
+        _rate_limit_event("allowed"),  # a rate-limit window's reset does not end a billing stop
+        _refused("billing_error", "Credit balance is too low"),
+        _result("Credit balance is too low", is_error=True),
+    )
+
+    quota = _parse_envelope(raw, 1).quota
+
+    assert quota is not None and quota.kind == "billing"
+    assert quota.message == "Credit balance is too low"
+    assert quota.resets_at is None and quota.window is None
+
+
+def test_other_assistant_errors_are_not_a_quota() -> None:
+    raw = _stream(
+        _refused("authentication_failed", "Invalid API key · Please run /login"),
+        _result("Invalid API key · Please run /login", is_error=True),
+    )
+
+    result = _parse_envelope(raw, 1)
+
+    assert result.ok is False and result.quota is None
+
+
+def test_the_legacy_limit_text_carries_its_reset_epoch() -> None:
+    result = _parse_envelope(f"Claude AI usage limit reached|{_RESETS_AT}\n", 1)
+
+    assert result.ok is False
+    assert result.quota is not None and result.quota.kind == "rate_limit"
+    assert result.quota.resets_at == datetime.fromtimestamp(_RESETS_AT, UTC)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["usage limit reached — check plan", "You\u2019ve hit your limit · resets 3pm (Europe/Berlin)"],
+)
+def test_a_short_final_limit_text_is_a_quota(text: str) -> None:
+    quota = _parse_envelope(_stream(_result(text)), 0).quota
+
+    assert quota is not None and quota.message == text
+
+
+def test_allowed_and_warning_events_leave_a_normal_run_ok() -> None:
+    warning = _rate_limit_event("allowed_warning")
+    raw = _stream(_rate_limit_event("allowed"), warning, _result("VERDICT: pass"))
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.ok is True and result.quota is None and result.error is None
+    assert result.rate_limit_info == warning["rate_limit_info"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Usage limit reached handling: " + "the retry path now backs off. " * 20,  # > 300 chars
+        "Fixed the bug where 'usage limit reached' was shown twice.",  # quotes it mid-text
+    ],
+)
+def test_an_answer_quoting_the_limit_wording_stays_ok(text: str) -> None:
+    result = _parse_envelope(_stream(_result(text)), 0)
+
+    assert result.ok is True and result.quota is None
+
+
+@pytest.mark.parametrize(
+    "overage",
+    [
+        {"overageStatus": "allowed", "isUsingOverage": True},
+        {"overageStatus": "allowed_warning", "isUsingOverage": True},
+        {"overageInUse": True},
+    ],
+)
+def test_a_rejected_limit_served_on_paid_extra_usage_is_not_a_quota(
+    overage: dict[str, object],
+) -> None:
+    """Past its limit, an account with extra usage on keeps being served: Claude Code reports
+    status "rejected" with isUsingOverage (or overageInUse) true, and its run succeeds."""
+    paid = _rate_limit_event("rejected", five_hour="rejected", **overage)
+    raw = _stream(paid, _result("Done, I have finished the task."))
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.ok is True and result.quota is None and result.error is None
+    assert result.rate_limit_info == paid["rate_limit_info"]
+
+
+def test_only_the_latest_rate_limit_info_counts() -> None:
+    raw = _stream(
+        _rate_limit_event("rejected", five_hour="rejected"),
+        _rate_limit_event("allowed"),  # requests are served again
+        _result("VERDICT: pass"),
+    )
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.ok is True and result.quota is None
+    assert result.rate_limit_info is not None and result.rate_limit_info["status"] == "allowed"
+
+
+def test_a_refused_message_the_run_went_on_from_is_not_a_quota() -> None:
+    raw = _stream(
+        _refused("rate_limit", "You've hit your limit · resets 3pm"),
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Done."}]}},
+        _result("Done."),
+    )
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.ok is True and result.quota is None
+
+
+def test_the_limit_text_fallback_is_off_when_the_stream_reports_rate_limits() -> None:
+    """A short answer opening with the wording is a limit only on a CLI that reports none."""
+    text = "Usage limit reached handling: the retry path now backs off and reports the reset."
+    assert len(text) <= 300
+
+    with_events = _parse_envelope(_stream(_rate_limit_event("allowed"), _result(text)), 0)
+    without_events = _parse_envelope(_stream(_result(text)), 0)
+
+    assert with_events.ok is True and with_events.quota is None
+    assert without_events.quota is not None
+
+
+def test_a_limiting_window_outside_the_unified_windows_decides_the_reset() -> None:
+    """The top-level rateLimitType names the window that limits now, e.g. the weekly Opus one,
+    which unifiedWindows does not list: requests stay refused until it resets too."""
+    weekly_opus = _RESETS_AT + 3 * 24 * 3600
+    event = _rate_limit_event(
+        "rejected", five_hour="rejected", rateLimitType="seven_day_opus", resetsAt=weekly_opus
+    )
+
+    quota = _parse_envelope(_stream(event, _result("x", is_error=True)), 1).quota
+
+    assert quota is not None and quota.window == "seven_day_opus"
+    assert quota.resets_at == datetime.fromtimestamp(weekly_opus, UTC)
+
+
+_LIMITED_CLI = """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+events = [
+    {"type": "system", "subtype": "init", "session_id": "ses-9"},
+    {"type": "rate_limit_event", "session_id": "ses-9",
+     "rate_limit_info": {"status": "rejected", "resetsAt": 1794924600,
+                         "rateLimitType": "five_hour"}},
+    {"type": "result", "is_error": True, "session_id": "ses-9",
+     "result": "You've hit your limit (API Error: ECONNRESET)"},
+]
+print("\\n".join(json.dumps(e) for e in events))
+"""
+
+
+async def test_a_limit_hit_is_returned_at_once_not_retried_as_a_dropped_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli = _make_cli(tmp_path, _LIMITED_CLI, name="limited.py")
+    monkeypatch.setattr(claude_cli, "_CLAUDE_TRANSIENT_RETRY_DELAY_S", 0.0)
+    spawns = _count_spawns(monkeypatch, cli)
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=30)
+
+    assert len(spawns) == 1
+    assert result.ok is False and result.quota is not None
+    assert result.session_id == "ses-9"
+
+
+# Past its five-hour limit, an account with extra usage on is served on paid credits: Claude Code
+# reports status "rejected" with isUsingOverage true on every turn, and the run succeeds.
+_OVERAGE_CLI = """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+info = {"status": "rejected", "resetsAt": 1794924600, "rateLimitType": "five_hour",
+        "overageStatus": "allowed", "isUsingOverage": True,
+        "unifiedWindows": {"five_hour": {"utilization": 1.0, "resetsAt": 1794924600,
+                                         "status": "rejected"}}}
+events = [
+    {"type": "system", "subtype": "init", "session_id": "ses-paid"},
+    {"type": "rate_limit_event", "rate_limit_info": info, "session_id": "ses-paid"},
+    {"type": "assistant", "session_id": "ses-paid",
+     "message": {"content": [{"type": "text", "text": "VERDICT: pass"}]}},
+    {"type": "result", "subtype": "success", "is_error": False, "session_id": "ses-paid",
+     "result": "VERDICT: pass", "total_cost_usd": 0.42, "num_turns": 1},
+]
+print("\\n".join(json.dumps(e) for e in events))
+"""
+
+
+async def test_a_run_served_on_paid_extra_usage_is_kept_and_waits_for_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_wait(seconds: float) -> None:
+        raise AssertionError(f"the dispatch waited {seconds}s for a usage limit")
+
+    cli = _make_cli(tmp_path, _OVERAGE_CLI, name="overage.py")
+    spawns = _count_spawns(monkeypatch, cli)
+    gate = QuotaGate(sleep=no_wait)
+    profile = ResolvedProfile(
+        name="claude-code", arg_mode=ArgMode.inherit, cli=cli, model="claude-code/opus"
+    )
+
+    result = await dispatch_with_quota(
+        ClaudeCliProvider(),
+        gate,
+        profile=profile,
+        prompt="review",
+        timeout_seconds=30,
+        retry_minutes=15,
+    )
+
+    assert len(spawns) == 1  # the paid result is the outcome: no wait, no resume
+    assert result.ok is True and result.quota is None and result.text == "VERDICT: pass"
+    assert result.cost_usd == 0.42
+    (row,) = gate.snapshot()
+    assert (row["key"], row["closed"]) == ("claude-code", False)
+    assert row["rate_limit"]["isUsingOverage"] is True
+
+
+async def test_a_session_to_resume_is_passed_as_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli = _make_cli(tmp_path, _FAKE_CLI)
+    spawns = _capture_spawns(monkeypatch, cli)
+    profile = ResolvedProfile(
+        name="claude-code", arg_mode=ArgMode.flag, cli=cli, model="opus", resume_session_id="s-7"
+    )
+
+    await ClaudeCliProvider().run_agent(profile=profile, prompt="go on", timeout_seconds=30)
+
+    (args, _env), = spawns
+    at = args.index("--resume")
+    assert args[at + 1] == "s-7" and args.index("--model") > at

@@ -75,7 +75,7 @@ from ..engine.workflow_evolver import (
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..providers import CLAUDE_CODE_PREFIX, Engine, engine_status, resolve_engine
-from ..runtime import Daemon, reload_status_report
+from ..runtime import Daemon, engine_quota_report, reload_status_report
 from ..verification import quarantine_integrity
 from .deps import get_daemon
 from .schemas import (
@@ -235,6 +235,13 @@ async def trigger_system_reload(
 ) -> dict[str, Any]:
     effective_force = bool(force or (body.force if body is not None else False))
     return await daemon.reload_now(force=effective_force)
+
+
+@router.get("/engines/quota")
+async def get_engine_quota(daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
+    """Each engine account's usage-limit gate: whether dispatches wait, until when and why, and
+    the latest rate-limit info the engine reported."""
+    return engine_quota_report(daemon)
 
 
 @router.get("/config/schema")

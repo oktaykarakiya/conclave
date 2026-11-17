@@ -14,7 +14,7 @@ from conclave.engine import (
     parse_verdict,
     trim_output,
 )
-from conclave.engine.orchestrator import _check_budget
+from conclave.engine.orchestrator import _check_budget, _over_budget
 
 # --- parse_verdict ----------------------------------------------------------
 
@@ -377,6 +377,25 @@ def test_check_budget_returns_false_when_not_exceeded() -> None:
     import time
     started = time.monotonic()
     assert _check_budget(started, 60.0) is False
+
+
+class _WaitedRunner:
+    """An AgentRunner stand-in whose dispatches waited *seconds* for a usage limit."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+
+    def quota_waited_seconds(self) -> float:
+        return self.seconds
+
+
+def test_over_budget_leaves_out_the_time_waited_for_a_usage_limit() -> None:
+    """Two hours since the start, of which 90 minutes waiting: 30 minutes count."""
+    import time
+    started = time.monotonic() - 2 * 3600
+    assert _over_budget(_WaitedRunner(0.0), started, 60.0) is True  # type: ignore[arg-type]
+    assert _over_budget(_WaitedRunner(90 * 60.0), started, 60.0) is False  # type: ignore[arg-type]
+    assert _over_budget(_WaitedRunner(90 * 60.0), started, 29.0) is True  # type: ignore[arg-type]
 
 
 def test_check_budget_returns_false_when_budget_is_zero() -> None:

@@ -8,19 +8,26 @@ opencode owns model/provider selection through its own config (``opencode.jsonc`
 Conclave passes no model flag by default — every dispatch uses opencode's configured
 default (e.g. ``deepseek/deepseek-flash``). A profile may still override with an
 opencode-format ``provider/model`` string.
+
+An ``error`` event refusing the request for a usage limit or balance (HTTP 402 or 429, or a
+balance / quota / rate-limit message) is reported as ``AgentResult.quota`` (never ok), with the
+reset time a 429's ``retry-after-ms`` or ``retry-after`` header gives.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import email.utils
 import json
 import os
 import random
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
-from .base import AgentResult, OnChunk
+from .base import UNKNOWN_SESSION_RE, AgentResult, OnChunk, QuotaExhausted
 from .claude_cli import (
     _SUCCESS_HINT,
     _WIN_SUBPROCESS_KW,
@@ -42,6 +49,13 @@ _TRANSIENT_API_ERROR_RE = re.compile(
 )
 _TRANSIENT_RETRY_DELAY_S = 1.0
 _MAX_DISPATCH_ATTEMPTS = 3
+
+# Error messages of a refused request: the balance or quota ran out, or a rate limit.
+_BALANCE_ERROR_RE = re.compile(
+    r"(?i)(insufficient[ _]balance|insufficient[ _](?:credits?|funds|quota)|quota[ _]exceeded|"
+    r"exceeded your (?:current )?quota|credit balance is too low|payment required)"
+)
+_RATE_LIMIT_ERROR_RE = re.compile(r"(?i)(rate[ _]limit|too many requests|usage limit)")
 
 
 def _is_transient_error(result: AgentResult, raw: str = "") -> bool:
@@ -101,7 +115,7 @@ class OpenCodeCliProvider:
             base_args += ["--pure"]
 
         last_result: AgentResult | None = None
-        resume_session_id: str | None = None
+        resume_session_id: str | None = profile.resume_session_id
         for attempt_idx in range(_MAX_DISPATCH_ATTEMPTS):
             if attempt_idx > 0:
                 await asyncio.sleep(_TRANSIENT_RETRY_DELAY_S + random.random() * 0.25)
@@ -189,6 +203,15 @@ class OpenCodeCliProvider:
                     with contextlib.suppress(asyncio.CancelledError):
                         await cancel_wait_task
                 last_result = _parse_events(raw, proc.returncode, model_hint=model_hint)
+                # Neither a usage limit nor a resume of a session opencode no longer has gets
+                # better on a quick re-run: the shared dispatch path waits for the reset, or
+                # starts afresh, instead.
+                if last_result.quota is not None or (
+                    resume_session_id is not None
+                    and not last_result.ok
+                    and UNKNOWN_SESSION_RE.search(last_result.error or "")
+                ):
+                    return last_result
                 if last_result.session_id:
                     resume_session_id = last_result.session_id
                 if _is_transient_error(last_result, raw):
@@ -225,15 +248,68 @@ def _add(acc: int | None, value: object) -> int | None:
     return value if acc is None else acc + value
 
 
+def _as_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            return float(value.strip())
+    return None
+
+
+def _retry_after(headers: object, now: datetime) -> datetime | None:
+    """The time a 429's ``retry-after-ms`` (milliseconds) or ``retry-after`` (seconds, or an HTTP
+    date) response header says to retry at, else ``None``. Header names are case-insensitive."""
+    if not isinstance(headers, dict):
+        return None
+    lowered = {str(name).lower(): value for name, value in headers.items()}
+    millis = _as_float(lowered.get("retry-after-ms"))
+    if millis is not None and millis >= 0:
+        return now + timedelta(milliseconds=millis)
+    raw = lowered.get("retry-after")
+    seconds = _as_float(raw)
+    if seconds is not None and seconds >= 0:
+        return now + timedelta(seconds=seconds)
+    if isinstance(raw, str):
+        with contextlib.suppress(TypeError, ValueError, IndexError, OverflowError):
+            when = email.utils.parsedate_to_datetime(raw)
+            return (when if when.tzinfo is not None else when.replace(tzinfo=UTC)).astimezone(UTC)
+    return None
+
+
+def _quota_error(data: dict[str, Any], message: str, now: datetime) -> QuotaExhausted | None:
+    """The quota refusal an ``error`` event reports (its ``data``: ``statusCode``,
+    ``responseHeaders``), or ``None``. A balance or quota that ran out has no reset time."""
+    status = data.get("statusCode")
+    if status == 402 or _BALANCE_ERROR_RE.search(message):
+        return QuotaExhausted(kind="billing", message=message)
+    if status == 429 or _RATE_LIMIT_ERROR_RE.search(message):
+        return QuotaExhausted(
+            kind="rate_limit",
+            resets_at=_retry_after(data.get("responseHeaders"), now),
+            message=message,
+        )
+    return None
+
+
 def _parse_events(
-    raw: str, exit_code: int | None, model_hint: str | None = None
+    raw: str,
+    exit_code: int | None,
+    model_hint: str | None = None,
+    now: datetime | None = None,
 ) -> AgentResult:
     """Parse opencode's NDJSON event stream into an :class:`AgentResult`.
 
     Concatenates every ``text`` event's ``part.text`` for the result, and sums
     ``step_finish`` events' ``part.cost`` and ``part.tokens`` for usage. Malformed
-    lines are skipped so partial/garbled output never crashes a dispatch.
+    lines are skipped so partial/garbled output never crashes a dispatch. An ``error`` event
+    that refuses the request for a usage limit or balance sets ``quota``; a ``retry-after``
+    reset is counted from *now* (the current time when omitted).
     """
+    now = now if now is not None else datetime.now(UTC)
+    quota: QuotaExhausted | None = None
     text_parts: list[str] = []
     cost = 0.0
     cost_seen = False
@@ -256,7 +332,7 @@ def _parse_events(
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
-            if _TRANSIENT_API_ERROR_RE.search(line):
+            if _TRANSIENT_API_ERROR_RE.search(line) or UNKNOWN_SESSION_RE.search(line):
                 error_parts.append(line)
             continue
         if not isinstance(obj, dict):
@@ -278,15 +354,18 @@ def _parse_events(
             raw_err = obj.get("error") or part.get("error") or part.get("message")
             if isinstance(raw_err, dict):
                 data_obj = raw_err.get("data")
+                data = data_obj if isinstance(data_obj, dict) else {}
                 msg = (
-                    (data_obj.get("message") if isinstance(data_obj, dict) else None)
+                    data.get("message")
                     or raw_err.get("message")
                     or raw_err.get("name")
                     or json.dumps(raw_err)
                 )
                 error_parts.append(str(msg))
+                quota = _quota_error(data, str(msg), now) or quota
             elif raw_err is not None:
                 error_parts.append(str(raw_err))
+                quota = _quota_error({}, str(raw_err), now) or quota
         elif etype == "step_finish":
             steps += 1
             c = part.get("cost")
@@ -330,6 +409,7 @@ def _parse_events(
         (exit_code == 0 or bool(_SUCCESS_HINT.search(text)))
         and not (has_transient_err and not text.strip())
         and not (error_str and not text.strip())
+        and quota is None
     )
     return AgentResult(
         ok=ok,
@@ -348,4 +428,5 @@ def _parse_events(
         tool_calls_count=tool_calls_count,
         tool_breakdown=tool_breakdown,
         messages=messages,
+        quota=quota,
     )

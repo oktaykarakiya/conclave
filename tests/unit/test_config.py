@@ -252,3 +252,16 @@ def test_context_is_in_the_config_schema() -> None:
     for field in ("compaction_max_chars", "bulk_max_chars"):
         assert (props[field]["minimum"], props[field]["maximum"]) == (1_000, 2_000_000)
     assert props["compaction_enabled"]["default"] is False
+
+
+def test_quota_retry_minutes_defaults_to_15_and_is_bounded() -> None:
+    assert ConclaveConfig().execution.quota_retry_minutes == 15
+    assert load_project_config(
+        {"execution": {"quota_retry_minutes": 1440}}
+    ).execution.quota_retry_minutes == 1440
+    for bad in (0, 1441):
+        with pytest.raises(ValidationError) as excinfo:
+            load_project_config({"execution": {"quota_retry_minutes": bad}})
+        assert excinfo.value.errors()[0]["loc"] == ("execution", "quota_retry_minutes")
+    prop = config_schema()["$defs"]["ExecutionSettings"]["properties"]["quota_retry_minutes"]
+    assert (prop["default"], prop["minimum"], prop["maximum"]) == (15, 1, 1440)

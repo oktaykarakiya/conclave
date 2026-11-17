@@ -12,6 +12,7 @@ import {
   input,
 } from "./panels";
 import type {
+  EngineQuotaGate,
   EventRow,
   Project,
   ProjectMode,
@@ -28,6 +29,9 @@ const MAIN_VIEWS: { id: MainView; label: string }[] = [
   { id: "history", label: "History & Logs" },
   { id: "settings", label: "Settings" },
 ];
+
+// How often the usage-limit banner re-reads the gates (quota.* events refresh it at once).
+const QUOTA_POLL_MS = 30_000;
 
 const AgentStudioView = AgentStudioViewBase as React.ComponentType<{
   projectId?: string | null;
@@ -54,7 +58,28 @@ export default function App() {
     Record<string, TaskCheckpoint["status"]>
   >({});
 
+  const [quotaGates, setQuotaGates] = useState<EngineQuotaGate[]>([]);
+
   const stream = useStream(selectedId);
+
+  const refreshQuota = useCallback(async () => {
+    try {
+      setQuotaGates((await api.engineQuota()).gates);
+    } catch {
+      /* ignore background refresh errors */
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshQuota();
+    const timer = setInterval(() => void refreshQuota(), QUOTA_POLL_MS);
+    return () => clearInterval(timer);
+  }, [refreshQuota]);
+
+  useEffect(() => {
+    const type = stream.lastEvent?.type;
+    if (type === "quota.waiting" || type === "quota.resumed") void refreshQuota();
+  }, [stream.lastEvent, refreshQuota]);
 
   const refreshProjects = useCallback(async () => {
     try {
@@ -462,6 +487,7 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <QuotaBanner gates={quotaGates} />
         {loading && !selected ? (
           <div className="flex flex-1 items-center justify-center gap-2.5 text-xs text-zinc-500">
             <Spinner size={16} />
@@ -626,6 +652,44 @@ export default function App() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+type ClosedGate = EngineQuotaGate & { resumes_at: string };
+
+/** "Claude Code" for the Claude Code account, else the gate's key (e.g. "opencode/deepseek"). */
+function engineLabel(key: string): string {
+  return key === "claude-code" ? "Claude Code" : key;
+}
+
+/** A local time, with the day when it is not today (a weekly limit resets days later). */
+function fmtResume(iso: string): string {
+  const at = new Date(iso);
+  const time: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit" };
+  return at.toDateString() === new Date().toDateString()
+    ? at.toLocaleTimeString([], time)
+    : at.toLocaleString([], { weekday: "short", month: "short", day: "numeric", ...time });
+}
+
+/** Shown while an engine account's usage-limit gate is closed: its dispatches wait, then resume. */
+function QuotaBanner({ gates }: { gates: EngineQuotaGate[] }) {
+  const now = Date.now();
+  const closed = gates.filter(
+    (g): g is ClosedGate =>
+      g.closed && g.resumes_at !== null && Date.parse(g.resumes_at) > now,
+  );
+  if (closed.length === 0) return null;
+  return (
+    <div
+      role="status"
+      className="shrink-0 space-y-0.5 border-b border-amber-800/60 bg-amber-950/40 px-4 py-1.5 text-xs text-amber-200"
+    >
+      {closed.map((g) => (
+        <div key={g.key} title={g.message ?? undefined}>
+          {engineLabel(g.key)} limit reached — resuming at {fmtResume(g.resumes_at)}
+        </div>
+      ))}
     </div>
   );
 }
