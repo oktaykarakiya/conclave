@@ -21,11 +21,13 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
   `on_fail`, `on_diff_trigger`). Nodes/edges can pause for a human (`await_human_approval`,
   `pause_after`, `require_human`). `conclave_get_workflow` shows the effective graph.
 - **Workflow evolution**: after each task the evolver works out how the workflow should change
-  (grow it after a failure or grounded catches; make quiet non-core reviewers optional after 3
-  clean tasks). `experimental.workflow_evolution` decides what happens: `suggest` (default)
-  stores a **proposal** that changes nothing until you approve it, `auto` applies the change,
-  `off` skips the post-task evolution. Every change to a project's workflow, whoever makes it,
-  is recorded as a **version** with its source and reason, and can be reverted (§8).
+  (grow it after a quality failure, i.e. a failed review or a red test gate, or after grounded
+  catches; make quiet non-core reviewers optional after 3 clean tasks). Configuration, infra and
+  other non-quality failures teach it nothing (§8). `experimental.workflow_evolution` decides what
+  happens: `suggest` (default) stores a **proposal** that changes nothing until you approve it,
+  and a proposal you reject stands until the workflow changes; `auto` applies the change, `off`
+  skips the post-task evolution. Every change to a project's workflow, whoever makes it, is
+  recorded as a **version** with its source and reason, and can be reverted (§8).
 - **Gate** = the project's `execution.baseline_test_command`, run on a baseline before work and
   again after review. Verdicts from reviewers are **grounded**: claims must cite evidence that
   exists in the diff, or they are downgraded.
@@ -294,7 +296,8 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   e.g. `rejected by SECURITY (fail): <its reason>`,
   `inconclusive: mandatory reviewer(s) SECURITY gave no usable verdict (...)`,
   `no reviewer returned a usable verdict`, `test gate not green (exit 1)`, the developer's
-  error, `infra_timed_out` or `no_test_command`; a developer failure also has `error`, a gate
+  error, `infra_timed_out`, `no_test_command`, or `operator rejected: <your message>` when you
+  failed the attempt at a checkpoint (§7); a developer failure also has `error`, a gate
   failure `exit_code`), `agent.dispatched` (configured `model`,
   and `effort`: the level it runs with after auto and clamping, `null` when no flag is passed),
   `agent.result` (`ok`, `model_reported`, `cost_usd`, `error`), `agent.verdict`
@@ -395,8 +398,11 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 - Costs: the run a limit interrupted keeps a usage row of its own, and each row is that run's own
   cost. Claude Code reports a resumed session's running total, so the resumed run's
   `agent.result.cost_usd` (and its usage row) is that total minus what the session's earlier runs
-  already reported (never below 0): the rows add up to the session's real cost. A session the
-  engine no longer has starts afresh and counts in full. opencode reports each run's own cost.
+  already reported: the rows add up to the session's real cost. Claude Code saves those totals
+  only when its process exits normally, so a run Conclave stopped (after a refused limit, or at
+  its timeout) may leave none to restore: a resumed total below the one already reported is that
+  run's own cost, charged in full, and the session's later runs are counted from it. A session
+  the engine no longer has starts afresh and counts in full. opencode reports each run's own cost.
 - To stop a wait, cancel as usual: `conclave_cancel_task` or `conclave_cancel_planning_session`
   ends it at once. A daemon restart during a wait puts the task back to `approved`; it runs
   again and waits again.
@@ -413,7 +419,10 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 - `conclave_get_hitl_state(task_id)`: `armed` lists the node and edge ids armed on the task,
   `waiting` the ids it is paused at now. Both live in the daemon's memory: a restart clears them.
 - `conclave_complete_node(task_id, node_id, status, verdict?, message?)`: resume a paused node
-  (`completed`), fail it, or skip it; `message` is passed on as feedback.
+  (`completed`), fail it, or skip it; `message` is passed on as feedback. Failing the developer's
+  or the gate's checkpoint, or overriding a reviewer to `fail`, fails the attempt: its
+  `attempt.failed` has that `stage` (`developer`, `gate`, `review`) and the reason
+  `operator rejected: <message>` (one line), which a task that then fails ends its summary with.
 - `conclave_cancel_task(task_id)`: stop a task (its worktree is cleaned up).
 - `conclave_approve_task` / `conclave_cascade_approve_task` for tasks created without
   `auto_approve` (e.g. a planning session's task tree).
@@ -449,8 +458,22 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   suggests (a `workflow.evolution_proposed` event announces each new one): `reason.summary`,
   `reason.changes` (one line per change), the evidence (`task_id`, `catching_reviewers`,
   `task_failed`, `gate_failed_after_review`, `clean_streak`), the `proposed_graph` and the
-  `base_graph` it was computed from. While a proposal is pending, an identical one is not stored
-  again.
+  `base_graph` it was computed from. While a proposal is pending, an identical one (the same
+  `proposed_graph` on the same `base_graph`) is not stored again. A rejection stands until the
+  workflow changes: while the live workflow is still a rejected proposal's `base_graph`, the
+  evolver does not propose that change again, after a task or on demand (nothing is stored, no
+  `workflow.evolution_proposed`). Once the workflow changes (any edit, a template, a revert, an
+  approved proposal), it may propose again, the same kind of change included. A different change
+  (another reviewer, grow instead of shrink) is proposed as usual.
+- The evolver learns only from quality failures. `task_failed` means the task ended
+  `failed (max_retries)` or `failed (timeout)` and an attempt failed at review or at a red test
+  gate; `gate_failed_after_review` means a gate ran the tests and found them red after the review
+  passed on the same attempt. A failed gate checkpoint records its `cause` in its artifact:
+  `tests` (red tests), `infra` (`infra_timed_out` and the like), `no_test_command` or `operator`
+  (you failed it at a checkpoint); only `tests`, or no cause (a checkpoint from before causes were
+  recorded), counts. Any other failed task (`no_test_command`, a failed setup, an unhandled
+  exception, a commit or merge failure, attempts that failed only on infra gate runs or developer
+  dispatch errors) is no signal: it neither counts toward the clean streak nor breaks it.
 - `conclave_decide_workflow_proposal(project_id, proposal_id, decision, reason?)`: `approve`
   applies the proposed graph as a `proposal` version; it is refused while the live workflow
   differs from `base_graph`, so reject that proposal and run `conclave_evolve_workflow` for a
@@ -461,9 +484,12 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 - `conclave_evolve_workflow(project_id, task_id?)` runs evolution on demand: in `suggest` mode it
   stores and returns a `proposal`, in `auto` mode it applies the change (an `evolver` version),
   in `off` mode it only previews; `apply: true` applies the change at once as your decision (an
-  `operator` version). Its answer leaves every graph out (the computed `workflow`, the
-  proposal's `proposed_graph` and `base_graph`, the version's `graph_after` and `graph_before`)
-  unless you pass `include_graphs: true`; `conclave_list_workflow_proposals` shows them too.
+  `operator` version). In `suggest` mode, a change you rejected on the same workflow is not
+  stored again: `proposal` is `null` and `suppressed_by` is the rejected proposal's id
+  (`suppressed_by` is `null` in every other answer). Its answer leaves every graph out (the
+  computed `workflow`, the proposal's `proposed_graph` and `base_graph`, the version's
+  `graph_after` and `graph_before`) unless you pass `include_graphs: true`;
+  `conclave_list_workflow_proposals` shows them too.
 - `conclave_list_workflow_versions(project_id, limit?)` shows every change, newest first:
   `source` (`evolver`, `operator`, `template`, `revert`, `proposal`), `reason`, `created_at`,
   `graph_after` and `graph_before` (`null` = the pipeline derived from the agents policy). The
@@ -590,7 +616,10 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   changes the request or plan that agents receive.
 - With the default `experimental.workflow_evolution: suggest` the evolver never changes a
   workflow by itself: its proposals wait for you. After failed tasks, check
-  `conclave_list_workflow_proposals(state: "pending")` and decide them (§8).
+  `conclave_list_workflow_proposals(state: "pending")` and decide them (§8). A rejection stands
+  until the workflow changes, so a rejected proposal does not come back after every task; to
+  make a rejected change after all, run `conclave_evolve_workflow` with the same input (its
+  `task_id`) and `apply: true`.
 - Approving a proposal fails with `isError` when the workflow changed after it was computed (an
   edit, a template, a revert or another approval); reject it and run `conclave_evolve_workflow`
   again.

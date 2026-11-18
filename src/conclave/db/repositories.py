@@ -256,7 +256,9 @@ async def add_workflow_proposal(
     base_graph: dict[str, Any],
 ) -> tuple[WorkflowProposal, bool]:
     """Store a pending proposal unless an identical one (same proposed and base graph) is
-    pending already. Returns ``(proposal, created)``; the check and insert are atomic."""
+    pending already or was rejected. Returns ``(proposal, created)``: on a match, the pending
+    proposal (else the newest rejected one) and ``False``. A rejection so stands until the
+    base graph changes. The checks and the insert are atomic."""
     proposed_json = json.dumps(proposed_graph, sort_keys=True)
     base_json = json.dumps(base_graph, sort_keys=True)
     async with db.transaction() as conn:
@@ -264,6 +266,15 @@ async def add_workflow_proposal(
             "SELECT * FROM workflow_proposals WHERE project_id = ? AND state = ? "
             "AND proposed_graph_json = ? AND base_graph_json = ? ORDER BY created_at LIMIT 1",
             (project_id, WorkflowProposalState.pending.value, proposed_json, base_json),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return WorkflowProposal.from_row(row), False
+        cur = await conn.execute(
+            "SELECT * FROM workflow_proposals WHERE project_id = ? AND state = ? "
+            "AND proposed_graph_json = ? AND base_graph_json = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (project_id, WorkflowProposalState.rejected.value, proposed_json, base_json),
         )
         row = await cur.fetchone()
         if row is not None:

@@ -622,7 +622,14 @@ async def test_workflow_decisions_leave_graphs_out_by_default(
         "version_id": None,
     }
     again = await evolve(third)
-    assert again["proposal"]["id"] != row["id"]  # none pending, so a new one
+    # The rejection stands on this workflow; the compact answer still says which one stopped it.
+    assert (again["proposal"], again["suppressed_by"]) == (None, row["id"])
+    assert "workflow" not in again
+    resp = await client.put(f"/api/projects/{third}/workflow", json={"template_id": "fast_track"})
+    assert resp.status_code == 200, resp.text
+    again = await evolve(third)
+    assert again["proposal"]["id"] != row["id"]  # the workflow changed, so a new one
+    assert again["suppressed_by"] is None
     rejected_full = await _tool(
         client,
         "conclave_decide_workflow_proposal",

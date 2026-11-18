@@ -247,7 +247,8 @@ class ExperimentalSettings(BaseModel):
         default="suggest",
         description=(
             "What the evolver does after each task. suggest: store a proposal for a person to "
-            "approve; auto: apply the change (recorded as a workflow version); off: nothing."
+            "approve; a rejected proposal is not proposed again until the workflow changes. "
+            "auto: apply the change (recorded as a workflow version); off: nothing."
         ),
     )
 

@@ -6,6 +6,7 @@ blocks until the test moves it, so nothing ever waits for real.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from typing import Any
 
 import pytest
 
+import conclave
 from conclave.config import ArgMode
 from conclave.providers import (
     CONTINUATION_PROMPT,
@@ -643,16 +645,40 @@ async def test_a_fresh_session_after_an_unknown_one_is_charged_in_full() -> None
     assert result.cost_usd == 3.00
 
 
-async def test_a_resumed_total_below_the_reported_one_is_charged_nothing() -> None:
+async def test_a_resumed_total_below_the_reported_one_is_charged_in_full() -> None:
+    """The engine did not restore the session's totals (the interrupted run was stopped before
+    it saved them), so the resumed run's total is its own cost."""
     clock = FakeClock()
     gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
     provider = ScriptedProvider(
         clock, [_run_cost(4.52, refused=True), _run_cost(3.00, refused=False)]
     )
+    listener = RecordingListener()
 
-    result = await _dispatch(provider, gate)
+    result = await _dispatch(provider, gate, listener=listener)
 
-    assert result.cost_usd == 0.0
+    assert _interrupted_costs(listener) == [4.52]
+    assert result.cost_usd == 3.00
+    assert [c.profile.resume_session_id for c in provider.calls] == [None, "ses-1"]
+
+
+async def test_a_restarted_total_is_where_the_running_total_continues_from() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock,
+        [
+            _run_cost(4.52, refused=True),
+            _run_cost(2.00, refused=True),  # restarted: its own 2.00
+            _run_cost(3.50, refused=False),  # restored from 2.00: 1.50 of its own
+        ],
+    )
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert _interrupted_costs(listener) == [4.52, 2.00]
+    assert result.cost_usd == pytest.approx(1.50)
 
 
 async def test_per_run_costs_pass_through_unchanged() -> None:
@@ -672,3 +698,48 @@ async def test_per_run_costs_pass_through_unchanged() -> None:
 
     assert _interrupted_costs(listener) == [0.40]
     assert result.cost_usd == 0.30
+
+
+# --- only the shared dispatch path continues a session ------------------------------------
+
+_SRC = Path(conclave.__file__).resolve().parent
+
+
+def _sets_resume_session_id(tree: ast.AST) -> list[int]:
+    """Lines of *tree* that set ``resume_session_id``: a keyword argument (``replace``, a
+    profile's constructor), an assigned attribute, or a string naming it (``setattr``, a
+    ``model_copy`` update). Reading it is fine."""
+    return sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if (isinstance(node, ast.keyword) and node.arg == "resume_session_id")
+        or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "resume_session_id"
+            and isinstance(node.ctx, ast.Store)
+        )
+        or (isinstance(node, ast.Constant) and node.value == "resume_session_id")
+    )
+
+
+def test_the_guard_finds_every_way_to_set_resume_session_id() -> None:
+    sample = (
+        "replace(profile, resume_session_id='s')\n"
+        "profile.resume_session_id = 's'\n"
+        "setattr(profile, 'resume_session_id', 's')\n"
+        "profile.model_copy(update={'resume_session_id': 's'})\n"
+        "print(profile.resume_session_id)\n"
+    )
+    assert _sets_resume_session_id(ast.parse(sample)) == [1, 2, 3, 4]
+
+
+def test_no_caller_outside_the_providers_continues_a_session() -> None:
+    """Callers start fresh sessions; continuing one is dispatch_with_quota's job, since it knows
+    the running totals of only the runs it made (see its docstring)."""
+    offenders = [
+        f"{path.relative_to(_SRC)}:{line}"
+        for path in sorted(_SRC.rglob("*.py"))
+        if "__pycache__" not in path.parts and path.relative_to(_SRC).parts[0] != "providers"
+        for line in _sets_resume_session_id(ast.parse(path.read_text(encoding="utf-8")))
+    ]
+    assert offenders == []

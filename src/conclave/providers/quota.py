@@ -9,7 +9,8 @@ engine account's key, waits until the gate reopens, and resumes the interrupted 
 so a caller never sees a quota result. Every other dispatch for the same key waits for the gate
 before it starts, so parallel reviewers and other projects do not each hit the refused API. Each
 result it hands on (the interrupted run's to the listener, the final one to the caller) carries its
-own run's cost, also when the engine reports a resumed session's running total.
+own run's cost, also when the engine reports a resumed session's running total, or restarts that
+total because it could not restore the session's.
 """
 
 from __future__ import annotations
@@ -278,7 +279,14 @@ async def dispatch_with_quota(
 
     The cost of every result handed on (to the listener as *interrupted*, and the final one) is
     that run's own: a run that continued a session whose cost the engine reports as a running total
-    (``AgentResult.cost_is_session_total``) is charged its total minus the one reported before it.
+    (``AgentResult.cost_is_session_total``) is charged its total minus the one reported before it,
+    or its whole total when that is below the one reported before it (the engine did not restore
+    the session's totals, so they restarted from this run).
+
+    Callers pass a *profile* that starts a fresh session (no ``resume_session_id``): continuing a
+    session is this function's job. It knows only the totals of the runs it made itself, so a
+    session the caller's profile already continued would have its first run charged the whole
+    running total of that session's earlier runs.
     """
     engine, key = quota_key(provider, profile)
     session_id: str | None = None  # the interrupted session to continue
@@ -346,15 +354,18 @@ def _own_cost(result: AgentResult, reported: float | None) -> tuple[AgentResult,
     """*result* charged its own run's cost, and the session's running total after it.
 
     When the engine reports the session's running total, a run that continued a session whose
-    earlier run reported *reported* already includes that cost: its own share is the difference,
-    never below 0. A copy is returned, never the provider's object changed. Any other cost (a
-    per-run one, or none) passes through, and *reported* stays the last total known.
+    earlier run reported *reported* already includes that cost: its own share is the difference.
+    A total below *reported* means the engine did not restore the session's totals (Claude Code
+    saves them when its process exits normally, so a run stopped before that leaves none to
+    restore): the run's total is then its own cost, charged in full, and the running total
+    continues from it. A copy is returned, never the provider's object changed. Any other cost
+    (a per-run one, or none) passes through, and *reported* stays the last total known.
     """
     if not result.cost_is_session_total or result.cost_usd is None:
         return result, reported
     total = result.cost_usd
-    if reported is not None:
-        result = result.model_copy(update={"cost_usd": max(total - reported, 0.0)})
+    if reported is not None and total >= reported:
+        result = result.model_copy(update={"cost_usd": total - reported})
     return result, total
 
 

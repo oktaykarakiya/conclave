@@ -16,12 +16,20 @@ from typing import Any
 import pytest
 from fake_provider import FakeProvider
 
-from conclave.config import EdgeCondition, NodeKind, WorkflowEdge, WorkflowGraph, WorkflowNode
-from conclave.db import Database, Project, Task, TaskState
+from conclave.config import (
+    EdgeCondition,
+    NodeKind,
+    WorkflowEdge,
+    WorkflowGraph,
+    WorkflowNode,
+    resolve_project_config,
+)
+from conclave.db import CheckpointStatus, Database, Project, Task, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
 from conclave.engine.orchestrator import _NO_TEST_COMMAND_SUMMARY
 from conclave.engine.task_merge import merge_task
+from conclave.engine.workflow_evolver import compute_workflow_evolution
 from conclave.events import EventBus
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 
@@ -191,6 +199,57 @@ async def test_test_command_removed_mid_task_fails_the_task_like_the_early_check
     assert await _payloads(db, task.id, "task.merged") == []
     code, _ = await run_git(tmp_path / "repo", "show", "main:FEATURE.txt")
     assert code != 0
+
+
+async def test_test_command_removed_mid_task_teaches_the_workflow_evolver_nothing(
+    db: Database, tmp_path: Path
+) -> None:
+    """The review passed, then the gate failed for want of a test command: a configuration
+    error, not a red gate after review. No proposal, and the clean streak is left as it was."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db,
+        name="t",
+        path=str(repo_path),
+        default_branch="main",
+        config={"execution": {"baseline_test_command": "echo ok"}},  # suggest mode (default)
+    )
+    for n in range(2):
+        await repo.create_task(
+            db, project_id=project.id, request=f"done {n}", state=TaskState.done
+        )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(
+        db, EventBus(db), _DeveloperDropsTestCommand(db), tmp_path / "home"
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None and claimed.id == task.id
+
+    assert await orchestrator.process_task(claimed) is False
+
+    checkpoints = {cp.node_id: cp for cp in await repo.list_task_checkpoints(db, task.id)}
+    assert checkpoints["review"].status == CheckpointStatus.completed
+    assert (checkpoints["gate"].status, checkpoints["gate"].artifact) == (
+        CheckpointStatus.failed,
+        {"cause": "no_test_command"},
+    )
+    assert await repo.list_workflow_proposals(db, project.id) == []
+    events = await repo.list_events(db, project_id=project.id, limit=10_000)
+    assert [e.type for e in events if e.type.startswith("workflow.")] == []
+    stored = await repo.get_project(db, project.id)
+    assert stored is not None
+    evolution = await compute_workflow_evolution(
+        db, project.id, await resolve_project_config(db, stored), task_id=task.id
+    )
+    assert (
+        evolution.action,
+        evolution.task_failed,
+        evolution.gate_failed_after_review,
+        evolution.clean_streak,
+    ) == ("none", False, False, 2)
 
 
 async def test_test_command_removed_mid_task_passes_logged_when_allowed(

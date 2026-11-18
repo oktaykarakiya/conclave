@@ -18,9 +18,18 @@ from conclave.config import (
     WorkflowGraph,
     WorkflowNode,
     load_project_config,
+    resolve_project_config,
     workflow_templates,
 )
-from conclave.db import CheckpointStatus, Database, Project, Task, TaskState
+from conclave.db import (
+    CheckpointStatus,
+    Database,
+    Project,
+    Task,
+    TaskState,
+    WorkflowProposal,
+    WorkflowProposalState,
+)
 from conclave.db import repositories as repo
 from conclave.engine import (
     derive_planner_nodes,
@@ -29,6 +38,7 @@ from conclave.engine import (
     scale_workflow_for_task,
     workflow_evolver,
 )
+from conclave.engine.orchestrator import _NO_TEST_COMMAND_SUMMARY
 from conclave.engine.workflow_evolver import describe_workflow_changes
 from conclave.events import EventBus, EventType
 from conclave.mcp.tools import call_mcp_tool
@@ -394,7 +404,7 @@ async def test_off_mode_post_task_hook_computes_nothing_and_changes_nothing(
     )
 
     assert res["evolved"] is False and res["mode"] == "off"
-    assert res["proposal"] is None and res["version"] is None
+    assert res["proposal"] is None and res["version"] is None and res["suppressed_by"] is None
     assert (await repo.get_project(db, project.id)) == project
     assert await repo.list_workflow_proposals(db, project.id) == []
     assert await repo.list_workflow_versions(db, project.id) == []
@@ -411,6 +421,7 @@ async def test_suggest_mode_stores_one_proposal_and_leaves_the_workflow(
     res = await evolve_project_workflow(db, bus, project.id, task_id=task.id, automatic=True)
 
     assert res["mode"] == "suggest" and res["evolved"] is False and res["version"] is None
+    assert res["suppressed_by"] is None
     assert (await repo.get_project(db, project.id)) == project  # the live workflow is untouched
     proposals = await repo.list_workflow_proposals(db, project.id)
     assert len(proposals) == 1
@@ -430,7 +441,7 @@ async def test_suggest_mode_stores_one_proposal_and_leaves_the_workflow(
 
     # The same trigger again neither duplicates the pending proposal nor announces it again.
     again = await evolve_project_workflow(db, bus, project.id, task_id=task.id, automatic=True)
-    assert again["proposal"]["id"] == proposal.id
+    assert again["proposal"]["id"] == proposal.id and again["suppressed_by"] is None
     assert len(await repo.list_workflow_proposals(db, project.id)) == 1
     assert await _workflow_events(db, project.id) == ["workflow.evolution_proposed"]
 
@@ -446,6 +457,7 @@ async def test_auto_mode_applies_the_change_as_an_evolver_version(
     )
 
     assert res["evolved"] is True and res["action"] == "grow" and res["proposal"] is None
+    assert res["suppressed_by"] is None
     updated = await repo.get_project(db, project.id)
     assert updated is not None
     live = load_project_config(updated.config).workflow
@@ -472,6 +484,7 @@ async def test_manual_evolve_in_off_mode_previews_and_apply_applies_it(
     preview = await evolve_project_workflow(db, bus, project.id, task_id=task.id)
     assert preview["evolved"] is False and preview["action"] == "grow"
     assert preview["proposal"] is None and preview["version"] is None
+    assert preview["suppressed_by"] is None
     assert preview["workflow"]["version"] == 2  # what it would become
     assert (await repo.get_project(db, project.id)) == project
     assert await repo.list_workflow_proposals(db, project.id) == []
@@ -480,10 +493,187 @@ async def test_manual_evolve_in_off_mode_previews_and_apply_applies_it(
     applied = await evolve_project_workflow(
         db, bus, project.id, task_id=task.id, apply=True, reason="  operator call  "
     )
-    assert applied["evolved"] is True
+    assert applied["evolved"] is True and applied["suppressed_by"] is None
     versions = await repo.list_workflow_versions(db, project.id)
     assert [(v.source.value, v.reason) for v in versions] == [("operator", "  operator call  ")]
     assert versions[0].graph_after == applied["workflow"]
+
+
+# --- a rejected proposal stands until the workflow changes ---------------------
+
+
+async def _rejected_growth(
+    db: Database, bus: EventBus, project: Project
+) -> tuple[Task, WorkflowProposal]:
+    """The post-task hook's growth proposal for a failed task, which the operator rejected."""
+    task = await _growth_task(db, project.id)
+    res = await evolve_project_workflow(db, bus, project.id, task_id=task.id, automatic=True)
+    proposal = await repo.get_workflow_proposal(db, res["proposal"]["id"])
+    assert proposal is not None
+    decided = await workflow_evolver.decide_workflow_proposal(
+        db, bus, project, proposal, approve=False, reason="not for this repo"
+    )
+    assert decided["proposal"]["state"] == "rejected"
+    return task, proposal
+
+
+async def test_a_rejected_proposal_is_not_proposed_again_on_the_same_workflow(
+    db: Database, tmp_path: Path
+) -> None:
+    bus = EventBus(db)
+    project = await _evolution_project(db, tmp_path, "suggest")
+    nothing = await evolve_project_workflow(db, bus, project.id, automatic=True)
+    assert nothing["action"] == "none" and nothing["suppressed_by"] is None
+    task, rejected = await _rejected_growth(db, bus, project)
+
+    hook = await evolve_project_workflow(db, bus, project.id, task_id=task.id, automatic=True)
+    manual = await evolve_project_workflow(db, bus, project.id, task_id=task.id)
+
+    for res in (hook, manual):
+        assert res["action"] == "grow" and res["evolved"] is False
+        assert res["proposal"] is None and res["version"] is None
+        assert res["suppressed_by"] == rejected.id
+    proposals = await repo.list_workflow_proposals(db, project.id)
+    assert [(p.id, p.state) for p in proposals] == [(rejected.id, WorkflowProposalState.rejected)]
+    assert await _workflow_events(db, project.id) == ["workflow.evolution_proposed"]
+    assert (await repo.get_project(db, project.id)) == project
+
+
+async def test_concurrent_evolutions_after_a_rejection_store_nothing(
+    db: Database, tmp_path: Path
+) -> None:
+    bus = EventBus(db)
+    project = await _evolution_project(db, tmp_path, "suggest")
+    task, rejected = await _rejected_growth(db, bus, project)
+
+    results = await asyncio.gather(
+        *(
+            evolve_project_workflow(db, bus, project.id, task_id=task.id, automatic=True)
+            for _ in range(2)
+        )
+    )
+
+    assert [(r["proposal"], r["suppressed_by"]) for r in results] == [(None, rejected.id)] * 2
+    assert [p.id for p in await repo.list_workflow_proposals(db, project.id)] == [rejected.id]
+    assert await _workflow_events(db, project.id) == ["workflow.evolution_proposed"]
+
+
+# --- only quality failures teach the evolver ------------------------------------
+
+# A failed task's checkpoints, each (node_id, status, the failed gate's recorded cause).
+_Checkpoints = list[tuple[str, CheckpointStatus, str | None]]
+_REVIEW_FAILED: _Checkpoints = [("review", CheckpointStatus.failed, None)]
+_RED_GATE: _Checkpoints = [
+    ("review", CheckpointStatus.completed, None),
+    ("gate", CheckpointStatus.failed, "tests"),
+]
+_INFRA_GATE: _Checkpoints = [
+    ("review", CheckpointStatus.completed, None),
+    ("gate", CheckpointStatus.failed, "infra"),
+]
+_GREEN: _Checkpoints = [
+    ("review", CheckpointStatus.completed, None),
+    ("gate", CheckpointStatus.completed, None),
+]
+
+
+async def _finished_failed_task(
+    db: Database, project_id: str, summary: str, checkpoints: _Checkpoints
+) -> Task:
+    task = await repo.create_task(
+        db, project_id=project_id, request="r", state=TaskState.in_progress
+    )
+    for node_id, status, cause in checkpoints:
+        await repo.save_task_checkpoint(
+            db,
+            task_id=task.id,
+            node_id=node_id,
+            attempt=1,
+            status=status,
+            artifact={"cause": cause} if cause is not None else None,
+        )
+    await repo.finalize_task(db, task.id, state=TaskState.failed, result_summary=summary)
+    return task
+
+
+@pytest.mark.parametrize(
+    ("cause", "red"),
+    [
+        (None, True),
+        ("tests", True),
+        ("infra", False),
+        ("no_test_command", False),
+        ("operator", False),
+    ],
+)
+async def test_only_a_red_test_gate_after_a_passing_review_reads_as_one(
+    cause: str | None, red: bool, db: Database, tmp_path: Path
+) -> None:
+    """A failed gate without a cause is a row written before causes were recorded: red."""
+    project = await _evolution_project(db, tmp_path, "suggest")
+    task = await _finished_failed_task(
+        db,
+        project.id,
+        "failed (max_retries) after 1 attempt(s); last: gate",
+        [("review", CheckpointStatus.completed, None), ("gate", CheckpointStatus.failed, cause)],
+    )
+
+    evolution = await workflow_evolver.compute_workflow_evolution(
+        db, project.id, await resolve_project_config(db, project), task_id=task.id
+    )
+
+    assert evolution.gate_failed_after_review is red
+    assert evolution.task_failed is red
+    assert evolution.action == ("grow" if red else "none")
+
+
+@pytest.mark.parametrize(
+    ("summary", "checkpoints", "quality"),
+    [
+        (
+            "failed (max_retries) after 2 attempt(s); last: rejected by REVIEWER (fail): no tests",
+            _REVIEW_FAILED,
+            True,
+        ),
+        ("failed (timeout) after 1 attempt(s)", _RED_GATE, True),
+        ("failed (max_retries) after 1 attempt(s); last: infra_timed_out", _INFRA_GATE, False),
+        (
+            "failed (max_retries) after 2 attempt(s); last: developer agent failed",
+            [("developer", CheckpointStatus.failed, None)],
+            False,
+        ),
+        (_NO_TEST_COMMAND_SUMMARY, _REVIEW_FAILED, False),
+        ("worktree setup failed (exit 1):\nNo module named pip", [], False),
+        ("unhandled exception processing task x", _REVIEW_FAILED, False),
+        ("merge conflict into main; branch conclave/x preserved", _GREEN, False),
+    ],
+)
+async def test_only_a_quality_failure_is_a_failed_task_and_others_leave_the_streak(
+    summary: str, checkpoints: _Checkpoints, quality: bool, db: Database, tmp_path: Path
+) -> None:
+    """Three clean done tasks, then a failed one: a quality failure ends the streak and grows
+    the workflow; any other failure is skipped, so the streak of three still shrinks it."""
+    deep_audit = workflow_templates()["deep_audit"]
+    project = await repo.create_project(
+        db,
+        name="evo-streak",
+        path=str(tmp_path),
+        default_branch="main",
+        config={"workflow": deep_audit.model_dump(mode="json")},
+    )
+    for n in range(3):
+        await repo.create_task(
+            db, project_id=project.id, request=f"clean {n}", state=TaskState.done
+        )
+    failed = await _finished_failed_task(db, project.id, summary, checkpoints)
+    config = await resolve_project_config(db, project)
+
+    for task_id in (failed.id, None):
+        evolution = await workflow_evolver.compute_workflow_evolution(
+            db, project.id, config, task_id=task_id
+        )
+        expected = (True, 0, "grow") if quality else (False, 3, "shrink")
+        assert (evolution.task_failed, evolution.clean_streak, evolution.action) == expected
 
 
 def _node(node_id: str, kind: NodeKind = NodeKind.reviewer, **fields: Any) -> WorkflowNode:

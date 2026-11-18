@@ -3265,10 +3265,13 @@ function summarizeEvent(ev: EventRow): string {
       return String(p.text ?? p.chunk ?? "");
     case "attempt.started":
       return `attempt #${String(p.n ?? "?")} started`;
-    case "attempt.failed":
+    case "attempt.failed": {
+      // Why it failed; events from before `reason` existed carry only a developer's `error`.
+      const why = p.reason || p.error;
       return `attempt #${String(p.n ?? "?")} failed at ${String(p.stage ?? "?")}${
-        p.error ? ` — ${String(p.error)}` : ""
+        why ? ` — ${String(why)}` : ""
       }`;
+    }
     case "node.started":
       return `node ${String(p.node_id ?? "?")} started`;
     case "node.waiting_for_approval":

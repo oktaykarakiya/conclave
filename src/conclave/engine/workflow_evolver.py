@@ -10,6 +10,7 @@ change is recorded as a workflow version, so it can be reverted.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,8 @@ from ..db import (
     CheckpointStatus,
     Database,
     Project,
+    Task,
+    TaskCheckpoint,
     TaskState,
     VerdictRow,
     WorkflowConflictError,
@@ -62,6 +65,40 @@ _GROWTH_SPECIALISTS: tuple[str, ...] = (
     "risk",
     "performance",
 )
+
+
+# How a failed task's summary begins when its attempts (max_retries) or its wall-clock budget
+# (timeout) ran out; Orchestrator._finish_failure is its only writer.
+_ATTEMPTS_RAN_OUT = re.compile(r"failed \((?:max_retries|timeout)\) after ")
+
+
+def _red_gate(cp: TaskCheckpoint) -> bool:
+    """Whether *cp* is a gate that ran the tests and found them red.
+
+    A failed gate records its ``cause``: ``tests``, ``infra``, ``no_test_command`` or
+    ``operator``. One without a cause (written before causes were recorded) reads as red.
+    """
+    return (
+        cp.node_id == "gate"
+        and cp.status == CheckpointStatus.failed
+        and cp.artifact.get("cause") in (None, "tests")
+    )
+
+
+async def _is_quality_failure(db: Database, task: Task) -> bool:
+    """Whether *task* failed on quality, which the workflow can learn from: it ended ``failed``
+    because its attempts or its time ran out, and an attempt failed at review or at a red test
+    gate. A task without a summary is judged by its checkpoints alone. Any other failure (no
+    test command, a failed setup, an unhandled exception, a commit or merge failure, attempts
+    that failed only on infra gate runs or developer dispatch errors) is not."""
+    if task.state != TaskState.failed:
+        return False
+    if task.result_summary and _ATTEMPTS_RAN_OUT.match(task.result_summary) is None:
+        return False
+    return any(
+        (cp.node_id == "review" and cp.status == CheckpointStatus.failed) or _red_gate(cp)
+        for cp in await repo.list_task_checkpoints(db, task.id)
+    )
 
 
 def _is_grounded_catch(verdict_row: VerdictRow) -> bool:
@@ -249,6 +286,11 @@ async def compute_workflow_evolution(
       reviewers (``architect``, ``performance``, ``risk``, ``legal``, ``devops``) had ``0``
       grounded ``fail``/``block`` verdicts (or only ungrounded ``unknown`` demotions), demotes
       those non-core reviewers to ``optional=True`` (``EdgeCondition.on_diff_trigger``).
+
+    Only quality failures teach it: *task_id*'s checkpoints set ``gate_failed_after_review``
+    for a red test gate after a passing review on the same attempt, and its failure sets
+    ``task_failed`` only when :func:`_is_quality_failure`. A failed task that is not one
+    neither counts toward the clean streak nor breaks it.
     """
     had_custom_workflow = config.workflow is not None
     base_graph = _active_graph(config).model_copy(deep=True)
@@ -261,10 +303,10 @@ async def compute_workflow_evolution(
     gate_node = next((n for n in nodes if n.kind == NodeKind.gate), None)
     gate_id = gate_node.id if gate_node is not None else "gate"
 
-    # Inspect target task if provided
+    # Inspect target task if provided: only quality failures are grow signals.
     if task_id is not None:
         target_task = await repo.get_task(db, task_id)
-        if target_task is not None and target_task.state == TaskState.failed:
+        if target_task is not None and await _is_quality_failure(db, target_task):
             task_failed = True
         cps = await repo.list_task_checkpoints(db, task_id)
         review_passed_attempts = {
@@ -272,11 +314,7 @@ async def compute_workflow_evolution(
             for cp in cps
             if cp.node_id == "review" and cp.status == CheckpointStatus.completed
         }
-        gate_failed_attempts = {
-            cp.attempt
-            for cp in cps
-            if cp.node_id == "gate" and cp.status == CheckpointStatus.failed
-        }
+        gate_failed_attempts = {cp.attempt for cp in cps if _red_gate(cp)}
         if review_passed_attempts & gate_failed_attempts:
             gate_failed_after_review = True
 
@@ -285,12 +323,15 @@ async def compute_workflow_evolution(
         t for t in all_tasks if t.state in (TaskState.done, TaskState.failed)
     ]
 
-    # Compute consecutive clean 'done' streak from most recent terminal task
+    # Compute consecutive clean 'done' streak from most recent terminal task. A quality failure
+    # ends it; any other failed task is skipped, neither counting toward it nor breaking it.
     clean_done_tasks = []
+    latest_failed_on_quality = False  # the newest task not skipped is a quality failure
     for t in terminal_tasks:
         if t.state == TaskState.done:
             clean_done_tasks.append(t)
-        else:
+        elif await _is_quality_failure(db, t):
+            latest_failed_on_quality = not clean_done_tasks
             break
     clean_streak = len(clean_done_tasks)
 
@@ -310,9 +351,8 @@ async def compute_workflow_evolution(
             if _is_grounded_catch(v):
                 catching_agents.add(v.agent)
 
-    # If clean_streak < 3 and no explicit task_id catches, also check if any recent failed task
-    # exists when task_id was not passed.
-    if task_id is None and terminal_tasks and terminal_tasks[0].state == TaskState.failed:
+    # Without a task_id, the latest task counts as failed when it failed on quality.
+    if task_id is None and latest_failed_on_quality:
         task_failed = True
 
     mutated = False
@@ -660,11 +700,14 @@ async def evolve_project_workflow(
     * *apply* (an operator decision) or ``auto`` mode applies it as a workflow version with
       source ``operator`` / ``evolver`` and emits ``workflow.evolved`` + ``workflow.updated``;
     * ``suggest`` stores a pending proposal, unless an identical one is pending already, and
-      emits ``workflow.evolution_proposed`` when it stored a new one;
+      emits ``workflow.evolution_proposed`` when it stored a new one. An identical proposal
+      (same proposed and base graph) that was rejected stands: nothing is stored or emitted,
+      and ``suppressed_by`` names it, until the live workflow changes;
     * a manual call in ``off`` mode only returns the preview.
 
     The result keeps the computed ``workflow``; ``evolved`` is true when the live workflow
-    changed, ``proposal`` / ``version`` hold what was stored. *reason* is recorded on the
+    changed, ``proposal`` / ``version`` hold what was stored, ``suppressed_by`` the id of the
+    rejected proposal that stopped this one (else ``None``). *reason* is recorded on the
     version, or kept as the proposal's ``note``. A conflicting concurrent edit raises
     :class:`WorkflowConflictError`.
     """
@@ -681,6 +724,7 @@ async def evolve_project_workflow(
         "action": "none",
         "proposal": None,
         "version": None,
+        "suppressed_by": None,
     }
     if automatic and mode == "off":
         return result
@@ -764,6 +808,11 @@ async def evolve_project_workflow(
             proposed_graph=wf_dump,
             base_graph=evolution.base.model_dump(mode="json"),
         )
+        if proposal.state == WorkflowProposalState.rejected:
+            # The same change on the same workflow was rejected: it stands until the workflow
+            # changes, so nothing is stored or announced again.
+            result["suppressed_by"] = proposal.id
+            return result
         if created:
             await bus.emit(
                 type=EventType.workflow_evolution_proposed,

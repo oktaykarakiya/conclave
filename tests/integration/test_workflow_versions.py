@@ -27,6 +27,8 @@ from conclave.config import (
 from conclave.db import Database, Project, StoreItemKind, TaskState, WorkflowVersionSource
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
+from conclave.engine.gate import GateResult
+from conclave.engine.workflow_evolver import decide_workflow_proposal, evolve_project_workflow
 from conclave.events import EventBus
 from conclave.mcp.server import handle_mcp_message
 from conclave.mcp.tools import MCP_TOOLS
@@ -524,7 +526,17 @@ async def test_lists_are_newest_first_bounded_and_filterable(
     first = await _propose(client, other.id)
     refused, _ = await _decide("rest", client, daemon, other.id, first["id"], "reject")
     assert not refused
-    second = await _propose(client, other.id)  # the same change again, now that none is pending
+    resp = await client.post(
+        f"/api/projects/{other.id}/workflow/evolve", json={"task_failed": True}
+    )
+    assert resp.status_code == 200, resp.text
+    # The rejection stands while the workflow is the one it was computed from.
+    assert (resp.json()["proposal"], resp.json()["suppressed_by"]) == (None, first["id"])
+    resp = await client.put(
+        f"/api/projects/{other.id}/workflow", json={"template_id": "fast_track"}
+    )
+    assert resp.status_code == 200, resp.text
+    second = await _propose(client, other.id)  # the workflow changed, so it is proposed again
     assert second["id"] != first["id"]
     assert [p["id"] for p in await _proposals(client, other.id)] == [second["id"], first["id"]]
     assert [p["id"] for p in await _proposals(client, other.id, state="pending")] == [
@@ -695,6 +707,12 @@ async def test_a_failed_task_follows_the_evolution_mode(
             ("pending", task.id)
         ]
         assert proposals[0].reason["action"] == "grow" and proposals[0].reason["summary"]
+        # A gate that ran the tests and found them red after the review passed: a quality
+        # failure the workflow learns from.
+        gates = [c for c in await repo.list_task_checkpoints(db, task.id) if c.node_id == "gate"]
+        assert [c.artifact.get("cause") for c in gates] == ["tests"]
+        assert proposals[0].reason["gate_failed_after_review"] is True
+        assert proposals[0].reason["task_failed"] is True
         assert versions == []
         assert "workflow" not in stored.config
     else:
@@ -703,6 +721,143 @@ async def test_a_failed_task_follows_the_evolution_mode(
         assert [v.source.value for v in versions] == ["evolver"]
         assert versions[0].graph_before is None
         assert stored.config["workflow"] == versions[0].graph_after
+
+
+async def test_a_rejected_proposal_is_not_proposed_again_after_the_next_task(
+    db: Database, tmp_path: Path
+) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db,
+        name="t",
+        path=str(repo_path),
+        default_branch="main",
+        config={
+            "execution": {"baseline_test_command": "test -f FEATURE.txt"},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+        },
+    )
+    bus = EventBus(db)
+    orchestrator = Orchestrator(db, bus, FakeProvider(developer_writes=False), tmp_path / "home")
+    for n in range(2):  # each task fails on a red gate after its review passed
+        await repo.create_task(
+            db, project_id=project.id, request=f"add a feature file {n}", state=TaskState.approved
+        )
+        claimed = await repo.claim_next_approved(db, project.id)
+        assert claimed is not None
+        assert await orchestrator.process_task(claimed) is False
+        if n == 0:
+            (proposal,) = await repo.list_workflow_proposals(db, project.id)
+            await decide_workflow_proposal(
+                db, bus, project, proposal, approve=False, reason="not over one red gate"
+            )
+
+    proposals = await repo.list_workflow_proposals(db, project.id)
+    assert [(p.id, p.state.value) for p in proposals] == [(proposal.id, "rejected")]
+    events = await repo.list_events(db, project_id=project.id, limit=10_000)
+    assert [e.type for e in events if e.type.startswith("workflow.")] == [
+        "workflow.evolution_proposed"
+    ]
+    # The second task's hook computed the same growth: the rejection stopped it.
+    hook = await evolve_project_workflow(
+        db, bus, project.id, task_id=claimed.id, automatic=True
+    )
+    assert (hook["action"], hook["suppressed_by"]) == ("grow", proposal.id)
+
+
+async def test_an_infra_gate_failure_teaches_the_workflow_evolver_nothing(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db,
+        name="t",
+        path=str(repo_path),
+        default_branch="main",
+        config={"execution": {"baseline_test_command": "pytest -q"}},  # suggest (default)
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    runs: list[str | None] = []
+
+    async def gate_times_out(
+        worktree: Path, command: str | None, **kwargs: object
+    ) -> GateResult:
+        runs.append(command)
+        if len(runs) == 1:  # the baseline snapshot
+            return GateResult(passed=True, exit_code=0, output="")
+        return GateResult(passed=False, exit_code=124, output="", outcome="timed_out")
+
+    monkeypatch.setattr("conclave.engine.orchestrator.run_tests", gate_times_out)
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+
+    assert await orchestrator.process_task(claimed) is False
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state == TaskState.failed
+    assert (final.result_summary or "").endswith("; last: infra_timed_out")
+    checkpoints = {cp.node_id: cp for cp in await repo.list_task_checkpoints(db, task.id)}
+    assert checkpoints["review"].status.value == "completed"
+    assert (checkpoints["gate"].status.value, checkpoints["gate"].artifact) == (
+        "failed",
+        {"cause": "infra"},
+    )
+    assert await repo.list_workflow_proposals(db, project.id) == []
+    events = await repo.list_events(db, project_id=project.id, limit=10_000)
+    assert [e.type for e in events if e.type.startswith("workflow.")] == []
+
+
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+async def test_a_rejection_stands_until_the_workflow_changes(
+    surface: str, db: Database, tmp_path: Path, daemon: Daemon, client: httpx.AsyncClient
+) -> None:
+    project = await _project(db, tmp_path)
+    pid = project.id
+    rejected = await _propose(client, pid)
+    refused, _ = await _decide(surface, client, daemon, pid, rejected["id"], "reject")
+    assert not refused
+
+    async def evolve() -> dict[str, Any]:
+        """The same manual evolve as the rejected proposal's (MCP: the compact answer)."""
+        if surface == "rest":
+            resp = await client.post(
+                f"/api/projects/{pid}/workflow/evolve", json={"task_failed": True}
+            )
+            assert resp.status_code == 200, resp.text
+            body: dict[str, Any] = resp.json()
+            return body
+        is_error, payload = await _mcp(
+            daemon, "conclave_evolve_workflow", {"project_id": pid, "task_failed": True}
+        )
+        assert not is_error and "workflow" not in payload
+        compact: dict[str, Any] = payload
+        return compact
+
+    async def proposed_events() -> int:
+        events = await repo.list_events(db, project_id=pid, limit=10_000)
+        return sum(e.type == "workflow.evolution_proposed" for e in events)
+
+    again = await evolve()
+    assert (again["mode"], again["action"], again["evolved"]) == ("suggest", "grow", False)
+    assert (again["proposal"], again["suppressed_by"]) == (None, rejected["id"])
+    assert [(p["id"], p["state"]) for p in await _proposals(client, pid)] == [
+        (rejected["id"], "rejected")
+    ]
+    assert await proposed_events() == 1
+
+    # Any change to the live workflow lifts the rejection: the same input is proposed again.
+    resp = await client.put(f"/api/projects/{pid}/workflow", json={"template_id": "fast_track"})
+    assert resp.status_code == 200, resp.text
+    fresh = await evolve()
+    assert fresh["suppressed_by"] is None
+    assert fresh["proposal"]["state"] == "pending" and fresh["proposal"]["id"] != rejected["id"]
+    assert [p["state"] for p in await _proposals(client, pid)] == ["pending", "rejected"]
+    assert await proposed_events() == 2
 
 
 # --- the setting and the tool schemas -------------------------------------------

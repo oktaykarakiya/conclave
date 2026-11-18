@@ -645,8 +645,13 @@ function stageLabel(ev: EventRow): string {
   switch (ev.type) {
     case "attempt.started":
       return `attempt #${String(p.n ?? "?")} started`;
-    case "attempt.failed":
-      return `attempt #${String(p.n ?? "?")} failed @ ${String(p.stage ?? "?")}`;
+    case "attempt.failed": {
+      // Why it failed; events from before `reason` existed carry only a developer's `error`.
+      const why = p.reason || p.error;
+      return `attempt #${String(p.n ?? "?")} failed @ ${String(p.stage ?? "?")}${
+        why ? ` — ${String(why).slice(0, 100)}` : ""
+      }`;
+    }
     case "pipeline.derived":
       return "deriving reviewers";
     case "agent.result":

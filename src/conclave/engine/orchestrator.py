@@ -619,6 +619,10 @@ class Orchestrator:
             else CheckpointStatus.completed
         )
         resolved_artifact = dict(artifact or {})
+        if cp_status == CheckpointStatus.failed:
+            # Why it failed: the operator said so. A gate failed this way is no red test run,
+            # so the workflow evolver does not learn from it.
+            resolved_artifact["cause"] = "operator"
         if resolution.get("message"):
             resolved_artifact["operator_message"] = resolution["message"]
         if resolution.get("output"):
@@ -1208,6 +1212,10 @@ class Orchestrator:
                         feedback = str(
                             dev_res.get("message") or "Operator rejected developer changes."
                         )
+                        last_reason = await self._attempt_failed(
+                            task, attempts, "developer",
+                            _operator_rejection(dev_res.get("message")),
+                        )
                         failed = True
                         continue
 
@@ -1339,6 +1347,8 @@ class Orchestrator:
                         if not config.execution.allow_no_test_command:
                             # The test command was removed while the task ran: a gate that runs
                             # no tests proves nothing, so the task fails as the early check does.
+                            # A failed gate records its cause: the workflow evolver learns only
+                            # from a red test run ("tests").
                             await repo.save_task_checkpoint(
                                 self._db,
                                 task_id=task.id,
@@ -1346,6 +1356,7 @@ class Orchestrator:
                                 attempt=attempts,
                                 status=CheckpointStatus.failed,
                                 git_tree_sha=review_tree,
+                                artifact={"cause": "no_test_command"},
                             )
                             await self._bus.emit(
                                 type=EventType.node_completed,
@@ -1452,6 +1463,7 @@ class Orchestrator:
                                 attempt=attempts,
                                 status=CheckpointStatus.failed,
                                 git_tree_sha=review_tree,
+                                artifact={"cause": "infra"},
                             )
                             await self._bus.emit(
                                 type=EventType.node_completed,
@@ -1473,6 +1485,7 @@ class Orchestrator:
                                 attempt=attempts,
                                 status=CheckpointStatus.failed,
                                 git_tree_sha=review_tree,
+                                artifact={"cause": "tests"},
                             )
                             await self._bus.emit(
                                 type=EventType.node_completed,
@@ -1526,6 +1539,9 @@ class Orchestrator:
                 if gate_res and gate_res.get("status") == "failed":
                     feedback = str(
                         gate_res.get("message") or "Operator rejected green-gate stage."
+                    )
+                    last_reason = await self._attempt_failed(
+                        task, attempts, "gate", _operator_rejection(gate_res.get("message"))
                     )
                     failed = True
                     continue
@@ -2995,7 +3011,8 @@ class Orchestrator:
             note += f"; last: {last_reason}"
         # One transaction: fail the task, record why, and block its descendants together so
         # a crash can't leave the task failed while children stay claimable. Announce only
-        # once the transition is durably committed.
+        # once the transition is durably committed. The workflow evolver reads the summary's
+        # "failed (<reason>) after" prefix (workflow_evolver._ATTEMPTS_RAN_OUT).
         blocked = await repo.finalize_task(
             self._db, task.id, state=TaskState.failed,
             result_summary=f"failed ({reason}) after {attempts} attempt(s){note}",
@@ -3326,7 +3343,16 @@ def _one_line(text: str, limit: int) -> str:
 def _rejection(agent: str, verdict: ParsedVerdict) -> str:
     """How a blocking reviewer's verdict reads in an attempt's failure reason."""
     why = _one_line(verdict.reason, _REVIEWER_REASON_CHARS)
+    if verdict.source == "operator":  # the operator overrode the reviewer to fail
+        return _operator_rejection(why)
     return f"rejected by {agent.upper()} ({verdict.verdict}): {why}"
+
+
+def _operator_rejection(message: str | None) -> str:
+    """How an operator's rejection at a HITL checkpoint reads in an attempt's failure reason
+    (``attempt.failed`` bounds it to one line)."""
+    text = (message or "").strip()
+    return f"operator rejected: {text}" if text else "operator rejected"
 
 
 def wm_merge_path(repo_path: Path, target_branch: str, task_id: str) -> Path:

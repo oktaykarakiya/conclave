@@ -642,3 +642,56 @@ async def test_a_developer_error_is_the_reason_on_one_line(db: Database, tmp_pat
         {"n": 1, "stage": "developer", "error": error, "reason": why}
     ]
     assert task.result_summary == f"failed (max_retries) after 1 attempt(s); last: {why}"
+
+
+_REJECTION = "not what I asked:\n use the helper"
+_LONG_REJECTION = "use the helper, not a new module\n" * 40  # about 1,300 characters, many lines
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "stage"),
+    [("developer", "developer"), ("gate", "gate"), ("reviewer", "review")],
+)
+@pytest.mark.parametrize("message", [_REJECTION, _LONG_REJECTION], ids=["short", "long"])
+async def test_an_operator_rejection_at_a_checkpoint_is_why_the_attempt_failed(
+    db: Database, tmp_path: Path, checkpoint: str, stage: str, message: str
+) -> None:
+    await _init_repo(tmp_path / "repo")
+    project = await repo.create_project(
+        db, name="t", path=str(tmp_path / "repo"), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "baseline_test_command": "true"},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    bus = EventBus(db)
+    orchestrator = Orchestrator(db, bus, FakeProvider(), tmp_path / "home")
+    orchestrator.set_hitl_checkpoint(task.id, checkpoint, True)
+    with bus.subscribe(task_id=task.id, types=["hitl.waiting"]) as waiting:
+        running = asyncio.create_task(orchestrator.process_task(claimed))
+        hitl = await asyncio.wait_for(anext(waiting), timeout=30)
+        assert hitl.payload["node_id"] == checkpoint
+        assert orchestrator.resolve_node(task.id, checkpoint, status="failed", message=message)
+        assert await asyncio.wait_for(running, timeout=30) is False
+
+    (failure,) = await _failure_payloads(db, task.id)
+    assert (set(failure), failure["n"], failure["stage"]) == ({"n", "stage", "reason"}, 1, stage)
+    reason = failure["reason"]
+    if message == _REJECTION:
+        assert reason == "operator rejected: not what I asked: use the helper"
+    else:
+        assert reason.startswith("operator rejected: use the helper, not a new module use the")
+        assert "\n" not in reason and len(reason) <= 300 and reason.endswith("...")
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state == TaskState.failed
+    assert final.result_summary == f"failed (max_retries) after 1 attempt(s); last: {reason}"
+    if checkpoint == "gate":  # an operator's rejection, not a red test run
+        gates = [c for c in await repo.list_task_checkpoints(db, task.id) if c.node_id == "gate"]
+        assert [(c.status, c.artifact.get("cause")) for c in gates] == [
+            (CheckpointStatus.failed, "operator")
+        ]

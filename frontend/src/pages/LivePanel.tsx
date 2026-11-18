@@ -159,7 +159,9 @@ function summarize(ev: EventRow): string {
       const where = String(p.stage ?? "?");
       let s = `attempt #${num(p.n)} failed @ ${where}`;
       if (p.exit_code != null) s += ` (exit ${num(p.exit_code)})`;
-      if (p.error) s += ` — ${String(p.error).slice(0, 100)}`;
+      // Why it failed; events from before `reason` existed carry only a developer's `error`.
+      const why = p.reason || p.error;
+      if (why) s += ` — ${String(why).slice(0, 140)}`;
       return s;
     }
     case "baseline.snapshot":

@@ -164,6 +164,63 @@ async def test_approving_a_proposal_that_is_no_longer_pending_writes_nothing(
     )
 
 
+async def test_a_rejected_proposal_stands_for_its_proposed_and_base_graph(db: Database) -> None:
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+    base = {"version": 1, "nodes": [{"id": "developer"}], "edges": []}
+    graph = {"version": 2, "nodes": [{"id": "developer"}, {"id": "tester"}], "edges": []}
+
+    async def propose(proposed: dict[str, object], on: dict[str, object]) -> tuple[str, bool]:
+        proposal, created = await repo.add_workflow_proposal(
+            db, project_id=p.id, reason={"action": "grow"}, proposed_graph=proposed, base_graph=on
+        )
+        return proposal.id, created
+
+    first, created = await propose(graph, base)
+    assert created
+    assert await propose(graph, base) == (first, False)  # pending: deduplicated as before
+    assert await repo.reject_workflow_proposal(db, first, decision_reason="no")
+    rejected = await repo.get_workflow_proposal(db, first)
+    assert rejected is not None
+
+    # The same graphs (key order aside) and another reason: the rejected proposal, no new row.
+    again, created = await repo.add_workflow_proposal(
+        db,
+        project_id=p.id,
+        reason={"action": "grow", "clean_streak": 9},
+        proposed_graph=dict(reversed(graph.items())),
+        base_graph=base,
+    )
+    assert (again, created) == (rejected, False)
+    assert await db.fetchval("SELECT COUNT(*) FROM workflow_proposals") == 1
+
+    # Another change on the same base, or the same change on another base, is stored.
+    other_change, created = await propose({**graph, "nodes": [{"id": "security"}]}, base)
+    assert created and other_change != first
+    other_base, created = await propose(graph, {**base, "version": 3})
+    assert created and other_base not in (first, other_change)
+
+    # An approved proposal never stops the same change from being proposed again.
+    q = await repo.create_project(db, name="other", path="/tmp/other", default_branch="main")
+    approved, _ = await repo.add_workflow_proposal(
+        db, project_id=q.id, reason={}, proposed_graph=graph, base_graph=base
+    )
+    await repo.update_project_with_workflow_version(
+        db,
+        q.id,
+        config={"workflow": graph},
+        source=WorkflowVersionSource.proposal,
+        reason="approve",
+        graph_before=None,
+        graph_after=graph,
+        approves_proposal=approved.id,
+    )
+    proposal, created = await repo.add_workflow_proposal(
+        db, project_id=q.id, reason={}, proposed_graph=graph, base_graph=base
+    )
+    assert created and proposal.id != approved.id
+    assert proposal.state == WorkflowProposalState.pending
+
+
 async def test_migration_failure_is_atomic(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:

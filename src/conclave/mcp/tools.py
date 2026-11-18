@@ -1309,11 +1309,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "task streaks (growing on failures/catches, shrinking zero-catch non-core reviewers "
         "after >= 3 clean done tasks), as experimental.workflow_evolution says: suggest "
         "(default) stores a proposal and returns it, auto applies the change as a workflow "
-        "version, off only previews it. apply=true applies it now as your decision. Returns the "
-        "outcome without graphs: evolved, mode, project_id, task_id, action, clean_streak, "
-        "promoted_agents, demoted_agents, proposal (without proposed_graph and base_graph) and "
-        "version (without graph_after and graph_before); include_graphs=true adds the computed "
-        "workflow and those graphs.",
+        "version, off only previews it. apply=true applies it now as your decision. A rejected "
+        "proposal stands until the workflow changes: the same change on the same workflow is not "
+        "stored again, and suppressed_by names the rejected proposal. Returns the outcome "
+        "without graphs: evolved, mode, project_id, task_id, action, clean_streak, "
+        "promoted_agents, demoted_agents, proposal (without proposed_graph and base_graph), "
+        "version (without graph_after and graph_before) and suppressed_by (null unless a "
+        "rejection stopped the proposal); include_graphs=true adds the computed workflow and "
+        "those graphs.",
         {
             "project_id": _prop("string", "Project ID."),
             "task_id": _prop("string", "Optional ID of a task of this project to evaluate."),

@@ -890,11 +890,11 @@ class _InterruptedCosts:
         pass
 
 
-@pytest.mark.parametrize("routed", [False, True], ids=["claude-provider", "engine-router"])
-async def test_a_resumed_session_is_charged_only_what_its_resumed_run_added(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, routed: bool
-) -> None:
-    cli = _make_cli(tmp_path, _RESUMED_TOTAL_CLI, name="resumed_total.py")
+async def _dispatch_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str, *, routed: bool
+) -> tuple[list[list[str]], _InterruptedCosts, AgentResult]:
+    """Dispatch through a fake "claude" *script* that is refused once, then resumed."""
+    cli = _make_cli(tmp_path, script, name="resumed_total.py")
     spawns = _capture_spawns(monkeypatch, cli)
     clock = _ClockedSleep()
     listener = _InterruptedCosts()
@@ -912,13 +912,46 @@ async def test_a_resumed_session_is_charged_only_what_its_resumed_run_added(
         retry_minutes=15,
         listener=listener,
     )
+    return [args for args, _env in spawns], listener, result
 
-    assert [("--resume" in args) for args, _env in spawns] == [False, True]
+
+@pytest.mark.parametrize("routed", [False, True], ids=["claude-provider", "engine-router"])
+async def test_a_resumed_session_is_charged_only_what_its_resumed_run_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, routed: bool
+) -> None:
+    spawns, listener, result = await _dispatch_resumed(
+        tmp_path, monkeypatch, _RESUMED_TOTAL_CLI, routed=routed
+    )
+
+    assert [("--resume" in args) for args in spawns] == [False, True]
     assert result.ok is True and result.text == "VERDICT: pass"
     assert result.cost_is_session_total is True
     assert listener.costs == [4.52]
     assert result.cost_usd == pytest.approx(3.97)  # 8.49 for the session, 4.52 already charged
     assert result.num_turns == 18  # per run, as reported
+
+
+# The same CLI, but the refused run was stopped before Claude Code saved the session's totals:
+# the resumed run restores none, so its total restarts from its own cost, 2.00.
+_RESTARTED_TOTAL_CLI = _RESUMED_TOTAL_CLI.replace(
+    '"total_cost_usd": 8.49', '"total_cost_usd": 2.00'
+)
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["claude-provider", "engine-router"])
+async def test_a_resumed_session_whose_total_restarted_is_charged_its_whole_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, routed: bool
+) -> None:
+    assert _RESTARTED_TOTAL_CLI != _RESUMED_TOTAL_CLI
+    spawns, listener, result = await _dispatch_resumed(
+        tmp_path, monkeypatch, _RESTARTED_TOTAL_CLI, routed=routed
+    )
+
+    assert [("--resume" in args) for args in spawns] == [False, True]
+    assert result.ok is True and result.text == "VERDICT: pass"
+    assert result.cost_is_session_total is True
+    assert listener.costs == [4.52]
+    assert result.cost_usd == 2.00  # below the 4.52 reported before: the run's own cost
 
 
 async def test_a_session_to_resume_is_passed_as_resume(
