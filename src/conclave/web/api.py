@@ -1815,4 +1815,6 @@ async def query_observability_logs(
 async def export_observability_parquet(
     daemon: Daemon = Depends(get_daemon),
 ) -> dict[str, Any]:
-    return await export_interaction_logs_to_parquet(daemon.db)
+    """Write every interaction log into the daemon home's ``INTERACTION_LOGS.parquet``, or
+    ``INTERACTION_LOGS.jsonl`` without ``pyarrow``: ``{ok, path, rows, format, size_bytes}``."""
+    return await export_interaction_logs_to_parquet(daemon.db, home=daemon.home)

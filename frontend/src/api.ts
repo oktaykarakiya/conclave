@@ -113,6 +113,8 @@ export const api = {
   patchConfig: (id: string, config: unknown, idempotencyKey?: string, unset?: string[]) =>
     req<unknown>("PATCH", `/api/projects/${id}/config`, { config, unset }, idempotencyKey),
   configSchema: () => req<Record<string, unknown>>("GET", "/api/config/schema"),
+  /** The resolved global settings (built-in defaults plus the global layer). */
+  getGlobalConfig: () => req<Record<string, unknown>>("GET", "/api/config/global"),
   /** Merge `config` into the global layer; `unset` paths are removed from it first. */
   patchGlobalConfig: (config: unknown, unset?: string[]) =>
     req<{ ok: boolean; global_config: Record<string, unknown>; updated_projects: string[] }>(
@@ -399,7 +401,7 @@ export const api = {
       tokens_saved_est: number;
     }>("POST", `/api/planning/sessions/${encodeURIComponent(sessionId)}/compact`),
 
-  // Observability & Interaction Logs (SQLite + INTERACTION_LOGS.parquet)
+  // Observability & Interaction Logs (SQLite; archive file written on request)
   observabilityStats: (projectId?: string) =>
     req<ObservabilityStats>(
       "GET",
@@ -425,11 +427,15 @@ export const api = {
     ),
   observabilityQuery: (sql: string, limit = 200) =>
     req<SqlQueryResult>("POST", "/api/observability/query", { sql, limit }),
+  /** Write every interaction log to INTERACTION_LOGS.parquet, or .jsonl without pyarrow. */
   exportParquet: () =>
-    req<{ ok: boolean; path: string; rows: number; size_bytes: number }>(
-      "POST",
-      "/api/observability/export-parquet",
-    ),
+    req<{
+      ok: boolean;
+      path: string;
+      rows: number;
+      format: "parquet" | "jsonl";
+      size_bytes: number;
+    }>("POST", "/api/observability/export-parquet"),
   /** Usage-limit gates per engine account: a closed gate's dispatches wait until resumes_at. */
   engineQuota: () => req<{ gates: EngineQuotaGate[] }>("GET", "/api/engines/quota"),
   reloadStatus: () =>

@@ -1,26 +1,31 @@
-"""Synchronize Conclave agent interaction logs to SQLite and ZSTD-compressed Apache Parquet.
+"""Record agent interaction logs in SQLite, and export them on request to an archive file.
 
-Matches the 23-column ``INTERACTION_LOGS.parquet`` schema used by ``sync_interaction_logs.py``
-so Conclave dispatches and OpenCode/Claude sessions share one unified analytical schema.
+The archive has the 23-column ``INTERACTION_LOGS`` schema used by ``sync_interaction_logs.py``,
+so Conclave dispatches and OpenCode/Claude sessions share one analytical schema. It is
+ZSTD-compressed Apache Parquet (``INTERACTION_LOGS.parquet``) when the optional ``pyarrow`` is
+installed (``pip install -e ".[observability]"``), else JSON Lines (``INTERACTION_LOGS.jsonl``).
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import importlib
 import json
-import logging
 import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from ..db import Database, InteractionLog
 from ..db import repositories as repo
 from ..providers import AgentResult
 from ..util import new_id
 
-logger = logging.getLogger("conclave.observability.parquet_sync")
+_ARCHIVE_STEM = "INTERACTION_LOGS"
+# Raw rows read from the database, then converted and written in a worker thread, per step.
+_EXPORT_PAGE_ROWS = 500
 
 
 def _load_pyarrow() -> tuple[Any, Any] | None:
@@ -33,85 +38,16 @@ def _load_pyarrow() -> tuple[Any, Any] | None:
         return None
 
 
-def default_parquet_paths() -> list[Path]:
-    """Return the default target paths for ``INTERACTION_LOGS.parquet``."""
-    home_dir = Path(
-        os.environ.get("CONCLAVE_HOME", str(Path.home() / ".local" / "share" / "conclave"))
-    )
-    paths: list[Path] = [home_dir / "INTERACTION_LOGS.parquet"]
-    if (
-        os.environ.get("CONCLAVE_PARQUET_SYNC") != "0"
-        and "PYTEST_CURRENT_TEST" not in os.environ
-    ):
-        cwd = Path.cwd()
-        if cwd.is_dir() and (cwd / "pyproject.toml").is_file():
-            cwd_target = cwd / "INTERACTION_LOGS.parquet"
-            if cwd_target not in paths:
-                paths.append(cwd_target)
-    return paths
+def _default_home() -> Path:
+    """``$CONCLAVE_HOME``, else ``~/.local/share/conclave``: the daemon's home."""
+    override = os.environ.get("CONCLAVE_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".local" / "share" / "conclave"
 
 
-async def export_interaction_logs_to_parquet(
-    db: Database, target_path: Path | None = None
-) -> dict[str, Any]:
-    """Export all ``interaction_logs`` rows into the 23-column ZSTD Parquet archive."""
-    logs = await repo.list_interaction_logs(db, limit=10_000)
-
-    if target_path is not None:
-        targets = [target_path]
-    elif "PYTEST_CURRENT_TEST" in os.environ:
-        targets = [db._path.parent / "INTERACTION_LOGS.parquet"]
-    else:
-        targets = default_parquet_paths()
-
-    out_path = targets[0]
-    records: list[dict[str, Any]] = [
-        {
-            "session_id": str(row.session_id),
-            "title": str(row.title),
-            "directory": str(row.directory),
-            "path": str(row.path or row.directory),
-            "slug": str(row.slug),
-            "model": str(row.model),
-            "agent": str(row.agent),
-            "cost": float(row.cost),
-            "tokens_input": int(row.tokens_input),
-            "tokens_output": int(row.tokens_output),
-            "tokens_reasoning": int(row.tokens_reasoning),
-            "tokens_cache_read": int(row.tokens_cache_read),
-            "tokens_cache_write": int(row.tokens_cache_write),
-            "time_created": int(row.time_created),
-            "time_updated": int(row.time_updated),
-            "created_at_str": str(row.created_at_str),
-            "updated_at_str": str(row.updated_at_str),
-            "duration": f"{row.duration:.1f}s",
-            "tool_calls_count": int(row.tool_calls_count),
-            "message_count": int(row.message_count),
-            "user_prompt": str(row.user_prompt),
-            "tool_breakdown": json.dumps(row.tool_breakdown, ensure_ascii=False),
-            "messages": json.dumps(row.messages, ensure_ascii=False),
-        }
-        for row in logs
-    ]
-
-    loaded = _load_pyarrow()
-    if loaded is None:
-        payload = "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n"
-        for dest in targets:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp_file = dest.with_name(f"{dest.name}.tmp")
-            tmp_file.write_text(payload, encoding="utf-8")
-            os.replace(tmp_file, dest)
-        return {
-            "ok": True,
-            "path": str(out_path),
-            "rows": len(logs),
-            "size_bytes": out_path.stat().st_size if out_path.is_file() else 0,
-            "format": "jsonl-fallback",
-        }
-
-    pa, pq = loaded
-    schema = pa.schema(
+def _parquet_schema(pa: Any) -> Any:
+    return pa.schema(
         [
             ("session_id", pa.string()),
             ("title", pa.string()),
@@ -139,18 +75,121 @@ async def export_interaction_logs_to_parquet(
         ]
     )
 
-    table = pa.Table.from_pylist(records, schema=schema)
-    for dest in targets:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp_file = dest.with_name(f"{dest.name}.tmp")
-        pq.write_table(table, str(tmp_file), compression="ZSTD")
-        os.replace(tmp_file, dest)
 
+def _archive_record(row: InteractionLog) -> dict[str, Any]:
+    """One archive row: the 23 columns of the ``INTERACTION_LOGS`` schema."""
+    return {
+        "session_id": str(row.session_id),
+        "title": str(row.title),
+        "directory": str(row.directory),
+        "path": str(row.path or row.directory),
+        "slug": str(row.slug),
+        "model": str(row.model),
+        "agent": str(row.agent),
+        "cost": float(row.cost),
+        "tokens_input": int(row.tokens_input),
+        "tokens_output": int(row.tokens_output),
+        "tokens_reasoning": int(row.tokens_reasoning),
+        "tokens_cache_read": int(row.tokens_cache_read),
+        "tokens_cache_write": int(row.tokens_cache_write),
+        "time_created": int(row.time_created),
+        "time_updated": int(row.time_updated),
+        "created_at_str": str(row.created_at_str),
+        "updated_at_str": str(row.updated_at_str),
+        "duration": f"{row.duration:.1f}s",
+        "tool_calls_count": int(row.tool_calls_count),
+        "message_count": int(row.message_count),
+        "user_prompt": str(row.user_prompt),
+        "tool_breakdown": json.dumps(row.tool_breakdown, ensure_ascii=False),
+        "messages": json.dumps(row.messages, ensure_ascii=False),
+    }
+
+
+class _ArchiveWriter:
+    """Writes one archive into a hidden temporary file beside it, then renames that over it.
+
+    Blocking file work: it is built and every method runs in a worker thread, never on the
+    event loop.
+    """
+
+    def __init__(self, target_path: Path | None, home: Path | None) -> None:
+        pyarrow = _load_pyarrow()
+        self.format = "jsonl" if pyarrow is None else "parquet"
+        base = target_path if target_path is not None else (home or _default_home()) / _ARCHIVE_STEM
+        # The suffix always names the content: never JSON Lines under a .parquet name.
+        self.path = base.with_suffix(f".{self.format}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.rows = 0
+        # Unique, so two exports never write into one file; hidden, as it is not the archive.
+        self._tmp = self.path.with_name(f".{self.path.name}.{new_id()}.tmp")
+        self._jsonl: IO[str] | None = None
+        self._parquet: Any = None
+        if pyarrow is None:
+            self._jsonl = open(self._tmp, "w", encoding="utf-8", newline="\n")
+        else:
+            pa, pq = pyarrow
+            self._pa = pa
+            self._schema = _parquet_schema(pa)
+            self._parquet = pq.ParquetWriter(str(self._tmp), self._schema, compression="ZSTD")
+
+    def write(self, raw_rows: list[Any]) -> None:
+        """Convert a page of raw ``interaction_logs`` rows and append it to the file."""
+        records = [_archive_record(InteractionLog.from_row(row)) for row in raw_rows]
+        if self._jsonl is not None:
+            self._jsonl.writelines(json.dumps(rec, ensure_ascii=False) + "\n" for rec in records)
+        else:
+            self._parquet.write_table(self._pa.Table.from_pylist(records, schema=self._schema))
+        self.rows += len(records)
+
+    def finish(self) -> int:
+        """Close the file and rename it over the archive; return the archive's size in bytes."""
+        if self._jsonl is not None:
+            self._jsonl.close()
+        else:
+            if self.rows == 0:  # still a Parquet file with the schema
+                self._parquet.write_table(self._schema.empty_table())
+            self._parquet.close()
+        os.replace(self._tmp, self.path)
+        return self.path.stat().st_size
+
+    def discard(self) -> None:
+        """Close and delete the temporary file; the archive in place, if any, stays as it was."""
+        with contextlib.suppress(Exception):
+            (self._jsonl if self._jsonl is not None else self._parquet).close()
+        self._tmp.unlink(missing_ok=True)
+
+
+async def export_interaction_logs_to_parquet(
+    db: Database, target_path: Path | None = None, *, home: Path | None = None
+) -> dict[str, Any]:
+    """Write every ``interaction_logs`` row into the archive file, replacing it atomically, and
+    return ``{ok, path, rows, format, size_bytes}``.
+
+    The format is ``parquet`` when ``pyarrow`` is importable, else ``jsonl``, and the file's
+    suffix is always ``.<format>``: *target_path* with that suffix, else
+    ``INTERACTION_LOGS.<format>`` in *home* (the daemon's home, ``$CONCLAVE_HOME`` when not
+    given). Rows are read in pages, without a cap, and converted and written in a worker
+    thread, never on the event loop. The name predates the JSON Lines format; the REST and MCP
+    callers keep it.
+    """
+    writer = await asyncio.to_thread(_ArchiveWriter, target_path, home)
+    try:
+        after: int | None = None
+        while page := await repo.interaction_log_rows_after(db, after, _EXPORT_PAGE_ROWS):
+            await asyncio.to_thread(writer.write, page)
+            after = int(page[-1]["row_key"])
+        size = await asyncio.to_thread(writer.finish)
+    except Exception:
+        # Not on cancellation: a write may still run in its thread then, and closing the file
+        # under it is unsafe, so that hidden temporary file stays behind.
+        await asyncio.to_thread(writer.discard)
+        raise
     return {
         "ok": True,
-        "path": str(out_path),
-        "rows": len(logs),
-        "size_bytes": out_path.stat().st_size,
+        "path": str(writer.path),
+        "rows": writer.rows,
+        "format": writer.format,
+        "size_bytes": size,
     }
 
 
@@ -170,7 +209,11 @@ async def log_agent_interaction(
     node_id: str | None = None,
     source: str = "conclave",
 ) -> InteractionLog:
-    """Record a completed agent dispatch into ``interaction_logs`` and sync Parquet."""
+    """Record a completed agent dispatch into ``interaction_logs``.
+
+    Only the row: the archive file is written on request
+    (:func:`export_interaction_logs_to_parquet`), never per dispatch.
+    """
     sid = session_id or result.session_id or new_id()
     now_ms = int(time.time() * 1000)
     dur_sec = max(0.0, float(duration_seconds))
@@ -237,11 +280,4 @@ async def log_agent_interaction(
         node_id=node_id,
         source=source,
     )
-
-    if "PYTEST_CURRENT_TEST" not in os.environ:
-        try:
-            await export_interaction_logs_to_parquet(db)
-        except Exception:
-            logger.debug("background parquet export failed", exc_info=True)
-
     return entry

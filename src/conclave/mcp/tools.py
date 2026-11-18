@@ -461,7 +461,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "description": (
                     "Optional SystemSettings overrides, daemon-wide (global settings only; a "
                     "project value is ignored): hot_reload_watch (default false) reloads "
-                    "Conclave when its source files change."
+                    "Conclave when its source files change; interaction_log_retention_days "
+                    "(integer 0-3650, default 90; 0 keeps them forever) deletes the interaction "
+                    "logs older than that at daemon start and then hourly (usage and cost "
+                    "records stay)."
                 ),
             },
             "ui": {
@@ -1238,12 +1241,18 @@ MCP_TOOLS: list[dict[str, Any]] = [
     _tool(
         "conclave_get_observability_stats",
         "Get aggregated observability statistics (sessions, cost, token totals, per-model and "
-        "per-agent breakdowns) from interaction_logs, optionally exporting to Parquet.",
+        "per-agent breakdowns) from interaction_logs, optionally exporting every interaction log "
+        "to an archive file in the daemon's home (export_parquet). The archive is only written "
+        "on request, never per dispatch.",
         {
-            "project_id": _prop("string", "Optional project ID filter."),
+            "project_id": _prop("string", "Optional project ID filter (not of the export)."),
             "export_parquet": _prop(
                 "boolean",
-                "If true, also synchronize/export interaction_logs to INTERACTION_LOGS.parquet.",
+                "If true, also write every interaction log, of all projects, into "
+                "$CONCLAVE_HOME/INTERACTION_LOGS.parquet (ZSTD Parquet; needs pyarrow, the "
+                "observability extra), else INTERACTION_LOGS.jsonl (JSON Lines), replacing that "
+                "file. The parquet key then holds ok, path, rows, format (parquet or jsonl) and "
+                "size_bytes.",
                 default=False,
             ),
         },
@@ -3048,7 +3057,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             pid_filter = None
         stats = await repo.interaction_stats(daemon.db, project_id=pid_filter)
         if _opt_bool(args, "export_parquet", False):
-            stats["parquet"] = await export_interaction_logs_to_parquet(daemon.db)
+            stats["parquet"] = await export_interaction_logs_to_parquet(
+                daemon.db, home=daemon.home
+            )
         return stats
 
     if name == "conclave_get_task_usage":

@@ -180,6 +180,24 @@ def test_new_sections_validate_their_values() -> None:
             load_project_config(bad)
 
 
+def test_interaction_log_retention_is_a_bounded_strict_integer() -> None:
+    assert ConclaveConfig().system.interaction_log_retention_days == 90
+    prop = config_schema()["$defs"]["SystemSettings"]["properties"][
+        "interaction_log_retention_days"
+    ]
+    assert (prop["type"], prop["default"], prop["minimum"], prop["maximum"]) == (
+        "integer", 90, 0, 3650
+    )
+    assert "0 keeps them forever" in prop["description"]
+    for days in (0, 1, 3650):
+        cfg = load_project_config({"system": {"interaction_log_retention_days": days}})
+        assert cfg.system.interaction_log_retention_days == days
+    # Strict, as it deletes data: true is not 1 and "30" is not 30.
+    for bad in (-1, 3651, True, "30"):
+        with pytest.raises(ValidationError):
+            load_project_config({"system": {"interaction_log_retention_days": bad}})
+
+
 def test_builtin_config_presets_keep_auto_merge_on() -> None:
     from conclave.bootstrap import _BUILT_IN_CONFIG_PRESETS
 

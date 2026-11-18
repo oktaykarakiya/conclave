@@ -433,12 +433,16 @@ async def test_observability_compaction_and_agent_config(
         )
         assert bad_sql.status_code == 400
 
-        # 6. Export to Parquet and verify file is created with rows
-        pq_path = tmp_path / "INTERACTION_LOGS.parquet"
-        pq_info = await export_interaction_logs_to_parquet(db, target_path=pq_path)
+        # 6. Export the archive and verify the file is created with rows, its suffix naming
+        # its format (.parquet with pyarrow, else .jsonl)
+        pq_info = await export_interaction_logs_to_parquet(
+            db, target_path=tmp_path / "INTERACTION_LOGS.parquet"
+        )
+        pq_path = Path(pq_info["path"])
         assert pq_info["ok"] is True
         assert pq_info["rows"] >= 3
         assert pq_path.is_file()
+        assert pq_path.parent == tmp_path and pq_path.suffix == f".{pq_info['format']}"
         assert pq_info["size_bytes"] > 0
 
 

@@ -135,6 +135,12 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      `agent_defaults.model` as `default_model`; without `project_id`, the global settings' list.
    - `system.hot_reload_watch` (default `false`): daemon-wide, so only the global settings count
      (a project value is stored but ignored). See §10.
+   - `system.interaction_log_retention_days` (an integer, `0`–`3650`, default `90`; `0` keeps
+     them forever): daemon-wide too. Interaction logs (the prompts and replies
+     `conclave_list_interactions` shows) last updated more than that many days ago are deleted at
+     daemon start and then once an hour, in batches. Usage and cost records
+     (`conclave_get_task_usage`, `conclave_get_project_usage`) are never deleted. Lowering it
+     deletes the older logs within the hour, irreversibly; export them first if you need them (§6).
    - `context.bulk_max_chars` (default 200000), `context.compaction_enabled` (default `false`),
      `context.compaction_max_chars` (default 60000); both limits accept 1000–2000000. Agents always
      get the task request, plan, reviewer feedback, steer and planning prompt whole. Only
@@ -341,6 +347,19 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 - `conclave_get_task_usage(task_id)` sums a task's turns and tokens (input, output, cache read,
   cache creation) over its usage rows (`agent_count`, one per agent run), without cost;
   `conclave_get_project_usage(project_id)` gives a project's `calls` and `total_cost_usd`.
+- Interaction logs (`conclave_list_interactions`, `conclave_get_interaction`,
+  `conclave_query_interactions`) are kept for `system.interaction_log_retention_days` (§3). Their
+  archive file is written only on request, never per dispatch:
+  `conclave_get_observability_stats(export_parquet=true)` (REST
+  `POST /api/observability/export-parquet`, the History tab's **Export interaction logs**) writes
+  every row of all projects, with no cap, to `$CONCLAVE_HOME/INTERACTION_LOGS.parquet` (ZSTD
+  Parquet) when `pyarrow` is installed (the `observability` extra:
+  `pip install -e ".[observability]"`), else to `INTERACTION_LOGS.jsonl` (JSON Lines), and
+  replaces that file atomically. It returns `ok`, `path`, `rows`, `format` (`parquet` or `jsonl`)
+  and `size_bytes`. Conclave no longer writes a second copy into the daemon's working directory,
+  and `CONCLAVE_PARQUET_SYNC`, which turned that copy off, is gone. Files written before stay
+  where they are (an older `INTERACTION_LOGS.parquet` without `pyarrow` holds JSON Lines); delete
+  them yourself if you do not need them.
 
 ### Usage limits
 - When an engine refuses work because a usage limit or the balance ran out (Claude Code's
@@ -480,8 +499,9 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   editing that checkout while tasks run.
 - `conclave_get_reload_status` shows `watcher_enabled`, `reload_pending` and `changed_files`
   without reloading.
-- A hot reload keeps the running daemon objects (the watcher loop, the engine router), so a change
-  to them takes effect after a restart; restart the daemon once after deploying such a change.
+- A hot reload keeps the running daemon objects (the watcher loop, the retention loop, the engine
+  router), so a change to them takes effect after a restart; restart the daemon once after
+  deploying such a change.
 
 ## 11. Pitfalls and response shapes
 
@@ -677,7 +697,8 @@ group for the first time.
 - `conclave_list_interactions` — list logged agent and MCP conversations.
 - `conclave_get_interaction` — read one full transcript and tool breakdown.
 - `conclave_query_interactions` — run a read-only SQL SELECT over interaction logs.
-- `conclave_get_observability_stats` — read aggregated cost, token, and model stats.
+- `conclave_get_observability_stats` — read aggregated cost, token, and model stats, or export
+  every interaction log to a file.
 - `conclave_get_task_usage` — read one task's turn and token totals.
 - `conclave_get_project_usage` — read one project's usage calls and total cost.
 

@@ -87,6 +87,15 @@ Conclave never touches your working tree: each task runs in an isolated git *wor
 `~/.local/share/conclave/` (override with `CONCLAVE_HOME`). Host/port via `CONCLAVE_HOST` /
 `CONCLAVE_PORT`.
 
+The **History** tab keeps every agent's prompt and reply for 90 days by default (**Settings →
+Global settings**; `0` keeps them forever). Its **Export interaction logs** button writes them
+all to `$CONCLAVE_HOME/INTERACTION_LOGS.jsonl` (JSON Lines), or to `INTERACTION_LOGS.parquet`
+(ZSTD Parquet) once the optional `observability` extra is installed:
+
+```bash
+.venv/bin/pip install -e ".[observability]"   # adds pyarrow to the launcher's venv
+```
+
 ## Security model
 
 Conclave is a **single-user, personal tool** and is **intentionally unauthenticated** — it can

@@ -54,6 +54,26 @@ async def hot_reload_watch_enabled(db: Database) -> bool:
     return (await resolve_project_config(db, None)).system.hot_reload_watch
 
 
+# How often the daemon deletes expired interaction logs, after the pass at its start.
+INTERACTION_LOG_RETENTION_INTERVAL_SECONDS = 3600.0
+
+
+async def prune_interaction_logs(db: Database) -> int:
+    """Delete the interaction logs older than ``system.interaction_log_retention_days`` (0
+    keeps them all) and return how many; the ``usage`` rows (cost accounting) stay.
+
+    Daemon-wide, so only the global settings count; a project's ``system`` value is ignored.
+    """
+    days = (await resolve_project_config(db, None)).system.interaction_log_retention_days
+    if days <= 0:
+        return 0
+    cutoff_ms = int(time.time() * 1000) - days * 86_400_000
+    deleted = await repo.delete_interaction_logs_before(db, cutoff_ms)
+    if deleted:
+        logger.info("deleted %d interaction log(s) older than %d day(s)", deleted, days)
+    return deleted
+
+
 async def reload_status_report(daemon: Daemon) -> dict[str, Any]:
     """The hot-reload status plus ``watcher_enabled`` (the global ``system.hot_reload_watch``).
 
@@ -398,12 +418,28 @@ class Daemon:
     async def start(self) -> None:
         if not self._workers_enabled:
             return
+        await self._interaction_log_retention_tick()
         for project in await repo.list_projects(self.db):
             await self.start_worker(project.id)
         if "PYTEST_CURRENT_TEST" not in os.environ:
-            watch_task = asyncio.create_task(self._watch_reload_loop())
-            self._bg_tasks.add(watch_task)
-            watch_task.add_done_callback(self._bg_tasks.discard)
+            for coro in (self._watch_reload_loop(), self._interaction_log_retention_loop()):
+                bg_task = asyncio.create_task(coro)
+                self._bg_tasks.add(bg_task)
+                bg_task.add_done_callback(self._bg_tasks.discard)
+
+    async def _interaction_log_retention_loop(self) -> None:
+        """Background loop: delete the expired interaction logs once an hour."""
+        while True:
+            await asyncio.sleep(INTERACTION_LOG_RETENTION_INTERVAL_SECONDS)
+            await self._interaction_log_retention_tick()
+
+    async def _interaction_log_retention_tick(self) -> None:
+        """One retention pass (:func:`prune_interaction_logs`); a failure is logged, not raised,
+        so it never stops the daemon's start or its loop."""
+        try:
+            await prune_interaction_logs(self.db)
+        except Exception:
+            logger.warning("interaction log retention pass failed", exc_info=True)
 
     async def _watch_reload_loop(self) -> None:
         """Background loop: run a pending reload, and watch the source files when enabled."""

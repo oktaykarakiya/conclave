@@ -517,7 +517,7 @@ async def test_patch_config_round_trips_the_quality_first_settings(
     assert before["execution"]["auto_merge"] is False
     assert before["experimental"]["auto_planner_char_threshold"] == 0
     assert before["agent_defaults"]["effort"] is None
-    assert before["system"] == {"hot_reload_watch": False}
+    assert before["system"] == {"hot_reload_watch": False, "interaction_log_retention_days": 90}
     assert before["ui"] == {"model_choices": []}
 
     # system: daemon-wide, set in the global settings via config and via the section arg
@@ -575,8 +575,18 @@ async def test_patch_config_round_trips_the_quality_first_settings(
         {"system": {"hot_reload_watch": "maybe"}},
         {"system": {"watch_files": True}},
         {"ui": {"model_choices": "claude-code/opus"}},
+        {"system": {"interaction_log_retention_days": -1}},
+        {"system": {"interaction_log_retention_days": 3651}},
+        {"system": {"interaction_log_retention_days": True}},
     ],
-    ids=["not-a-bool", "unknown-key", "not-a-list"],
+    ids=[
+        "not-a-bool",
+        "unknown-key",
+        "not-a-list",
+        "retention-negative",
+        "retention-over-3650",
+        "retention-not-an-int",
+    ],
 )
 async def test_bad_quality_first_values_are_rejected_over_mcp_and_rest(
     db: Database, tmp_path: Path, bad: dict[str, Any]
@@ -600,6 +610,7 @@ async def test_bad_quality_first_values_are_rejected_over_mcp_and_rest(
 
     glob = await resolve_project_config(db, None)  # nothing bad was stored
     assert glob.system.hot_reload_watch is False and glob.ui.model_choices == []
+    assert glob.system.interaction_log_retention_days == 90
 
 
 async def test_get_task_and_task_events_describe_what_they_return(

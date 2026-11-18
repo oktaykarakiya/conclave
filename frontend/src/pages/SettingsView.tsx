@@ -18,6 +18,12 @@ function modelChoicesText(cfg: Record<string, unknown>): string {
   return Array.isArray(choices) ? choices.map(String).join("\n") : "";
 }
 
+/** system.interaction_log_retention_days of a resolved config, or null when it is absent. */
+function retentionDaysOf(cfg: Record<string, unknown> | null): number | null {
+  const days = asRecord(cfg?.system).interaction_log_retention_days;
+  return typeof days === "number" ? days : null;
+}
+
 type ReloadStatus = Awaited<ReturnType<typeof api.reloadStatus>>;
 
 export function SettingsView({
@@ -62,20 +68,24 @@ export function SettingsView({
   } | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Global (daemon-wide) settings: the hot-reload watcher and a manual reload
+  // Global (daemon-wide) settings: the hot-reload watcher, a manual reload, log retention
   const [reloadInfo, setReloadInfo] = useState<ReloadStatus | null>(null);
   const [globalBusy, setGlobalBusy] = useState(false);
+  // The stored retention, and the input's text: it deletes data, so only Save writes it.
+  const [retentionDays, setRetentionDays] = useState<number | null>(null);
+  const [retentionInput, setRetentionInput] = useState("");
 
   const loadAll = useCallback(async () => {
     setLoading(true);
     setNotice(null);
     try {
-      const [cfg, qList, qHealth, mcp, reload] = await Promise.all([
+      const [cfg, qList, qHealth, mcp, reload, globalCfg] = await Promise.all([
         api.getConfig(projectId),
         api.listQuarantine(projectId),
         api.quarantineIntegrity(projectId),
         api.mcpInfo().catch(() => null),
         api.reloadStatus().catch(() => null),
+        api.getGlobalConfig().catch(() => null),
       ]);
       setLoaded(cfg);
       setConfig(cfg);
@@ -85,6 +95,9 @@ export function SettingsView({
       setIntegrity(qHealth);
       setMcpInfo(mcp);
       setReloadInfo(reload);
+      const days = retentionDaysOf(globalCfg);
+      setRetentionDays(days);
+      setRetentionInput(days === null ? "" : String(days));
     } catch (e) {
       setNotice({ kind: "err", text: String(e) });
     } finally {
@@ -176,6 +189,36 @@ export function SettingsView({
       setNotice({
         kind: "ok",
         text: `Hot-reload watcher ${enabled ? "on" : "off"} for the whole daemon.`,
+      });
+    } catch (e) {
+      setNotice({ kind: "err", text: String(e) });
+    } finally {
+      setGlobalBusy(false);
+    }
+  }
+
+  /** Save the daemon-wide interaction log retention in the global layer (never in projects). */
+  async function saveRetention() {
+    const days = Number(retentionInput);
+    if (retentionInput.trim() === "" || !Number.isInteger(days) || days < 0 || days > 3650) {
+      setNotice({ kind: "err", text: "Retention is a whole number of days from 0 to 3650." });
+      return;
+    }
+    setGlobalBusy(true);
+    setNotice(null);
+    try {
+      const res = await api.patchGlobalConfig({
+        system: { interaction_log_retention_days: days },
+      });
+      const saved = retentionDaysOf(res.global_config) ?? days;
+      setRetentionDays(saved);
+      setRetentionInput(String(saved));
+      setNotice({
+        kind: "ok",
+        text:
+          saved === 0
+            ? "Interaction logs are now kept forever."
+            : `Interaction logs are now kept for ${saved} days.`,
       });
     } catch (e) {
       setNotice({ kind: "err", text: String(e) });
@@ -914,6 +957,40 @@ export function SettingsView({
             </span>
           </span>
         </label>
+
+        <div className="space-y-1 rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2">
+          <label htmlFor="interaction-log-retention" className="block text-xs text-zinc-300">
+            Interaction log retention (days)
+          </label>
+          <div className="flex items-center gap-2">
+            <div className="w-28">
+              <input
+                id="interaction-log-retention"
+                type="number"
+                min={0}
+                max={3650}
+                step={1}
+                className={input}
+                value={retentionInput}
+                disabled={globalBusy || retentionDays === null}
+                onChange={(e) => setRetentionInput(e.target.value)}
+              />
+            </div>
+            <Button
+              size="sm"
+              onClick={() => void saveRetention()}
+              disabled={
+                globalBusy || retentionDays === null || retentionInput === String(retentionDays)
+              }
+            >
+              Save
+            </Button>
+          </div>
+          <span className="block text-[11px] text-zinc-500">
+            History's prompts and replies older than this are deleted at daemon start and then
+            hourly; usage and cost records stay. 0 keeps them forever (default 90).
+          </span>
+        </div>
 
         {reloadInfo && (
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-zinc-500">

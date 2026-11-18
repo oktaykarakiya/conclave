@@ -1974,6 +1974,49 @@ async def list_interaction_logs(
     return [InteractionLog.from_row(r) for r in rows]
 
 
+async def interaction_log_rows_after(
+    db: Database, after_rowid: int | None, limit: int
+) -> list[Any]:
+    """One keyset page of raw ``interaction_logs`` rows, in rowid order: at most *limit* rows
+    whose rowid is above *after_rowid* (``None``: from the first row), each with its rowid as
+    ``row_key``. Pass the last ``row_key`` back to read the next page; unlike an OFFSET, a row
+    inserted or deleted meanwhile never makes a page repeat or skip another row."""
+    if after_rowid is None:
+        return await db.fetchall(
+            "SELECT rowid AS row_key, * FROM interaction_logs ORDER BY rowid LIMIT ?", (limit,)
+        )
+    return await db.fetchall(
+        "SELECT rowid AS row_key, * FROM interaction_logs WHERE rowid > ? ORDER BY rowid LIMIT ?",
+        (after_rowid, limit),
+    )
+
+
+async def delete_interaction_logs_before(
+    db: Database, cutoff_ms: int, *, batch_size: int = 1000
+) -> int:
+    """Delete the interaction logs last updated before *cutoff_ms* (epoch milliseconds); return
+    how many.
+
+    At most *batch_size* rows per statement, each committed on its own, so the shared
+    connection's write lock is released between batches. Only ``interaction_logs`` is touched:
+    the ``usage`` rows (cost accounting) stay.
+    """
+    size = max(1, batch_size)
+    total = 0
+    while True:
+        # DELETE ... LIMIT needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT, hence the subquery.
+        async with db._write() as conn:
+            cur = await conn.execute(
+                "DELETE FROM interaction_logs WHERE rowid IN ("
+                "SELECT rowid FROM interaction_logs WHERE time_updated < ? LIMIT ?)",
+                (cutoff_ms, size),
+            )
+            deleted = max(0, cur.rowcount)
+        total += deleted
+        if deleted < size:
+            return total
+
+
 async def interaction_stats(
     db: Database, *, project_id: str | None = None
 ) -> dict[str, Any]:

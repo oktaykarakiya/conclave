@@ -40,6 +40,11 @@ dev = [
     "ruff>=0.7",
     "types-PyYAML>=6.0",
 ]
+# Interaction log export as ZSTD Parquet; without it the export writes JSON Lines.
+# 14.0.1 is the first release with the CVE-2023-47248 fix.
+observability = [
+    "pyarrow>=14.0.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/oktaykarakiya/conclave"

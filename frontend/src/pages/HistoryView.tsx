@@ -11,6 +11,9 @@ import type {
 } from "../types";
 import { Badge, Button, Card, Spinner, input } from "../ui";
 
+/** What an export reports: the file written, its row count, format and size. */
+type ExportResult = Awaited<ReturnType<typeof api.exportParquet>>;
+
 interface SqlPreset {
   label: string;
   sql: string;
@@ -300,14 +303,9 @@ export function HistoryView({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Parquet sync state
-  const [syncingParquet, setSyncingParquet] = useState(false);
-  const [parquetBadge, setParquetBadge] = useState<{
-    ok: boolean;
-    path: string;
-    rows: number;
-    size_bytes: number;
-  } | null>(null);
+  // Interaction log export state (the archive file is written only on request)
+  const [exporting, setExporting] = useState(false);
+  const [exportBadge, setExportBadge] = useState<ExportResult | null>(null);
 
   // SQL Console state
   const [showSqlConsole, setShowSqlConsole] = useState(false);
@@ -411,16 +409,15 @@ export function HistoryView({
     setSessionError(null);
   }, []);
 
-  async function handleExportParquet() {
-    setSyncingParquet(true);
+  async function handleExport() {
+    setExporting(true);
     setError(null);
     try {
-      const res = await api.exportParquet();
-      setParquetBadge(res);
+      setExportBadge(await api.exportParquet());
     } catch (e) {
       setError(String(e));
     } finally {
-      setSyncingParquet(false);
+      setExporting(false);
     }
   }
 
@@ -493,17 +490,18 @@ export function HistoryView({
             )}
           </div>
 
-          {parquetBadge && (
+          {exportBadge && (
             <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-800/70 bg-emerald-950/50 px-2.5 py-1 text-[11px] text-emerald-300">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              <span className="font-mono">{parquetBadge.path}</span>
+              <span className="font-mono">{exportBadge.path}</span>
               <span>·</span>
               <span className="font-semibold">
-                {parquetBadge.rows.toLocaleString()} rows
+                {exportBadge.rows.toLocaleString()} rows
               </span>
               <span>·</span>
               <span className="font-mono">
-                ZSTD {formatByteSize(parquetBadge.size_bytes)}
+                {exportBadge.format === "parquet" ? "Parquet (ZSTD)" : "JSON Lines"}{" "}
+                {formatByteSize(exportBadge.size_bytes)}
               </span>
             </div>
           )}
@@ -520,16 +518,17 @@ export function HistoryView({
           <Button
             variant="default"
             size="sm"
-            disabled={syncingParquet}
-            onClick={handleExportParquet}
+            disabled={exporting}
+            onClick={handleExport}
+            title="Writes every interaction log into the daemon's home: INTERACTION_LOGS.parquet, or INTERACTION_LOGS.jsonl without pyarrow"
           >
-            {syncingParquet ? (
+            {exporting ? (
               <>
                 <Spinner size={12} />
-                Syncing Parquet…
+                Exporting…
               </>
             ) : (
-              "Sync INTERACTION_LOGS.parquet"
+              "Export interaction logs"
             )}
           </Button>
         </div>

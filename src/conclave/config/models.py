@@ -528,6 +528,19 @@ class SystemSettings(BaseModel):
             "work either way."
         ),
     )
+    # Strict: a lax int would turn true into 1, which deletes almost every row.
+    interaction_log_retention_days: int = Field(
+        default=90,
+        ge=0,
+        le=3650,
+        strict=True,
+        description=(
+            "Daemon-wide (global settings only): days an interaction log (an agent's prompt and "
+            "reply, shown in History) is kept after its last update. Older ones are deleted at "
+            "daemon start and then hourly. 0 keeps them forever. Usage and cost records are "
+            "never deleted."
+        ),
+    )
 
 
 # One offered model string (e.g. "deepseek/deepseek-flash", "claude-code/opus").
