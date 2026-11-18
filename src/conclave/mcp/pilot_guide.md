@@ -58,8 +58,9 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
    you choose here (its branch, `config_preset`, `workflow_template`, `max_parallel_tasks`);
    everything else is inherited from the global settings (see "Settings layers" below).
 2. `conclave_patch_config(project_id, config={...})` merges into the project's settings
-   (`conclave_get_config` shows the effective result; `conclave_get_workflow` the graph). Key
-   fields:
+   (`conclave_get_config` shows the effective result; `conclave_get_workflow` the graph;
+   `conclave_get_config_schema` the JSON Schema of every valid key, with its type, default and
+   description). Key fields:
    - `execution.target_branch`, `execution.auto_merge` (default `false`: a green task ends
      `done` on its branch, unmerged), `execution.setup_command`,
      `execution.baseline_test_command`, `execution.require_full_green`,
@@ -129,8 +130,9 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      planner runs for every task; a task's `use_planner` wins either way)
    - `ui.model_choices` (default `[]`): the models the UI pickers offer. Empty offers a built-in
      list limited to the engines available on this host; models the settings already use (agent
-     defaults, overrides, workflow nodes) are always offered. `GET /api/models?project_id=<id>`
-     returns that project's list and its `agent_defaults.model` as `default_model`.
+     defaults, overrides, workflow nodes) are always offered. `conclave_list_models(project_id)`
+     (REST `GET /api/models?project_id=<id>`) returns that project's list and its
+     `agent_defaults.model` as `default_model`; without `project_id`, the global settings' list.
    - `system.hot_reload_watch` (default `false`): daemon-wide, so only the global settings count
      (a project value is stored but ignored). See §10.
    - `context.bulk_max_chars` (default 200000), `context.compaction_enabled` (default `false`),
@@ -215,6 +217,8 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
   (or `agent_overrides.<agent>.effort`).
 - Only configure models whose engine and credentials actually work on this host; a quick
   low-cost task is the cheapest way to confirm a new model string end to end.
+  `conclave_list_models` returns `engines`: `default` (the default engine), `available` (whether
+  each engine's CLI is on this host) and `claude_code_prefix` (`claude-code/`).
 
 ### Project rule files
 - Every agent prompt has a PROJECT RULES section built from the workspace-level `AGENTS.md` (in
@@ -274,6 +278,8 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 
 - `conclave_create_task(project_id, request, title, auto_approve=true, use_planner)` →
   `conclave_get_task(task_id)` (the task is under the `task` key) for state and `result_summary`.
+  It summarizes each checkpoint and leaves verdict evidence out; pass `include_checkpoints: true`
+  or `include_evidence: true` when you need them (§11).
 - `conclave_get_task_events(task_id, after_id)` returns events in **pages** of at most 500,
   oldest first after `after_id`: loop, passing the last event's `id` as `after_id`, until fewer
   than 500 come back. Useful types:
@@ -332,6 +338,9 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 - Costs are reported per dispatch in `agent.result.cost_usd`. Subscription-backed engines
   report a notional cost that counts against plan limits, not money. A dispatch that waited out
   a usage limit has one usage row per run, each that run's own cost (see Usage limits below).
+- `conclave_get_task_usage(task_id)` sums a task's turns and tokens (input, output, cache read,
+  cache creation) over its usage rows (`agent_count`, one per agent run), without cost;
+  `conclave_get_project_usage(project_id)` gives a project's `calls` and `total_cost_usd`.
 
 ### Usage limits
 - When an engine refuses work because a usage limit or the balance ran out (Claude Code's
@@ -382,6 +391,8 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 - `conclave_steer_task(task_id, message, node_id?)`: guidance injected into the next dispatch.
 - `conclave_set_hitl_checkpoint(task_id, target_id, enabled)`: pause a running task after a node
   (e.g. `gate`) or on an edge; the task goes `waiting_for_approval`.
+- `conclave_get_hitl_state(task_id)`: `armed` lists the node and edge ids armed on the task,
+  `waiting` the ids it is paused at now. Both live in the daemon's memory: a restart clears them.
 - `conclave_complete_node(task_id, node_id, status, verdict?, message?)`: resume a paused node
   (`completed`), fail it, or skip it; `message` is passed on as feedback.
 - `conclave_cancel_task(task_id)`: stop a task (its worktree is cleaned up).
@@ -424,11 +435,16 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 - `conclave_decide_workflow_proposal(project_id, proposal_id, decision, reason?)`: `approve`
   applies the proposed graph as a `proposal` version; it is refused while the live workflow
   differs from `base_graph`, so reject that proposal and run `conclave_evolve_workflow` for a
-  fresh one. `reject` records the decision and leaves the workflow alone.
+  fresh one. `reject` records the decision and leaves the workflow alone. It answers in one
+  line: `decision`, `proposal_id`, `state`, `summary`, `changes` and `version_id` (the version
+  an approval created, `null` on reject); `include_graphs: true` returns the decided proposal and
+  the version with their graphs instead, and on approve the live `workflow` and `is_custom`.
 - `conclave_evolve_workflow(project_id, task_id?)` runs evolution on demand: in `suggest` mode it
   stores and returns a `proposal`, in `auto` mode it applies the change (an `evolver` version),
   in `off` mode it only previews; `apply: true` applies the change at once as your decision (an
-  `operator` version).
+  `operator` version). Its answer leaves every graph out (the computed `workflow`, the
+  proposal's `proposed_graph` and `base_graph`, the version's `graph_after` and `graph_before`)
+  unless you pass `include_graphs: true`; `conclave_list_workflow_proposals` shows them too.
 - `conclave_list_workflow_versions(project_id, limit?)` shows every change, newest first:
   `source` (`evolver`, `operator`, `template`, `revert`, `proposal`), `reason`, `created_at`,
   `graph_after` and `graph_before` (`null` = the pipeline derived from the agents policy). The
@@ -436,7 +452,8 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   and the evolver all record one; pass `reason` to say why.
 - `conclave_revert_workflow(project_id, version_id, reason?)` restores that version's
   `graph_after` as a new `revert` version (history is never deleted); a version holding `null`
-  restores the derived pipeline.
+  restores the derived pipeline. It returns `changed`, `reverted_to`, `version` and `is_custom`
+  without graphs; `include_graphs: true` adds the restored `workflow` and the version's graphs.
 - REST: `GET /api/projects/{id}/workflow/versions?limit=`,
   `POST /api/projects/{id}/workflow/versions/{version_id}/revert`,
   `GET /api/projects/{id}/workflow/proposals?state=`, and
@@ -469,10 +486,23 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 ## 11. Pitfalls and response shapes
 
 - `conclave_get_task` returns `{"task": {...}, "checkpoints": [...], "verdicts": [...],
-  "usage": {...}, "hitl": {"armed": [...], "waiting": [...]}}`: the task is under `task`, with
-  at most 100 verdicts (`conclave_get_task_verdicts` returns up to 200) and the token totals
-  under `usage`. List tools may wrap lists too (`conclave_list_quarantine` returns
-  `{"integrity": {...}, "entries": [...]}`) — read the keys before indexing.
+  "usage": {...}, "hitl": {"armed": [...], "waiting": [...]}}`: the task, request and plan
+  included, is under `task`; each checkpoint is only `{node_id, attempt, status, git_tree_sha}`
+  (`include_checkpoints: true` returns the full rows, artifacts included); the verdicts, at most
+  100 (`conclave_get_task_verdicts` returns up to 200), come without `evidence`
+  (`include_evidence: true` adds it); the token totals are under `usage`. List tools may wrap
+  lists too (`conclave_list_quarantine` returns `{"integrity": {...}, "entries": [...]}`, and
+  `conclave_get_quarantine_integrity` just the integrity block) — read the keys before indexing.
+- Answers leave bulk out unless you ask for it. `conclave_list_projects`,
+  `conclave_get_project_status` (its `project`) and `conclave_set_project_mode` return each
+  project's `id`, `name`, `path`, `default_branch`, `mode` and `created_at`, without its stored
+  `config` (`include_config: true`; `conclave_get_config` shows the effective config).
+  `conclave_get_task` leaves out checkpoint artifacts and verdict evidence (`include_checkpoints`,
+  `include_evidence`). `conclave_decide_workflow_proposal`, `conclave_evolve_workflow` and
+  `conclave_revert_workflow` leave out every workflow graph (`include_graphs: true`). Tools that
+  change a config or graph still return what they changed, and `conclave_get_workflow`,
+  `conclave_list_workflow_versions`, `conclave_list_workflow_proposals` and
+  `conclave_store_list` always include their graphs.
 - Event lists are paged, 500 events per call (§6); a single call is not the full history. The
   other list tools return one bounded page with no cursor: each tool's description gives its
   cap and order.
@@ -569,11 +599,16 @@ group for the first time.
 - `conclave_patch_config` — merge execution, agent, planning, and workflow settings into a
   project or the global layer; `unset` removes overrides, `apply_to_all_projects` clears the
   patched keys from every project.
+- `conclave_get_config_schema` — look up every valid config key with its type, default and
+  description.
+- `conclave_list_models` — see the models the pickers offer, the default model and which
+  engines this host has.
 
 ### Tasks
 - `conclave_list_tasks` — find tasks, optionally filtered by state.
 - `conclave_create_task` — queue a coding or PR-review task (auto_approve=true runs it now).
-- `conclave_get_task` — read state, branch, result summary, and checkpoints for one task.
+- `conclave_get_task` — read state, branch, result summary, checkpoint summaries and verdicts
+  for one task (`include_checkpoints`, `include_evidence` for the bulk).
 - `conclave_get_task_events` — page through execution events while a task runs.
 - `conclave_cancel_task` — stop a task you no longer want.
 - `conclave_delete_task` — remove a finished task and its records.
@@ -588,6 +623,7 @@ group for the first time.
 - `conclave_approve_task` — approve an inbox, failed, blocked, cancelled, or paused task.
 - `conclave_cascade_approve_task` — approve a parent and all descendants in dependency order.
 - `conclave_set_hitl_checkpoint` — arm or disarm a pause on a node or edge.
+- `conclave_get_hitl_state` — see what a task waits on and which pauses are armed on it.
 - `conclave_complete_node` — resume, fail, or skip a node paused at a checkpoint.
 - `conclave_steer_task` — inject guidance into the next dispatch.
 
@@ -623,7 +659,9 @@ group for the first time.
 
 ### Quarantine
 - `conclave_list_bug_candidates` — review candidates from the autonomous bug-fixer ledger.
+- `conclave_list_needs_human` — review the candidates the bug fixer handed to a human.
 - `conclave_list_quarantine` — inspect quarantined test patterns and gate health.
+- `conclave_get_quarantine_integrity` — check gate health: which quarantine entries expired.
 - `conclave_add_quarantine` — quarantine a flaky test pattern until a date.
 - `conclave_delete_quarantine` — remove a quarantine entry.
 
@@ -640,6 +678,8 @@ group for the first time.
 - `conclave_get_interaction` — read one full transcript and tool breakdown.
 - `conclave_query_interactions` — run a read-only SQL SELECT over interaction logs.
 - `conclave_get_observability_stats` — read aggregated cost, token, and model stats.
+- `conclave_get_task_usage` — read one task's turn and token totals.
+- `conclave_get_project_usage` — read one project's usage calls and total cost.
 
 ### System
 - `conclave_get_engine_quota` — see which engine accounts wait for a usage limit, and until when.

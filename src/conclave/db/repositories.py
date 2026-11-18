@@ -1424,9 +1424,14 @@ async def list_bug_candidates(
     return [BugCandidate.from_row(r) for r in rows]
 
 
-async def list_needs_human(db: Database, project_id: str) -> list[BugCandidate]:
-    """The human work-queue: candidates parked in ``declined_needs_human`` for this project."""
-    return await list_bug_candidates(db, project_id, status=BugStatus.declined_needs_human)
+async def list_needs_human(
+    db: Database, project_id: str, *, limit: int | None = None, offset: int = 0
+) -> list[BugCandidate]:
+    """The human work-queue: candidates parked in ``declined_needs_human`` for this project,
+    newest first (*limit* ``None``: all of them)."""
+    return await list_bug_candidates(
+        db, project_id, status=BugStatus.declined_needs_human, limit=limit, offset=offset
+    )
 
 
 async def set_repro_artifacts(

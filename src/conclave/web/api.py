@@ -74,8 +74,13 @@ from ..engine.workflow_evolver import (
 )
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
-from ..providers import CLAUDE_CODE_PREFIX, Engine, engine_status, resolve_engine
-from ..runtime import Daemon, engine_quota_report, reload_status_report
+from ..runtime import (
+    Daemon,
+    engine_quota_report,
+    hitl_report,
+    models_catalog,
+    reload_status_report,
+)
 from ..verification import quarantine_integrity
 from .deps import get_daemon
 from .schemas import (
@@ -176,35 +181,6 @@ async def _require_planning_session(
 
 # --- meta -------------------------------------------------------------------
 
-# Offered when ui.model_choices is empty, limited to the engines available on this host.
-_BUILTIN_MODEL_CHOICES: list[str] = [
-    "deepseek/deepseek-flash",  # supersedes deepseek-v4-pro, which is intentionally not offered
-    "google/gemini-2.5-flash-lite",
-    "google/gemini-3.1-flash-lite-preview",
-    "google/gemini-2.5-flash",
-    "google/gemini-2.5-pro",
-    "google/gemini-3-flash-preview",
-    "google/gemini-3.1-pro-preview",
-    "deepseek/deepseek-chat",
-    "deepseek/deepseek-reasoner",
-    "anthropic/claude-sonnet-4-5",
-    # Claude Code CLI engine (its own login/subscription), routed by the prefix.
-    f"{CLAUDE_CODE_PREFIX}default",
-    f"{CLAUDE_CODE_PREFIX}opus",
-    f"{CLAUDE_CODE_PREFIX}sonnet",
-    f"{CLAUDE_CODE_PREFIX}haiku",
-]
-_EFFORT_VARIANTS: list[str] = ["low", "medium", "high", "xhigh", "max"]
-_CLI_AGENTS: list[str] = ["build", "general", "explore", "plan"]
-_SKILL_TEMPLATES: list[str] = [
-    "tdd-strict",
-    "minimal-diff",
-    "security-hardening",
-    "async-safety",
-    "type-strict",
-    "zero-regression",
-]
-
 
 class ObservabilityQueryInput(BaseModel):
     sql: str
@@ -249,17 +225,6 @@ async def get_config_schema() -> dict[str, Any]:
     return config_schema()
 
 
-def _configured_models(config: ConclaveConfig) -> list[str]:
-    """Every model string *config* dispatches with: agent defaults, overrides, workflow nodes."""
-    found: list[str | None] = [config.agent_defaults.model]
-    for override in config.agent_overrides.values():
-        model = override.get("model")
-        found.append(model if isinstance(model, str) else None)
-    if config.workflow is not None:
-        found.extend(node.model for node in config.workflow.nodes)
-    return [m.strip() for m in found if m and m.strip()]
-
-
 @router.get("/models")
 async def get_models_catalog(
     project_id: str | None = Query(
@@ -267,31 +232,10 @@ async def get_models_catalog(
     ),
     daemon: Daemon = Depends(get_daemon),
 ) -> dict[str, Any]:
-    """The model pickers' catalog, from the resolved config (the project's, else global).
-
-    ``ui.model_choices`` is offered when set, else the built-in list for the engines this host
-    has; every model the config already uses is added so a picker never hides one.
-    """
+    """The model pickers' catalog, from the resolved config (the project's, else global):
+    see :func:`conclave.runtime.models_catalog`."""
     project = await _require_project(daemon, project_id) if project_id else None
-    config = await resolve_project_config(daemon.db, project)
-    engines = engine_status(daemon.provider)
-    offered = list(config.ui.model_choices) or [
-        model
-        for model in _BUILTIN_MODEL_CHOICES
-        if engines["available"].get(str(resolve_engine(model, Engine.opencode)[0]), False)
-    ]
-    models = list(dict.fromkeys([*offered, *_configured_models(config)]))
-    return {
-        "default_model": config.agent_defaults.model,
-        "models": models,
-        "recommended_models": list(models),
-        "efforts": list(_EFFORT_VARIANTS),
-        "effort_variants": list(_EFFORT_VARIANTS),
-        "cli_agents": list(_CLI_AGENTS),
-        "skills": list(_SKILL_TEMPLATES),
-        "skill_templates": list(_SKILL_TEMPLATES),
-        "engines": engines,
-    }
+    return await models_catalog(daemon, project)
 
 
 @router.get("/events/stream")
@@ -780,15 +724,21 @@ async def get_bug_candidates(
 
 @router.get("/projects/{project_id}/needs-human")
 async def get_needs_human(
-    project_id: str, daemon: Daemon = Depends(get_daemon)
+    project_id: str,
+    pagination: PaginationParams = Depends(_pagination),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[BugCandidate]:
-    """Candidates parked in ``declined_needs_human`` — the operator's review queue."""
+    """Candidates parked in ``declined_needs_human`` — the operator's review queue, newest
+    first."""
     await _require_project(daemon, project_id)
-    return await repo.list_needs_human(daemon.db, project_id)
+    return await repo.list_needs_human(
+        daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
+    )
 
 
 @router.get("/projects/{project_id}/usage")
 async def get_usage(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
+    await _require_project(daemon, project_id)
     return await repo.usage_summary(daemon.db, project_id)
 
 
@@ -810,6 +760,7 @@ async def list_quarantine(
 async def quarantine_health(
     project_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
+    await _require_project(daemon, project_id)
     return await quarantine_integrity(daemon.db, project_id)
 
 
@@ -1026,7 +977,7 @@ async def get_task_hitl(
     task_id: str, daemon: Daemon = Depends(get_daemon)
 ) -> dict[str, Any]:
     await _require_task(daemon, task_id)
-    return {"task_id": task_id, **daemon.get_hitl_state(task_id)}
+    return hitl_report(daemon, task_id)
 
 
 @router.post("/tasks/{task_id}/hitl")

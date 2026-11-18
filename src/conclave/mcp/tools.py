@@ -19,6 +19,7 @@ from ..config import (
     WorkflowNode,
     already_attached_message,
     build_default_workflow,
+    config_schema,
     create_project_with_config,
     deep_merge,
     load_global_overrides,
@@ -62,7 +63,13 @@ from ..engine.workflow_evolver import (
 from ..events import EventType
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..providers import engine_status
-from ..runtime import Daemon, engine_quota_report, reload_status_report
+from ..runtime import (
+    Daemon,
+    engine_quota_report,
+    hitl_report,
+    models_catalog,
+    reload_status_report,
+)
 from ..verification import quarantine_integrity
 
 PILOT_GUIDE_URI = "conclave://guide/pilot"
@@ -214,8 +221,18 @@ MCP_TOOLS: list[dict[str, Any]] = [
     # --- Projects & Worker Control ---
     _tool(
         "conclave_list_projects",
-        "List the git repositories attached to Conclave, oldest first.",
-        {"limit": _prop("integer", "Max items to return (1-500, default 50).", default=50)},
+        "List the git repositories attached to Conclave, oldest first: each project's id, name, "
+        "path, default_branch, mode and created_at. include_config=true adds each project's "
+        "stored config delta, which can hold a whole workflow graph (conclave_get_config shows "
+        "a project's effective config).",
+        {
+            "limit": _prop("integer", "Max items to return (1-500, default 50).", default=50),
+            "include_config": _prop(
+                "boolean",
+                "Also return each project's stored config (left out by default).",
+                default=False,
+            ),
+        },
     ),
     _tool(
         "conclave_attach_project",
@@ -252,8 +269,18 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_project_status",
-        "Get a project's worker status (paused/running), execution mode, and config summary.",
-        {"project_id": _prop("string", "Project ID.")},
+        "Get a project's worker status: {project, paused, mode, usage}: the project's id, name, "
+        "path, default_branch, mode and created_at (include_config=true adds its stored config "
+        "delta, which can hold a whole workflow graph), whether its worker is paused, its "
+        "execution mode, and its usage totals (calls, total_cost_usd).",
+        {
+            "project_id": _prop("string", "Project ID."),
+            "include_config": _prop(
+                "boolean",
+                "Also return the project's stored config under project (left out by default).",
+                default=False,
+            ),
+        },
         required=["project_id"],
     ),
     _tool(
@@ -270,13 +297,20 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_set_project_mode",
-        "Switch a project between task_queue and autonomous_bug_fixer mode.",
+        "Switch a project between task_queue and autonomous_bug_fixer mode. Returns the updated "
+        "project's id, name, path, default_branch, mode and created_at; include_config=true "
+        "adds its stored config delta.",
         {
             "project_id": _prop("string", "Project ID."),
             "mode": _prop(
                 "string",
                 "Execution mode.",
                 enum=["task_queue", "autonomous_bug_fixer"],
+            ),
+            "include_config": _prop(
+                "boolean",
+                "Also return the project's stored config (left out by default).",
+                default=False,
             ),
         },
         required=["project_id", "mode"],
@@ -463,6 +497,31 @@ MCP_TOOLS: list[dict[str, Any]] = [
             ),
         },
     ),
+    _tool(
+        "conclave_get_config_schema",
+        "Get the JSON Schema of the Conclave configuration (REST GET /api/config/schema): every "
+        "valid key of conclave_patch_config's config with its type, default, allowed values and "
+        "description (the sections are under $defs). The global settings and every project use "
+        "the same schema.",
+        {},
+    ),
+    _tool(
+        "conclave_list_models",
+        "Get the model pickers' catalog for a project or the global settings (REST GET "
+        "/api/models): default_model (agent_defaults.model); models and recommended_models "
+        "(ui.model_choices when set, else the built-in list for the engines on this host, plus "
+        "every model the settings already use); efforts and effort_variants; cli_agents; skills "
+        "and skill_templates; and engines: default (the default engine), claude_code_prefix (a "
+        "model with this prefix runs on Claude Code, any other on the default engine) and "
+        "available (whether each engine's CLI is on this host).",
+        {
+            "project_id": _prop(
+                "string",
+                "Optional Project ID whose settings decide the default and offered models "
+                "(omit or pass 'global' for the global settings).",
+            ),
+        },
+    ),
     # --- Tasks & Live Execution ---
     _tool(
         "conclave_list_tasks",
@@ -510,12 +569,27 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_task",
-        'Get full details of a task. Returns {"task": {...}, "checkpoints": [...], '
+        'Get a task and its review state. Returns {"task": {...}, "checkpoints": [...], '
         '"verdicts": [...], "usage": {...}, "hitl": {...}}: the task itself (state, branch, '
-        "result_summary, ...), its step checkpoints, its reviewer verdicts (at most 100, oldest "
-        "first; conclave_get_task_verdicts returns up to 200), its token usage totals, and the "
-        "HITL pauses armed on it and waiting for approval.",
-        {"task_id": _prop("string", "Task ID.")},
+        "request, plan, result_summary, ...); its step checkpoints, each with only node_id, "
+        "attempt, status and git_tree_sha (include_checkpoints=true returns the full rows, "
+        "artifacts included); its reviewer verdicts without their evidence (at most 100, oldest "
+        "first; include_evidence=true adds each one's evidence, and conclave_get_task_verdicts "
+        "returns up to 200 with evidence); its token usage totals; and the HITL pauses armed on "
+        "it and waiting for approval.",
+        {
+            "task_id": _prop("string", "Task ID."),
+            "include_checkpoints": _prop(
+                "boolean",
+                "Return the full checkpoint rows (artifact, updated_at) instead of the summary.",
+                default=False,
+            ),
+            "include_evidence": _prop(
+                "boolean",
+                "Also return each verdict's evidence (left out by default).",
+                default=False,
+            ),
+        },
         required=["task_id"],
     ),
     _tool(
@@ -542,6 +616,17 @@ MCP_TOOLS: list[dict[str, Any]] = [
             ),
         },
         required=["task_id", "target_id"],
+    ),
+    _tool(
+        "conclave_get_hitl_state",
+        "Get what a task waits on and which Human-in-the-Loop pauses are armed on it (REST GET "
+        "/api/tasks/{task_id}/hitl): {task_id, armed, waiting}. armed lists the node and edge "
+        "ids conclave_set_hitl_checkpoint armed on this task; waiting lists the ids it is "
+        "paused at now (resume one with conclave_complete_node). Both are sorted, not paged "
+        "(they hold only this task's pauses), and live in the daemon's memory: a daemon restart "
+        "clears them.",
+        {"task_id": _prop("string", "Task ID.")},
+        required=["task_id"],
     ),
     _tool(
         "conclave_complete_node",
@@ -907,9 +992,31 @@ MCP_TOOLS: list[dict[str, Any]] = [
         required=["project_id"],
     ),
     _tool(
+        "conclave_list_needs_human",
+        "List the bug candidates the autonomous bug fixer handed to a human (status "
+        "declined_needs_human; decline_reason says why), newest first, at most limit (REST GET "
+        "/api/projects/{project_id}/needs-human).",
+        {
+            "project_id": _prop("string", "Project ID."),
+            "limit": _prop("integer", "Max candidates to return (1-500, default 50).", default=50),
+        },
+        required=["project_id"],
+    ),
+    _tool(
         "conclave_list_quarantine",
         'List quarantined test patterns and gate health integrity for a project: {"integrity": '
         '{...}, "entries": [...]}, at most 100 entries, soonest expiry first.',
+        {"project_id": _prop("string", "Project ID.")},
+        required=["project_id"],
+    ),
+    _tool(
+        "conclave_get_quarantine_integrity",
+        "Get a project's test-gate integrity from its quarantine (REST GET "
+        "/api/projects/{project_id}/quarantine/integrity), the integrity block of "
+        "conclave_list_quarantine: as_of (today), total, active and expired entry counts, "
+        "expired_patterns (the pattern of every expired entry, not capped: entries are added by "
+        "operators only) and healthy (false while any entry has expired, as an expired entry "
+        "no longer excuses its failing tests).",
         {"project_id": _prop("string", "Project ID.")},
         required=["project_id"],
     ),
@@ -1142,6 +1249,23 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     ),
     _tool(
+        "conclave_get_task_usage",
+        "Get a task's token-usage totals over all its attempts (REST GET "
+        "/api/tasks/{task_id}/usage): task_id, total_turns, input_tokens, output_tokens, "
+        "cache_read_tokens, cache_creation_tokens and agent_count (its usage rows, one per "
+        "agent run). No cost: conclave_get_project_usage has the project's total cost.",
+        {"task_id": _prop("string", "Task ID.")},
+        required=["task_id"],
+    ),
+    _tool(
+        "conclave_get_project_usage",
+        "Get a project's usage totals (REST GET /api/projects/{project_id}/usage): calls (its "
+        "usage rows, one per agent run) and total_cost_usd (the sum of the costs the engines "
+        "reported; a subscription engine's cost is notional).",
+        {"project_id": _prop("string", "Project ID.")},
+        required=["project_id"],
+    ),
+    _tool(
         "conclave_get_reload_status",
         "Get current quiescent hot-reload status, pending state, changed files, module coverage "
         "and watcher_enabled (the global system.hot_reload_watch setting) without triggering a "
@@ -1176,7 +1300,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "task streaks (growing on failures/catches, shrinking zero-catch non-core reviewers "
         "after >= 3 clean done tasks), as experimental.workflow_evolution says: suggest "
         "(default) stores a proposal and returns it, auto applies the change as a workflow "
-        "version, off only previews it. apply=true applies it now as your decision.",
+        "version, off only previews it. apply=true applies it now as your decision. Returns the "
+        "outcome without graphs: evolved, mode, project_id, task_id, action, clean_streak, "
+        "promoted_agents, demoted_agents, proposal (without proposed_graph and base_graph) and "
+        "version (without graph_after and graph_before); include_graphs=true adds the computed "
+        "workflow and those graphs.",
         {
             "project_id": _prop("string", "Project ID."),
             "task_id": _prop("string", "Optional ID of a task of this project to evaluate."),
@@ -1201,6 +1329,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "Optional reason recorded on the version when applied, else kept as the "
                 "proposal's note (at most 2000 characters).",
             ),
+            "include_graphs": _prop(
+                "boolean",
+                "Also return the computed workflow and the proposal's and version's graphs "
+                "(left out by default).",
+                default=False,
+            ),
         },
         required=["project_id"],
     ),
@@ -1219,7 +1353,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "conclave_revert_workflow",
         "Restore the graph a workflow version recorded after its change (null restores the "
         "derived pipeline) as a new revert version. History is never deleted; restoring the "
-        "graph the project already has changes nothing (changed: false).",
+        "graph the project already has changes nothing (changed: false). Returns {changed, "
+        "reverted_to, version, is_custom}, the version without its graphs; include_graphs=true "
+        "adds the restored workflow and the version's graph_after and graph_before.",
         {
             "project_id": _prop("string", "Project ID."),
             "version_id": _prop(
@@ -1228,6 +1364,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "reason": _prop(
                 "string",
                 "Optional reason recorded on the revert version (at most 2000 characters).",
+            ),
+            "include_graphs": _prop(
+                "boolean",
+                "Also return the restored workflow and the version's graphs (left out by "
+                "default).",
+                default=False,
             ),
         },
         required=["project_id", "version_id"],
@@ -1253,7 +1395,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "Approve or reject a pending workflow proposal. approve applies its graph as a "
         "proposal version, and is refused when the workflow changed since the proposal was "
         "computed (reject it and run conclave_evolve_workflow again); reject leaves the "
-        "workflow as it is.",
+        "workflow as it is. Returns {decision, proposal_id, state, summary, changes, "
+        "version_id}: the proposal's new state, its reason summary and changes, and the id of "
+        "the version an approval created (null on reject). include_graphs=true returns the full "
+        "result instead: {decision, proposal, version}, the proposal with its proposed_graph and "
+        "base_graph and the version with its graphs, plus the live workflow and is_custom on "
+        "approve.",
         {
             "project_id": _prop("string", "Project ID."),
             "proposal_id": _prop(
@@ -1264,6 +1411,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "string",
                 "Optional decision reason, also recorded on the version when approving (at "
                 "most 2000 characters).",
+            ),
+            "include_graphs": _prop(
+                "boolean",
+                "Return the full result, graphs included, instead of the summary.",
+                default=False,
             ),
         },
         required=["project_id", "proposal_id", "decision"],
@@ -1363,6 +1515,47 @@ async def _require_workflow_proposal(
     return proposal
 
 
+def _project_json(project: Project, include_config: bool) -> dict[str, Any]:
+    """*project*'s row for a pilot: its stored config, which can hold a whole workflow graph,
+    only with *include_config*."""
+    if include_config:
+        return project.model_dump(mode="json")
+    return project.model_dump(
+        mode="json", include={"id", "name", "path", "default_branch", "mode", "created_at"}
+    )
+
+
+def _without_graphs(result: dict[str, Any]) -> dict[str, Any]:
+    """An evolve or revert outcome without its workflow graphs: no ``workflow``, no
+    ``proposed_graph``/``base_graph`` in ``proposal``, no ``graph_after``/``graph_before`` in
+    ``version`` (``include_graphs`` returns them)."""
+    compact = {key: value for key, value in result.items() if key != "workflow"}
+    for key, graphs in (
+        ("proposal", ("proposed_graph", "base_graph")),
+        ("version", ("graph_after", "graph_before")),
+    ):
+        nested = compact.get(key)
+        if isinstance(nested, dict):
+            compact[key] = {k: v for k, v in nested.items() if k not in graphs}
+    return compact
+
+
+def _decision_summary(result: dict[str, Any], proposal: WorkflowProposal) -> dict[str, Any]:
+    """A proposal decision in one line: the decision, the proposal's id and new state, its
+    reason summary and changes (a decision never changes them), and the version an approval
+    created."""
+    decided = result.get("proposal")
+    version = result.get("version")
+    return {
+        "decision": result["decision"],
+        "proposal_id": proposal.id,
+        "state": decided.get("state") if isinstance(decided, dict) else None,
+        "summary": proposal.reason.get("summary"),
+        "changes": proposal.reason.get("changes"),
+        "version_id": version.get("id") if isinstance(version, dict) else None,
+    }
+
+
 async def _emit_projects_updated(daemon: Daemon, projects: list[Project]) -> None:
     """Announce each project's row and effective config after a global config change."""
     for proj in projects:
@@ -1383,7 +1576,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     if name == "conclave_list_projects":
         limit = max(1, min(_opt_int(args, "limit", 50), 500))
         projects = await repo.list_projects(daemon.db, limit=limit)
-        return [p.model_dump(mode="json") for p in projects]
+        include_config = _opt_bool(args, "include_config", False)
+        return [_project_json(p, include_config) for p in projects]
 
     if name == "conclave_attach_project":
         proj_name = _opt_str(args, "name")
@@ -1464,7 +1658,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         project = await _require_project(daemon, _opt_str(args, "project_id"))
         usage = await repo.usage_summary(daemon.db, project.id)
         return {
-            "project": project.model_dump(mode="json"),
+            "project": _project_json(project, _opt_bool(args, "include_config", False)),
             "paused": daemon.is_paused(project.id),
             "mode": project.mode.value,
             "usage": usage,
@@ -1483,13 +1677,12 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         mode = ProjectMode(_opt_str(args, "mode", "task_queue"))
         await repo.set_project_mode(daemon.db, project.id, mode)
         updated = await _require_project(daemon, project.id)
-        updated_json = updated.model_dump(mode="json")
         await daemon.bus.emit(
             type=EventType.project_updated,
             project_id=project.id,
-            payload={"project": updated_json},
+            payload={"project": updated.model_dump(mode="json")},
         )
-        return updated_json
+        return _project_json(updated, _opt_bool(args, "include_config", False))
 
     if name == "conclave_get_config":
         raw_pid = _opt_str(args, "project_id")
@@ -1643,6 +1836,18 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             )
         return resolved_json
 
+    if name == "conclave_get_config_schema":
+        return config_schema()
+
+    if name == "conclave_list_models":
+        raw_pid = _opt_str(args, "project_id")
+        models_project = (
+            None
+            if not raw_pid or raw_pid in ("global", "default", "defaults", "*")
+            else await _require_project(daemon, raw_pid)
+        )
+        return await models_catalog(daemon, models_project)
+
     # --- Tasks ---
     if name == "conclave_list_tasks":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -1692,10 +1897,18 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         checkpoints = await repo.list_task_checkpoints(daemon.db, task.id)
         verdicts = await repo.list_verdicts(daemon.db, task.id, limit=100)
         usage = await repo.get_task_usage(daemon.db, task.id)
+        checkpoint_fields = (
+            None
+            if _opt_bool(args, "include_checkpoints", False)
+            else {"node_id", "attempt", "status", "git_tree_sha"}
+        )
+        verdict_exclude = None if _opt_bool(args, "include_evidence", False) else {"evidence"}
         return {
             "task": task.model_dump(mode="json"),
-            "checkpoints": [cp.model_dump(mode="json") for cp in checkpoints],
-            "verdicts": [v.model_dump(mode="json") for v in verdicts],
+            "checkpoints": [
+                cp.model_dump(mode="json", include=checkpoint_fields) for cp in checkpoints
+            ],
+            "verdicts": [v.model_dump(mode="json", exclude=verdict_exclude) for v in verdicts],
             "usage": usage,
             "hitl": daemon.get_hitl_state(task.id),
         }
@@ -1757,6 +1970,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             "enabled": enabled,
             **daemon.get_hitl_state(task.id),
         }
+
+    if name == "conclave_get_hitl_state":
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        return hitl_report(daemon, task.id)
 
     if name in ("conclave_complete_node", "conclave_approve_node"):
         task = await _require_task(daemon, _opt_str(args, "task_id"))
@@ -2452,6 +2669,12 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             cands = await repo.list_bug_candidates(daemon.db, project.id, limit=100)
         return [c.model_dump(mode="json") for c in cands]
 
+    if name == "conclave_list_needs_human":
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        limit = max(1, min(_opt_int(args, "limit", 50), 500))
+        cands = await repo.list_needs_human(daemon.db, project.id, limit=limit)
+        return [c.model_dump(mode="json") for c in cands]
+
     if name == "conclave_list_quarantine":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
         entries = await repo.list_quarantine(daemon.db, project.id, limit=100)
@@ -2460,6 +2683,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             "integrity": health,
             "entries": [q.model_dump(mode="json") for q in entries],
         }
+
+    if name == "conclave_get_quarantine_integrity":
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        return await quarantine_integrity(daemon.db, project.id)
 
     if name == "conclave_add_quarantine":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -2824,6 +3051,14 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             stats["parquet"] = await export_interaction_logs_to_parquet(daemon.db)
         return stats
 
+    if name == "conclave_get_task_usage":
+        task = await _require_task(daemon, _opt_str(args, "task_id"))
+        return await repo.get_task_usage(daemon.db, task.id)
+
+    if name == "conclave_get_project_usage":
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        return await repo.usage_summary(daemon.db, project.id)
+
     if name == "conclave_get_reload_status":
         return await reload_status_report(daemon)
 
@@ -2843,7 +3078,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 raise McpToolError(f"task not found: {tid_val}")
         gate_failed = _opt_bool(args, "gate_failed_after_review", False)
         task_failed = _opt_bool(args, "task_failed", False)
-        return await evolve_project_workflow(
+        evolved = await evolve_project_workflow(
             daemon.db,
             daemon.bus,
             project.id,
@@ -2853,6 +3088,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             apply=_opt_bool(args, "apply", False),
             reason=_opt_reason(args),
         )
+        return evolved if _opt_bool(args, "include_graphs", False) else _without_graphs(evolved)
 
     if name == "conclave_list_workflow_versions":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -2863,9 +3099,10 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     if name == "conclave_revert_workflow":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
         version = await _require_workflow_version(daemon, project, _opt_str(args, "version_id"))
-        return await revert_workflow(
+        reverted = await revert_workflow(
             daemon.db, daemon.bus, project, version, reason=_opt_reason(args)
         )
+        return reverted if _opt_bool(args, "include_graphs", False) else _without_graphs(reverted)
 
     if name == "conclave_list_workflow_proposals":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
@@ -2890,7 +3127,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         proposal = await _require_workflow_proposal(
             daemon, project, _opt_str(args, "proposal_id")
         )
-        return await decide_workflow_proposal(
+        decided = await decide_workflow_proposal(
             daemon.db,
             daemon.bus,
             project,
@@ -2898,6 +3135,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             approve=decision == "approve",
             reason=_opt_reason(args),
         )
+        if _opt_bool(args, "include_graphs", False):
+            return decided
+        return _decision_summary(decided, proposal)
 
     if name == "conclave_get_pilot_guide":
         section = _opt_str(args, "section")

@@ -20,6 +20,9 @@ full guide once per session before acting.
 - A usage limit or empty balance fails nothing: dispatches wait for the reset, then resume
   (`quota.waiting` events, `conclave_get_engine_quota`); cancel a task to stop its wait.
 - Measure model choices on your own tasks, not by reputation.
+- Answers are compact by default: project rows come without their stored config,
+  `conclave_get_task` without checkpoint artifacts and verdict evidence, workflow decisions
+  without graphs. Each tool's description names the `include_*` flag that adds them.
 
 **Full guide**
 - Resource: `conclave://guide/pilot` (markdown).

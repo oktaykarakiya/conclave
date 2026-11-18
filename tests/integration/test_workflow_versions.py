@@ -131,7 +131,13 @@ async def _decide(
         )
         assert resp.status_code in (200, 409), resp.text
         return resp.status_code == 409, resp.json()
-    args = {"project_id": pid, "proposal_id": proposal_id, "decision": decision}
+    # The full result (graphs included), the payload the REST endpoint returns.
+    args: dict[str, Any] = {
+        "project_id": pid,
+        "proposal_id": proposal_id,
+        "decision": decision,
+        "include_graphs": True,
+    }
     if reason:
         args["reason"] = reason
     return await _mcp(daemon, "conclave_decide_workflow_proposal", args)

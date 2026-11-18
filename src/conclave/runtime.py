@@ -32,7 +32,15 @@ from .engine import AgentRunner, BugFixerController, Orchestrator, SessionBudget
 from .events import EventBus, EventType
 from .hot_reload import HotReloader
 from .planning.session import PlanningOrchestrator
-from .providers import Provider, QuotaGate, WaitTracker
+from .providers import (
+    CLAUDE_CODE_PREFIX,
+    Engine,
+    Provider,
+    QuotaGate,
+    WaitTracker,
+    engine_status,
+    resolve_engine,
+)
 from .util import new_id
 
 logger = logging.getLogger("conclave.runtime")
@@ -63,6 +71,84 @@ def engine_quota_report(daemon: Daemon) -> dict[str, Any]:
     """
     gate: QuotaGate | None = getattr(daemon, "quota_gate", None)
     return {"gates": gate.snapshot() if gate is not None else []}
+
+
+# Offered when ui.model_choices is empty, limited to the engines available on this host.
+_BUILTIN_MODEL_CHOICES: list[str] = [
+    "deepseek/deepseek-flash",  # supersedes deepseek-v4-pro, which is intentionally not offered
+    "google/gemini-2.5-flash-lite",
+    "google/gemini-3.1-flash-lite-preview",
+    "google/gemini-2.5-flash",
+    "google/gemini-2.5-pro",
+    "google/gemini-3-flash-preview",
+    "google/gemini-3.1-pro-preview",
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-reasoner",
+    "anthropic/claude-sonnet-4-5",
+    # Claude Code CLI engine (its own login/subscription), routed by the prefix.
+    f"{CLAUDE_CODE_PREFIX}default",
+    f"{CLAUDE_CODE_PREFIX}opus",
+    f"{CLAUDE_CODE_PREFIX}sonnet",
+    f"{CLAUDE_CODE_PREFIX}haiku",
+]
+_EFFORT_VARIANTS: list[str] = ["low", "medium", "high", "xhigh", "max"]
+_CLI_AGENTS: list[str] = ["build", "general", "explore", "plan"]
+_SKILL_TEMPLATES: list[str] = [
+    "tdd-strict",
+    "minimal-diff",
+    "security-hardening",
+    "async-safety",
+    "type-strict",
+    "zero-regression",
+]
+
+
+def _configured_models(config: ConclaveConfig) -> list[str]:
+    """Every model string *config* dispatches with: agent defaults, overrides, workflow nodes."""
+    found: list[str | None] = [config.agent_defaults.model]
+    for override in config.agent_overrides.values():
+        model = override.get("model")
+        found.append(model if isinstance(model, str) else None)
+    if config.workflow is not None:
+        found.extend(node.model for node in config.workflow.nodes)
+    return [m.strip() for m in found if m and m.strip()]
+
+
+async def models_catalog(daemon: Daemon, project: Project | None) -> dict[str, Any]:
+    """The model pickers' catalog, from the resolved config (*project*'s, else the global one):
+    the REST (``GET /api/models``) and MCP (``conclave_list_models``) view.
+
+    ``ui.model_choices`` is offered when set, else the built-in list for the engines this host
+    has; every model the config already uses is added so a picker never hides one. A module
+    function for the same hot-reload reason as :func:`reload_status_report`.
+    """
+    config = await resolve_project_config(daemon.db, project)
+    engines = engine_status(daemon.provider)
+    offered = list(config.ui.model_choices) or [
+        model
+        for model in _BUILTIN_MODEL_CHOICES
+        if engines["available"].get(str(resolve_engine(model, Engine.opencode)[0]), False)
+    ]
+    models = list(dict.fromkeys([*offered, *_configured_models(config)]))
+    return {
+        "default_model": config.agent_defaults.model,
+        "models": models,
+        "recommended_models": list(models),
+        "efforts": list(_EFFORT_VARIANTS),
+        "effort_variants": list(_EFFORT_VARIANTS),
+        "cli_agents": list(_CLI_AGENTS),
+        "skills": list(_SKILL_TEMPLATES),
+        "skill_templates": list(_SKILL_TEMPLATES),
+        "engines": engines,
+    }
+
+
+def hitl_report(daemon: Daemon, task_id: str) -> dict[str, Any]:
+    """*task_id*'s human-in-the-loop state: ``armed`` (the node and edge ids with a pause armed)
+    and ``waiting`` (the ids it is paused on now). The REST (``GET /api/tasks/{id}/hitl``) and
+    MCP (``conclave_get_hitl_state``) view; a module function like :func:`reload_status_report`.
+    """
+    return {"task_id": task_id, **daemon.get_hitl_state(task_id)}
 
 
 class ProjectWorker:
