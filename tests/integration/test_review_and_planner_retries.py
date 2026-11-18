@@ -695,3 +695,179 @@ async def test_an_operator_rejection_at_a_checkpoint_is_why_the_attempt_failed(
         assert [(c.status, c.artifact.get("cause")) for c in gates] == [
             (CheckpointStatus.failed, "operator")
         ]
+
+
+# --- retry bounds -----------------------------------------------------------------------------
+# The developer's max_retries bounds the attempts, execution.review_rounds_max the attempts that
+# reach review, and each on_fail edge's max_iterations the retries taken through it: the tightest
+# ends the task, and the summary names it with its value.
+
+
+def _standard_workflow(**edge_iterations: int) -> dict[str, Any]:
+    """The standard workflow with the on_fail edges named in *edge_iterations* (by id, with
+    ``-`` as ``_``) set to that many iterations, and ``all`` setting every on_fail edge."""
+    graph = workflow_templates()["standard"]
+    for edge in graph.edges:
+        if edge.condition != "on_fail":
+            continue
+        edge.max_iterations = edge_iterations.get(
+            edge.id.replace("-", "_"), edge_iterations.get("all", edge.max_iterations)
+        )
+    return graph.model_dump(mode="json")
+
+
+async def test_review_rounds_max_ends_the_task_before_another_review_round(
+    db: Database, tmp_path: Path
+) -> None:
+    provider = FakeProvider(replies={"reviewer:security": [_verdict("fail", "still wrong")]})
+
+    task, ok = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {"review_rounds_max": 1},
+            "agent_overrides": {"developer": {"max_retries": 5}},
+        },
+    )
+
+    assert ok is False and task.state is TaskState.failed
+    assert len(_prompts_of(provider, "developer")) == 1  # no attempt it could not review
+    why = "rejected by SECURITY (fail): still wrong"
+    assert task.result_summary == (
+        "failed (review_rounds_max) after 1 attempt(s); "
+        f"stopped by execution.review_rounds_max=1; last: {why}"
+    )
+    (failed,) = await _events(db, task.id, "task.failed")
+    assert failed.payload == {"reason": "review_rounds_max", "attempts": 1}
+
+
+async def test_an_on_fail_edge_is_taken_at_most_its_max_iterations(
+    db: Database, tmp_path: Path
+) -> None:
+    # Security's edge allows one retry, the reviewer's the default three: security rejects
+    # attempt 1 (its one retry), the reviewer attempt 2 (its own edge still allows it), and
+    # security attempt 3, whose retry its edge no longer allows.
+    provider = FakeProvider(
+        replies={
+            "reviewer:security": [
+                _verdict("fail", "unsafe"), _PASS, _verdict("fail", "unsafe again")
+            ],
+            "reviewer:reviewer": [_verdict("fail", "unclear")],
+        }
+    )
+
+    task, ok = await _run_task(
+        db, tmp_path, provider,
+        {
+            "workflow": _standard_workflow(e_security_developer_fail=1),
+            "agent_overrides": {"developer": {"max_retries": 5}},
+        },
+    )
+
+    assert ok is False and task.state is TaskState.failed
+    assert len(_prompts_of(provider, "developer")) == 3
+    assert [p["reason"] for p in await _failure_payloads(db, task.id)] == [
+        "rejected by SECURITY (fail): unsafe",
+        "rejected by REVIEWER (fail): unclear",
+        "rejected by SECURITY (fail): unsafe again",
+    ]
+    assert task.result_summary == (
+        "failed (max_iterations) after 3 attempt(s); stopped by max_iterations=1 of on_fail edge "
+        "e-security-developer-fail (security -> developer); "
+        "last: rejected by SECURITY (fail): unsafe again"
+    )
+
+
+async def test_the_gate_on_fail_edge_bounds_the_retries_of_a_red_gate(
+    db: Database, tmp_path: Path
+) -> None:
+    provider = FakeProvider()
+
+    task, ok = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {"baseline_test_command": "if [ -f FEATURE.txt ]; then exit 3; fi"},
+            "workflow": _standard_workflow(e_gate_developer_fail=1),
+            "agent_overrides": {"developer": {"max_retries": 5}},
+        },
+    )
+
+    assert ok is False and task.state is TaskState.failed
+    assert len(_prompts_of(provider, "developer")) == 2  # attempt 1, and its one retry
+    assert task.result_summary == (
+        "failed (max_iterations) after 2 attempt(s); stopped by max_iterations=1 of on_fail edge "
+        "e-gate-developer-fail (gate -> developer); last: test gate not green (exit 3)"
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [None, _standard_workflow(all=6)],
+    ids=["default-graph", "on-fail-edges-at-6"],
+)
+async def test_the_default_bounds_still_make_three_attempts(
+    db: Database, tmp_path: Path, workflow: dict[str, Any] | None
+) -> None:
+    # max_retries 3, on_fail edges at 3 (or this project's 6) and review_rounds_max 20: the
+    # developer's max_retries ends the task, as before the other bounds were enforced.
+    provider = FakeProvider(replies={"reviewer:security": [_verdict("fail", "still wrong")]})
+
+    task, ok = await _run_task(
+        db, tmp_path, provider, {"workflow": workflow} if workflow is not None else None
+    )
+
+    assert ok is False and task.state is TaskState.failed
+    assert len(_prompts_of(provider, "developer")) == 3
+    assert task.result_summary == (
+        "failed (max_retries) after 3 attempt(s); last: rejected by SECURITY (fail): still wrong"
+    )
+    (failed,) = await _events(db, task.id, "task.failed")
+    assert failed.payload == {"reason": "max_retries", "attempts": 3}
+
+
+async def test_a_resumed_task_counts_the_review_rounds_before_its_crash(
+    db: Database, tmp_path: Path
+) -> None:
+    # The daemon stopped after attempt 2's developer finished; attempt 1 had been reviewed. On
+    # resume, attempt 2 is the task's second review round, and with review_rounds_max 2 its last.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    (repo_path / "FEATURE.txt").write_text("done\n", encoding="utf-8")
+    await run_git(repo_path, "add", "FEATURE.txt")
+    _, tree = await run_git(repo_path, "write-tree")  # attempt 2's work, kept as a tree object
+    await run_git(repo_path, "reset", "-q")
+    (repo_path / "FEATURE.txt").unlink()
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {
+                "target_branch": "main", "allow_no_test_command": True, "review_rounds_max": 2
+            },
+            "agent_overrides": {"developer": {"max_retries": 5}},
+        },
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    await repo.save_task_checkpoint(
+        db, task_id=task.id, node_id="developer", attempt=1, status=CheckpointStatus.completed
+    )
+    await repo.save_task_checkpoint(
+        db, task_id=task.id, node_id="review", attempt=1, status=CheckpointStatus.failed
+    )
+    await repo.save_task_checkpoint(
+        db, task_id=task.id, node_id="developer", attempt=2,
+        status=CheckpointStatus.completed, git_tree_sha=tree.strip(),
+    )
+    provider = FakeProvider(replies={"reviewer:security": [_verdict("fail", "still wrong")]})
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+
+    ok = await Orchestrator(db, EventBus(db), provider, tmp_path / "home").process_task(claimed)
+
+    final = await repo.get_task(db, task.id)
+    assert ok is False and final is not None and final.state is TaskState.failed
+    assert _prompts_of(provider, "developer") == []  # attempt 2 resumed from its checkpoint
+    assert final.result_summary == (
+        "failed (review_rounds_max) after 2 attempt(s); stopped by execution.review_rounds_max=2; "
+        "last: rejected by SECURITY (fail): still wrong"
+    )

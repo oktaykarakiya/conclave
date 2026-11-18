@@ -16,13 +16,21 @@ import logging
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..config import ConclaveConfig, WorkflowNode, resolve_agent, resolve_project_config
+from ..config import (
+    ConclaveConfig,
+    EdgeCondition,
+    NodeKind,
+    WorkflowEdge,
+    WorkflowNode,
+    resolve_agent,
+    resolve_project_config,
+)
 from ..db import CheckpointStatus, Database, Project, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType, build_notification_sink
@@ -93,6 +101,21 @@ _NECESSITY_YAGNI_RULE = (
     "or abstractions. Reject redundant or speculative code."
 )
 
+# Every reviewer prompt ends with this (Conclave's own text, never the editable persona's): the
+# reviewers of an attempt, parallel ones included, and the gate after them share one worktree, so
+# one reviewer's experiment (base files swapped in to prove a test fails on base) would disturb
+# another's test run. After the reviews, a changed worktree is reported (review.worktree_modified)
+# and restored to the reviewed tree.
+_SHARED_WORKTREE_RULE = (
+    "SHARED WORKTREE: this worktree is shared with the other reviewers and the green gate. Do "
+    "not change, add or delete any file in it, not even temporarily. To run code against another "
+    "version (the base, a variant), work in your own copy outside the worktree (for example "
+    "`git worktree add <scratch> <rev>` or `git archive <rev> | tar -x -C <scratch>`) and "
+    "remove it afterwards."
+)
+# The changed paths a review.worktree_modified event lists at most (its count has them all).
+_WORKTREE_MODIFIED_PATHS = 50
+
 logger = logging.getLogger("conclave.engine.orchestrator")
 
 
@@ -147,6 +170,17 @@ class _ReviewOutcome:
 
     # Which reviewers failed the attempt and why (one line); None when the review did not fail it.
     reason: str | None = None
+    # The workflow node ids whose verdict rejected the attempt: a retry follows their on_fail
+    # edges. Empty when the review passed, or failed for want of a usable verdict.
+    rejected_nodes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _RetryBound:
+    """A retry bound other than the developer's ``max_retries`` that ended a task."""
+
+    reason: str  # the failure summary's "failed (<reason>)": review_rounds_max | max_iterations
+    detail: str  # the bound and its value, e.g. "execution.review_rounds_max=1"
 
 
 class Orchestrator:
@@ -926,6 +960,24 @@ class Orchestrator:
             # Why the current attempt failed (its attempt.failed reason); a failed task ends
             # its summary with the last one.
             last_reason: str | None = None
+            # The retry bounds besides max_retries, the overall bound; the tightest wins (see
+            # _exhausted_bound). review_rounds counts the attempts that reached review, those
+            # before a resumed one included. retry_edges are the on_fail edges a retry after the
+            # current attempt takes, edge_uses the retries taken through each edge so far (not
+            # rebuilt on a resume, where max_retries still bounds the task).
+            review_rounds = (
+                len({
+                    cp.attempt
+                    for cp in existing_cps
+                    if cp.node_id == "review" and cp.attempt < resumed_attempt
+                })
+                if resumed_attempt is not None
+                else 0
+            )
+            retry_edges: list[WorkflowEdge] = []
+            edge_uses: dict[str, int] = {}
+            # The bound that ended the task, when not max_retries or the budget.
+            stopped_by: _RetryBound | None = None
 
             while attempts < max_retries:
                 config = await self._refresh_task_config(project.id, runner, config)
@@ -955,6 +1007,14 @@ class Orchestrator:
                 # Cooperative cancellation — never start another attempt once cancelled.
                 if cancel_event is not None and cancel_event.is_set():
                     return await self._finish_cancelled(task, wm, task_branch)
+                # Checked once the loop's max_retries test has passed, so max_retries names a tie.
+                stopped_by = _exhausted_bound(config, review_rounds, retry_edges, edge_uses)
+                if stopped_by is not None:
+                    failed = True
+                    break
+                for edge in retry_edges:
+                    edge_uses[edge.id] = edge_uses.get(edge.id, 0) + 1
+                retry_edges = []
                 attempts += 1
                 failed = False
                 last_reason = None
@@ -1271,6 +1331,7 @@ class Orchestrator:
                 # post-gate nodes, so each actual cut is made and reported once.
                 diff_cache: dict[BulkLimit, str] = {}
                 review = _ReviewOutcome()
+                review_rounds += 1
                 failed, feedback, review_timed_out = await self._review(
                     runner, task, project.id, worktree, full_diff, attempts, config, knowledge,
                     rules, started, budget, cancel_event=cancel_event, diff_cmd=diff_cmd,
@@ -1280,6 +1341,9 @@ class Orchestrator:
                 # Cooperative cancellation — a review cut short by a cancel is not a failed attempt.
                 if cancel_event is not None and cancel_event.is_set():
                     return await self._finish_cancelled(task, wm, task_branch)
+                # The reviewers share the worktree: report any change they left in it (the
+                # restore below, or the next attempt's reset, removes it).
+                await self._check_reviewed_tree(task, worktree, review_tree, attempts)
                 if review_timed_out:
                     timed_out = True
                     failed = True
@@ -1305,6 +1369,9 @@ class Orchestrator:
                     last_reason = await self._attempt_failed(
                         task, attempts, "review", review.reason or "review failed"
                     )
+                    # The retry loops back through each rejecting reviewer's on_fail edge (none
+                    # when the round failed for want of a usable verdict).
+                    retry_edges = _retry_edges(config, review.rejected_nodes)
                     continue
 
                 # ENG-2: the review passed, but reviewers may have written to the worktree.
@@ -1525,6 +1592,7 @@ class Orchestrator:
                                     "status": "failed",
                                 },
                             )
+                            retry_edges = _gate_retry_edges(config)
                             continue  # real failure — feed back and retry
 
                 next_after_gate = post_gate_nodes[0].id if post_gate_nodes else "merge"
@@ -1572,6 +1640,7 @@ class Orchestrator:
                         task, attempts, "gate", _operator_rejection(gate_res.get("message"))
                     )
                     failed = True
+                    retry_edges = _gate_retry_edges(config)
                     continue
 
                 # Execute any post-gate custom nodes (e.g. 'submitter' in acme_pr_review)
@@ -1694,7 +1763,7 @@ class Orchestrator:
                 return await self._finish_failure(
                     task, wm, task_branch, timed_out, attempts,
                     integrity=integrity, integrity_mode=integrity_mode, planner_note=planner_note,
-                    last_reason=last_reason,
+                    last_reason=last_reason, bound=stopped_by,
                 )
             return await self._finish_success(
                 task, wm, task_branch, repo_path, target_branch, worktree, config, attempts,
@@ -2505,9 +2574,10 @@ class Orchestrator:
 
         async def _with_diff(n: WorkflowNode) -> str:
             """*base_prompt* plus the diff fitted for reviewer *n* (nothing to show if blank),
-            then the whole *integrity_section*."""
+            then the whole *integrity_section* and the shared-worktree rule."""
+            rule = f"\n\n{_SHARED_WORKTREE_RULE}"
             if not current_diff.strip():
-                return base_prompt + integrity_section
+                return base_prompt + integrity_section + rule
             diff = await self._fit_bulk(
                 task, config, current_diff,
                 block="diff",
@@ -2516,7 +2586,7 @@ class Orchestrator:
                 node=n,
                 cache=diff_cache,
             )
-            return f"{base_prompt}\n\nDIFF:\n```diff\n{diff}\n```{integrity_section}"
+            return f"{base_prompt}\n\nDIFF:\n```diff\n{diff}\n```{integrity_section}{rule}"
 
         if is_parallel_review(config) and len(review_nodes) > 1:
             if cancel_event is not None and cancel_event.is_set():
@@ -2597,6 +2667,7 @@ class Orchestrator:
 
             failures: list[str] = []
             rejections: list[str] = []  # each blocking verdict, as the failure reason names it
+            rejected_nodes: list[str] = []
             for node, (result, raw_verdict) in zip(review_nodes, dispatched, strict=True):
                 agent = node.agent or node.id
                 verdict = await self._record_reviewer_verdict(
@@ -2624,6 +2695,7 @@ class Orchestrator:
                     header = f"{agent.upper()} FEEDBACK ({verdict.verdict.upper()})"
                     failures.append(f"\n{header}:\n{verdict.reason}\n")
                     rejections.append(_rejection(agent, verdict))
+                    rejected_nodes.append(node.id)
                 elif verdict.verdict == "pass":
                     passes += 1
 
@@ -2649,6 +2721,7 @@ class Orchestrator:
                 )
                 if outcome is not None:
                     outcome.reason = "; ".join(rejections)
+                    outcome.rejected_nodes = rejected_nodes
                 return True, "".join(failures), False
         else:
             failures = []
@@ -2754,6 +2827,7 @@ class Orchestrator:
                         )
                         if outcome is not None:
                             outcome.reason = _rejection(agent, verdict)
+                            outcome.rejected_nodes = [node.id]
                         return True, f"\n{header}:\n{verdict.reason}\n", False
                 if verdict.verdict == "pass":
                     passes += 1
@@ -2834,6 +2908,48 @@ class Orchestrator:
             },
         )
         return False, summary_text, False
+
+    async def _check_reviewed_tree(
+        self, task: Task, worktree: Path, review_tree: str, attempt: int
+    ) -> None:
+        """Report reviewers that left the shared worktree changed: ``review.worktree_modified``.
+
+        The worktree is staged as for the review tree (caches removed) and compared with the
+        tree that was reviewed; the changed paths, ``.venv`` left out, are listed (at most
+        :data:`_WORKTREE_MODIFIED_PATHS`, with their total ``count``). A verdict, or another
+        reviewer's test run, may then rest on a disturbed worktree. The index is reset to the
+        reviewed tree either way, so the next attempt's previous diff, and the restore before
+        the gate, start from what was reviewed.
+        """
+        await _stage_worktree_excluding_caches(worktree)
+        try:
+            rc, out = await run_git(worktree, "write-tree")
+            current = out.strip()
+            if rc != 0 or not current or current == review_tree:
+                return
+            rc, out = await run_git(
+                worktree, "diff", "--name-only", "--no-renames", "-z", review_tree, current
+            )
+            if rc != 0:
+                return
+            paths = [
+                path for path in out.split("\0")
+                if path and ".venv" not in PurePosixPath(path).parts
+            ]
+            if not paths:
+                return
+            await self._bus.emit(
+                type=EventType.review_worktree_modified,
+                project_id=task.project_id,
+                task_id=task.id,
+                payload={
+                    "attempt": attempt,
+                    "paths": paths[:_WORKTREE_MODIFIED_PATHS],
+                    "count": len(paths),
+                },
+            )
+        finally:
+            await run_git(worktree, "read-tree", review_tree)
 
     async def _finish_success(
         self,
@@ -3071,10 +3187,15 @@ class Orchestrator:
         integrity_mode: str = "off",
         planner_note: str = "",
         last_reason: str | None = None,
+        bound: _RetryBound | None = None,
     ) -> bool:
-        """Fail *task* after its attempts; the summary ends with why the last one failed."""
-        reason = "timeout" if timed_out else "max_retries"
-        note = planner_note + _integrity_note(integrity, integrity_mode)
+        """Fail *task* after its attempts; the summary ends with why the last one failed.
+
+        Its reason is ``timeout``, the *bound* that allowed no further attempt (named with its
+        value in the summary), else ``max_retries``."""
+        reason = "timeout" if timed_out else bound.reason if bound else "max_retries"
+        note = f"; stopped by {bound.detail}" if bound and not timed_out else ""
+        note += planner_note + _integrity_note(integrity, integrity_mode)
         if last_reason:
             note += f"; last: {last_reason}"
         # One transaction: fail the task, record why, and block its descendants together so
@@ -3342,6 +3463,53 @@ def _find_workflow_node(
     return None
 
 
+def _retry_edges(config: ConclaveConfig, sources: Iterable[str]) -> list[WorkflowEdge]:
+    """The ``on_fail`` edges from the *sources* nodes back to a developer node: the loopbacks a
+    retry after those nodes failed the attempt takes."""
+    workflow = resolve_workflow(config)
+    developers = {n.id for n in workflow.nodes if n.kind == NodeKind.developer}
+    wanted = set(sources)
+    return [
+        edge
+        for edge in workflow.edges
+        if edge.condition == EdgeCondition.on_fail
+        and edge.source in wanted
+        and edge.target in developers
+    ]
+
+
+def _gate_retry_edges(config: ConclaveConfig) -> list[WorkflowEdge]:
+    """The ``on_fail`` edges from the workflow's gate nodes back to a developer node."""
+    gates = [n.id for n in resolve_workflow(config).nodes if n.kind == NodeKind.gate]
+    return _retry_edges(config, gates)
+
+
+def _exhausted_bound(
+    config: ConclaveConfig,
+    review_rounds: int,
+    retry_edges: Sequence[WorkflowEdge],
+    edge_uses: Mapping[str, int],
+) -> _RetryBound | None:
+    """The bound, besides the developer's ``max_retries``, that allows no further attempt.
+
+    A task makes at most ``execution.review_rounds_max`` attempts that reach review, and a retry
+    takes each ``on_fail`` edge in *retry_edges* (the loopbacks of the nodes that failed the last
+    attempt) at most that edge's ``max_iterations`` times; *edge_uses* counts the retries taken
+    through each edge so far. ``None`` when another attempt is allowed.
+    """
+    rounds_max = config.execution.review_rounds_max
+    if review_rounds >= rounds_max:
+        return _RetryBound("review_rounds_max", f"execution.review_rounds_max={rounds_max}")
+    for edge in retry_edges:
+        if edge_uses.get(edge.id, 0) >= edge.max_iterations:
+            return _RetryBound(
+                "max_iterations",
+                f"max_iterations={edge.max_iterations} of on_fail edge {edge.id} "
+                f"({edge.source} -> {edge.target})",
+            )
+    return None
+
+
 def _has_enabled_developer(config: ConclaveConfig) -> bool:
     """Whether a developer runs: the default flow, or a workflow with an enabled developer.
 
@@ -3598,7 +3766,9 @@ def _build_developer_prompt(
             + "\n".join(f"```\n{cmd}\n```" for cmd in all_cmds) + "\n"
         )
     if use_memory and memory is not None:
-        dev_prompt += memory.build_preamble()
+        # The latest rejected diff is shown below as the prior diff: its history entry points
+        # there instead of repeating it.
+        dev_prompt += memory.build_preamble(diff_shown_below=previous_diff if feedback else "")
     if feedback:
         dev_prompt += (
             "\n\nLATEST REVIEWER FEEDBACK (must fix these issues):\n" + feedback

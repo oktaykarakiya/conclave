@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -16,7 +17,7 @@ _TOOLS = (
     "Task,Bash,Read,Edit,Write,NotebookEdit,WebFetch,WebSearch,ToolSearch,"
     "Glob,Grep,LSP,TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite,PowerShell"
 )
-_ISOLATION = [
+_ISOLATION_FLAGS = [
     "--strict-mcp-config",
     "--setting-sources",
     "project,local",
@@ -30,6 +31,15 @@ _BACKGROUND_VAR = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
 _CRON_VAR = "CLAUDE_CODE_DISABLE_CRON"
 _CLAUDE_MDS_VAR = "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
 _ISOLATION_ENV = {_MEMORY_VAR: "1", _BACKGROUND_VAR: "1", _CRON_VAR: "1", _CLAUDE_MDS_VAR: "1"}
+
+
+def _settings(env: dict[str, str]) -> list[str]:
+    """The ``--settings`` pair that carries *env* as inline command-line settings."""
+    return ["--settings", json.dumps({"env": env}, separators=(",", ":"))]
+
+
+# The isolation flags, then the isolation variables as command-line settings.
+_ISOLATION = [*_ISOLATION_FLAGS, *_settings(_ISOLATION_ENV)]
 
 # The built-in tools the system/init event of an isolated planner dispatch listed (Claude Code
 # 2.1.326, worker isolation without a tool allowlist): the ones a coding task needs, and the ones
@@ -187,10 +197,11 @@ def test_isolation_only_adds_its_flags_and_env(mode: ArgMode) -> None:
 
     on_args, on_env = build(True)
     off_args, off_env = build(False)
-    # Not isolated: none of the isolation flags (no tool allowlist) or variables, and never an
-    # MCP config.
+    # Not isolated: none of the isolation flags (no tool allowlist, no command-line settings) or
+    # variables, and never an MCP config.
     assert not set(_ISOLATION) & set(off_args)
     assert "--tools" not in off_args
+    assert "--settings" not in off_args
     assert not set(_ISOLATION_ENV) & set(off_env)
     assert "--mcp-config" not in on_args + off_args
     # Isolated: the same invocation plus the flags right after the base args, plus the variables.
@@ -198,13 +209,29 @@ def test_isolation_only_adds_its_flags_and_env(mode: ArgMode) -> None:
     assert on_env == {**off_env, **_ISOLATION_ENV}
 
 
+def test_an_isolated_worker_gets_the_isolation_env_as_command_line_settings() -> None:
+    # A project or local settings file's env block applies over the inherited environment, but
+    # not over --settings: the isolation variables go there too, right after the isolation flags.
+    args = build_invocation(
+        ResolvedProfile(name="x", arg_mode=ArgMode.inherit, extra_env={"FOO": "bar"})
+    ).args
+
+    assert args.count("--settings") == 1
+    at = args.index("--settings")
+    assert args[:at] == [*_BASE, *_ISOLATION_FLAGS]
+    # Exactly the isolation variables: the operator's other extra_env stays in the environment.
+    assert json.loads(args[at + 1]) == {"env": _ISOLATION_ENV}
+
+
 @pytest.mark.parametrize("var", sorted(_ISOLATION_ENV))
 def test_extra_env_overrides_the_isolation_env(var: str) -> None:
     inv = build_invocation(
         ResolvedProfile(name="x", arg_mode=ArgMode.inherit, extra_env={var: "0"})
     )
-    assert inv.env == {**_ISOLATION_ENV, var: "0"}  # the other switches stay on
-    assert inv.args == [*_BASE, *_ISOLATION]  # the flags stay
+    overridden = {**_ISOLATION_ENV, var: "0"}  # the other switches stay on
+    assert inv.env == overridden
+    # The flags stay, and the command-line settings carry the operator's value too.
+    assert inv.args == [*_BASE, *_ISOLATION_FLAGS, *_settings(overridden)]
 
 
 def test_isolation_turns_native_rule_files_off_unless_extra_env_says_otherwise() -> None:

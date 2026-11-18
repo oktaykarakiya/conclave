@@ -11,13 +11,16 @@ profile composes the exact CLI args + environment for a dispatch:
 An ``isolated`` profile (the default; ``execution.worker_isolation``) also keeps the operator's
 own Claude Code setup out of the dispatch, limits it to the built-in tools a coding task needs
 and turns off background tasks and native rule-file loading (see ``_ISOLATION_ARGS``,
-``ISOLATED_WORKER_TOOLS`` and ``_ISOLATION_ENV``).
+``ISOLATED_WORKER_TOOLS`` and ``_ISOLATION_ENV``), in a way no settings file can undo
+(``_isolation_settings``).
 
 ``build_invocation`` is pure and the most heavily tested function here.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from ..config import ArgMode
@@ -96,6 +99,19 @@ _ISOLATION_ENV: dict[str, str] = {
 }
 
 
+def _isolation_settings(extra_env: Mapping[str, str]) -> str:
+    """The isolation variables as inline ``--settings`` JSON (``{"env": {...}}``, no file).
+
+    Claude Code applies the ``env`` of its settings files over the environment it inherits, and
+    in a git worktree reads ``.claude/settings.local.json`` from the main checkout's root, so the
+    repository's settings, or a file a worker writes there during the task, could turn these
+    switches back off for the next dispatch. Command-line settings outrank the project and local
+    files, which otherwise still apply (their permissions and hooks). A variable the operator
+    sets in ``extra_env`` keeps the operator's value here too, as in the process environment."""
+    env = {var: extra_env.get(var, value) for var, value in _ISOLATION_ENV.items()}
+    return json.dumps({"env": env}, separators=(",", ":"))
+
+
 @dataclass(frozen=True)
 class ResolvedProfile:
     """A fully-resolved dispatch spec (profile defaults overlaid with agent overrides
@@ -128,16 +144,17 @@ class Invocation:
 def build_invocation(profile: ResolvedProfile) -> Invocation:
     """Compose the CLI args and environment overrides for a dispatch (pure).
 
-    Args come in this order: ``cli_flags``, the base args, the isolation flags (when
-    ``profile.isolated``), ``--resume <id>`` (when ``profile.resume_session_id`` is set), then
-    ``--model``/``--effort`` (flag mode). Without isolation or a session to resume nothing is
-    added, so the args and environment are exactly those of a profile that predates them.
+    Args come in this order: ``cli_flags``, the base args, the isolation flags and their
+    ``--settings`` (when ``profile.isolated``), ``--resume <id>`` (when
+    ``profile.resume_session_id`` is set), then ``--model``/``--effort`` (flag mode). Without
+    isolation or a session to resume nothing is added, so the args and environment are exactly
+    those of a profile that predates them.
     """
     args: list[str] = [*profile.cli_flags, *_BASE_ARGS]
     env: dict[str, str] = {}
 
     if profile.isolated:
-        args += _ISOLATION_ARGS
+        args += [*_ISOLATION_ARGS, "--settings", _isolation_settings(profile.extra_env)]
         env.update(_ISOLATION_ENV)
     if profile.resume_session_id:
         args += ["--resume", profile.resume_session_id]

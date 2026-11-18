@@ -61,7 +61,11 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
    Change that project with `conclave_patch_config` (`config`, `name`); to run two
    configurations against one repository, attach separate clones. The project stores only what
    you choose here (its branch, `config_preset`, `workflow_template`, `max_parallel_tasks`);
-   everything else is inherited from the global settings (see "Settings layers" below).
+   everything else is inherited from the global settings (see "Settings layers" below). A
+   `config_preset` that is not a Store config preset, or a `workflow_template` that is neither a
+   Store workflow nor a built-in template (`standard`, `fast_track`, `tdd_loop`, `deep_audit`),
+   is refused the same way (`isError`, REST `422`) naming it, and nothing is attached:
+   `conclave_store_list` shows what exists.
 2. `conclave_patch_config(project_id, config={...})` merges into the project's settings
    (`conclave_get_config` shows the effective result; `conclave_get_workflow` the graph;
    `conclave_get_config_schema` the JSON Schema of every valid key, with its type, default and
@@ -69,7 +73,8 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
    - `execution.target_branch`, `execution.auto_merge` (default `false`: a green task ends
      `done` on its branch, unmerged), `execution.setup_command`,
      `execution.baseline_test_command`, `execution.require_full_green`,
-     `execution.max_parallel_tasks`, `execution.review_rounds_max`
+     `execution.max_parallel_tasks`, `execution.review_rounds_max` (the attempts that may
+     reach review; how it combines with `max_retries` and `max_iterations`: §6)
    - `execution.allow_no_test_command` (default `false`): with `require_full_green` on and no test
      command, a task with a developer fails with reason `no_test_command` before any worktree or
      agent is spent; its summary names the fix. A test command removed while a task runs fails
@@ -101,7 +106,13 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      that names no timeout stops after 20 minutes, or the agent's timeout when that is shorter
      (`BASH_DEFAULT_TIMEOUT_MS`). It also gets the repository's `.claude/settings.json` and
      `.claude/settings.local.json`, managed settings, its login and
-     `--dangerously-skip-permissions`. It gets no MCP servers (neither the repository's
+     `--dangerously-skip-permissions`. The isolation variables (`CLAUDE_CODE_DISABLE_*`) are
+     also passed as command-line settings (`--settings '{"env": {...}}'`, no file), which
+     outrank those two files, so an `env` block in them cannot turn isolation back off: not the
+     repository's own, and not one a worker writes during the task (in a git worktree Claude
+     Code reads `settings.local.json` from the main checkout). Their permissions and hooks still
+     apply, and a value an engine profile's `extra_env` sets wins there too. It gets no MCP
+     servers (neither the repository's
      `.mcp.json` nor Conclave's own), no user settings (`~/.claude/settings.json`, so not their
      `model`, `env`, `apiKeyHelper`, hooks or enabled plugins), no skills or slash commands, and
      no auto-memory, which every worktree of a repository shares: a worker that is not isolated
@@ -324,6 +335,19 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   (`requested`, `used`, `model`, `agent`, `node_id`); the dispatch ran with `used`.
   `quota.waiting` and `quota.resumed` mark a dispatch waiting out a usage limit (see Usage
   limits below).
+- **Reviewers share one worktree.** An attempt's reviewers (parallel ones at the same time) and
+  the gate after them work in the same worktree, so every reviewer prompt tells the reviewer, in
+  Conclave's own text after its persona's, not to change, add or delete any file there, not even
+  temporarily, and to run another version (the base, a variant) in its own copy outside the
+  worktree (`git worktree add <scratch> <rev>` or `git archive <rev> | tar -x -C <scratch>`),
+  removed afterwards. After the reviews, Conclave compares the worktree (caches and `.venv`
+  left out) with the tree that was reviewed; if a reviewer changed it anyway, a
+  `review.worktree_modified` event (`attempt`, `paths`: at most 50 changed paths, `count`: all
+  of them) says so. A verdict of that attempt, or another reviewer's test run, may then rest on
+  a disturbed worktree: read that attempt's verdicts with this in mind, and re-run the task if
+  one decided the outcome. The commit is never affected: the worktree is restored to the
+  reviewed tree before the gate (and reset before a retry), so only reviewed work is tested and
+  committed.
 - `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review. A node the
   task's end interrupted (a cancel, an unhandled error) reads `skipped` with `interrupted: true` in
   its checkpoint artifact once the task is over, never `running` or `waiting_for_approval`.
@@ -354,6 +378,23 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   attempt's `attempt.failed` reason, after any planner and test-integrity notes:
   `failed (max_retries) after 3 attempt(s); last: rejected by SECURITY (fail): <its reason>`.
   Read the `attempt.failed` events for every attempt's reason.
+- **Three bounds limit the retries; the tightest ends the task.** The developer's `max_retries`
+  (default 3) bounds the attempts in all. `execution.review_rounds_max` (default 20) bounds the
+  attempts that reach review: once that many have, no further attempt starts. An `on_fail`
+  edge's `max_iterations` (default 3) bounds the retries taken through that edge, so attempt 1
+  plus at most `max_iterations` retries through it: a retry after a rejecting reviewer follows
+  that reviewer's `on_fail` edge back to the developer (every rejecting reviewer's edge, when
+  parallel reviewers reject together, and each must still allow it), a retry after a red test
+  gate or a gate you failed at a checkpoint follows the gate's, and one after a developer error
+  or a round without a usable verdict follows none. A task the developer's `max_retries` ended
+  reads `failed (max_retries) after N attempt(s)`, also when another bound ran out at the same
+  time; one that another bound ended names it with its value, e.g.
+  `failed (review_rounds_max) after 1 attempt(s); stopped by execution.review_rounds_max=1; last:
+  ...` or `failed (max_iterations) after 3 attempt(s); stopped by max_iterations=1 of on_fail edge
+  e-security-developer-fail (security -> developer); last: ...`, and `task.failed` has that
+  `reason`. With the defaults `max_retries` is the tightest bound, so raising an edge's
+  `max_iterations` (as the evolver's grow does, up to 6) only allows more retries through it
+  when that edge is the tightest bound, e.g. after you raise `max_retries`.
 - Typical timeline: setup + baseline test run, planner, developer, each reviewer in turn, the
   gate, commit. Poll every 15–60 s; long silences during planning or development are normal.
 - Costs are reported per dispatch in `agent.result.cost_usd`. Subscription-backed engines
@@ -375,6 +416,14 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   and `CONCLAVE_PARQUET_SYNC`, which turned that copy off, is gone. Files written before stay
   where they are (an older `INTERACTION_LOGS.parquet` without `pyarrow` holds JSON Lines); delete
   them yourself if you do not need them.
+- `conclave_query_interactions(sql, limit)` (REST `POST /api/observability/query`) runs one
+  `SELECT` or `WITH` query (no `;`, no writing keyword) on a read-only connection of its own,
+  beside the daemon's, so a heavy query holds nothing else up. It is stopped after 10 seconds
+  (`isError`, REST `400`: the query took too long); narrow it, e.g. with a `WHERE` on
+  `project_id` or a time range. It cannot read the `secrets` table, directly or in a subquery or
+  `WITH`, nor SQLite's raw pages (`sqlite_dbpage`): such a query is refused with `isError`
+  (REST `400`) naming the table. It returns `columns`, `rows` (at most `limit`, default 200) and
+  `row_count`.
 
 ### Usage limits
 - When an engine refuses work because a usage limit or the balance ran out (Claude Code's
@@ -389,18 +438,22 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   waits the same way; it is never failed as a timeout.
 - A wait lasts until the reported reset plus a minute, or `execution.quota_retry_minutes`
   (default 15, 1 to 1440) when the engine gives no reset time; a dispatch refused again waits
-  again, with no cap. A Claude Code request refused while its rate-limit info still reads
-  `allowed` (or extra usage serves it) hit a short burst limit, not an exhausted window, so it
-  waits `quota_retry_minutes`, not until the window's reset. There is one gate per engine
-  account, `claude-code` for every Claude Code dispatch and `opencode/<provider>` (e.g.
-  `opencode/deepseek`) per opencode model provider: while it is closed, every dispatch on that
-  account, in every project, waits for it.
+  again, with no cap. A reported reset more than 8 days ahead is beyond any usage window (a
+  misread value, such as a retry-after in milliseconds read as seconds), so it is ignored and the
+  wait lasts `quota_retry_minutes`, as without one: the `quota.waiting` event then has
+  `reset_ignored: true` and still shows the reported `resets_at`. A Claude Code request refused
+  while its rate-limit info still reads `allowed` (or extra usage serves it) hit a short burst
+  limit, not an exhausted window, so it waits `quota_retry_minutes`, not until the window's
+  reset. There is one gate per engine account, `claude-code` for every Claude Code dispatch and
+  `opencode/<provider>` (e.g. `opencode/deepseek`) per opencode model provider: while it is
+  closed, every dispatch on that account, in every project, waits for it.
 - The interrupted session is continued (Claude Code `--resume`, opencode `--session`) with a
   short continuation prompt; without a session, or when the engine no longer has it, the
   original prompt runs again.
 - Where to see it: the task's (or planning session's) `quota.waiting` event (`engine`, `key`,
-  `kind`: `rate_limit` | `billing`, `window`, `resets_at`, `resumes_at`, `message`, `agent`,
-  `node_id`) and `quota.resumed` (`engine`, `key`, `waited_seconds`, `resumed_session`);
+  `kind`: `rate_limit` | `billing`, `window`, `resets_at`, `reset_ignored`, `resumes_at`,
+  `message`, `agent`, `node_id`) and `quota.resumed` (`engine`, `key`, `waited_seconds`,
+  `resumed_session`);
   `conclave_get_engine_quota` (REST `GET /api/engines/quota`) for every gate, until when, and
   Claude Code's latest rate-limit windows (`rate_limit`); the UI's banner; and the webhook
   (`notifications.webhook_url`) receives `quota.waiting` once per gate closing and project.
@@ -488,8 +541,9 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   approved proposal), it may propose again, the same kind of change included. A different change
   (another reviewer, grow instead of shrink) is proposed as usual.
 - The evolver learns only from quality failures. `task_failed` means the task ended
-  `failed (max_retries)` or `failed (timeout)` and an attempt failed at review or at a red test
-  gate; `gate_failed_after_review` means a gate ran the tests and found them red after the review
+  `failed (max_retries)`, `failed (review_rounds_max)`, `failed (max_iterations)` (§6) or
+  `failed (timeout)` and an attempt failed at review or at a red test gate;
+  `gate_failed_after_review` means a gate ran the tests and found them red after the review
   passed on the same attempt. A failed gate checkpoint records its `cause` in its artifact:
   `tests` (red tests), `infra` (`infra_timed_out` and the like), `no_test_command` or `operator`
   (you failed it at a checkpoint); only `tests`, or no cause (a checkpoint from before causes were
@@ -579,7 +633,9 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 - Over the stdio bridge (`conclave-mcp`) with the daemon down, `initialize`, the tool list and
   this guide still answer, but every tool call returns `isError` with
   `Conclave daemon unreachable at <url>: <reason>`. The bridge never runs a tool itself: start
-  the daemon (`./conclave` or `systemctl --user start conclave`) and call again.
+  the daemon (`./conclave` or `systemctl --user start conclave`) and call again. When the daemon
+  errors or times out, a request gets a JSON-RPC error from the bridge; a notification (a
+  message without an `id`) gets no answer at all, as JSON-RPC requires.
 - Attaching an already-attached path is refused with `isError` and changes nothing; change that
   project with `conclave_patch_config` (§3).
 - Settings are layered (§3): a global change reaches every project that does not override that
@@ -748,7 +804,8 @@ group for the first time.
 ### Observability
 - `conclave_list_interactions` — list logged agent and MCP conversations.
 - `conclave_get_interaction` — read one full transcript and tool breakdown.
-- `conclave_query_interactions` — run a read-only SQL SELECT over interaction logs.
+- `conclave_query_interactions` — run a read-only SQL SELECT over interaction logs (stopped
+  after 10 seconds; cannot read secrets).
 - `conclave_get_observability_stats` — read aggregated cost, token, and model stats, or export
   every interaction log to a file.
 - `conclave_get_task_usage` — read one task's turn and token totals.

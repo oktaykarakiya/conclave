@@ -137,6 +137,8 @@ class ClaudeCliProvider:
             env.update(_bash_timeout_env(timeout_seconds))
         env.update(invocation.env)  # last, so the profile's extra_env wins
 
+        # An isolated dispatch's args also carry its isolation variables as inline --settings
+        # JSON, which no project or local settings file outranks (profiles._isolation_settings).
         exec_bin, exec_args = _resolve_cli_exec(profile.cli, list(invocation.args))
         last_result: AgentResult | None = None
         for attempt_idx in range(_CLAUDE_MAX_ATTEMPTS):

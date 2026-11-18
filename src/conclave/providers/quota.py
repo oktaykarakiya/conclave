@@ -32,6 +32,10 @@ logger = logging.getLogger("conclave.providers.quota")
 
 # A gate reopens this long after the reported reset, so the first request is not refused again.
 RESUME_MARGIN = timedelta(seconds=60)
+# A reported reset further ahead than this is beyond any usage window (Claude Code's longest is
+# weekly), so it is a misread value (e.g. a retry-after in milliseconds read as seconds): it is
+# ignored, as an unknown reset, instead of closing the gate until then.
+MAX_PLAUSIBLE_RESET = timedelta(days=8)
 # A wait sleeps at most this long before it reads the reopen time again (an extended closure, a
 # wall-clock jump after a suspend).
 _MAX_SLEEP_S = 60.0
@@ -70,12 +74,16 @@ def quota_key(provider: Provider, profile: ResolvedProfile) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class QuotaWait:
-    """A closed key one dispatch waits for (the details of its ``quota.waiting`` event)."""
+    """A closed key one dispatch waits for (the details of its ``quota.waiting`` event).
+
+    ``reset_ignored``: the engine reported a reset more than :data:`MAX_PLAUSIBLE_RESET` ahead
+    (still ``quota.resets_at``), so the key closed for the retry minutes instead."""
 
     engine: str
     key: str
     quota: QuotaExhausted
     resumes_at: datetime
+    reset_ignored: bool = False
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -84,6 +92,7 @@ class QuotaWait:
             "kind": self.quota.kind,
             "window": self.quota.window,
             "resets_at": iso_utc(self.quota.resets_at),
+            "reset_ignored": self.reset_ignored,
             "resumes_at": iso_utc(self.resumes_at),
             "message": self.quota.message,
         }
@@ -94,6 +103,7 @@ class _Closure:
     engine: str
     reopens_at: datetime
     quota: QuotaExhausted
+    reset_ignored: bool = False
     notified: set[str] = field(default_factory=set)  # projects told about this closure
 
 
@@ -101,9 +111,11 @@ class QuotaGate:
     """Which engine accounts are out of quota, and until when (one per daemon).
 
     :meth:`close` shuts a key until the reported reset plus :data:`RESUME_MARGIN`, or for
-    ``retry_minutes`` when no future reset time is known; a closure is only ever extended, never
-    shortened. :meth:`wait` blocks until a key reopens. The gate also keeps the latest
-    rate-limit info each key reported. The clock and sleep are injectable so tests never wait.
+    ``retry_minutes`` when no future reset time is known (none reported, one already past, or one
+    more than :data:`MAX_PLAUSIBLE_RESET` ahead, which is ignored); a closure is only ever
+    extended, never shortened. :meth:`wait` blocks until a key reopens. The gate also keeps the
+    latest rate-limit info each key reported. The clock and sleep are injectable so tests never
+    wait.
     """
 
     def __init__(self, *, clock: Clock = utc_now, sleep: Sleep = asyncio.sleep) -> None:
@@ -120,8 +132,10 @@ class QuotaGate:
     ) -> datetime:
         """Close *key* for *quota*; return when it reopens."""
         now = self._clock()
-        if quota.resets_at is not None and quota.resets_at > now:
-            reopens_at = quota.resets_at + RESUME_MARGIN
+        resets_at = quota.resets_at
+        reset_ignored = resets_at is not None and resets_at - now > MAX_PLAUSIBLE_RESET
+        if resets_at is not None and resets_at > now and not reset_ignored:
+            reopens_at = resets_at + RESUME_MARGIN
         else:
             reopens_at = now + timedelta(minutes=max(retry_minutes, 1))
         current = self._closures.get(key)
@@ -129,8 +143,11 @@ class QuotaGate:
             if reopens_at > current.reopens_at:
                 current.reopens_at = reopens_at
                 current.quota = quota
+                current.reset_ignored = reset_ignored
             return current.reopens_at
-        self._closures[key] = _Closure(engine=engine, reopens_at=reopens_at, quota=quota)
+        self._closures[key] = _Closure(
+            engine=engine, reopens_at=reopens_at, quota=quota, reset_ignored=reset_ignored
+        )
         return reopens_at
 
     def pending(self, key: str) -> QuotaWait | None:
@@ -138,7 +155,9 @@ class QuotaGate:
         closure = self._closures.get(key)
         if closure is None or closure.reopens_at <= self._clock():
             return None
-        return QuotaWait(closure.engine, key, closure.quota, closure.reopens_at)
+        return QuotaWait(
+            closure.engine, key, closure.quota, closure.reopens_at, closure.reset_ignored
+        )
 
     async def wait(self, key: str, cancel_event: asyncio.Event | None = None) -> bool:
         """Sleep until *key* reopens (``True``); ``False`` as soon as *cancel_event* is set."""
@@ -188,7 +207,9 @@ class QuotaGate:
                 row = wait.payload()
             else:
                 engine = closure.engine if closure is not None else limit[0] if limit else ""
-                row = dict.fromkeys(("kind", "window", "resets_at", "resumes_at", "message"))
+                row = dict.fromkeys(
+                    ("kind", "window", "resets_at", "reset_ignored", "resumes_at", "message")
+                )
                 row["engine"] = engine
             row.update(
                 key=key,

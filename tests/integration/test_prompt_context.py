@@ -372,8 +372,73 @@ async def test_prior_attempt_memory_keeps_the_previous_diff_whole(
         assert match.group(3, 4) == ("bulk_max_chars", "1000")
         assert match.group(5).startswith("Run `git diff ")
         assert added[0] in entry and added[-1] in entry  # head and tail are kept
-        assert len(cuts) == 2  # one per previous diff (attempts 1 and 2), shown twice each
+        # One per previous diff (attempts 1 and 2), fitted once for the retry that shows it.
+        assert len(cuts) == 2
         assert {(c["agent"], c["node_id"]) for c in cuts} == {("developer", "developer")}
+
+
+class _WritesPerAttempt(FakeProvider):
+    """FakeProvider whose developer writes ``contents[n]`` on its n-th dispatch, so every attempt
+    leaves a diff of its own."""
+
+    def __init__(self, contents: list[str], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.contents = contents
+        self.developer_dispatches = 0
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        if self.role_of(prompt) == "developer":
+            self.developer_content = self.contents[self.developer_dispatches]
+            self.developer_dispatches += 1
+        return await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+
+
+async def test_every_rejected_diff_reaches_the_retry_exactly_once(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The latest rejected diff is shown as YOUR IMMEDIATELY PRIOR DIFF, so its history entry
+    points there instead of repeating it; earlier attempts keep their own diffs."""
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    await _init_repo(tmp_path / "repo")
+    contents = [
+        "".join(f"attempt-{n} writes line {i:03d}\n" for i in range(40)) for n in (1, 2, 3)
+    ]
+    provider = _WritesPerAttempt(
+        contents,
+        replies={"reviewer:security": [_SECURITY_FAILS, _SECURITY_FAILS, _SECURITY_PASSES]},
+    )
+
+    task, ok = await _run_task(
+        db, tmp_path, provider, {"agent_overrides": {"developer": {"max_retries": 3}}}
+    )
+
+    assert ok is True and task.state is TaskState.done
+    third = _prompts_of(provider, "developer")[2]
+    first_entry = _history_entry(third, 1)
+    diff_1 = first_entry.split("Diff produced:\n", 1)[1].rstrip("\n")
+    diff_2 = third.split("YOUR IMMEDIATELY PRIOR DIFF:\n```diff\n", 1)[1].split("\n```", 1)[0]
+    assert "+attempt-1 writes line 000" in diff_1 and "+attempt-1 writes line 039" in diff_1
+    assert "+attempt-2 writes line 000" in diff_2 and "+attempt-2 writes line 039" in diff_2
+    assert third.count(diff_1) == 1
+    assert third.count(diff_2) == 1
+    assert third.count("+attempt-2 writes line 000") == 1
+    second_entry = _history_entry(third, 2).split("\n\nLATEST REVIEWER FEEDBACK", 1)[0]
+    assert second_entry.startswith("Why it was rejected:\n")
+    assert second_entry.rstrip("\n").endswith(
+        "\nDiff produced: shown below as YOUR IMMEDIATELY PRIOR DIFF"
+    )
 
 
 class _RebuildsTheBundle(FakeProvider):

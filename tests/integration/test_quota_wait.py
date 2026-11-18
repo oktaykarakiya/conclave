@@ -127,6 +127,7 @@ def _assert_waited_and_resumed(
         "kind": "rate_limit",
         "window": "five_hour",
         "resets_at": None,
+        "reset_ignored": False,
         "resumes_at": waiting.payload["resumes_at"],
         "message": "You've hit your limit",
         "agent": agent,
@@ -537,6 +538,7 @@ async def test_the_gate_state_is_reported_over_rest_and_mcp(
                 "kind": "rate_limit",
                 "window": "five_hour",
                 "resets_at": resets_at.isoformat(),
+                "reset_ignored": False,
                 "message": "m",
                 "rate_limit": info,
             }

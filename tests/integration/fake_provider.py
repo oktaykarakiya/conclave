@@ -166,7 +166,8 @@ class FakeProvider:
         agent = _AGENT_NAME.search(prompt)
         if "Produce a structured plan" in prompt:
             return "planner"
-        if "Post-Mortem Agent" in prompt:
+        # The seeded persona's heading, or the runner's context when no persona is seeded.
+        if "Post-Mortem Agent" in prompt or (agent is not None and agent.group(1) == "postmortem"):
             return "postmortem"
         if "Review the changes made for this task" in prompt:
             return f"reviewer:{agent.group(1) if agent else '?'}"
@@ -243,7 +244,7 @@ class FakeProvider:
         # persona-name checks below don't intercept it. (Both now return a JSON verdict.)
         if "Produce a structured plan" in prompt:
             return AgentResult(ok=True, text=_PLAN, model_reported="fake", cost_usd=0.0)
-        if "Post-Mortem Agent" in prompt:
+        if role == "postmortem":
             # The orchestrator dispatches this on a terminal task failure when
             # post_mortem_enabled. Track it so a test can assert it ran (or didn't).
             self.post_mortem_calls += 1

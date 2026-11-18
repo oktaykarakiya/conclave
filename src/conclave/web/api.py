@@ -301,13 +301,19 @@ async def create_project(
 
     # Only what the caller chose is stored; everything else is inherited (built-in -> global)
     # when the config is resolved, and the server keeps just the delta.
+    # A preset or template that does not exist is refused, never ignored: nothing is attached.
     initial_cfg: dict[str, Any] = {}
     if body.config_preset:
         preset = await repo.get_store_item_by_name(
             daemon.db, StoreItemKind.config_preset, body.config_preset
         )
-        if preset is not None:
-            initial_cfg = deep_merge(initial_cfg, preset.payload)
+        if preset is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown config_preset: {body.config_preset!r} (no Store config preset "
+                "of that name)",
+            )
+        initial_cfg = deep_merge(initial_cfg, preset.payload)
     if body.workflow_template:
         wf_item = await repo.get_store_item_by_name(
             daemon.db, StoreItemKind.workflow, body.workflow_template
@@ -316,10 +322,13 @@ async def create_project(
             initial_cfg["workflow"] = wf_item.payload
         else:
             templates = workflow_templates()
-            if body.workflow_template in templates:
-                initial_cfg["workflow"] = templates[body.workflow_template].model_dump(
-                    mode="json"
+            if body.workflow_template not in templates:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"unknown workflow_template: {body.workflow_template!r} (neither a "
+                    f"Store workflow nor a built-in template: {', '.join(templates)})",
                 )
+            initial_cfg["workflow"] = templates[body.workflow_template].model_dump(mode="json")
     if body.max_parallel_tasks is not None:
         exec_sec = dict(initial_cfg.get("execution") or {})
         exec_sec["max_parallel_tasks"] = body.max_parallel_tasks

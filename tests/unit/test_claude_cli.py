@@ -106,6 +106,12 @@ _TOOLS = (
     "Task,Bash,Read,Edit,Write,NotebookEdit,WebFetch,WebSearch,ToolSearch,"
     "Glob,Grep,LSP,TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite,PowerShell"
 )
+_ISOLATION_VARS = (
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+    "CLAUDE_CODE_DISABLE_CRON",
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+)
 _ISOLATION_FLAGS = [
     "--strict-mcp-config",
     "--setting-sources",
@@ -114,6 +120,9 @@ _ISOLATION_FLAGS = [
     "--exclude-dynamic-system-prompt-sections",
     "--tools",
     _TOOLS,
+    # The isolation variables again, as command-line settings no settings file outranks.
+    "--settings",
+    json.dumps({"env": dict.fromkeys(_ISOLATION_VARS, "1")}, separators=(",", ":")),
 ]
 _BASE_ARGS = ["--print", "--output-format", "stream-json", "--verbose"]
 _SWITCHES = ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "CLAUDE_CODE_DISABLE_CRON")
@@ -242,7 +251,86 @@ async def test_an_unisolated_dispatch_gets_no_tool_allowlist_switches_or_bash_ti
     assert result.ok
     argv, env = _started(record)
     assert "--tools" not in argv
+    assert "--settings" not in argv
     assert env == {}
+
+
+def _settings_applying_cli(tmp_path: Path) -> tuple[str, Path]:
+    """A fake "claude" that resolves its environment as Claude Code documents it (Settings
+    precedence): the inherited environment, then the ``env`` of the project's
+    ``.claude/settings.json`` and ``.claude/settings.local.json`` (read from its cwd, the
+    worktree), then the ``env`` of ``--settings``, which outranks both. It records the isolation
+    variables it ends with, and its args, in the returned file."""
+    record = tmp_path / "resolved.json"
+    body = f"""#!/usr/bin/env python3
+import json, os, sys
+sys.stdin.read()
+env = dict(os.environ)
+for name in ("settings.json", "settings.local.json"):
+    path = os.path.join(".claude", name)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            env.update(json.load(f).get("env", {{}}))
+args = sys.argv[1:]
+if "--settings" in args:
+    env.update(json.loads(args[args.index("--settings") + 1]).get("env", {{}}))
+with open({str(record)!r}, "w", encoding="utf-8") as f:
+    resolved = {{key: env[key] for key in {list(_ISOLATION_VARS)!r} if key in env}}
+    json.dump({{"argv": args, "env": resolved}}, f)
+print(json.dumps({{"type": "result", "is_error": False, "result": "ok", "session_id": "s-r"}}))
+"""
+    return _make_cli(tmp_path, body, name="settings_applying.py"), record
+
+
+@pytest.mark.parametrize(
+    ("isolated", "extra_env", "expected"),
+    [
+        # Isolated: --settings outranks the worktree's local settings file.
+        (True, {}, dict.fromkeys(_ISOLATION_VARS, "1")),
+        # The operator's extra_env still wins, through --settings too.
+        (
+            True,
+            {"CLAUDE_CODE_DISABLE_CRON": "0"},
+            {**dict.fromkeys(_ISOLATION_VARS, "1"), "CLAUDE_CODE_DISABLE_CRON": "0"},
+        ),
+        # Not isolated: no --settings, so the settings file decides, as before.
+        (False, {}, dict.fromkeys(_ISOLATION_VARS, "0")),
+    ],
+)
+async def test_a_settings_file_in_the_worktree_cannot_undo_the_isolation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated: bool,
+    extra_env: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    cli, record = _settings_applying_cli(tmp_path)
+    # This suite may itself run inside an isolated worker, which has the variables set.
+    for var in _ISOLATION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    # What the repository, or a worker earlier in the task, could leave in the worktree.
+    worktree = tmp_path / "worktree"
+    (worktree / ".claude").mkdir(parents=True)
+    (worktree / ".claude" / "settings.local.json").write_text(
+        json.dumps({"env": dict.fromkeys(_ISOLATION_VARS, "0")}), encoding="utf-8"
+    )
+    profile = ResolvedProfile(
+        name="claude-code",
+        arg_mode=ArgMode.flag,
+        model="opus",
+        cli=cli,
+        isolated=isolated,
+        extra_env=extra_env,
+    )
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=30, cwd=worktree
+    )
+
+    assert result.ok
+    argv, env = _started(record)
+    assert env == expected
+    assert ("--settings" in argv) is isolated
 
 
 async def test_the_profile_extra_env_overrides_the_derived_bash_timeouts(

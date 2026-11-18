@@ -54,6 +54,11 @@ class Database:
             raise RuntimeError("Database is not connected; call connect() first.")
         return self._conn
 
+    @property
+    def path(self) -> Path:
+        """The database file, for a connection of its own (e.g. a read-only one)."""
+        return self._path
+
     async def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # isolation_level=None → driver autocommit: only our explicit BEGIN/COMMIT/ROLLBACK

@@ -254,7 +254,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "inherits everything else from the global settings. A path that is already attached "
         "is refused with an error naming that project, and nothing changes: change it with "
         "conclave_patch_config (config, name), or attach a separate clone of the repository "
-        "to run another configuration.",
+        "to run another configuration. A config_preset or workflow_template that does not "
+        "exist is refused the same way, naming it.",
         {
             "name": _prop("string", "Display name for the project."),
             "path": _prop("string", "Absolute path to the local git repository."),
@@ -1249,7 +1250,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_query_interactions",
-        "Execute a read-only SQL SELECT query against interaction_logs and return rows.",
+        "Execute a read-only SQL SELECT query against interaction_logs and return rows. It runs "
+        "on a read-only connection of its own, is stopped after 10 seconds, and cannot read the "
+        "secrets table (or SQLite's raw pages).",
         {
             "sql": _prop("string", "Read-only SELECT or WITH SQL query against interaction_logs."),
             "limit": _prop("integer", "Max rows to return (1-5000, default 200).", default=200),
@@ -1303,7 +1306,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "conclave_get_engine_quota",
         "Get each engine account's usage-limit gate: gates[] with key (claude-code, or "
         "opencode/<provider>), engine, closed, resumes_at, kind (rate_limit or billing), window, "
-        "resets_at, message, and rate_limit (the latest rate-limit info Claude Code reported: "
+        "resets_at, reset_ignored (true when the reported reset was more than 8 days ahead, so "
+        "the gate closed for execution.quota_retry_minutes instead), message, and rate_limit "
+        "(the latest rate-limit info Claude Code reported: "
         "status, windows with utilization and reset times). While a gate is closed, every "
         "dispatch on that account waits and then resumes; nothing fails.",
         {},
@@ -1881,14 +1886,20 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
         # Only what the caller chose is stored; everything else is inherited (built-in ->
         # global) when the config is resolved, and the server keeps just the delta.
+        # A preset or template that does not exist is refused, never ignored: nothing is
+        # attached.
         initial_cfg: dict[str, Any] = {}
         preset_name = _opt_str(args, "config_preset")
         if preset_name:
             preset = await repo.get_store_item_by_name(
                 daemon.db, StoreItemKind.config_preset, preset_name
             )
-            if preset is not None:
-                initial_cfg = deep_merge(initial_cfg, preset.payload)
+            if preset is None:
+                raise McpToolError(
+                    f"unknown config_preset: {preset_name!r} (no Store config preset of that "
+                    "name)"
+                )
+            initial_cfg = deep_merge(initial_cfg, preset.payload)
         wf_tpl = _opt_str(args, "workflow_template")
         if wf_tpl:
             wf_item = await repo.get_store_item_by_name(
@@ -1898,8 +1909,12 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 initial_cfg["workflow"] = wf_item.payload
             else:
                 templates = workflow_templates()
-                if wf_tpl in templates:
-                    initial_cfg["workflow"] = templates[wf_tpl].model_dump(mode="json")
+                if wf_tpl not in templates:
+                    raise McpToolError(
+                        f"unknown workflow_template: {wf_tpl!r} (neither a Store workflow nor "
+                        f"a built-in template: {', '.join(templates)})"
+                    )
+                initial_cfg["workflow"] = templates[wf_tpl].model_dump(mode="json")
         if args.get("max_parallel_tasks") is not None:
             exec_sec = dict(initial_cfg.get("execution") or {})
             exec_sec["max_parallel_tasks"] = max(

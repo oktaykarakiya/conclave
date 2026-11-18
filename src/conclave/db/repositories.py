@@ -6,11 +6,13 @@ Each returns domain row models from :mod:`conclave.db.models`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -1916,6 +1918,13 @@ _FORBIDDEN_SQL_RE = re.compile(
     re.IGNORECASE,
 )
 _ALLOWED_START_RE = re.compile(r"^(SELECT|WITH)\b", re.IGNORECASE)
+# An operator's read-only query is stopped once it has run this long (seconds).
+_READONLY_QUERY_TIMEOUT_S = 10.0
+# The deadline is checked every this many SQLite virtual-machine instructions.
+_READONLY_QUERY_PROGRESS_STEPS = 1000
+# Tables an operator's read-only query may not read: secrets, whose values no endpoint returns,
+# and sqlite_dbpage (where SQLite has it), whose raw database pages hold the secrets table too.
+_UNREADABLE_TABLES = frozenset({"secrets", "sqlite_dbpage"})
 
 
 async def record_interaction_log(
@@ -2188,6 +2197,14 @@ async def interaction_stats(
 async def query_interaction_logs_readonly(
     db: Database, sql: str, limit: int = 200
 ) -> dict[str, Any]:
+    """Run an operator's read-only SELECT and return ``{columns, rows, row_count}``.
+
+    Besides the keyword guard below, the query runs on a read-only connection of its own in a
+    worker thread, never on the daemon's shared connection (in WAL mode a reader never blocks
+    the writer, so a heavy query stalls nothing else); it is stopped after
+    :data:`_READONLY_QUERY_TIMEOUT_S` and may not read :data:`_UNREADABLE_TABLES`. Every refusal
+    is a :class:`ValueError` saying why.
+    """
     cleaned = sql.strip()
     if not cleaned:
         raise ValueError("SQL query must not be empty")
@@ -2202,15 +2219,52 @@ async def query_interaction_logs_readonly(
         )
 
     effective_limit = max(1, int(limit))
+    return await asyncio.to_thread(_run_readonly_query, db.path, cleaned, effective_limit)
+
+
+def _run_readonly_query(path: Path, sql: str, limit: int) -> dict[str, Any]:
+    """:func:`query_interaction_logs_readonly`'s query, run on a read-only connection opened,
+    used and closed in this (worker) thread."""
+    denied: list[str] = []
+    timed_out = False
+
+    def authorize(
+        action: int, arg1: str | None, arg2: str | None, db_name: str | None, source: str | None
+    ) -> int:
+        # SQLITE_READ names the table for every column read, and once with an empty column for
+        # a table read without columns (count(*), SELECT 1 FROM ...), in subqueries and CTEs too.
+        if action == sqlite3.SQLITE_READ and arg1 and arg1.lower() in _UNREADABLE_TABLES:
+            denied.append(arg1.lower())
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     try:
-        cur = await db.conn.execute(cleaned)
+        conn.set_authorizer(authorize)
+        deadline = time.monotonic() + _READONLY_QUERY_TIMEOUT_S
+
+        def past_deadline() -> int:
+            nonlocal timed_out
+            timed_out = time.monotonic() > deadline
+            return 1 if timed_out else 0  # non-zero aborts the query
+
+        conn.set_progress_handler(past_deadline, _READONLY_QUERY_PROGRESS_STEPS)
         try:
+            cur = conn.execute(sql)
             columns = [str(col[0]) for col in (cur.description or [])]
-            raw_rows = await cur.fetchmany(effective_limit)
-        finally:
-            await cur.close()
-    except sqlite3.Error as exc:
-        raise ValueError(f"Invalid SQL query: {exc}") from exc
+            raw_rows = cur.fetchmany(limit)
+        except sqlite3.Error as exc:
+            # Decided by what the handlers recorded: SQLite's own messages vary.
+            if denied:
+                raise ValueError(f"Read-only queries cannot read the {denied[0]} table") from exc
+            if timed_out:
+                raise ValueError(
+                    f"Query took longer than {_READONLY_QUERY_TIMEOUT_S:g} seconds and was "
+                    "stopped"
+                ) from exc
+            raise ValueError(f"Invalid SQL query: {exc}") from exc
+    finally:
+        conn.close()
 
     rows = [dict(zip(columns, tuple(r), strict=False)) for r in raw_rows]
     return {

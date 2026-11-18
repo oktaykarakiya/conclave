@@ -7,6 +7,8 @@ the daemon is unreachable (stopped, or restarting during a deploy), `initialize`
 `tools/list` and the pilot guide resource are answered from the same packaged definitions
 the daemon serves, and a tool call (or any other request) gets an error naming the URL and
 the reason. Every message tries the daemon first, so the bridge recovers once it is back.
+A notification (or a batch of nothing else) is never answered, as JSON-RPC requires, not even
+with the error the bridge writes itself when the daemon errors or times out.
 """
 
 from __future__ import annotations
@@ -20,7 +22,15 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .server import handle_offline_mcp_message
+from .server import _parse_message, handle_offline_mcp_message
+
+
+def _expects_reply(msg: dict[str, Any] | list[Any]) -> bool:
+    """Whether JSON-RPC lets *msg* be answered: a request, or a batch holding one. A notification
+    (as the daemon reads it) never is, nor a batch of nothing else: the daemon answers neither
+    (HTTP 202), so the bridge must not either, error or not."""
+    items = msg if isinstance(msg, list) else [msg]
+    return any(isinstance(item, dict) and not _parse_message(item)[3] for item in items)
 
 
 def _forward_http(
@@ -207,7 +217,7 @@ async def _run_stdio() -> None:
                 )
                 response = _answer_offline(msg, unreachable)
 
-        if response is not None:
+        if response is not None and _expects_reply(msg):
             sys.stdout.write(json.dumps(response) + "\n")
             sys.stdout.flush()
 

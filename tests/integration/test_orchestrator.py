@@ -20,7 +20,11 @@ from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
 from conclave.engine.gate import GateResult
-from conclave.engine.orchestrator import _check_budget
+from conclave.engine.orchestrator import (
+    _SHARED_WORKTREE_RULE,
+    _VERDICT_REMINDER,
+    _check_budget,
+)
 from conclave.engine.project_rules import ProjectRules
 from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
@@ -418,6 +422,129 @@ async def test_reviewer_edits_are_not_committed(db: Database, tmp_path: Path) ->
     assert code != 0
 
 
+async def test_a_reviewer_that_changes_the_shared_worktree_is_reported(
+    db: Database, tmp_path: Path
+) -> None:
+    # Each reviewer clobbers the developer's tracked FEATURE.txt and creates STRAY_REVIEWER.txt
+    # in the worktree it shares with the other reviewers and the gate: the attempt reports both
+    # paths once, and the commit is still exactly the tree that was reviewed.
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": _MERGING_EXECUTION},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(
+        db, EventBus(db), FakeProvider(reviewer_tampers=True), tmp_path / "home"
+    )
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    events = await repo.list_events(db, task_id=task.id)
+    (modified,) = [e for e in events if e.type == "review.worktree_modified"]
+    assert modified.payload == {
+        "attempt": 1, "paths": ["FEATURE.txt", "STRAY_REVIEWER.txt"], "count": 2
+    }
+    checkpoints = await repo.list_task_checkpoints(db, task.id)
+    (reviewed,) = [cp.git_tree_sha for cp in checkpoints if cp.node_id == "developer"]
+    _, committed = await run_git(repo_path, "rev-parse", "main^{tree}")
+    assert committed.strip() == reviewed
+
+
+async def test_a_reviewer_change_never_reaches_the_next_attempts_previous_diff(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The check stages the worktree to compare it, then puts the reviewed tree back in the index,
+    # which the next attempt reads its previous diff from.
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    fails = AgentResult(
+        ok=True,
+        text='```json\n{"verdict": "fail", "reason": "not yet", "evidence": []}\n```',
+        model_reported="fake",
+    )
+    passes = AgentResult(
+        ok=True,
+        text='```json\n{"verdict": "pass", "reason": "ok", "evidence": []}\n```',
+        model_reported="fake",
+    )
+    # The tester (first in turn) tampers, then security rejects attempt 1 and passes attempt 2.
+    provider = FakeProvider(
+        reviewer_tampers=True, replies={"reviewer:security": [fails, passes]}
+    )
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    events = await repo.list_events(db, task_id=task.id)
+    modified = [e.payload["attempt"] for e in events if e.type == "review.worktree_modified"]
+    assert modified == [1, 2]
+    retry = [p for p in provider.prompts if FakeProvider.role_of(p) == "developer"][1]
+    prior = retry.split("YOUR IMMEDIATELY PRIOR DIFF:\n```diff\n", 1)[1]
+    assert "+done" in prior
+    assert "tampered" not in prior and "STRAY_REVIEWER" not in prior
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
+async def test_every_reviewer_prompt_keeps_the_shared_worktree_unchanged(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parallel: bool
+) -> None:
+    # The rule is Conclave's own text in every reviewer prompt, a mandatory reviewer's re-run
+    # (its first reply had no verdict) included; reviewers that change nothing raise no event.
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {**_UNGATED_EXECUTION, "parallel_reviewers": parallel}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    prose = AgentResult(ok=True, text="It looks fine to me.", model_reported="fake")
+    passes = AgentResult(
+        ok=True,
+        text='```json\n{"verdict": "pass", "reason": "ok", "evidence": []}\n```',
+        model_reported="fake",
+    )
+    provider = FakeProvider(replies={"reviewer:security": [prose, passes]})
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is True
+
+    reviews = [p for p in provider.prompts if FakeProvider.role_of(p).startswith("reviewer:")]
+    # The mandatory three, security twice, and the architect a new file brings in.
+    assert sorted(FakeProvider.role_of(p) for p in reviews) == [
+        "reviewer:architect",
+        "reviewer:reviewer",
+        "reviewer:security",
+        "reviewer:security",
+        "reviewer:tester",
+    ]
+    assert all(_SHARED_WORKTREE_RULE in p for p in reviews)
+    (rerun,) = [p for p in reviews if _VERDICT_REMINDER in p]
+    assert FakeProvider.role_of(rerun) == "reviewer:security"
+    events = await repo.list_events(db, task_id=task.id)
+    assert not [e for e in events if e.type == "review.worktree_modified"]
+
+
 async def test_review_all_empty_reviewers_record_unknown_and_block(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -760,6 +887,44 @@ async def test_post_mortem_dispatched_on_failure_when_enabled(
     assert len(pm_events) == 1
     assert pm_events[0].payload.get("analysis")
     assert pm_events[0].agent == "postmortem"
+
+
+async def test_the_fake_reads_the_post_mortem_without_seeded_personas(
+    db: Database, tmp_path: Path,
+) -> None:
+    """Without seeded personas the post-mortem prompt carries the runner's own context ("You are
+    the postmortem agent of ..."), not the persona's heading: the test double must still read it
+    as the post-mortem, never as one more developer prompt."""
+    assert FakeProvider.role_of(
+        "SYSTEM CONTEXT:\nYou are the postmortem agent of an autonomous software engineering "
+        "team.\n\nTASK:\nThis task FAILED after exhausting its retries."
+    ) == "postmortem"
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={
+            "execution": {"target_branch": "main", "baseline_test_command": "test -f FEATURE.txt"},
+            "agent_overrides": {"developer": {"max_retries": 2}},
+            "experimental": {"post_mortem_enabled": True},
+        },
+    )
+    await repo.create_task(
+        db, project_id=project.id, request="add feature", state=TaskState.approved,
+    )
+    provider = FakeProvider(developer_writes=False)
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    assert await orchestrator.process_task(claimed) is False
+
+    assert provider.post_mortem_calls == 1
+    roles = [FakeProvider.role_of(p) for p in provider.prompts]
+    assert roles[-1] == "postmortem"
+    assert "You are the postmortem agent of" in provider.prompts[-1]
+    # Two developer attempts (the second one a fix-up of the red gate), and nothing else.
+    assert [r for r in roles if r in ("developer", "fixup")] == ["developer", "fixup"]
 
 
 async def test_post_mortem_skipped_when_disabled(db: Database, tmp_path: Path) -> None:

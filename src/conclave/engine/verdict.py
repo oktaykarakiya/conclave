@@ -71,13 +71,14 @@ def parse_verdict(log_text: str) -> ParsedVerdict:
         idx = 0
         while (idx := log_text.find("{", idx)) != -1:
             try:
-                obj, end = decoder.raw_decode(log_text[idx:])
+                # Decoded in place: *end* is an index into log_text, which is never copied.
+                obj, end = decoder.raw_decode(log_text, idx)
             except (json.JSONDecodeError, ValueError):
                 idx += 1
                 continue
             if isinstance(obj, dict) and "verdict" in obj:
-                last = (obj, log_text[idx : idx + end])
-                idx += end  # its nested objects are part of it, not later verdicts
+                last = (obj, log_text[idx:end])
+                idx = end  # its nested objects are part of it, not later verdicts
             else:
                 idx += 1
         if last is not None:

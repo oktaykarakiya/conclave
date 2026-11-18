@@ -245,6 +245,47 @@ async def test_run_stdio_no_duplicate_execution_on_timeout_or_http_error_and_off
     assert not home.exists()
 
 
+async def test_run_stdio_never_answers_a_notification_even_when_the_daemon_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON-RPC forbids answering a notification: when the daemon errors, times out or sends an
+    unreadable reply, a notification (or a batch of them) gets nothing, a request its error."""
+    notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    cancelled = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {}}
+    script: list[Any] = [
+        # The five notifications first, each meeting another failure...
+        _make_http_error(502, "Bad Gateway", b"upstream error"),
+        TimeoutError("timed out"),
+        urllib.error.URLError(TimeoutError("socket timed out")),
+        _reply(lambda *_: b"<html>oops</html>"),
+        _make_http_error(500, "Internal Server Error", b""),
+        # ... then two requests, which still get the bridge's error.
+        _make_http_error(502, "Bad Gateway", b"upstream error"),
+        TimeoutError("timed out"),
+    ]
+    messages: list[Any] = [
+        notification, notification, notification, notification, [notification, cancelled],
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call"},
+        {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+    ]
+
+    def fake_urlopen(req: Any, timeout: float = 0.0) -> Any:
+        step = script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    fake_stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdin", io.StringIO("".join(json.dumps(m) + "\n" for m in messages)))
+    monkeypatch.setattr("sys.stdout", fake_stdout)
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        await _run_stdio()
+
+    assert script == []  # every message, notifications included, reached the daemon
+    out = [json.loads(line) for line in fake_stdout.getvalue().splitlines() if line.strip()]
+    assert [(line["id"], line["error"]["code"]) for line in out] == [(1, -32603), (2, -32603)]
+
+
 _RETRY_HINT = "Start it (./conclave or systemctl --user start conclave) and retry."
 
 

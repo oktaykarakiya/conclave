@@ -67,9 +67,12 @@ _GROWTH_SPECIALISTS: tuple[str, ...] = (
 )
 
 
-# How a failed task's summary begins when its attempts (max_retries) or its wall-clock budget
-# (timeout) ran out; Orchestrator._finish_failure is its only writer.
-_ATTEMPTS_RAN_OUT = re.compile(r"failed \((?:max_retries|timeout)\) after ")
+# How a failed task's summary begins when its attempts ran out (max_retries, or the tighter
+# review_rounds_max or an on_fail edge's max_iterations) or its wall-clock budget did (timeout);
+# Orchestrator._finish_failure is its only writer.
+_ATTEMPTS_RAN_OUT = re.compile(
+    r"failed \((?:max_retries|review_rounds_max|max_iterations|timeout)\) after "
+)
 
 
 def _red_gate(cp: TaskCheckpoint) -> bool:

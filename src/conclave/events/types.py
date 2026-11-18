@@ -31,6 +31,8 @@ class EventType(StrEnum):
     verdict = "agent.verdict"
     grounding_warning = "grounding.warning"
     pipeline_derived = "pipeline.derived"
+    # the reviewers left the shared worktree different from the tree they reviewed
+    review_worktree_modified = "review.worktree_modified"
     # attempts / gate
     attempt_started = "attempt.started"
     attempt_failed = "attempt.failed"

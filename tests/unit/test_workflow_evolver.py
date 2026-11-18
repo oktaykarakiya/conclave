@@ -636,6 +636,19 @@ async def test_only_a_red_test_gate_after_a_passing_review_reads_as_one(
             True,
         ),
         ("failed (timeout) after 1 attempt(s)", _RED_GATE, True),
+        # The attempts ran out on a bound tighter than max_retries: still a quality failure.
+        (
+            "failed (review_rounds_max) after 1 attempt(s); stopped by "
+            "execution.review_rounds_max=1; last: rejected by REVIEWER (fail): no tests",
+            _REVIEW_FAILED,
+            True,
+        ),
+        (
+            "failed (max_iterations) after 2 attempt(s); stopped by max_iterations=1 of on_fail "
+            "edge e-gate-developer-fail (gate -> developer); last: test gate not green (exit 1)",
+            _RED_GATE,
+            True,
+        ),
         ("failed (max_retries) after 1 attempt(s); last: infra_timed_out", _INFRA_GATE, False),
         (
             "failed (max_retries) after 2 attempt(s); last: developer agent failed",

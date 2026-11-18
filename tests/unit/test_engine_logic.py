@@ -4,6 +4,7 @@ budget checks. Diff fitting is covered by test_context_limits.py."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import SupportsIndex
 
 from conclave.config import AgentsPolicy
 from conclave.engine import (
@@ -77,6 +78,35 @@ def test_parse_verdict_uses_the_final_verdict_block() -> None:
 
     v = parse_verdict("VERDICT: PASS was my first guess. VERDICT: FAIL the test is wrong")
     assert (v.verdict, v.reason, v.source) == ("fail", "FAIL the test is wrong", "string")
+
+
+class _CountingSlices(str):
+    """A reply that counts how often a slice of it is taken (each one a copy)."""
+
+    slices = 0
+
+    def __getitem__(self, key: SupportsIndex | slice) -> str:
+        if isinstance(key, slice):
+            type(self).slices += 1
+        return super().__getitem__(key)
+
+
+def test_parse_verdict_finds_a_bare_verdict_after_many_braces_without_copying_the_reply() -> None:
+    verdict = '{"verdict": "fail", "reason": "broken", "evidence": [{"file": "a.py"}]}'
+    # Code-like prose: hundreds of braces that open no JSON object, then the verdict, then more.
+    noise = "".join(f"if (x{i}) {{ y{i}(); }} and {{ not json\n" for i in range(300))
+    reply = _CountingSlices(f"{noise}Final verdict:\n{verdict}\nthanks {{")
+    _CountingSlices.slices = 0
+
+    v = parse_verdict(reply)
+
+    assert (v.verdict, v.reason, v.evidence, v.source) == (
+        "fail", "broken", [{"file": "a.py"}], "json"
+    )
+    assert v.raw == verdict
+    # Decoded in place: the only slice is the verdict's own raw text, not the rest of the reply
+    # at every brace.
+    assert _CountingSlices.slices == 1
 
 
 # --- check_grounding --------------------------------------------------------
@@ -159,6 +189,26 @@ def test_attempt_memory_trims_and_renders() -> None:
 
 def test_attempt_memory_empty() -> None:
     assert AttemptMemory().build_preamble() == ""
+
+
+def test_attempt_memory_points_the_latest_entry_at_the_diff_shown_below() -> None:
+    mem = AttemptMemory()
+    mem.add(1, "diff-1\n", "rejected because A")
+    mem.add(2, "diff-2\n", "rejected because B")
+
+    preamble = mem.build_preamble(diff_shown_below="diff-2\n")
+
+    assert preamble.count("diff-1") == 1  # an earlier attempt keeps its own diff
+    assert "diff-2" not in preamble
+    assert (
+        "--- Attempt 2 (REJECTED) ---\nWhy it was rejected:\nrejected because B\n"
+        "Diff produced: shown below as YOUR IMMEDIATELY PRIOR DIFF\n"
+    ) in preamble
+    # No diff shown below, or another one: every entry keeps its own diff.
+    assert mem.build_preamble().count("diff-2") == 1
+    assert mem.build_preamble(diff_shown_below="diff-3").count("diff-2") == 1
+    # Only the latest entry ever points below.
+    assert mem.build_preamble(diff_shown_below="diff-1").count("diff-1") == 1
 
 
 # --- baseline ---------------------------------------------------------------

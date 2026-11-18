@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -600,3 +602,166 @@ async def test_get_mcp_is_405_while_info_and_post_are_unchanged(
         ping = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
         assert ping.status_code == 200
         assert ping.json() == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+
+# --- operator SQL: POST /api/observability/query and conclave_query_interactions --------------
+
+_SECRET_VALUE = "sk-never-returned"
+_RUNAWAY_SQL = (
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT max(x) FROM c"
+)
+
+
+async def _store_secret(db: Database) -> None:
+    await db.execute(
+        "INSERT INTO secrets(id, name, value, created_at) VALUES (?, ?, ?, ?)",
+        ("sec-1", "deepseek-key", _SECRET_VALUE, "2026-11-18T00:00:00+00:00"),
+    )
+
+
+async def _query_rest_and_mcp(
+    db: Database, tmp_path: Path, sql: str
+) -> tuple[httpx.Response, dict[str, object]]:
+    """The REST answer to *sql*, and the MCP tool's ``result``."""
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        rest = await c.post("/api/observability/query", json={"sql": sql})
+        mcp = await c.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "conclave_query_interactions", "arguments": {"sql": sql}},
+            },
+        )
+    result: dict[str, object] = mcp.json()["result"]
+    return rest, result
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM secrets",
+        "SELECT count(*) FROM secrets",
+        "SELECT session_id FROM interaction_logs WHERE session_id IN (SELECT value FROM secrets)",
+        "WITH s AS (SELECT * FROM secrets) SELECT name, value FROM s",
+    ],
+    ids=["direct", "count", "subquery", "with"],
+)
+async def test_operator_sql_cannot_read_the_secrets_table(
+    db: Database, tmp_path: Path, sql: str
+) -> None:
+    await _store_secret(db)
+
+    with pytest.raises(ValueError, match="cannot read the secrets table"):
+        await repo.query_interaction_logs_readonly(db, sql)
+    rest, mcp = await _query_rest_and_mcp(db, tmp_path, sql)
+
+    assert rest.status_code == 400
+    assert "cannot read the secrets table" in rest.json()["detail"]
+    assert mcp["isError"] is True
+    assert "cannot read the secrets table" in json.dumps(mcp["content"])
+    assert _SECRET_VALUE not in rest.text + json.dumps(mcp)
+
+
+async def test_operator_sql_cannot_read_raw_database_pages(db: Database) -> None:
+    # sqlite_dbpage (in SQLite builds that have it) returns every raw page, the secrets
+    # table's included: refused as well, or unknown where the build lacks it.
+    await _store_secret(db)
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute("SELECT * FROM sqlite_dbpage LIMIT 1")
+        has_dbpage = True
+    except sqlite3.Error:
+        has_dbpage = False
+    finally:
+        probe.close()
+
+    with pytest.raises(ValueError) as refused:
+        await repo.query_interaction_logs_readonly(db, "SELECT data FROM sqlite_dbpage")
+
+    if has_dbpage:
+        assert str(refused.value) == "Read-only queries cannot read the sqlite_dbpage table"
+    assert _SECRET_VALUE not in str(refused.value)
+
+
+async def test_a_runaway_operator_query_stops_at_its_deadline_and_blocks_nothing(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(repo, "_READONLY_QUERY_TIMEOUT_S", 1.0)
+    runaway = asyncio.create_task(repo.query_interaction_logs_readonly(db, _RUNAWAY_SQL))
+    await asyncio.sleep(0.1)  # under way in its worker thread
+
+    # Another database call of the daemon completes meanwhile, on the shared connection.
+    assert await asyncio.wait_for(repo.list_projects(db), timeout=0.8) == []
+    assert not runaway.done()
+    with pytest.raises(ValueError, match="took longer than 1 seconds and was stopped"):
+        await runaway
+
+    monkeypatch.setattr(repo, "_READONLY_QUERY_TIMEOUT_S", 0.2)
+    rest, mcp = await _query_rest_and_mcp(db, tmp_path, _RUNAWAY_SQL)
+    assert rest.status_code == 400 and "took longer than" in rest.json()["detail"]
+    assert mcp["isError"] is True and "took longer than" in json.dumps(mcp["content"])
+
+
+async def test_an_ordinary_operator_query_answers_as_before(db: Database) -> None:
+    for session_id, agent, cost in (("s-1", "developer", 0.5), ("s-2", "tester", 0.25)):
+        await repo.record_interaction_log(db, session_id=session_id, agent=agent, cost=cost)
+    sql = "SELECT session_id, agent, cost FROM interaction_logs ORDER BY session_id"
+
+    answer = await repo.query_interaction_logs_readonly(db, sql, limit=1)
+
+    # What the daemon's shared connection, where the query used to run, reads.
+    cur = await db.conn.execute(sql)
+    expected = [dict(row) for row in await cur.fetchall()]
+    assert answer == {
+        "columns": ["session_id", "agent", "cost"],
+        "rows": expected[:1],
+        "row_count": 1,
+    }
+    assert expected[0] == {"session_id": "s-1", "agent": "developer", "cost": 0.5}
+
+
+# --- attaching with a preset or template that does not exist -----------------------------------
+
+
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("config_preset", "unknown config_preset: 'no-such-preset'"),
+        ("workflow_template", "unknown workflow_template: 'no-such-preset'"),
+    ],
+)
+async def test_attaching_with_an_unknown_preset_or_template_is_refused(
+    db: Database, tmp_path: Path, surface: str, field: str, message: str
+) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await seed_global_defaults(db)  # the built-in presets and workflows exist; this one not
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    request = {"name": "t", "path": str(repo_path), field: "no-such-preset"}
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        if surface == "rest":
+            res = await c.post("/api/projects", json=request)
+            assert res.status_code == 422, res.text
+            assert message in res.json()["detail"]
+        else:
+            res = await c.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "conclave_attach_project", "arguments": request},
+                },
+            )
+            result = res.json()["result"]
+            assert result["isError"] is True
+            assert message in result["content"][0]["text"]
+
+    assert await repo.list_projects(db) == []  # nothing attached

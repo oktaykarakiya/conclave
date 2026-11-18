@@ -31,6 +31,7 @@ from conclave.providers import (
     dispatch_with_quota,
     quota_key,
 )
+from conclave.providers.quota import RESUME_MARGIN
 
 T0 = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
 
@@ -131,6 +132,58 @@ def test_a_reset_time_already_past_falls_back_to_the_retry_minutes() -> None:
     assert gate.close("claude-code", "claude", stale, retry_minutes=7) == T0 + timedelta(
         minutes=7
     )
+
+
+def test_a_reset_beyond_any_usage_window_is_ignored_for_the_retry_minutes() -> None:
+    # E.g. a retry-after in milliseconds read as seconds: kept closed until then, only a cancel
+    # or a restart would recover.
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    absurd = T0 + timedelta(days=30)
+
+    reopens_at = gate.close(
+        "claude-code", "claude", QuotaExhausted(kind="rate_limit", resets_at=absurd),
+        retry_minutes=15,
+    )
+
+    assert reopens_at == T0 + timedelta(minutes=15)
+    wait = gate.pending("claude-code")
+    assert wait is not None and wait.resumes_at == reopens_at
+    payload = wait.payload()
+    assert payload["reset_ignored"] is True
+    assert payload["resets_at"] == absurd.isoformat()  # what the engine reported, ignored
+
+
+def test_a_weekly_reset_days_ahead_is_kept() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    weekly = T0 + timedelta(days=6)
+
+    reopens_at = gate.close(
+        "claude-code", "claude",
+        QuotaExhausted(kind="rate_limit", resets_at=weekly, window="seven_day"),
+        retry_minutes=15,
+    )
+
+    assert reopens_at == weekly + RESUME_MARGIN
+    wait = gate.pending("claude-code")
+    assert wait is not None and wait.payload()["reset_ignored"] is False
+
+
+async def test_a_dispatch_refused_with_an_absurd_reset_waits_the_retry_minutes() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    absurd = QuotaExhausted(kind="rate_limit", resets_at=T0 + timedelta(days=30), message="x")
+    provider = ScriptedProvider(clock, [_refused(quota=absurd), AgentResult(ok=True, text="ok")])
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert result.ok is True
+    _first, resumed = provider.calls
+    assert resumed.at == T0 + timedelta(minutes=15)  # _dispatch's retry_minutes
+    (kind, waiting), _ = listener.events
+    assert kind == "waiting" and waiting["reset_ignored"] is True
 
 
 def test_a_closure_is_extended_but_never_shortened() -> None:
@@ -271,6 +324,7 @@ def test_snapshot_reports_closed_gates_and_rate_limit_info() -> None:
             "kind": None,
             "window": None,
             "resets_at": None,
+            "reset_ignored": None,
             "message": None,
             "rate_limit": info,
         },
@@ -282,6 +336,7 @@ def test_snapshot_reports_closed_gates_and_rate_limit_info() -> None:
             "kind": "rate_limit",
             "window": None,
             "resets_at": resets_at.isoformat(),
+            "reset_ignored": False,
             "message": "429",
             "rate_limit": None,
         },
