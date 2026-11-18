@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from conclave.engine.gate import GateResult, inject_quarantine_exclusions, run_tests
 
 
@@ -225,3 +227,47 @@ def test_inject_shell_safe_jest() -> None:
     # The $(...) must be quoted so the shell doesn't execute it.
     after_flag = result.split("--testPathIgnorePatterns=", 1)[1]
     assert after_flag.startswith("'")
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # The runner is followed by another command: the flags go to the runner, not to it.
+        ("pytest -q && mypy", "pytest -q --deselect tests/x.py && mypy"),
+        ("pytest -q 2>&1 | tee log", "pytest -q 2>&1 --deselect tests/x.py | tee log"),
+        ("pytest -q || true", "pytest -q --deselect tests/x.py || true"),
+        ("pytest -q; echo done", "pytest -q --deselect tests/x.py; echo done"),
+        ("pytest -q\nruff check .", "pytest -q --deselect tests/x.py\nruff check ."),
+        ("pytest -q & wait", "pytest -q --deselect tests/x.py & wait"),
+        (
+            "pytest -q &> out.log; cat out.log",
+            "pytest -q &> out.log --deselect tests/x.py; cat out.log",
+        ),
+        (
+            "pytest -k 'a || b; c' && mypy",
+            "pytest -k 'a || b; c' --deselect tests/x.py && mypy",
+        ),
+        (
+            'pytest -k "not slow && x" $(cat args) | tee log',
+            'pytest -k "not slow && x" $(cat args) --deselect tests/x.py | tee log',
+        ),
+        # The runner is last, or the only command: the same output as before.
+        (
+            "pip install pytest && pytest -q",
+            "pip install pytest && pytest -q --deselect tests/x.py",
+        ),
+        ("ruff check src && pytest -q  ", "ruff check src && pytest -q --deselect tests/x.py"),
+        ("pytest -q\n", "pytest -q --deselect tests/x.py"),
+        ("pytest -q", "pytest -q --deselect tests/x.py"),
+        ("(cd sub && pytest -q)", "(cd sub && pytest -q) --deselect tests/x.py"),
+        ("pytest -k 'unclosed && mypy", "pytest -k 'unclosed && mypy --deselect tests/x.py"),
+    ],
+)
+def test_quarantine_exclusions_go_to_the_test_runner_segment(command: str, expected: str) -> None:
+    assert inject_quarantine_exclusions(command, ["tests/x.py"]) == expected
+
+
+def test_jest_quarantine_exclusions_go_to_the_jest_segment() -> None:
+    assert inject_quarantine_exclusions("npx jest && eslint .", ["a.test.js"]) == (
+        r"npx jest --testPathIgnorePatterns='a\.test\.js' && eslint ."
+    )

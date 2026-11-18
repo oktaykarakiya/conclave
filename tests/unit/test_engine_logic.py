@@ -48,6 +48,37 @@ def test_parse_unknown_when_absent_or_invalid() -> None:
     assert parse_verdict('```json\n{"verdict": "weird"}\n```').verdict == "unknown"
 
 
+def test_parse_verdict_uses_the_final_verdict_block() -> None:
+    """Every reviewer must END its reply with its verdict block, so an earlier block (the
+    format example echoed back, a template) never decides the verdict."""
+    echoed_then_fail = (
+        "The format asks for:\n"
+        '```json\n{"verdict": "pass", "reason": "what you verified", "evidence": []}\n```\n'
+        "But I found a bug.\n"
+        '```json\n{"verdict": "fail", "reason": "off by one", "evidence": []}\n```'
+    )
+    v = parse_verdict(echoed_then_fail)
+    assert (v.verdict, v.reason, v.source) == ("fail", "off by one", "json")
+
+    template_then_pass = (
+        '```json\n{"verdict": "pass|fail", "reason": "..."}\n```\n'
+        "Checked everything.\n"
+        '```json\n{"verdict": "pass", "reason": "verified"}\n```'
+    )
+    v = parse_verdict(template_then_pass)
+    assert (v.verdict, v.reason, v.source) == ("pass", "verified", "json")
+
+    bare_objects = (
+        'I first thought {"verdict": "pass", "reason": "fine"} but then '
+        '{"verdict": "fail", "reason": "broken", "evidence": [{"file": "a.py"}]}'
+    )
+    v = parse_verdict(bare_objects)
+    assert (v.verdict, v.reason, v.evidence) == ("fail", "broken", [{"file": "a.py"}])
+
+    v = parse_verdict("VERDICT: PASS was my first guess. VERDICT: FAIL the test is wrong")
+    assert (v.verdict, v.reason, v.source) == ("fail", "FAIL the test is wrong", "string")
+
+
 # --- check_grounding --------------------------------------------------------
 
 

@@ -101,7 +101,9 @@ class MergeResult(StrEnum):
 
     ``success`` — the target now contains the task work.
     ``conflict`` — a real merge conflict; task branch is preserved, task is failed.
-    ``error`` — a transient infra error (e.g. concurrent ref advance); retryable.
+    ``error`` — git refused or could not make the merge (local changes in the way of the target's
+    checkout, a merge in progress there, a missing branch, a concurrent ref advance); nothing
+    changed, retryable.
     """
 
     success = "success"
@@ -768,7 +770,11 @@ class Orchestrator:
                 rc, out = await run_shell(
                     worktree, setup_cmd,
                     timeout_seconds=config.execution.setup_timeout_seconds,
+                    cancel_event=cancel_event,
                 )
+                # A setup stopped by a cancel did not fail.
+                if cancel_event is not None and cancel_event.is_set():
+                    return await self._finish_cancelled(task, wm, task_branch)
                 if rc != 0:
                     setup_output = await self._fit_bulk(
                         task, config, out,
@@ -790,7 +796,10 @@ class Orchestrator:
             # does not load natively (see project_rules).
             knowledge = ""
             rules = read_project_rules(worktree, repo_path=repo_path)
-            rules = replace(rules, extra=self._build_venv_guidance(worktree, config, None))
+            # This task's own repo: self._repo_path is the latest task's, of any project.
+            rules = replace(
+                rules, extra=self._build_venv_guidance(worktree, config, None, repo_path=repo_path)
+            )
             test_command = _test_command(config, None)
             # Inject active quarantine exclusions so flaky quarantined tests
             # don't fail the baseline snapshot or the green-gate.
@@ -815,7 +824,11 @@ class Orchestrator:
             )
             baseline = await self._baseline(
                 task, config, worktree, checkpoint, target_branch, test_command, gate_timeout,
+                cancel_event=cancel_event,
             )
+            # Cooperative cancellation — a baseline stopped by a cancel did not complete.
+            if cancel_event is not None and cancel_event.is_set():
+                return await self._finish_cancelled(task, wm, task_branch)
             await repo.save_task_checkpoint(
                 self._db,
                 task_id=task.id,
@@ -1021,14 +1034,28 @@ class Orchestrator:
                     dev_node_id = dev_node.id if dev_node else "developer"
                     dev_agent = (dev_node.agent or "developer") if dev_node else "developer"
                     prev_tree = ""
+                    # The previous diff is fitted once per limit for this attempt, shared by its
+                    # history entry and the prior-diff block, so each cut is reported once.
+                    previous_cache: dict[BulkLimit, str] = {}
                     if attempts > 1:
                         _, previous_diff = await run_git(worktree, "diff", "--cached", checkpoint)
-                        if use_memory:
-                            memory.add(attempts - 1, previous_diff, feedback)
                         # The index holds the tree previous_diff came from: record it so the
                         # full previous diff stays recoverable after the reset below.
                         tree_rc, tree_out = await run_git(worktree, "write-tree")
                         prev_tree = tree_out.strip() if tree_rc == 0 else ""
+                        if use_memory:
+                            memory.add(
+                                attempts - 1,
+                                await self._fit_bulk(
+                                    task, config, previous_diff,
+                                    block="previous_diff",
+                                    how_to_get_rest=_previous_diff_hint(checkpoint, prev_tree),
+                                    agent=dev_agent,
+                                    node=dev_node,
+                                    cache=previous_cache,
+                                ),
+                                feedback,
+                            )
                         await run_git(worktree, "reset", "--hard", base_head_sha)
                         # Preserve the provisioned .venv across attempts; rebuilding it each
                         # retry is slow and pointless.  .gitignore is the belt (the ideal
@@ -1057,15 +1084,10 @@ class Orchestrator:
                         prior_diff = await self._fit_bulk(
                             task, config, previous_diff,
                             block="previous_diff",
-                            how_to_get_rest=(
-                                f"Run `git diff {checkpoint} {prev_tree}` in your working "
-                                "directory for the full previous diff."
-                                if prev_tree
-                                else "The rest is not available: your previous attempt was "
-                                "reset before this one started."
-                            ),
+                            how_to_get_rest=_previous_diff_hint(checkpoint, prev_tree),
                             agent=dev_agent,
                             node=dev_node,
+                            cache=previous_cache,
                         )
                     dev_prompt = self._build_developer_prompt(
                         task.request,
@@ -1403,7 +1425,8 @@ class Orchestrator:
                         gate_mark: str | None = None  # {"infra", "real", None}
                         for label, cmd in gate_commands:
                             gate = await run_tests(
-                                worktree, cmd, timeout_seconds=gate_timeout
+                                worktree, cmd, timeout_seconds=gate_timeout,
+                                cancel_event=cancel_event,
                             )
                             # Cooperative cancellation — no infra re-run, next command or
                             # failed attempt once cancelled while the gate ran.
@@ -1419,8 +1442,13 @@ class Orchestrator:
                                 # feed toolchain noise to the developer as code feedback.
                                 if gate.outcome in ("timed_out", "missing_command"):
                                     gate = await run_tests(
-                                        worktree, cmd, timeout_seconds=gate_timeout
+                                        worktree, cmd, timeout_seconds=gate_timeout,
+                                        cancel_event=cancel_event,
                                     )
+                                    if cancel_event is not None and cancel_event.is_set():
+                                        return await self._finish_cancelled(
+                                            task, wm, task_branch
+                                        )
                                     if not gate.passed:
                                         last_reason = await self._attempt_failed(
                                             task, attempts, "gate", f"infra_{gate.outcome}",
@@ -1708,6 +1736,12 @@ class Orchestrator:
             self._node_steers.pop(k, None)
         for k in [k for k in self._approval_resolutions if k[0] == task_id]:
             self._approval_resolutions.pop(k, None)
+        # A node the task's end stopped (a cancel, an exception) must not read running, or
+        # waiting for an approval nobody can give, once the task is over. Best-effort, like GC.
+        try:
+            await repo.skip_interrupted_checkpoints(self._db, task_id)
+        except Exception:
+            logger.warning("checkpoint sweep failed for task %s", task_id, exc_info=True)
         # Prune events/baselines unconditionally — every processed task, regardless of
         # outcome (success/failure/cancel/exception) and crucially even for projects with
         # NO test command (which never run a baseline, and fail before any worktree exists).
@@ -1788,13 +1822,16 @@ class Orchestrator:
         target_branch: str,
         test_command: str | None,
         gate_timeout: int,
+        *,
+        cancel_event: asyncio.Event | None = None,
     ) -> _Baseline:
         """Snapshot the pre-existing test failures at *checkpoint* (cached per SHA).
 
         The cached row is fitted to ``context.bulk_max_chars``, marker included, so it stays
         bounded and a reader at that limit shows it as stored; a cut is reported once, here.
         This task keeps the whole output, and each reader fits it to its own limit when the
-        preamble is built (:meth:`_baseline_preamble`).
+        preamble is built (:meth:`_baseline_preamble`). Once *cancel_event* is set the test
+        run is stopped, and nothing is cached: a cancelled run shows no failures either way.
         """
         if not test_command:
             return _Baseline(target_branch)
@@ -1806,7 +1843,11 @@ class Orchestrator:
             project_id=task.project_id,
             payload={"sha": checkpoint[:12]},
         )
-        gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
+        gate = await run_tests(
+            worktree, test_command, timeout_seconds=gate_timeout, cancel_event=cancel_event
+        )
+        if gate.outcome == "cancelled":
+            return _Baseline(target_branch, test_command)
         # ENG-7: infra failures (timeout / missing command) must not be cached as
         # pre-existing test failures — they are toolchain noise, not code defects.
         if gate.passed or gate.outcome in ("timed_out", "missing_command"):
@@ -2525,8 +2566,8 @@ class Orchestrator:
             # Build every prompt first, in pipeline order, so shared cuts are made (and
             # reported) once and deterministically before the reviewers run concurrently.
             rev_prompts = [await _build_rev_prompt(node) for node in review_nodes]
-            dispatched = await asyncio.gather(
-                *(
+            reviews = [
+                asyncio.ensure_future(
                     self._dispatch_reviewer(
                         runner,
                         node.agent or node.id,
@@ -2539,9 +2580,18 @@ class Orchestrator:
                         node=node,
                         mandatory=_is_mandatory(node),
                     )
-                    for node, rev_prompt in zip(review_nodes, rev_prompts, strict=True)
                 )
-            )
+                for node, rev_prompt in zip(review_nodes, rev_prompts, strict=True)
+            ]
+            try:
+                dispatched = await asyncio.gather(*reviews)
+            except BaseException:
+                # A dispatch raised (or this task was cancelled): stop and await the others
+                # before the error ends the task, so none runs on unawaited after it.
+                for review in reviews:
+                    review.cancel()
+                await asyncio.gather(*reviews, return_exceptions=True)
+                raise
             if cancel_event is not None and cancel_event.is_set():
                 return True, "cancelled", False
 
@@ -2803,14 +2853,16 @@ class Orchestrator:
         """Commit the reviewed work, then merge it when ``execution.auto_merge`` allows.
 
         A change with test-integrity findings under ``block`` mode is never merged here: it ends
-        ``done`` on its committed branch for a human to review and merge. *planner_note* (a
-        failed planner's) leads the notes every result summary ends with.
+        ``done`` on its committed branch for a human to review and merge, as does a workflow
+        with a developer but no enabled merge node. Only a workflow with neither (review only)
+        ends without a commit. *planner_note* (a failed planner's) leads the notes every result
+        summary ends with.
         """
         note = planner_note + _integrity_note(integrity, integrity_mode)
         has_merge_node = config.workflow is None or any(
             n.enabled and n.kind.value == "merge" for n in config.workflow.nodes
         )
-        if not has_merge_node:
+        if not has_merge_node and not _has_enabled_developer(config):
             summary_msg = (
                 f"completed in {attempts} attempt(s); review/submitter workflow finished{note}"
             )
@@ -2897,7 +2949,7 @@ class Orchestrator:
         )
 
         held = bool(integrity) and integrity_mode == "block"
-        if config.execution.auto_merge and not held:
+        if config.execution.auto_merge and has_merge_node and not held:
             merge_result = await self._merge(repo_path, target_branch, task_branch, task.id)
             if merge_result == MergeResult.success:
                 await self._bus.emit(
@@ -2911,6 +2963,14 @@ class Orchestrator:
                 # a loud failure event so the operator can resolve it manually.
                 summary = (
                     f"merge conflict into {target_branch}; branch {task_branch} preserved{note}"
+                )
+                await repo.save_task_checkpoint(
+                    self._db,
+                    task_id=task.id,
+                    node_id="merge",
+                    attempt=attempts,
+                    status=CheckpointStatus.failed,
+                    artifact={"branch": task_branch, "reason": "merge_conflict"},
                 )
                 await repo.finalize_task(
                     self._db, task.id, state=TaskState.failed, result_summary=summary,
@@ -2928,11 +2988,19 @@ class Orchestrator:
                 await wm.cleanup(task.id, None)  # keep the branch
                 return False
             else:
-                # MergeResult.error — transient infra error (e.g. concurrent ref
-                # advance the retry couldn't resolve). Mark failed but preserve the
-                # branch so nothing is lost.
+                # MergeResult.error — git refused or could not make the merge (local
+                # changes in the way, a missing branch, a ref advance the retry couldn't
+                # resolve). Mark failed but preserve the branch so nothing is lost.
                 summary = (
                     f"merge error into {target_branch}; branch {task_branch} preserved{note}"
+                )
+                await repo.save_task_checkpoint(
+                    self._db,
+                    task_id=task.id,
+                    node_id="merge",
+                    attempt=attempts,
+                    status=CheckpointStatus.failed,
+                    artifact={"branch": task_branch, "reason": "merge_error"},
                 )
                 await repo.finalize_task(
                     self._db, task.id, state=TaskState.failed, result_summary=summary,
@@ -3191,7 +3259,8 @@ class Orchestrator:
         * ``success`` — the target now contains the task work.
         * ``conflict`` — a real merge conflict (caller must fail the task, preserve
           the branch).
-        * ``error`` — transient infra failure (e.g. concurrent ref advance); retryable.
+        * ``error`` — a merge git refused or could not make (e.g. local changes in the way,
+          a missing branch, a concurrent ref advance); nothing changed, retryable.
         """
         holder = self._merge_lock_holders.get(target_branch)
         held = holder is not None and holder is asyncio.current_task()
@@ -3208,66 +3277,50 @@ class Orchestrator:
     async def _merge_locked(
         self, repo_path: Path, target_branch: str, task_branch: str, task_id: str
     ) -> MergeResult:
-        """Body of :meth:`_merge` — runs while holding the per-target-branch lock."""
-        ancestor_code, _ = await run_git(
-            repo_path, "merge-base", "--is-ancestor", target_branch, task_branch
-        )
-        is_ff = ancestor_code == 0
-        _, current = await run_git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
-        current_branch = current.strip()
-        _, task_sha = await run_git(repo_path, "rev-parse", task_branch)
-        task_sha = task_sha.strip()
+        """Body of :meth:`_merge` — runs while holding the per-target-branch lock.
 
-        if is_ff and current_branch != target_branch:
-            # Fast-forward via GUARDED update-ref so a concurrent advance is
-            # detected rather than silently clobbered. Retry once with the new
-            # HEAD when the old-value doesn't match (target advanced while we
-            # were computing task_sha).
-            _, old_sha = await run_git(repo_path, "rev-parse", target_branch)
-            old_sha = old_sha.strip()
+        Never raises for a git failure: a missing task or target branch, or a merge git refuses
+        to make, is an ``error``. Where the target is checked out (the main checkout or a linked
+        worktree), it is merged there, so that checkout's index and files move with the branch.
+        Otherwise a fast-forward is a guarded ``update-ref`` on the tip whose ancestry was just
+        checked; when the target moved, it is re-read once and fast-forwarded only if still an
+        ancestor of the task commit, and merged in a temporary worktree when it diverged.
+        """
+        task_sha = await _branch_commit(repo_path, task_branch)
+        if task_sha is None:
+            return MergeResult.error
+        checkout = await _checked_out_at(repo_path, target_branch)
+        if checkout is not None:
+            return await _merge_in_checkout(checkout, task_branch)
+
+        for _ in range(2):  # the guarded update, and one retry once the target moved
+            old_sha = await _branch_commit(repo_path, target_branch)
+            if old_sha is None:
+                return MergeResult.error
+            code, _ = await run_git(repo_path, "merge-base", "--is-ancestor", old_sha, task_sha)
+            if code == 1:
+                break  # diverged: a merge commit is needed
+            if code != 0:
+                return MergeResult.error
             code, _ = await run_git(
                 repo_path, "update-ref", f"refs/heads/{target_branch}", task_sha, old_sha,
             )
-            if code != 0:
-                _, new_old = await run_git(repo_path, "rev-parse", target_branch)
-                new_old = new_old.strip()
-                if new_old != old_sha:
-                    code, _ = await run_git(
-                        repo_path, "update-ref", f"refs/heads/{target_branch}",
-                        task_sha, new_old,
-                    )
             if code == 0:
                 return MergeResult.success
+        else:
             return MergeResult.error
 
-        if current_branch == target_branch:
-            code, _ = await run_git(repo_path, "merge", "--ff-only", task_branch)
-            if code != 0:
-                code, _ = await run_git(
-                    repo_path, "merge", "--no-ff", "-m",
-                    f"merge(conclave): {task_branch}", task_branch,
-                )
-                if code != 0:
-                    # Abort the failed merge to leave the repo clean.
-                    await run_git(repo_path, "merge", "--abort")
-                    return MergeResult.conflict
-            return MergeResult.success
-
-        # target is not checked out and history diverged: merge via a temp worktree.
-        # Include task_id so concurrent merges into the same target never collide.
+        # Not checked out anywhere and diverged: merge via a temp worktree. Include task_id so
+        # concurrent merges into the same target never collide.
         merge_path = wm_merge_path(repo_path, target_branch, task_id)
-        await run_git(repo_path, "worktree", "add", str(merge_path), target_branch)
         try:
-            code, _ = await run_git(
-                merge_path, "merge", "--no-ff", "-m",
-                f"merge(conclave): {task_branch}", task_branch,
-            )
+            code, _ = await run_git(repo_path, "worktree", "add", str(merge_path), target_branch)
             if code != 0:
-                return MergeResult.conflict
+                return MergeResult.error
+            return await _merge_in_checkout(merge_path, task_branch)
         finally:
             await run_git(repo_path, "worktree", "remove", "--force", str(merge_path))
             await run_git(repo_path, "worktree", "prune")
-        return MergeResult.success
 
 
 # --- module helpers ---------------------------------------------------------
@@ -3366,6 +3419,64 @@ def wm_merge_path(repo_path: Path, target_branch: str, task_id: str) -> Path:
     return repo_path.parent / f".conclave-merge-{repo_path.name}-{safe}-{safe_task}"
 
 
+async def _branch_commit(repo_path: Path, branch: str) -> str | None:
+    """The commit local *branch* points at, or ``None`` when there is no such branch."""
+    code, out = await run_git(
+        repo_path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"
+    )
+    return out.strip() if code == 0 and out.strip() else None
+
+
+async def _checked_out_at(repo_path: Path, branch: str) -> Path | None:
+    """The checkout (the main one or a linked worktree) that has *branch* checked out, if any.
+
+    A worktree whose directory is gone (``prunable``) has nothing to keep in step, so it does
+    not count.
+    """
+    code, out = await run_git(repo_path, "worktree", "list", "--porcelain")
+    if code != 0:
+        return None
+    wanted = f"branch refs/heads/{branch}"
+    for record in out.split("\n\n"):
+        lines = record.splitlines()
+        if wanted not in lines or not lines[0].startswith("worktree "):
+            continue
+        path = Path(lines[0].removeprefix("worktree "))
+        if path.is_dir():
+            return path
+    return None
+
+
+async def _merge_in_progress(checkout: Path) -> bool:
+    """Whether a merge stopped in *checkout* (its ``MERGE_HEAD`` exists)."""
+    code, _ = await run_git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    return code == 0
+
+
+async def _merge_in_checkout(checkout: Path, task_branch: str) -> MergeResult:
+    """Merge *task_branch* into the branch checked out at *checkout*: a fast-forward when it
+    can be, else a merge commit.
+
+    ``conflict`` only for a merge that stopped on its conflicts, which is then aborted. A merge
+    git refuses to start (local changes in the way, a merge the operator has in progress there)
+    leaves *checkout* as it was and is an ``error``: nothing is aborted that this did not start.
+    """
+    if await _merge_in_progress(checkout):
+        return MergeResult.error
+    code, _ = await run_git(checkout, "merge", "--ff-only", task_branch)
+    if code == 0:
+        return MergeResult.success
+    code, _ = await run_git(
+        checkout, "merge", "--no-ff", "-m", f"merge(conclave): {task_branch}", task_branch,
+    )
+    if code == 0:
+        return MergeResult.success
+    if await _merge_in_progress(checkout):
+        await run_git(checkout, "merge", "--abort")
+        return MergeResult.conflict
+    return MergeResult.error
+
+
 def _commit_message(task: Task) -> str:
     first_line = next((ln.strip() for ln in task.request.splitlines() if ln.strip()), task.id)
     subject = task.title or first_line
@@ -3393,6 +3504,16 @@ def _over_budget(runner: AgentRunner, started: float, budget_minutes: float) -> 
 def _diff_hint(diff_cmd: str) -> str:
     """How an agent recovers a fitted diff: the command that produced it."""
     return f"Run `{diff_cmd}` in your working directory for the full diff."
+
+
+def _previous_diff_hint(checkpoint: str, prev_tree: str) -> str:
+    """How an agent recovers a fitted previous-attempt diff: the tree it came from, if kept."""
+    if prev_tree:
+        return (
+            f"Run `git diff {checkpoint} {prev_tree}` in your working directory for the full "
+            "previous diff."
+        )
+    return "The rest is not available: your previous attempt was reset before this one started."
 
 
 def _rerun_hint(command: str) -> str:

@@ -8,14 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_MAX_DIFF_EXCERPT = 1500
-
 
 @dataclass(frozen=True)
 class _Entry:
     attempt: int
     feedback: str
-    diff_excerpt: str
+    diff: str
 
 
 class AttemptMemory:
@@ -24,12 +22,9 @@ class AttemptMemory:
         self._max = max_entries
 
     def add(self, attempt: int, diff: str, feedback: str) -> None:
-        excerpt = diff.strip()
-        if len(excerpt) > _MAX_DIFF_EXCERPT:
-            excerpt = excerpt[:_MAX_DIFF_EXCERPT] + "\n…(truncated)"
-        self._entries.append(
-            _Entry(attempt=attempt, feedback=feedback.strip(), diff_excerpt=excerpt)
-        )
+        """Remember rejected *attempt*: its *diff* (kept as given, so a caller that fits it to a
+        context limit passes the fitted text, marker included) and why it was rejected."""
+        self._entries.append(_Entry(attempt=attempt, feedback=feedback.strip(), diff=diff.strip()))
         if len(self._entries) > self._max:
             self._entries = self._entries[-self._max :]
 
@@ -39,7 +34,7 @@ class AttemptMemory:
         blocks = [
             f"--- Attempt {e.attempt} (REJECTED) ---\n"
             f"Why it was rejected:\n{e.feedback}\n"
-            f"Diff produced (excerpt):\n{e.diff_excerpt}"
+            f"Diff produced:\n{e.diff}"
             for e in self._entries
         ]
         body = "\n\n".join(blocks)

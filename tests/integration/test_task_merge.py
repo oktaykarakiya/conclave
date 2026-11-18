@@ -432,3 +432,151 @@ async def test_merge_under_the_held_merge_lock_runs_without_waiting_on_itself(
     assert await other is MergeResult.success
     assert merged == ["feature", "other"]
     _assert_no_merge_lock_left(orchestrator)
+
+
+# --- Engine audit: the merge never raises, never drops a commit, never desyncs a checkout ---
+
+
+async def _repo_with_branch(tmp_path: Path) -> tuple[Path, str]:
+    """A repo on ``main`` with branch ``feature`` one commit ahead (it adds ``task.txt``)."""
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    await _git(repo_path, "init", "-b", "main")
+    await _commit_file(repo_path, "app.txt", "base\n", "init")
+    await _git(repo_path, "checkout", "-b", "feature")
+    await _commit_file(repo_path, "task.txt", "task change\n", "task work")
+    task_sha = await _git(repo_path, "rev-parse", "feature")
+    await _git(repo_path, "checkout", "main")
+    return repo_path, task_sha
+
+
+async def test_merge_into_a_missing_target_returns_error(db: Database, tmp_path: Path) -> None:
+    repo_path, task_sha = await _repo_with_branch(tmp_path)
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    assert await orchestrator._merge(repo_path, "gone", "feature", "task-1") is MergeResult.error
+
+    assert await _ref(repo_path, "feature") == task_sha
+    assert await _ref(repo_path, "gone") is None
+    assert len((await _git(repo_path, "worktree", "list")).splitlines()) == 1
+    assert list(tmp_path.glob(".conclave-merge-*")) == []
+    _assert_no_merge_lock_left(orchestrator)
+
+
+async def test_merge_of_a_branch_deleted_by_hand_returns_error(
+    db: Database, tmp_path: Path
+) -> None:
+    repo_path, _ = await _repo_with_branch(tmp_path)
+    main_before = await _git(repo_path, "rev-parse", "main")
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    assert await orchestrator._merge(repo_path, "main", "deleted", "task-1") is MergeResult.error
+    assert await _git(repo_path, "rev-parse", "main") == main_before
+    assert await _git(repo_path, "status", "--porcelain") == ""
+
+
+async def test_guarded_fast_forward_never_drops_a_concurrent_target_commit(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The target moves (outside Conclave) between reading its tip and the guarded update."""
+    repo_path, task_sha = await _repo_with_branch(tmp_path)
+    await _git(repo_path, "checkout", "-b", "side")  # main is checked out nowhere: update-ref
+    real_run_git = run_git
+    concurrent: list[str] = []
+
+    async def _target_moves_before_the_first_update(
+        cwd: Path, *args: str, env: dict[str, str] | None = None
+    ) -> tuple[int, str]:
+        if args[:1] == ("update-ref",) and not concurrent:
+            _, tree = await real_run_git(repo_path, "rev-parse", "main^{tree}")
+            _, sha = await real_run_git(
+                repo_path, "commit-tree", tree.strip(), "-p", "main", "-m", "concurrent"
+            )
+            concurrent.append(sha.strip())
+            await real_run_git(repo_path, "update-ref", "refs/heads/main", concurrent[0])
+        return await real_run_git(cwd, *args, env=env)
+
+    monkeypatch.setattr(
+        "conclave.engine.orchestrator.run_git", _target_moves_before_the_first_update
+    )
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    assert await orchestrator._merge(repo_path, "main", "feature", "task-1") is (
+        MergeResult.success
+    )
+
+    for kept in (concurrent[0], task_sha):
+        code, _ = await real_run_git(repo_path, "merge-base", "--is-ancestor", kept, "main")
+        assert code == 0, f"{kept} is not in main"
+    assert await _git(repo_path, "show", "main:task.txt") == "task change"
+    assert list(tmp_path.glob(".conclave-merge-*")) == []
+
+
+@pytest.mark.parametrize("diverged", [False, True], ids=["fast-forward", "merge-commit"])
+async def test_merge_into_a_target_checked_out_in_a_linked_worktree_leaves_it_clean(
+    db: Database, tmp_path: Path, diverged: bool
+) -> None:
+    repo_path, task_sha = await _repo_with_branch(tmp_path)
+    await _git(repo_path, "checkout", "-b", "side")
+    linked = tmp_path / "linked"
+    await _git(repo_path, "worktree", "add", str(linked), "main")
+    if diverged:
+        await _commit_file(linked, "main-only.txt", "later\n", "main moves on")
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    assert await orchestrator._merge(repo_path, "main", "feature", "task-1") is (
+        MergeResult.success
+    )
+
+    assert await _git(linked, "status", "--porcelain") == ""
+    assert (linked / "task.txt").read_text(encoding="utf-8") == "task change\n"
+    assert await _git(linked, "rev-parse", "HEAD") == await _git(repo_path, "rev-parse", "main")
+    code, _ = await run_git(repo_path, "merge-base", "--is-ancestor", task_sha, "main")
+    assert code == 0
+    assert diverged == (await _git(repo_path, "rev-parse", "main") != task_sha)
+    assert list(tmp_path.glob(".conclave-merge-*")) == []
+    assert await _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD") == "side"
+
+
+async def test_a_dirty_checkout_is_a_merge_error_not_a_conflict(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    repo_path, _, task_id, branch = await _task(client, db, tmp_path)
+    (repo_path / "task.txt").write_text("operator's draft\n", encoding="utf-8")  # in the way
+    main_before = await _git(repo_path, "rev-parse", "main")
+
+    res = await client.post(f"/api/tasks/{task_id}/merge")
+    assert res.status_code == 503, res.text
+    assert "retry" in res.json()["detail"]
+    is_error, text = await _mcp_call(client, task_id)
+    assert is_error is True
+    assert "retry" in text
+
+    assert (repo_path / "task.txt").read_text(encoding="utf-8") == "operator's draft\n"
+    assert await _git(repo_path, "rev-parse", "main") == main_before
+    assert await _ref(repo_path, branch) is not None
+    task = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert task["state"] == "done"
+
+
+async def test_a_merge_in_progress_in_the_checkout_is_left_alone(
+    db: Database, tmp_path: Path
+) -> None:
+    """The operator is resolving a merge of their own in the target's checkout: Conclave's
+    merge changes nothing there, and never aborts it."""
+    repo_path, _ = await _repo_with_branch(tmp_path)
+    await _git(repo_path, "checkout", "-b", "theirs")
+    await _commit_file(repo_path, "app.txt", "their edit\n", "their work")
+    await _git(repo_path, "checkout", "main")
+    await _commit_file(repo_path, "app.txt", "main edit\n", "main work")
+    code, _ = await run_git(repo_path, "merge", "theirs")
+    assert code != 0  # the operator's own merge stopped on its conflict
+    merge_head = await _git(repo_path, "rev-parse", "MERGE_HEAD")
+    main_before = await _git(repo_path, "rev-parse", "main")
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    assert await orchestrator._merge(repo_path, "main", "feature", "task-1") is MergeResult.error
+
+    assert await _git(repo_path, "rev-parse", "MERGE_HEAD") == merge_head
+    assert "<<<<<<<" in (repo_path / "app.txt").read_text(encoding="utf-8")
+    assert await _git(repo_path, "rev-parse", "main") == main_before

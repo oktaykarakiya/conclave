@@ -1691,6 +1691,47 @@ async def get_task_checkpoint(
     return TaskCheckpoint.from_row(row) if row else None
 
 
+_ENDED_STATES = (TaskState.done.value, TaskState.failed.value, TaskState.cancelled.value)
+_UNFINISHED_CHECKPOINTS = (
+    CheckpointStatus.running.value,
+    CheckpointStatus.waiting_for_approval.value,
+)
+
+
+async def skip_interrupted_checkpoints(db: Database, task_id: str) -> int:
+    """Once *task_id* has ended (``done``, ``failed`` or ``cancelled``), mark its checkpoints
+    still ``running`` or ``waiting_for_approval`` ``skipped``, with ``interrupted: true`` added
+    to their artifact: the task's end stopped those nodes. Nothing changes while the task runs
+    or waits. One transaction, so a checkpoint written meanwhile is never overwritten. Returns
+    how many were marked.
+    """
+    async with db.transaction() as conn:
+        cur = await conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,))
+        row = await cur.fetchone()
+        if row is None or row["state"] not in _ENDED_STATES:
+            return 0
+        cur = await conn.execute(
+            "SELECT * FROM task_checkpoints WHERE task_id = ? AND status IN (?, ?)",
+            (task_id, *_UNFINISHED_CHECKPOINTS),
+        )
+        interrupted = [TaskCheckpoint.from_row(r) for r in await cur.fetchall()]
+        ts = now_iso()
+        for cp in interrupted:
+            await conn.execute(
+                "UPDATE task_checkpoints SET status = ?, artifact_json = ?, updated_at = ? "
+                "WHERE task_id = ? AND node_id = ? AND attempt = ?",
+                (
+                    CheckpointStatus.skipped.value,
+                    json.dumps({**cp.artifact, "interrupted": True}),
+                    ts,
+                    task_id,
+                    cp.node_id,
+                    cp.attempt,
+                ),
+            )
+    return len(interrupted)
+
+
 async def clear_task_checkpoints(
     db: Database, task_id: str, *, after_attempt: int | None = None
 ) -> None:

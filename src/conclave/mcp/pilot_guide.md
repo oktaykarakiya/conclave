@@ -34,6 +34,9 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
 - **Branches**: each task gets `<branch_prefix><task_id>` (default `conclave/<id>`) from the
   project's `execution.target_branch`. `auto_merge` is off by default: a green task ends `done`
   on its committed branch and **you** merge it. With `auto_merge` on, a green task merges itself.
+  A workflow without an enabled `merge` node never merges: with a developer, a green task still
+  ends `done` on its committed, unmerged branch (`merged=False`); a review-only workflow (no
+  developer) commits nothing.
 
 ## 2. Golden rules
 
@@ -315,10 +318,13 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   (`requested`, `used`, `model`, `agent`, `node_id`); the dispatch ran with `used`.
   `quota.waiting` and `quota.resumed` mark a dispatch waiting out a usage limit (see Usage
   limits below).
-- `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review.
+- `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review. A node the
+  task's end interrupted (a cancel, an unhandled error) reads `skipped` with `interrupted: true` in
+  its checkpoint artifact once the task is over, never `running` or `waiting_for_approval`.
 - **Mandatory reviewers block until they answer.** A reviewer's reply counts only when it ends
   with its JSON verdict block (`pass`, `fail`, `block`, `decline`; a block that declines to judge
-  or abstains also counts, as a non-blocking `unknown`). A mandatory reviewer
+  or abstains also counts, as a non-blocking `unknown`). The last verdict block of the reply
+  counts: an example or a draft verdict earlier in it never decides. A mandatory reviewer
   (`agents.mandatory`, default `tester`, `security`, `reviewer`) that crashes, times out, comes
   back empty or ends without that block is re-run alone, up to 2 more times, its prompt then
   reminding it to end with the verdict block. If it still has none, its verdict is recorded
@@ -423,7 +429,9 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   or the gate's checkpoint, or overriding a reviewer to `fail`, fails the attempt: its
   `attempt.failed` has that `stage` (`developer`, `gate`, `review`) and the reason
   `operator rejected: <message>` (one line), which a task that then fails ends its summary with.
-- `conclave_cancel_task(task_id)`: stop a task (its worktree is cleaned up).
+- `conclave_cancel_task(task_id)`: stop a task (its worktree is cleaned up). What it runs stops at
+  once, a dispatch or a setup, baseline or gate command (its process group is killed), and the
+  task ends `cancelled`; a baseline stopped this way is not cached.
 - `conclave_approve_task` / `conclave_cascade_approve_task` for tasks created without
   `auto_approve` (e.g. a planning session's task tree).
 
@@ -434,9 +442,16 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   spec, error handling, tests that actually exercise the behaviour, no deleted or skipped tests,
   no unrelated changes.
 - `conclave_merge_task(task_id)`: merges a `done` task's branch into the target through
-  Conclave's guarded merge (conflicts leave everything untouched and return an error). If a
-  change is not acceptable, do not merge it: create a follow-up task that states exactly what to
-  fix, or cancel and rewrite the spec.
+  Conclave's guarded merge (conflicts leave everything untouched and return an error). Where the
+  target is checked out (your main checkout or a linked worktree), it is merged there, so that
+  checkout's files follow the branch; elsewhere the target is fast-forwarded only while it is an
+  ancestor of the task's commit, else merged in a temporary worktree, so a commit that moved it
+  meanwhile is kept. A checkout with local changes in the way (or a merge of yours in progress
+  there) is left untouched: that is a transient error (REST `503`, an `isError` saying `retry`),
+  not a conflict; clear it and retry. An auto-merge that meets it ends the task `failed` with
+  `merge error into <target>; branch <branch> preserved` (`task.failed` reason `merge_error`; a
+  real conflict is `merge_conflict`). If a change is not acceptable, do not merge it: create a
+  follow-up task that states exactly what to fix, or cancel and rewrite the spec.
 - **Test-integrity flags.** A `test_integrity.flagged` event (and a `test integrity (...)` note in
   the result summary) means the change took pre-existing coverage away: `deleted_file` (a test
   file deleted or moved out of the suite), `removed_test` (a test removed and not added back

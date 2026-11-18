@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
+import sys
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -1159,9 +1162,11 @@ async def test_setup_timeout_seconds_from_config_is_passed_to_run_shell(
 
     _original = orch_mod.run_shell
 
-    async def _spy(cwd: Path, command: str, *, env=None, timeout_seconds=None):
+    async def _spy(cwd: Path, command: str, *, env=None, timeout_seconds=None, cancel_event=None):
         captured_timeouts.append(timeout_seconds)
-        return await _original(cwd, command, env=env, timeout_seconds=timeout_seconds)
+        return await _original(
+            cwd, command, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+        )
 
     monkeypatch.setattr(orch_mod, "run_shell", _spy)
 
@@ -2089,3 +2094,459 @@ async def test_steer_via_api_endpoint_injects_into_in_flight_task(
             assert state == "done", f"expected done, got {state!r}"
         finally:
             await daemon.shutdown()
+
+
+# --- Engine audit: every exit path ends cleanly ------------------------------
+
+
+class _SecurityRaisesWhileTesterRuns(FakeProvider):
+    """Parallel reviewers: the tester's dispatch runs until it is cancelled, and the security
+    dispatch raises once the tester has started (a provider bug escaping ``run_agent``)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tester_started = asyncio.Event()
+        self.tester_outcome = "not started"
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        role = self.role_of(prompt)
+        if role == "reviewer:tester":
+            self.tester_outcome = "running"
+            self.tester_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.tester_outcome = "cancelled"
+                raise
+        if role == "reviewer:security":
+            await self.tester_started.wait()
+            raise RuntimeError("security dispatch blew up")
+        return await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+
+
+async def test_a_raising_parallel_reviewer_cancels_its_siblings(
+    db: Database, tmp_path: Path
+) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {**_UNGATED_EXECUTION, "parallel_reviewers": True}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    provider = _SecurityRaisesWhileTesterRuns()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+
+    async with asyncio.timeout(60):
+        assert await orchestrator.process_task(claimed) is False
+
+    # The sibling was stopped (and awaited) before the task ended, not left running.
+    assert provider.tester_outcome == "cancelled"
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state is TaskState.failed
+    assert final.result_summary == f"unhandled exception processing task {task.id}"
+    worktree_path = tmp_path / "home" / "projects" / project.id / "worktrees" / task.id
+    assert worktree_path.resolve() not in await _worktree_paths(repo_path)
+
+
+class _OperatorActsDuringDeveloper(FakeProvider):
+    """Runs *act* (what the operator does in their repo meanwhile) once, while the developer of
+    the task works."""
+
+    def __init__(self, act: Callable[[], Awaitable[None]]) -> None:
+        super().__init__()
+        self._act: Callable[[], Awaitable[None]] | None = act
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        if self.role_of(prompt) == "developer" and self._act is not None:
+            act, self._act = self._act, None
+            await act()
+        return await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+
+
+async def _git_ok(cwd: Path, *args: str) -> str:
+    code, out = await run_git(cwd, *args)
+    assert code == 0, (args, out)
+    return out.strip()
+
+
+async def _merging_task(
+    db: Database, tmp_path: Path, provider: FakeProvider, *, target: str = "main"
+) -> tuple[Path, str, bool]:
+    """Process one auto-merging task into *target* of ``tmp_path/repo``; return the repo, the
+    task id and the result. The repo must exist."""
+    repo_path = tmp_path / "repo"
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch=target,
+        config={"execution": {**_MERGING_EXECUTION, "target_branch": target}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+    async with asyncio.timeout(120):
+        result = await orchestrator.process_task(claimed)
+    return repo_path, task.id, result
+
+
+async def _failure_reasons(db: Database, task_id: str) -> list[object]:
+    events = await repo.list_events(db, task_id=task_id, limit=10_000)
+    return [e.payload.get("reason") for e in events if e.type == "task.failed"]
+
+
+async def test_merge_into_a_target_checked_out_elsewhere_keeps_the_work(
+    db: Database, tmp_path: Path
+) -> None:
+    """main is checked out in a linked worktree, where the operator commits while the task runs:
+    the task is merged there, never failed with its committed branch deleted."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await _git_ok(repo_path, "checkout", "-b", "side")
+    linked = tmp_path / "linked"
+    await _git_ok(repo_path, "worktree", "add", str(linked), "main")
+
+    async def operator_commits_on_main() -> None:
+        (linked / "OPERATOR.txt").write_text("operator work\n", encoding="utf-8")
+        await _git_ok(linked, "add", "-A")
+        await _git_ok(linked, "commit", "-m", "operator work")
+
+    provider = _OperatorActsDuringDeveloper(operator_commits_on_main)
+    repo_path, task_id, result = await _merging_task(db, tmp_path, provider)
+
+    final = await repo.get_task(db, task_id)
+    assert final is not None
+    assert (result, final.state, final.result_summary) == (
+        True, TaskState.done, "completed in 1 attempt(s); merged=True"
+    )
+    assert await _git_ok(repo_path, "show", "main:FEATURE.txt") == "done"
+    assert await _git_ok(repo_path, "show", "main:OPERATOR.txt") == "operator work"
+    assert await _git_ok(linked, "status", "--porcelain") == ""
+    assert (linked / "FEATURE.txt").read_text(encoding="utf-8") == "done\n"
+
+
+async def test_merge_into_a_target_deleted_during_the_task_preserves_the_branch(
+    db: Database, tmp_path: Path
+) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await _git_ok(repo_path, "branch", "release")
+
+    async def operator_deletes_the_target() -> None:
+        await _git_ok(repo_path, "branch", "-D", "release")
+
+    provider = _OperatorActsDuringDeveloper(operator_deletes_the_target)
+    repo_path, task_id, result = await _merging_task(db, tmp_path, provider, target="release")
+
+    branch = f"conclave/{task_id}"
+    final = await repo.get_task(db, task_id)
+    assert final is not None
+    assert (result, final.state) == (False, TaskState.failed)
+    assert final.result_summary == f"merge error into release; branch {branch} preserved"
+    assert await _failure_reasons(db, task_id) == ["merge_error"]
+    assert await _git_ok(repo_path, "show", f"{branch}:FEATURE.txt") == "done"
+    checkpoints = {cp.node_id: cp for cp in await repo.list_task_checkpoints(db, task_id)}
+    assert checkpoints["merge"].status.value == "failed"
+
+
+async def test_a_dirty_checkout_fails_the_merge_as_an_error_and_keeps_the_operators_file(
+    db: Database, tmp_path: Path
+) -> None:
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+
+    async def operator_drafts_the_same_file() -> None:
+        (repo_path / "FEATURE.txt").write_text("operator's draft\n", encoding="utf-8")
+
+    provider = _OperatorActsDuringDeveloper(operator_drafts_the_same_file)
+    repo_path, task_id, result = await _merging_task(db, tmp_path, provider)
+
+    branch = f"conclave/{task_id}"
+    final = await repo.get_task(db, task_id)
+    assert final is not None
+    assert (result, final.state) == (False, TaskState.failed)
+    assert final.result_summary == f"merge error into main; branch {branch} preserved"
+    assert await _failure_reasons(db, task_id) == ["merge_error"]
+    assert (repo_path / "FEATURE.txt").read_text(encoding="utf-8") == "operator's draft\n"
+    assert await _git_ok(repo_path, "show", f"{branch}:FEATURE.txt") == "done"
+
+
+async def test_a_workflow_without_a_merge_node_commits_and_keeps_the_branch(
+    db: Database, tmp_path: Path
+) -> None:
+    """The developer's reviewed work is committed on the kept task branch, never discarded."""
+    from conclave.config import build_default_workflow
+
+    workflow = build_default_workflow()
+    for node in workflow.nodes:
+        if node.kind.value == "merge":
+            node.enabled = False
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": _MERGING_EXECUTION, "workflow": workflow.model_dump(mode="json")},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    assert await orchestrator.process_task(claimed) is True
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state is TaskState.done
+    assert final.result_summary == "completed in 1 attempt(s); merged=False"
+    branch = f"conclave/{task.id}"
+    assert final.branch == branch
+    assert await _git_ok(repo_path, "show", f"{branch}:FEATURE.txt") == "done"
+    code, _ = await run_git(repo_path, "show", "main:FEATURE.txt")
+    assert code != 0  # no merge node: the target is untouched
+    done = [e.payload for e in await repo.list_events(db, task_id=task.id) if e.type == "task.done"]
+    assert done == [{"attempts": 1, "merged": False}]
+
+
+async def _cancel_once_started(
+    db: Database, tmp_path: Path, execution: dict[str, object], started: Path
+) -> tuple[str, str, float]:
+    """Run an approved task with *execution*; cancel it once the *started* marker exists (a
+    command of the task began). Return its project id, its id and the seconds the task took
+    after the cancel."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"target_branch": "main", **execution}},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    cancel_event = asyncio.Event()
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    orchestrator._cancel_events[task.id] = cancel_event  # in flight, as the worker registers it
+    async with asyncio.timeout(120):
+        running = asyncio.create_task(orchestrator.process_task(claimed, cancel_event=cancel_event))
+        while not started.exists():
+            assert not running.done(), "the task ended before its command started"
+            await asyncio.sleep(0.05)
+        assert orchestrator.request_cancel(task.id) is True
+        cancelled_at = time.monotonic()
+        assert await running is False
+    took = time.monotonic() - cancelled_at
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None
+    assert (final.state, final.result_summary) == (TaskState.cancelled, "cancelled by operator")
+    types = [e.type for e in await repo.list_events(db, task_id=task.id, limit=10_000)]
+    assert "attempt.failed" not in types and "task.failed" not in types
+    assert types.count("task.cancelled") == 1
+    return project.id, task.id, took
+
+
+def _sleeper(marker: Path) -> str:
+    """A command that marks it started, then runs until it is stopped."""
+    return f"touch {shlex.quote(str(marker))} && sleep 30"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sleep and process groups")
+async def test_cancel_stops_a_running_setup_command(db: Database, tmp_path: Path) -> None:
+    started = tmp_path / "setup-started"
+    _, _, took = await _cancel_once_started(
+        db, tmp_path, {"setup_command": _sleeper(started), "allow_no_test_command": True}, started
+    )
+    assert took < 10
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sleep and process groups")
+async def test_cancel_stops_a_running_baseline_and_caches_nothing(
+    db: Database, tmp_path: Path
+) -> None:
+    started = tmp_path / "baseline-started"
+    project_id, task_id, took = await _cancel_once_started(
+        db, tmp_path, {"baseline_test_command": _sleeper(started)}, started
+    )
+    assert took < 10
+    _, head = await run_git(tmp_path / "repo", "rev-parse", "main")
+    assert await repo.get_baseline(db, project_id, head.strip()) is None
+    baseline = await repo.get_task_checkpoint(db, task_id, "baseline", attempt=0)
+    assert baseline is not None and baseline.status.value != "completed"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sleep and process groups")
+async def test_cancel_stops_a_running_gate_command(db: Database, tmp_path: Path) -> None:
+    baseline_ran = shlex.quote(str(tmp_path / "baseline-ran"))
+    started = tmp_path / "gate-started"
+    # The first run (the baseline) passes at once; the next one (the gate) runs until stopped.
+    command = f"if [ -e {baseline_ran} ]; then {_sleeper(started)}; else touch {baseline_ran}; fi"
+    _, _, took = await _cancel_once_started(
+        db, tmp_path, {"baseline_test_command": command}, started
+    )
+    assert took < 10
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell loop")
+async def test_concurrent_tasks_of_two_projects_get_their_own_venv_guidance(
+    db: Database, tmp_path: Path
+) -> None:
+    """Project B (with a provisioned .venv) runs while project A's task is in its setup: A's
+    prompts carry no venv guidance, which only B's repo would give."""
+    repo_a, repo_b = tmp_path / "repo-a", tmp_path / "repo-b"
+    await _init_repo(repo_a)
+    await _init_repo(repo_b)
+    (repo_b / ".venv" / "bin").mkdir(parents=True)
+    a_waiting, release_a = tmp_path / "a-waiting", tmp_path / "release-a"
+    wait = (
+        f"touch {shlex.quote(str(a_waiting))}; "
+        f"while [ ! -e {shlex.quote(str(release_a))} ]; do sleep 0.05; done"
+    )
+    project_a = await repo.create_project(
+        db, name="a", path=str(repo_a), default_branch="main",
+        config={"execution": {**_UNGATED_EXECUTION, "setup_command": wait}},
+    )
+    project_b = await repo.create_project(
+        db, name="b", path=str(repo_b), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION},
+    )
+    await repo.create_task(
+        db, project_id=project_a.id, request="task A: add a feature file",
+        state=TaskState.approved,
+    )
+    await repo.create_task(
+        db, project_id=project_b.id, request="task B: add a feature file",
+        state=TaskState.approved,
+    )
+    provider = FakeProvider()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+    claimed_a = await repo.claim_next_approved(db, project_a.id)
+    claimed_b = await repo.claim_next_approved(db, project_b.id)
+    assert claimed_a is not None and claimed_b is not None
+
+    async with asyncio.timeout(120):
+        running_a = asyncio.create_task(orchestrator.process_task(claimed_a))
+        while not a_waiting.exists():
+            assert not running_a.done()
+            await asyncio.sleep(0.05)
+        assert await orchestrator.process_task(claimed_b) is True
+        release_a.touch()
+        assert await running_a is True
+
+    prompts_a = [p for p in provider.prompts if "task A:" in p]
+    prompts_b = [p for p in provider.prompts if "task B:" in p]
+    assert prompts_a and prompts_b
+    assert all("Worktree environment (MANDATORY)" in p for p in prompts_b)
+    assert not any("Worktree environment (MANDATORY)" in p for p in prompts_a)
+
+
+class _DeveloperRaises(FakeProvider):
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        if self.role_of(prompt) == "developer":
+            raise RuntimeError("developer dispatch blew up")
+        return await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+
+
+@pytest.mark.parametrize("how", ["cancel_in_review", "developer_raises", "cancel_in_hitl_pause"])
+async def test_terminal_tasks_leave_no_running_or_waiting_checkpoint(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """A node the task's end interrupted reads skipped (with interrupted) once the task is
+    over, never running or waiting for an approval nobody can give any more."""
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    provider: FakeProvider = {
+        "cancel_in_review": lambda: FakeProvider(cancel_during="reviewer"),
+        "developer_raises": _DeveloperRaises,
+        "cancel_in_hitl_pause": FakeProvider,
+    }[how]()
+    interrupted = {
+        "cancel_in_review": {"review", "tester"},
+        "developer_raises": {"developer"},
+        "cancel_in_hitl_pause": {"developer"},
+    }[how]
+    final_state = TaskState.failed if how == "developer_raises" else TaskState.cancelled
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+    cancel_event = asyncio.Event()
+    orchestrator._cancel_events[task.id] = cancel_event
+    if how == "cancel_in_hitl_pause":
+        orchestrator.set_hitl_checkpoint(task.id, "developer", True)
+
+    async with asyncio.timeout(60):
+        running = asyncio.create_task(orchestrator.process_task(claimed, cancel_event=cancel_event))
+        if how == "cancel_in_review":
+            await provider.dispatch_blocked.wait()
+        elif how == "cancel_in_hitl_pause":
+            for _ in range(1200):
+                paused = await repo.get_task(db, task.id)
+                if paused is not None and paused.state is TaskState.waiting_for_approval:
+                    break
+                await asyncio.sleep(0.05)
+        if how != "developer_raises":
+            assert orchestrator.request_cancel(task.id) is True
+        assert await running is False
+
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state is final_state
+    checkpoints = await repo.list_task_checkpoints(db, task.id)
+    unfinished = [
+        (cp.node_id, cp.status.value)
+        for cp in checkpoints
+        if cp.status.value in ("running", "waiting_for_approval")
+    ]
+    assert unfinished == []
+    marked = {cp.node_id: cp for cp in checkpoints if cp.artifact.get("interrupted")}
+    assert set(marked) == interrupted
+    assert all(cp.status.value == "skipped" for cp in marked.values())

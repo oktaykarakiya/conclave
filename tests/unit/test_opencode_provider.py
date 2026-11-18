@@ -614,6 +614,33 @@ async def test_cancelling_the_dispatch_task_kills_the_cli(
                 os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec permissions")
+@pytest.mark.parametrize(
+    ("mode", "body", "why"),
+    [
+        (0o644, "#!/bin/sh\necho hi\n", "Permission denied"),  # PermissionError
+        (0o755, "not a program\n", "Exec format error"),  # ENOEXEC: no shebang
+    ],
+)
+async def test_unexecutable_cli_returns_a_failed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int, body: str, why: str
+) -> None:
+    fake = tmp_path / "opencode"
+    fake.write_text(body, encoding="utf-8")
+    fake.chmod(mode)
+    monkeypatch.setattr(opencode_cli, "_OPENCODE_BIN", str(fake))
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+        prompt="hi",
+        timeout_seconds=5,
+    )
+
+    assert result.ok is False
+    assert (result.error or "").startswith("CLI could not be started: ")
+    assert why in (result.error or "")
+
+
 async def test_a_cli_that_exits_before_reading_its_prompt_fails_with_its_own_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

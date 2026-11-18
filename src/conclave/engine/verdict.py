@@ -21,6 +21,7 @@ _JSON_BLOCK = re.compile(
     r"```(?:json)?\s*(\{(?:[^`]|`(?!``))*?\"verdict\"\s*:[^`]*?\})\s*```",
     re.DOTALL | re.IGNORECASE,
 )
+_VERDICT_STRING = re.compile(r"VERDICT: (PASS|DECLINE|BLOCK|FAIL)")
 _VALID = {"pass", "fail", "block", "decline"}
 _GROUNDABLE = {"fail", "block", "decline"}
 
@@ -50,38 +51,48 @@ def _build_parsed_verdict(data: dict[str, Any], raw_str: str) -> ParsedVerdict:
 
 
 def parse_verdict(log_text: str) -> ParsedVerdict:
-    """Extract a structured verdict from agent log output."""
-    match = _JSON_BLOCK.search(log_text)
-    if match:
+    """Extract a structured verdict from agent log output.
+
+    The verdict contract asks every reviewer to END its reply with its verdict block, so within
+    each form (a fenced JSON block, then a bare JSON object, then a legacy ``VERDICT: …`` string)
+    the last one counts: an earlier one (the format example echoed back, a draft) never decides.
+    """
+    for match in reversed(list(_JSON_BLOCK.finditer(log_text))):
         try:
             data = json.loads(match.group(1))
-            if isinstance(data, dict):
-                return _build_parsed_verdict(data, match.group(0))
         except (json.JSONDecodeError, ValueError):
-            pass
+            continue
+        if isinstance(data, dict):
+            return _build_parsed_verdict(data, match.group(0))
 
     if '"verdict"' in log_text.lower():
         decoder = json.JSONDecoder()
-        for idx, ch in enumerate(log_text):
-            if ch != "{":
-                continue
+        last: tuple[dict[str, Any], str] | None = None
+        idx = 0
+        while (idx := log_text.find("{", idx)) != -1:
             try:
                 obj, end = decoder.raw_decode(log_text[idx:])
             except (json.JSONDecodeError, ValueError):
+                idx += 1
                 continue
             if isinstance(obj, dict) and "verdict" in obj:
-                return _build_parsed_verdict(obj, log_text[idx : idx + end])
+                last = (obj, log_text[idx : idx + end])
+                idx += end  # its nested objects are part of it, not later verdicts
+            else:
+                idx += 1
+        if last is not None:
+            return _build_parsed_verdict(*last)
 
-    upper = log_text.upper()
-    if "VERDICT: PASS" in upper:
-        return ParsedVerdict(verdict="pass", source="string", raw="VERDICT: PASS")
-    for token in ("DECLINE", "BLOCK", "FAIL"):
-        if f"VERDICT: {token}" in upper:
-            parts = re.split(r"VERDICT:", log_text, flags=re.IGNORECASE)
-            tail = parts[-1].strip() if len(parts) > 1 else "Issues found"
-            return ParsedVerdict(
-                verdict=token.lower(), reason=tail, source="string", raw=f"VERDICT: {token}"
-            )
+    strings = list(_VERDICT_STRING.finditer(log_text.upper()))
+    if strings:
+        token = strings[-1].group(1)
+        if token == "PASS":
+            return ParsedVerdict(verdict="pass", source="string", raw="VERDICT: PASS")
+        parts = re.split(r"VERDICT:", log_text, flags=re.IGNORECASE)
+        tail = parts[-1].strip() if len(parts) > 1 else "Issues found"
+        return ParsedVerdict(
+            verdict=token.lower(), reason=tail, source="string", raw=f"VERDICT: {token}"
+        )
     return ParsedVerdict()
 
 

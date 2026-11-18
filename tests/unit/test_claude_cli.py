@@ -404,6 +404,29 @@ async def test_cli_not_found() -> None:
     assert "not found" in (result.error or "")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec permissions")
+@pytest.mark.parametrize(
+    ("mode", "body", "why"),
+    [
+        (0o644, "#!/bin/sh\necho hi\n", "Permission denied"),  # PermissionError
+        (0o755, "not a program\n", "Exec format error"),  # ENOEXEC: no shebang
+    ],
+)
+async def test_unexecutable_cli_returns_a_failed_result(
+    tmp_path: Path, mode: int, body: str, why: str
+) -> None:
+    cli = tmp_path / "claude"
+    cli.write_text(body, encoding="utf-8")
+    cli.chmod(mode)
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=str(cli), cli_flags=())
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=5)
+
+    assert result.ok is False
+    assert (result.error or "").startswith("CLI could not be started: ")
+    assert why in (result.error or "")
+
+
 # A fake CLI that reads stdin one byte at a time and writes a large (~128 KB)
 # stderr chunk after each byte — stderr is merged into stdout by the provider
 # (stderr=STDOUT), so the OS pipe buffer still fills and triggers the deadlock

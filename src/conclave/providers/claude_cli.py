@@ -159,6 +159,8 @@ class ClaudeCliProvider:
                 )
             except FileNotFoundError:
                 return AgentResult(ok=False, error=f"CLI not found: {profile.cli!r}")
+            except OSError as exc:  # e.g. not executable (EACCES) or no valid binary (ENOEXEC)
+                return AgentResult(ok=False, error=f"CLI could not be started: {exc}")
 
             # Everything the run streams. Kept outside drive() so a stopped run can still be
             # parsed; safe to share, since only one coroutine runs at a time.

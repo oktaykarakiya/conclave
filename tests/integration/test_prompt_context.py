@@ -316,6 +316,66 @@ async def test_previous_diff_is_fitted_and_recoverable_with_the_command_in_its_m
     assert rc == 0 and len(recovered) == cuts[0]["original_chars"]
 
 
+_SECURITY_FAILS = AgentResult(
+    ok=True,
+    text='```json\n{"verdict": "fail", "reason": "rejected again", "evidence": []}\n```',
+    model_reported="fake",
+)
+_SECURITY_PASSES = AgentResult(
+    ok=True,
+    text='```json\n{"verdict": "pass", "reason": "fine now", "evidence": []}\n```',
+    model_reported="fake",
+)
+
+
+def _history_entry(prompt: str, attempt: int) -> str:
+    """The PRIOR ATTEMPT HISTORY entry of *attempt* in a developer *prompt*."""
+    history = prompt.split("PRIOR ATTEMPT HISTORY", 1)[1]
+    entry = history.split(f"--- Attempt {attempt} (REJECTED) ---\n", 1)[1]
+    return entry.split("\n\n--- Attempt ", 1)[0]
+
+
+@pytest.mark.parametrize("bulk_max_chars", [None, 1_000], ids=["default", "small-limit"])
+async def test_prior_attempt_memory_keeps_the_previous_diff_whole(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bulk_max_chars: int | None
+) -> None:
+    """The rejected attempts' diffs reach the retry's history whole, or fitted like every other
+    bulk block (with the standard marker and one context_truncated event per previous diff)."""
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    await _init_repo(tmp_path / "repo")
+    content = _neutral_text(5_000)
+    provider = FakeProvider(
+        developer_content=content,
+        replies={"reviewer:security": [_SECURITY_FAILS, _SECURITY_FAILS, _SECURITY_PASSES]},
+    )
+    config: dict[str, Any] = {"agent_overrides": {"developer": {"max_retries": 3}}}
+    if bulk_max_chars is not None:
+        config["context"] = {"bulk_max_chars": bulk_max_chars}
+
+    task, ok = await _run_task(db, tmp_path, provider, config)
+
+    assert ok is True and task.state is TaskState.done
+    developer = _prompts_of(provider, "developer")
+    assert len(developer) == 3
+    entry = _history_entry(developer[2], 1)
+    assert entry.startswith("Why it was rejected:\n")
+    assert "(truncated)" not in entry
+    added = [f"+{line}" for line in content.splitlines()]
+    cuts = [c for c in await _cuts(db, task.id) if c["block"] == "previous_diff"]
+    if bulk_max_chars is None:
+        assert all(line in entry.splitlines() for line in added)
+        assert _MARKER_RE.search(entry) is None
+        assert cuts == []
+    else:
+        match = _MARKER_RE.search(entry)
+        assert match is not None
+        assert match.group(3, 4) == ("bulk_max_chars", "1000")
+        assert match.group(5).startswith("Run `git diff ")
+        assert added[0] in entry and added[-1] in entry  # head and tail are kept
+        assert len(cuts) == 2  # one per previous diff (attempts 1 and 2), shown twice each
+        assert {(c["agent"], c["node_id"]) for c in cuts} == {("developer", "developer")}
+
+
 class _RebuildsTheBundle(FakeProvider):
     """FakeProvider whose developer also rewrites committed build output, as a rebuild does."""
 

@@ -203,6 +203,10 @@ class OpenCodeCliProvider:
                 return _plus_usage(
                     AgentResult(ok=False, error=f"CLI not found: {_OPENCODE_BIN!r}"), last_result
                 )
+            except OSError as exc:  # e.g. not executable (EACCES) or no valid binary (ENOEXEC)
+                return _plus_usage(
+                    AgentResult(ok=False, error=f"CLI could not be started: {exc}"), last_result
+                )
 
             async def drive(p: asyncio.subprocess.Process = proc) -> str:
                 assert p.stdin is not None

@@ -96,6 +96,10 @@ def inject_quarantine_exclusions(command: str, patterns: list[str]) -> str:
       then joined with ``|``, then shell-quoted as a single argument)
     * unknown → *command* returned unchanged (no injection)
 
+    The flags go to the end of the last command of *command* that runs the framework, so a
+    compound gate (``pytest -q && mypy``, ``pytest -q | tee log``) passes them to the test
+    runner, not to whatever follows it (see :func:`_append_to_runner`).
+
     .. note::
 
        Operators should configure explicit ``pytest`` / ``jest`` commands in
@@ -111,16 +115,91 @@ def inject_quarantine_exclusions(command: str, patterns: list[str]) -> str:
         deselections = " ".join(
             f"--deselect {shlex.quote(p)}" for p in patterns
         )
-        return f"{command.rstrip()} {deselections}"
+        return _append_to_runner(command, _PYTEST_RE, deselections)
 
     if _JEST_RE.search(command):
         # re.escape so literal paths don't act as accidental regexes;
         # shlex.quote so the joined regex is a single shell-safe argument.
         escaped = [re.escape(p) for p in patterns]
         joined = "|".join(escaped)
-        return f"{command.rstrip()} --testPathIgnorePatterns={shlex.quote(joined)}"
+        return _append_to_runner(
+            command, _JEST_RE, f"--testPathIgnorePatterns={shlex.quote(joined)}"
+        )
 
     return command
+
+
+def _append_to_runner(command: str, runner: re.Pattern[str], flags: str) -> str:
+    """*command* with *flags* at the end of its last command matching *runner*.
+
+    When that command is the last one, or *command* cannot be split with confidence (see
+    :func:`_shell_segments`), the flags go to the end of *command*, as they always did.
+    """
+    segments = _shell_segments(command)
+    matching = [
+        end for start, end in segments or () if runner.search(command[start:end])
+    ]
+    if not matching or not command[matching[-1] :].strip():
+        return f"{command.rstrip()} {flags}"
+    head = command[: matching[-1]].rstrip()
+    return f"{head} {flags}{command[len(head) :]}"
+
+
+def _shell_segments(command: str) -> list[tuple[int, int]] | None:
+    """The ``(start, end)`` spans of *command*'s top-level commands, or ``None`` when unsure.
+
+    Splits on the control operators outside quotes, escapes and parentheses: ``&&``, ``||``,
+    ``;``, a newline, ``|`` (and ``|&``) and a background ``&``, never on the ``&`` of a
+    redirection (``2>&1``, ``>&``, ``<&``, ``&>``). ``None`` for an unclosed quote or unbalanced
+    parentheses (e.g. a ``case`` pattern), so the caller keeps its old placement.
+    """
+    spans: list[tuple[int, int]] = []
+    start = depth = i = 0
+    quote = ""
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote != "'":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        operator = 0  # length of the control operator at i, if any
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in "'\"`":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0:
+            nxt = command[i + 1] if i + 1 < n else ""
+            if ch in ";\n":
+                operator = 1
+            elif ch == "|":
+                operator = 2 if nxt and nxt in "|&" else 1
+            elif ch == "&":
+                if nxt == "&":
+                    operator = 2
+                elif not (nxt == ">" or (i and command[i - 1] in "<>")):
+                    operator = 1
+        if operator:
+            spans.append((start, i))
+            start = i + operator
+            i += operator
+            continue
+        i += 1
+    if quote or depth:
+        return None
+    spans.append((start, n))
+    return spans
 
 
 async def apply_quarantine(
