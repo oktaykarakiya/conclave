@@ -1,0 +1,41 @@
+# W18 Evolver respects rejections and learns only from quality failures; follow-ups (resumed cost, operator rejections, UI reasons, resume contract)
+
+Make the workflow evolver respect a rejected proposal and learn only from quality failures, and fix four small follow-ups from the W12/W13 reviews: a resumed session whose cost restarts, operator rejections without a failure reason, failure reasons missing from the UI, and an undocumented resume contract.
+
+MEASURED on the live daemon (2026-11-17/18). Project Conclave runs `experimental.workflow_evolution: suggest`. After every clean task the evolver stored the same proposal: "Shrink: N clean done tasks in a row without a grounded catch by risk, so they become optional (diff-triggered)". It did so after every task from N = 9 to N = 18 (ten proposals in two days), and each time the owner rejected it with the same reason. Each proposal also emitted `workflow.evolution_proposed`, which shows in the UI and the event stream, and needed a decision. `repo.add_workflow_proposal` skips a new proposal only when an identical one is still *pending*; a rejected one does not count, so a rejection holds for exactly one task.
+
+REQUIRED
+1. In `suggest` mode (`engine/workflow_evolver.py::evolve_project_workflow`), do not store a proposal when the project already has a *rejected* proposal with the same proposed graph and the same base graph. Use the same comparison `add_workflow_proposal` uses for its pending check (`json.dumps(..., sort_keys=True)` of both graphs). Do the check atomically with the insert, in the same transaction, so two tasks finishing at once cannot both store one.
+   - In that case, emit no `workflow.evolution_proposed` and set `result["suppressed_by"]` to the rejected proposal's id; `result["proposal"]` stays `None`. Everywhere else, `suppressed_by` is `None` (always present in the result).
+   - A rejection holds only for that base graph. Once the live workflow changes (any edit, template, revert, approved proposal), the base graph differs and the evolver may propose again, including the same kind of change.
+   - A proposal that differs from the rejected one (another agent, grow instead of shrink) is stored as today.
+   - `auto` mode and an explicit operator `apply` are unchanged: they apply, never propose.
+   - A manual evolve (`POST /api/projects/{id}/workflow/evolve`, `conclave_evolve_workflow`) in suggest mode follows the same rule and returns `suppressed_by`, so the pilot sees why nothing was stored. W15 made the MCP evolve answer compact by default (no graphs unless `include_graphs`): keep `suppressed_by` in the compact answer too.
+2. Document it: the pilot guide's workflow-evolution section (a rejection stands until the workflow changes; `suppressed_by`), and the `experimental.workflow_evolution` field description.
+
+3. The evolver learns only from quality failures (`engine/workflow_evolver.py`). Found in W13's review: when the test command is removed while a task runs, W13 fails the attempt at the gate and saves the gate checkpoint as `failed` after the review passed. The evolver's checkpoint inference (review `completed` and gate `failed` on the same attempt) reads that as `gate_failed_after_review` and proposes growing the review panel over a configuration error. An infra gate failure (`infra_timed_out` and the like) is saved the same way and is misread the same way.
+   - `gate_failed_after_review` counts only a gate that ran the tests and found them red. Record the cause where the evolver can read it (for example the gate checkpoint's artifact: `tests`, `infra`, `no_test_command`, `operator`), or read W13's `attempt.failed` `stage` and `reason`. A gate checkpoint without a recorded cause (rows written before this change) keeps today's reading.
+   - `task_failed` is a grow signal only when the task ended `failed` with reason `max_retries` or `timeout` and at least one attempt failed at review or at a red test gate. A task that failed with `no_test_command`, on setup, on an unhandled exception, or whose attempts failed only on infra gate runs or developer dispatch errors, is not a signal. Such a task neither counts toward nor breaks the clean-done streak; it is skipped.
+   - The orchestrator's own `gate_failed_after_review` argument (set only for a real red gate) is unchanged.
+   - Tests: a mid-task test-command removal stores no proposal and leaves the streak as it was; a task whose gate failed only for infra stores no grow proposal; a real red gate after a passing review still proposes growth; an old gate checkpoint without a cause keeps today's behaviour.
+4. A resumed run whose running total restarted (`providers/quota.py::_own_cost`). Found in W13's plan: Claude Code saves a session's totals to its transcript when the process exits normally, and restores them on `--resume`. A run that Conclave stops (the W17 refusal grace period, or the timeout) may exit before it saves them, so the resumed run's `total_cost_usd` starts again from its own cost. W13 then charges `max(total - reported, 0)`: 0 for a resumed run that really cost, for example, 2.00 after an interrupted 4.52.
+   - When the continued run's running total is below the total already reported for that session, the engine did not restore the session's totals: charge that run its total in full, and continue the running total from it. When totals were restored, the new total is never below the reported one, so the rule never fires there.
+   - Tests (fake `claude` whose `--resume` restarts the total at 0): run costs 4.52 then 2.00 give interrupted 4.52 and final 2.00; the restored case (4.52 then 8.49 → 3.97) is unchanged.
+5. Operator rejections say why (`engine/orchestrator.py`). Found in W13's review: an operator who rejects at a HITL checkpoint (the developer node's `await_human_approval`, the gate's, a reviewer's override to fail) sends the attempt back with feedback, but no `attempt.failed` is emitted and the attempt's failure reason is not updated, so a failed task's "; last:" can name an older attempt's cause.
+   - Emit `attempt.failed` for each operator rejection, with the stage (`developer`, `gate` or `review`) and `reason` "operator rejected: <the operator's message, one line, bounded like W13's reasons>", and make it the attempt's last reason.
+   - Tests: a HITL rejection at the developer checkpoint and at the gate checkpoint each emit that event, and a task that then fails ends its summary with that reason.
+6. The UI shows why an attempt failed (`frontend/src/pages/LivePanel.tsx`, `TasksPanel.tsx`). W13 added `reason` to every `attempt.failed`; the Live panel renders only `error`. Render `reason` (fall back to `error` for old events), bounded like the other event lines. Rebuild and commit the SPA (`src/conclave/web/static/`).
+7. Document the resume contract of `dispatch_with_quota` (from W13's review). Only `dispatch_with_quota` sets `profile.resume_session_id` today. A caller that passes a profile that already resumes a session would have its first run charged the session's whole running total, because the earlier runs' total is unknown to the function. Say so in its docstring (callers start fresh sessions; continuing one is the function's job), and add a test that no module outside `providers/` sets `resume_session_id`.
+
+Item 3, 5 and 7: update the pilot guide where it describes the evolver's signals and `attempt.failed`.
+
+TESTS (items 1-2)
+- Reject a proposal, then evolve again with the same input: no new proposal (pending or otherwise), no `workflow.evolution_proposed` event, and `suppressed_by` equals the rejected id. This covers the automatic post-task hook and the manual REST and MCP evolve.
+- After the workflow changes (apply a template), the same evolution input stores a new pending proposal.
+- A pending identical proposal is still deduplicated as today. An approved proposal does not suppress.
+- Two concurrent evolutions after a rejection store nothing.
+
+CONSTRAINTS
+- No DB migration is needed (the proposals table already has `state`, `proposed_graph_json`, `base_graph_json`). If one is needed after all, it is append-only.
+- Never weaken or skip an existing test. Never call the live daemon or its MCP tools.
+- Quality gate (must stay green): `ruff check src tests && mypy && pytest -q` and `cd frontend && npx tsc --noEmit && npm run build`.

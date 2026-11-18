@@ -35,10 +35,75 @@ full gate is green.
     (`specs/w6_workflow_evolution.md`);
   - W7 cancellation stops retries immediately; attaching an attached path no longer modifies it
     (`specs/w7_cancel_and_attach.md`).
+- Run 3 (2026-11-17/18), Claude only, with the usage limit as a live test (`RESULTS.md`, run 3):
+  - W8 Claude Code worker isolation: no MCP servers, user settings, plugins, skills, auto-memory
+    or `CLAUDE.md` loading in worker dispatches (`specs/w8_claude_worker_isolation.md`);
+  - W9 usage limits: a refusal waits for the reset and resumes the same session, never fails
+    work or skips a reviewer (`specs/w9_quota_wait_and_resume.md`);
+  - W17 Claude Code worker tool scope: no messaging other sessions, scheduling, notifications,
+    workflows or leaving the worktree; no background wake-ups; full usage
+    (`specs/w17_claude_worker_tool_scope.md`);
+  - W10 opencode worker isolation: no MCP servers, no external skills, `extra_env` honoured
+    (`specs/w10_opencode_worker_isolation.md`);
+  - W11 each project rule file once, per engine (`specs/w11_rules_once_per_engine.md`);
+  - W12 mandatory reviewers must answer, failed planners retried and visible, the committed SPA
+    out of the review diff (`specs/w12_review_and_plan_completeness.md`);
+  - W13 engine backlog: merge race, bounded baseline, no-test-command paths, linear focus scan,
+    repro-gate cancel, resumed-session cost counted once, failure reasons everywhere
+    (`specs/w13_engine_backlog_fixes.md`);
+  - W14 MCP stdio bridge never opens the database, hot-reload-safe enum comparisons, response
+    shapes in the descriptions, `GET /mcp` 405 (`specs/w14_mcp_stdio_and_enum_safety.md`);
+  - W15 MCP parity and compact answers (`specs/w15_mcp_parity.md`, completes `r4`);
+  - W16 interaction-log retention and an honest export
+    (`specs/w16_interaction_log_retention.md`);
+  - W18 the evolver respects a rejection and learns only from quality failures, plus the W12/W13
+    review follow-ups (`specs/w18_evolver_respects_rejections.md`).
 
 ## Remaining work, in order (one task at a time, pilot review before each merge)
 
-1. **MCP parity** — the rest of `specs/r4_mcp_parity.md`: config schema, models/engines, usage,
-   HITL state, quarantine integrity, needs-human (the attach fix landed as W7).
-2. **Log retention** for interaction logs (settable).
-3. Small fixes from `backlog.md`.
+1. **Audits** — Conclave audits its own providers, engine, and MCP/web/database layers
+   (`specs/a1..a3`), fixing every defect it can demonstrate with a failing test.
+2. The open items in `backlog.md`.
+
+## Run 3 (2026-11-17/18): worker isolation, usage limits, review completeness, backlog
+
+Owner decisions: Claude only (every seat `claude-code/claude-opus-5-5`, project-scoped; the DeepSeek
+balance is empty, HTTP 402); fix every flaw found, including new ones, with complete tests; a usage
+limit must pause the work and continue seamlessly after the reset.
+
+Waves (one task at a time; the pilot reads every diff, runs the hidden tests in `hidden-tests/`,
+then merges; deploy between waves when the daemon's other project is idle):
+
+| Wave | Task | Why |
+|---|---|---|
+| A | W8 Claude Code worker isolation (`specs/w8_claude_worker_isolation.md`) | workers loaded the operator's MCP servers (including Conclave's own), plugins, skills and auto-memory under `--dangerously-skip-permissions` |
+| A | W9 usage-limit wait and resume (`specs/w9_quota_wait_and_resume.md`) | a limit hit failed the whole queue, skipped the plan and let a partial review panel pass |
+| A | W10 opencode worker isolation (`specs/w10_opencode_worker_isolation.md`) | Playwright MCP and synced skills in every request; random duplicate skills broke the prompt cache; `extra_env` ignored |
+| B | W11 rule files once per engine (`specs/w11_rules_once_per_engine.md`) | `AGENTS.md` sent twice per dispatch |
+| B | W12 review and plan completeness (`specs/w12_review_and_plan_completeness.md`) | a mandatory reviewer without a verdict did not block (hidden test: a task whose security reviewer never answered, or crashed, ended `done`); a failed planner was skipped silently; the committed SPA bundle filled the review diff |
+| A | W17 Claude Code worker tool scope (`specs/w17_claude_worker_tool_scope.md`) | found live during W9: isolated workers still had `SendMessage`/`ListAgents` (reach other Claude sessions on the host, the pilot's included), `CronCreate`/`RemoteTrigger`, `PushNotification`, `Workflow`, `EnterWorktree`; a background `pytest` woke the planner for a second, repeated turn; usage kept only the last `result` (1 turn instead of 103) |
+| C | W13 engine backlog fixes (`specs/w13_engine_backlog_fixes.md`) | backlog 5–9; reproduced on master by the hidden tests: two concurrent merges both returned 200, a stored baseline row of 840,000 chars, a test command removed mid-task still ended `done`, a quadratic focus-marker scan (4k markers 2.3 s); found live: a resumed Claude Code session's cost counted twice (13.01 recorded for a planner that cost 8.49); found on W12's branch: a failed attempt and a failed task never said why (`attempt.failed` without `reason`, summary "failed (max_retries)") |
+| C | W14 MCP stdio safety, enum identity, response shapes (`specs/w14_mcp_stdio_and_enum_safety.md`) | backlog 2–4: the stdio fallback mutated the live DB without the daemon lock; found live: `GET /mcp` answered 200 JSON, so the pilot's own MCP client re-polled it every second (392,577 requests in two days) |
+| C | W15 MCP parity (`specs/w15_mcp_parity.md`) | rest of r4 |
+| C | W18 the evolver respects a rejection and learns only from quality failures, plus review follow-ups (`specs/w18_evolver_respects_rejections.md`) | found live: the same "make risk optional" proposal came back after every clean task (ten times) although the owner rejected each one; found in W13's review: a removed test command or an infra gate failure read as a quality failure, a resumed run whose total restarted charged 0, operator rejections without a reason |
+| C | W16 interaction-log retention and honest export (`specs/w16_interaction_log_retention.md`) | 38.5 MB never pruned; a JSONL file named `.parquet` rewritten after every dispatch |
+| D | audits A1 providers, A2 engine, A3 MCP/web/database (`specs/a1..a3`): Conclave hunts for defects, fixes each one it can demonstrate with a failing test | "all flaws fixed, even newly discovered ones" |
+
+Deferred with reasons: persona-first prompt order (it only helps prefix-cached engines; Claude Code
+sends the prompt as one block, so there is nothing to gain there, and a DeepSeek A/B needs a funded
+account); staggered parallel reviewers (needs a measurement first).
+
+Usage-limit evidence before W9 (`e2e/`: a scratch daemon on its own home and port, a fake `claude`
+emitting Claude Code 2.1.326's measured `rate_limit_event`/`error: "rate_limit"` stream): one refusal
+burned all three developer attempts within the same second, the post-mortem hit the same limit, the
+task failed with `max_retries`, and the workflow evolver proposed growing the review panel over what
+was only a usage limit.
+
+Usage limits hit for real during the run (Claude Code 2.1.326, the five-hour window), each one waited
+out by the gate and resumed in the same session (`quota.waiting` → `quota.resumed`,
+`resumed_session: true`), no attempt consumed, nothing failed:
+- W17's planner, 2026-11-17 12:56 UTC: waited 4,492 s, resumed and finished its plan.
+- W12's planner, 18:28 UTC: waited 2,558 s, resumed, plan in 8 more minutes.
+- W12's `risk` reviewer, 20:05 UTC: waited 14,728 s (overnight), resumed at 00:11, rendered its
+  verdict; the task committed at 00:15. The laptop was rebooted at 00:35: the systemd user service
+  brought the daemon back at boot with nothing in flight and nothing lost.

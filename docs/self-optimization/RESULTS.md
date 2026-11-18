@@ -66,3 +66,72 @@ Observations:
   the specs missed (W1: six more flaky waits; W2: `run_tests` trimmed all output at the source).
 - No test was weakened: the few removed tests covered deleted code and were replaced, and every new
   skip marker in the tests is test data for the integrity parser.
+
+# Run 3 (2026-11-17/18) — worker isolation, usage limits, review completeness, backlog (W8–W18)
+
+Owner decisions: Claude only (every seat `claude-code/claude-opus-5-5`, project-scoped: planners
+and developer `max`, reviewers `xhigh`); fix every flaw found, including new ones, with complete
+tests; a usage limit must pause the work and continue seamlessly after the reset; push when done.
+
+Method: the pilot wrote each spec from measurements on this host, then a hidden acceptance test
+(`hidden-tests/`) from the spec alone, and checked that it fails on master for the right reason.
+After the developer finished, the pilot snapshotted the worktree, ran every hidden test so far and
+the full suite on the snapshot, read the diff, checked the committed branch was byte-identical to
+the snapshot, and only then called `conclave_merge_task`. Each wave was deployed (SQLite backup,
+stop, fast-forward `master`, start) before the next one began, so later waves ran on the fixes of
+earlier ones. Costs are the engine's notional subscription cost, as reported.
+
+| Task | Attempts | Caught on attempt 1 (by) | Tests after | Reported cost (planner / developer / reviewers) |
+|---|---|---|---|---|
+| W8 Claude Code worker isolation | 1 | — | 859 | 4.44 / 6.18 / 11.46 |
+| W9 usage-limit wait and resume | 2 | a `rate_limit_event` with `status: rejected` but `isUsingOverage: true` (paid extra usage, request served) was read as a refusal: the paid result thrown away and the gate closed for 4 h (tester) | 942 | 8.88 / 24.53 / 24.55 |
+| W17 Claude Code worker tool scope | 1 | — | 966 | 8.49¹ / 5.35 / 6.94 |
+| W10 opencode worker isolation | 1 | — | 992 | 5.26 / 4.03 / 9.11 |
+| W11 rule files once per engine | 1 | — | 1103 | 5.88 / 7.37 / 7.64 |
+| W12 review and plan completeness | 1 | — | 1120 | 12.11 / 9.38 / 9.30 |
+| W13 engine backlog fixes | 1 | — | 1243 | 12.49 / 16.10 / 10.86 |
+| W14 MCP stdio safety, enum identity | 1 | — | 1252 | 4.98 / 5.92 / 5.92 |
+| W15 MCP parity, compact answers | 1 | — | 1259 | 5.80 / 7.45 / 6.73 |
+| W16 interaction-log retention, honest export | 1 | — | 1275 (+1 skipped without pyarrow) | 5.30 / 7.87 / 5.76 |
+| W18 evolver respects rejections, follow-ups | 1 | — | 1307 (+1 skipped) | 6.57 / 8.72 / 6.77 |
+
+¹ Recorded as 13.01: the double count of a resumed Claude Code session that W13 fixed.
+
+Usage limits, live (Claude Code 2.1.326/2.1.327, the five-hour window): each hit closed the
+engine's gate, the dispatch waited for the reset and resumed the same session
+(`quota.waiting` → `quota.resumed`, `resumed_session: true`); no attempt was consumed, nothing
+failed, and no reviewer was skipped:
+- W17's planner, 2026-11-17 12:56 UTC: waited 4,492 s.
+- W12's planner, 18:28 UTC: waited 2,558 s.
+- W12's `risk` reviewer, 20:05 UTC: waited 14,728 s overnight, verdict at 00:11, commit at 00:15.
+- The laptop was rebooted at 00:35: the systemd user service restarted the daemon at boot, with
+  nothing in flight and nothing lost.
+
+Before W9 (`e2e/` harness: scratch daemon, a fake `claude` emitting Claude Code's measured
+refusal stream), one refusal burned all three developer attempts in the same second, the
+post-mortem hit the same limit, the task failed with `max_retries`, and the workflow evolver
+proposed growing the review panel over a usage limit.
+
+Flaws found while piloting, beyond the specs, and fixed in the same run:
+- isolated workers could still message other Claude sessions on the host (`SendMessage`,
+  `ListAgents`), schedule wake-ups, and a background `pytest` woke the planner for a second turn
+  (W17);
+- a resumed Claude Code session's cost was counted twice (W13);
+- a failed attempt or task never said why (W13);
+- `GET /mcp` answered 200 JSON, so the pilot's own MCP client re-polled it every second: 392,577
+  requests in two days (W14; after deploy, two 405s and the client stops);
+- the evolver re-proposed the rejected "make risk optional" change after every clean task (ten
+  times, N = 9 to 19), and read a removed test command or an infra gate failure as a quality
+  failure (W18; after deploy, a manual evolve computed the same change and returned
+  `suppressed_by` with nothing stored);
+- MCP responses too large for a pilot's context (a 110k-character `conclave_get_task`, a 20k-token
+  echo for a one-line decision) (W15; after deploy, a rejection answers in seven lines).
+
+Observations:
+- One second attempt in eleven tasks: the panel caught a real money-and-availability defect that
+  every gate and the other seven reviewers passed. Hidden tests found no defect the panel missed.
+- Opus planners at `max` read the installed Claude Code bundle and the opencode source to verify
+  behaviour before planning (W9: the real refusal stream; W14: which client versions mishandle a
+  405 or a 404), instead of trusting the spec.
+- The test-integrity guard flagged one removed test (W14): the rewrite of the stdio fallback
+  test, intended by the spec; the duplicate-execution guarantees it held were kept.
