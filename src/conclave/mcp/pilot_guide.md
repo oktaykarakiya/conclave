@@ -274,8 +274,9 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 
 - `conclave_create_task(project_id, request, title, auto_approve=true, use_planner)` →
   `conclave_get_task(task_id)` (the task is under the `task` key) for state and `result_summary`.
-- `conclave_get_task_events(task_id, after_id)` returns events in **pages**: loop, passing the
-  last seen `id` as `after_id`, until the page is empty. Useful types:
+- `conclave_get_task_events(task_id, after_id)` returns events in **pages** of at most 500,
+  oldest first after `after_id`: loop, passing the last event's `id` as `after_id`, until fewer
+  than 500 come back. Useful types:
   `task.started`, `plan.artifact`, `attempt.started`, `attempt.failed` (`n`, `stage`:
   `developer` | `review` | `gate`, and `reason`: why, on one line of at most 300 characters,
   e.g. `rejected by SECURITY (fail): <its reason>`,
@@ -467,10 +468,19 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
 
 ## 11. Pitfalls and response shapes
 
-- `conclave_get_task` wraps the task as `{"task": {...}}`; list tools may wrap lists too —
-  read the keys before indexing.
-- Event lists are paged (§6); a single call is not the full history.
+- `conclave_get_task` returns `{"task": {...}, "checkpoints": [...], "verdicts": [...],
+  "usage": {...}, "hitl": {"armed": [...], "waiting": [...]}}`: the task is under `task`, with
+  at most 100 verdicts (`conclave_get_task_verdicts` returns up to 200) and the token totals
+  under `usage`. List tools may wrap lists too (`conclave_list_quarantine` returns
+  `{"integrity": {...}, "entries": [...]}`) — read the keys before indexing.
+- Event lists are paged, 500 events per call (§6); a single call is not the full history. The
+  other list tools return one bounded page with no cursor: each tool's description gives its
+  cap and order.
 - Tool errors come back with `isError: true` and a text message; they are not exceptions.
+- Over the stdio bridge (`conclave-mcp`) with the daemon down, `initialize`, the tool list and
+  this guide still answer, but every tool call returns `isError` with
+  `Conclave daemon unreachable at <url>: <reason>`. The bridge never runs a tool itself: start
+  the daemon (`./conclave` or `systemctl --user start conclave`) and call again.
 - Attaching an already-attached path is refused with `isError` and changes nothing; change that
   project with `conclave_patch_config` (§3).
 - Settings are layered (§3): a global change reaches every project that does not override that

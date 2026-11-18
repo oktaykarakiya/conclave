@@ -825,7 +825,7 @@ async def decide_workflow_proposal(
     proposal was computed from. Rejecting leaves the workflow as it is. A proposal that is no
     longer pending, or a live workflow that changed, raises :class:`WorkflowConflictError`.
     """
-    if proposal.state is not WorkflowProposalState.pending:
+    if proposal.state != WorkflowProposalState.pending:
         raise WorkflowConflictError(
             f"workflow proposal {proposal.id} is already {proposal.state.value}"
         )

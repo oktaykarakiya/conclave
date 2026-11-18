@@ -22,12 +22,24 @@ async def get_mcp_info(request: Request) -> dict[str, Any]:
     return mcp_connect_snippets(f"{scheme}://{host}")
 
 
-@router.get("/mcp")
-async def mcp_get_info(request: Request) -> dict[str, Any]:
-    """Return server metadata on GET /mcp."""
-    host = request.headers.get("host", "127.0.0.1:8700")
-    scheme = request.url.scheme or "http"
-    return mcp_connect_snippets(f"{scheme}://{host}")
+@router.get("/mcp", include_in_schema=False)
+async def mcp_get() -> JSONResponse:
+    """Refuse the optional server-to-client SSE stream: ``405`` with ``Allow: POST``.
+
+    The Streamable HTTP transport lets a client open that stream with ``GET``, and the server
+    must answer it with ``text/event-stream`` or ``405``. Conclave never sends anything
+    unprompted, so it answers ``405`` whatever the ``Accept`` header: a ``200`` reads as a
+    stream that ended at once, which clients reopen every second. Without this route the SPA
+    mount at ``/`` would answer ``404``. The metadata is at ``GET /api/mcp/info``.
+    """
+    return JSONResponse(
+        status_code=405,
+        content={
+            "detail": "Method Not Allowed: send JSON-RPC requests with POST /mcp; "
+            "server metadata is at GET /api/mcp/info"
+        },
+        headers={"Allow": "POST"},
+    )
 
 
 @router.post("/mcp")

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import http.server
 import io
 import json
+import socket
+import threading
 import urllib.error
 from email.message import Message
 from pathlib import Path
@@ -17,7 +20,8 @@ from conclave.db import CheckpointStatus, Database
 from conclave.db import repositories as repo
 from conclave.events import EventType
 from conclave.mcp.__main__ import _forward_http, _run_stdio
-from conclave.mcp.server import handle_mcp_message
+from conclave.mcp.server import handle_mcp_message, handle_offline_mcp_message
+from conclave.mcp.tools import MCP_TOOLS, PILOT_GUIDE_URI, load_pilot_brief, load_pilot_guide
 from conclave.providers import AgentResult, OnChunk, Provider, ResolvedProfile
 from conclave.runtime import Daemon
 
@@ -130,17 +134,14 @@ def test_forward_http_supports_batch_list_response() -> None:
     assert res == batch_payload
 
 
-async def test_run_stdio_no_duplicate_execution_on_timeout_or_http_error_and_fallback_on_refused(
-    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_run_stdio_no_duplicate_execution_on_timeout_or_http_error_and_offline_on_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """_run_stdio must NOT fall back to fallback_daemon on TimeoutError or HTTPError,
-    must emit -32700 on invalid JSON, and MUST fall back on ConnectionRefusedError."""
-    fallback_calls: list[dict[str, Any]] = []
-
-    async def fake_handle_mcp(daemon: Daemon, payload: dict[str, Any]) -> dict[str, Any] | None:
-        fallback_calls.append(payload)
-        return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"fallback": True}}
-
+    """_run_stdio must answer TimeoutError and HTTPError with -32603 (never anything that could
+    run the call again), emit -32700 on invalid JSON, and answer locally, without a database,
+    on ConnectionRefusedError."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("CONCLAVE_HOME", str(home))
     call_idx = 0
 
     def fake_urlopen(req: Any, timeout: float = 0.0) -> Any:
@@ -165,9 +166,6 @@ async def test_run_stdio_no_duplicate_execution_on_timeout_or_http_error_and_fal
 
     monkeypatch.setattr("sys.stdin", fake_stdin)
     monkeypatch.setattr("sys.stdout", fake_stdout)
-    monkeypatch.setattr("conclave.mcp.__main__.conclave_home", lambda: tmp_path)
-    monkeypatch.setattr("conclave.mcp.__main__.make_provider", _StubProvider)
-    monkeypatch.setattr("conclave.mcp.__main__.handle_mcp_message", fake_handle_mcp)
 
     with patch("urllib.request.urlopen", side_effect=fake_urlopen):
         await _run_stdio()
@@ -179,18 +177,258 @@ async def test_run_stdio_no_duplicate_execution_on_timeout_or_http_error_and_fal
     assert out_lines[0]["error"]["code"] == -32700
     assert out_lines[0]["id"] is None
 
-    # 2. TimeoutError -> -32603 error, NOT sent to fallback_daemon
+    # 2. TimeoutError -> -32603 error, not answered as if the daemon were down
     assert out_lines[1]["id"] == 1
     assert out_lines[1]["error"]["code"] == -32603
 
-    # 3. HTTPError -> -32603 error, NOT sent to fallback_daemon
+    # 3. HTTPError -> -32603 error, not answered as if the daemon were down
     assert out_lines[2]["id"] == 2
     assert out_lines[2]["error"]["code"] == -32603
 
-    # 4. ConnectionRefusedError -> handled cleanly by fallback_daemon
-    assert out_lines[3] == {"jsonrpc": "2.0", "id": 3, "result": {"fallback": True}}
-    assert len(fallback_calls) == 1
-    assert fallback_calls[0]["id"] == 3
+    # 4. ConnectionRefusedError -> answered locally, without opening any database
+    assert out_lines[3] == {"jsonrpc": "2.0", "id": 3, "result": {}}
+    assert call_idx == 3
+    assert not home.exists()
+
+
+_RETRY_HINT = "Start it (./conclave or systemctl --user start conclave) and retry."
+
+
+def _closed_local_port() -> int:
+    """A local TCP port nothing listens on (bound, read, then released)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+    return port
+
+
+async def _run_stdio_lines(
+    monkeypatch: pytest.MonkeyPatch, url: str, home: Path, messages: list[Any]
+) -> list[Any]:
+    """Run the stdio bridge against *url* on *messages* and return the parsed output lines."""
+    monkeypatch.setenv("CONCLAVE_URL", url)
+    monkeypatch.setenv("CONCLAVE_HOME", str(home))
+    monkeypatch.setenv("CONCLAVE_MCP_TIMEOUT", "10")
+    # urllib honours *_proxy variables: talk to 127.0.0.1 directly.
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NO_PROXY", "*")
+    fake_stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdin", io.StringIO("".join(json.dumps(m) + "\n" for m in messages)))
+    monkeypatch.setattr("sys.stdout", fake_stdout)
+    await _run_stdio()
+    return [json.loads(line) for line in fake_stdout.getvalue().splitlines() if line.strip()]
+
+
+async def test_run_stdio_with_the_daemon_down_answers_locally_and_never_opens_a_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nothing listening at CONCLAVE_URL, the bridge answers initialize, ping, tools/list
+    and the guide resource itself, refuses every tool call (mutating ones included) with an
+    isError result, and never creates or opens a database in CONCLAVE_HOME."""
+
+    def no_database(self: Database) -> None:
+        raise AssertionError("the stdio bridge opened a database")
+
+    monkeypatch.setattr(Database, "connect", no_database)
+    port = _closed_local_port()
+    home = tmp_path / "home"
+    merge = {"name": "conclave_merge_task", "arguments": {"task_id": "t1"}}
+    delete = {"name": "conclave_delete_task", "arguments": {"task_id": "t1"}}
+    out = await _run_stdio_lines(
+        monkeypatch,
+        f"http://127.0.0.1:{port}/",
+        home,
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"},
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "resources/list"},
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "resources/read",
+                "params": {"uri": PILOT_GUIDE_URI},
+            },
+            {"jsonrpc": "2.0", "id": 5, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": merge},
+            [
+                {"jsonrpc": "2.0", "id": 7, "method": "ping"},
+                {"jsonrpc": "2.0", "method": "notifications/cancelled"},
+                {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": delete},
+            ],
+            [{"jsonrpc": "2.0", "method": "notifications/initialized"}],
+        ],
+    )
+
+    assert len(out) == 7  # one line per request or batch with a request; none for notifications
+    init = out[0]
+    assert init["id"] == 1
+    assert init["result"]["protocolVersion"] == "2025-06-18"
+    assert init["result"]["serverInfo"]["name"] == "conclave-mcp"
+    assert init["result"]["instructions"] == load_pilot_brief()
+    assert out[1] == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"tools": json.loads(json.dumps(MCP_TOOLS))},
+    }
+    assert [r["uri"] for r in out[2]["result"]["resources"]] == [PILOT_GUIDE_URI]
+    assert out[3]["result"]["contents"][0]["text"] == load_pilot_guide()
+    assert out[4] == {"jsonrpc": "2.0", "id": 5, "result": {}}
+
+    call = out[5]
+    assert call["id"] == 6
+    assert call["result"]["isError"] is True
+    text = call["result"]["content"][0]["text"]
+    assert text.startswith(f"Conclave daemon unreachable at http://127.0.0.1:{port}: ")
+    assert "refused" in text.lower()
+    assert text.endswith(_RETRY_HINT)
+
+    batch = out[6]
+    assert isinstance(batch, list) and len(batch) == 2
+    assert batch[0] == {"jsonrpc": "2.0", "id": 7, "result": {}}
+    assert batch[1]["id"] == 8
+    assert batch[1]["result"] == {"content": [{"type": "text", "text": text}], "isError": True}
+
+    assert not (home / "conclave.db").exists()
+    assert not home.exists()
+
+
+def _recording_mcp_handler(
+    received: list[tuple[str, str | None, Any]],
+) -> type[http.server.BaseHTTPRequestHandler]:
+    """A stand-in daemon: records each POST and answers requests with 200, notifications 202."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            received.append((self.path, self.headers.get("Content-Type"), body))
+            if "id" not in body:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            reply = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "merged by the daemon"}],
+                        "isError": False,
+                    },
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    return Handler
+
+
+async def test_run_stdio_forwards_to_a_reachable_daemon_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reachable daemon gets every message verbatim at POST /mcp; its reply is written back
+    as it came, a notification's 202 writes nothing, and the bridge needs no CONCLAVE_HOME."""
+    received: list[tuple[str, str | None, Any]] = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _recording_mcp_handler(received))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    home = tmp_path / "home"
+    call = {
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {"name": "conclave_merge_task", "arguments": {"task_id": "t1"}},
+    }
+    notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    try:
+        port = server.server_address[1]
+        out = await _run_stdio_lines(
+            monkeypatch, f"http://127.0.0.1:{port}", home, [call, notification]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+
+    assert received == [
+        ("/mcp", "application/json", call),
+        ("/mcp", "application/json", notification),
+    ]
+    assert out == [
+        {
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "result": {
+                "content": [{"type": "text", "text": "merged by the daemon"}],
+                "isError": False,
+            },
+        }
+    ]
+    assert not home.exists()
+
+
+async def test_offline_answers_match_the_daemon_and_refuse_what_needs_it(
+    db: Database, tmp_path: Path
+) -> None:
+    """The bridge's offline answers are the daemon's own for every request that needs no daemon
+    state; a tool call is an isError result and anything else a -32603 error naming why."""
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    unreachable = (
+        "Conclave daemon unreachable at http://127.0.0.1:9: [Errno 111] Connection refused. "
+        + _RETRY_HINT
+    )
+    for message in (
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        },
+        {"jsonrpc": "2.0", "id": 2, "method": "initialize"},
+        {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 5, "method": "resources/list"},
+        {"jsonrpc": "2.0", "id": 6, "method": "resources/read", "params": {"uri": PILOT_GUIDE_URI}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": None, "method": "notifications/cancelled"},
+    ):
+        expected = await handle_mcp_message(daemon, message)
+        assert handle_offline_mcp_message(message, unreachable) == expected, message
+
+    task_uri = {"uri": "conclave://tasks/x"}
+    for message in (
+        {"jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": task_uri},
+        {"jsonrpc": "2.0", "id": 8, "method": "resources/templates/list"},
+        {"jsonrpc": "2.0", "id": 9, "method": "no/such/method"},
+    ):
+        assert handle_offline_mcp_message(message, unreachable) == {
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "error": {"code": -32603, "message": unreachable},
+        }
+
+    call = {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "conclave_list_projects", "arguments": {}},
+    }
+    assert handle_offline_mcp_message(call, unreachable) == {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "result": {"content": [{"type": "text", "text": unreachable}], "isError": True},
+    }
 
 
 async def test_mcp_resource_templates_and_task_resource_read(

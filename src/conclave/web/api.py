@@ -1475,17 +1475,17 @@ async def publish_store_item(
     daemon: Daemon = Depends(get_daemon),
 ) -> StoreItem:
     clean_payload = normalize_config_keys(body.payload)
-    if body.kind is StoreItemKind.workflow:
+    if body.kind == StoreItemKind.workflow:
         try:
             WorkflowGraph.model_validate(clean_payload)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
-    elif body.kind is StoreItemKind.config_preset:
+    elif body.kind == StoreItemKind.config_preset:
         try:
             load_project_config(clean_payload)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
-    elif body.kind is StoreItemKind.agent:
+    elif body.kind == StoreItemKind.agent:
         role = str(clean_payload.get("role") or "conditional")
         persona_md = str(clean_payload.get("persona_md") or "").strip()
         if not persona_md:
@@ -1559,7 +1559,7 @@ async def install_store_item(
         payload={"item": item.model_dump(mode="json"), "project_id": project_id},
     )
 
-    if item.kind is StoreItemKind.workflow:
+    if item.kind == StoreItemKind.workflow:
         try:
             resolved = await save_project_config(
                 daemon.db,
@@ -1588,7 +1588,7 @@ async def install_store_item(
             "workflow": wf_dump,
         }
 
-    if item.kind is StoreItemKind.config_preset:
+    if item.kind == StoreItemKind.config_preset:
         try:
             resolved = await save_project_config(
                 daemon.db,

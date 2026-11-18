@@ -15,6 +15,7 @@ from conclave.bootstrap import seed_global_defaults
 from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine.gitio import run_git
+from conclave.mcp import mcp_connect_snippets
 from conclave.runtime import Daemon
 from conclave.web import create_app
 
@@ -563,3 +564,35 @@ async def test_mcp_attach_hyphenated_store_keys_refuses_reattach_and_global_sett
         assert effective["execution"]["target_branch"] == "release"
         assert effective["execution"]["max_parallel_tasks"] == 6
 
+
+
+async def test_get_mcp_is_405_while_info_and_post_are_unchanged(
+    db: Database, tmp_path: Path
+) -> None:
+    """GET /mcp would open the optional server-to-client stream, which Conclave does not offer:
+    405 with Allow: POST whatever the Accept header (a 200 made clients reopen it every
+    second). GET /api/mcp/info and POST /mcp answer as before."""
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    # The SPA mount at "/" is what answers an unrouted GET /mcp, so it must be present here.
+    assert any(getattr(route, "name", None) == "spa" for route in app.routes)
+    transport = ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for headers in (
+            {},
+            {"Accept": "text/event-stream"},
+            {"Accept": "application/json, text/event-stream"},
+        ):
+            res = await client.get("/mcp", headers=headers)
+            assert res.status_code == 405, headers
+            assert "POST" in [m.strip() for m in res.headers["allow"].split(",")], headers
+            assert "text/event-stream" not in res.headers.get("content-type", "")
+
+        info = await client.get("/api/mcp/info")
+        assert info.status_code == 200
+        assert info.json() == mcp_connect_snippets("http://test")
+
+        ping = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        assert ping.status_code == 200
+        assert ping.json() == {"jsonrpc": "2.0", "id": 1, "result": {}}

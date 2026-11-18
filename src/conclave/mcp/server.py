@@ -90,42 +90,99 @@ def _jsonrpc_error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
-async def handle_mcp_message(
-    daemon: Daemon, payload: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Process one JSON-RPC 2.0 MCP message and return a response dict (or None)."""
+def _parse_message(payload: dict[str, Any]) -> tuple[str, Any, dict[str, Any], bool]:
+    """``(method, id, params, is_notification)`` of one JSON-RPC message."""
     method = str(payload.get("method", ""))
     msg_id = payload.get("id")
     params_raw = payload.get("params")
     params = params_raw if isinstance(params_raw, dict) else {}
-
     # Notifications carry no id and expect no response object.
-    if "id" not in payload or (msg_id is None and method.startswith("notifications/")):
+    notification = "id" not in payload or (msg_id is None and method.startswith("notifications/"))
+    return method, msg_id, params, notification
+
+
+def _pilot_guide_resource() -> dict[str, Any]:
+    return {
+        "uri": PILOT_GUIDE_URI,
+        "name": "Conclave Pilot Guide",
+        "description": (
+            "How to operate Conclave over MCP: multi-agent flows, review/merge, "
+            "model strategy, pitfalls, tool index"
+        ),
+        "mimeType": "text/markdown",
+    }
+
+
+def _static_result(method: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    """The result of a request answered from the packaged definitions alone (no daemon state),
+    or ``None`` when the request needs the daemon."""
+    if method == "initialize":
+        return {
+            "protocolVersion": str(params.get("protocolVersion") or _DEFAULT_PROTOCOL_VERSION),
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "resources": {"subscribe": False, "listChanged": False},
+            },
+            "serverInfo": {
+                "name": "conclave-mcp",
+                "version": __version__,
+            },
+            "instructions": load_pilot_brief(),
+        }
+    if method == "ping":
+        return {}
+    if method == "tools/list":
+        return {"tools": MCP_TOOLS}
+    if method == "resources/read" and str(params.get("uri", "")) == PILOT_GUIDE_URI:
+        return {
+            "contents": [
+                {
+                    "uri": PILOT_GUIDE_URI,
+                    "mimeType": "text/markdown",
+                    "text": load_pilot_guide(),
+                }
+            ]
+        }
+    return None
+
+
+def handle_offline_mcp_message(
+    payload: dict[str, Any], unreachable: str
+) -> dict[str, Any] | None:
+    """Answer one JSON-RPC 2.0 MCP message while the daemon cannot be reached.
+
+    Used by the stdio bridge (``conclave-mcp``), which never opens Conclave's database:
+    ``initialize``, ``ping``, ``tools/list``, ``resources/list`` (the pilot guide only) and
+    ``resources/read`` of the pilot guide get the daemon's own answers. A tool call gets an
+    ``isError`` result and every other request a JSON-RPC error, both with the *unreachable*
+    text; notifications get no response.
+    """
+    method, msg_id, params, notification = _parse_message(payload)
+    if notification:
+        return None
+    result = _static_result(method, params)
+    if result is not None:
+        return _jsonrpc_result(msg_id, result)
+    if method == "resources/list":
+        return _jsonrpc_result(msg_id, {"resources": [_pilot_guide_resource()]})
+    if method == "tools/call":
+        return _jsonrpc_result(
+            msg_id, {"content": [{"type": "text", "text": unreachable}], "isError": True}
+        )
+    return _jsonrpc_error(msg_id, -32603, unreachable)
+
+
+async def handle_mcp_message(
+    daemon: Daemon, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Process one JSON-RPC 2.0 MCP message and return a response dict (or None)."""
+    method, msg_id, params, notification = _parse_message(payload)
+    if notification:
         return None
 
-    if method == "initialize":
-        client_version = str(params.get("protocolVersion") or _DEFAULT_PROTOCOL_VERSION)
-        return _jsonrpc_result(
-            msg_id,
-            {
-                "protocolVersion": client_version,
-                "capabilities": {
-                    "tools": {"listChanged": False},
-                    "resources": {"subscribe": False, "listChanged": False},
-                },
-                "serverInfo": {
-                    "name": "conclave-mcp",
-                    "version": __version__,
-                },
-                "instructions": load_pilot_brief(),
-            },
-        )
-
-    if method == "ping":
-        return _jsonrpc_result(msg_id, {})
-
-    if method == "tools/list":
-        return _jsonrpc_result(msg_id, {"tools": MCP_TOOLS})
+    result = _static_result(method, params)
+    if result is not None:
+        return _jsonrpc_result(msg_id, result)
 
     if method == "tools/call":
         tool_name = str(params.get("name", ""))
@@ -244,17 +301,7 @@ async def handle_mcp_message(
 
     if method == "resources/list":
         projects = await repo.list_projects(daemon.db, limit=100)
-        resources: list[dict[str, Any]] = [
-            {
-                "uri": PILOT_GUIDE_URI,
-                "name": "Conclave Pilot Guide",
-                "description": (
-                    "How to operate Conclave over MCP: multi-agent flows, review/merge, "
-                    "model strategy, pitfalls, tool index"
-                ),
-                "mimeType": "text/markdown",
-            }
-        ]
+        resources: list[dict[str, Any]] = [_pilot_guide_resource()]
         resources.extend(
             {
                 "uri": f"conclave://projects/{p.id}",
@@ -287,19 +334,6 @@ async def handle_mcp_message(
 
     if method == "resources/read":
         uri = str(params.get("uri", ""))
-        if uri == PILOT_GUIDE_URI:
-            return _jsonrpc_result(
-                msg_id,
-                {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "text/markdown",
-                            "text": load_pilot_guide(),
-                        }
-                    ]
-                },
-            )
         if uri.startswith("conclave://projects/"):
             pid = uri.removeprefix("conclave://projects/").strip("/")
             proj = await repo.get_project(daemon.db, pid)

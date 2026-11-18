@@ -122,7 +122,7 @@ async def reproduce_bug(
     # Only a `discovered` candidate is eligible — this gate IS the discovered → {reproduced,
     # dismissed, declined} step. Anything else is a caller error we decline to act on rather than
     # force an illegal transition through the guard.
-    if candidate.status is not BugStatus.discovered:
+    if candidate.status != BugStatus.discovered:
         return ReproResult(outcome=ReproOutcome.ineligible, candidate=candidate)
 
     # bf-repro-pathguard, defense in depth: the path was vetted when the ReproTest was parsed, but

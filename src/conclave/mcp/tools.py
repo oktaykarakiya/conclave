@@ -214,8 +214,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
     # --- Projects & Worker Control ---
     _tool(
         "conclave_list_projects",
-        "List all git repositories attached to Conclave.",
-        {"limit": _prop("integer", "Max items to return (default 50).", default=50)},
+        "List the git repositories attached to Conclave, oldest first.",
+        {"limit": _prop("integer", "Max items to return (1-500, default 50).", default=50)},
     ),
     _tool(
         "conclave_attach_project",
@@ -466,7 +466,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
     # --- Tasks & Live Execution ---
     _tool(
         "conclave_list_tasks",
-        "List tasks for a project, optionally filtered by state.",
+        "List tasks for a project, newest first, optionally filtered by state.",
         {
             "project_id": _prop("string", "Project ID."),
             "state": _prop(
@@ -483,7 +483,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                     "blocked",
                 ],
             ),
-            "limit": _prop("integer", "Max tasks to return.", default=50),
+            "limit": _prop("integer", "Max tasks to return (1-500, default 50).", default=50),
         },
         required=["project_id"],
     ),
@@ -510,7 +510,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_task",
-        "Get full details of a task, including its state, branch, result summary, and checkpoints.",
+        'Get full details of a task. Returns {"task": {...}, "checkpoints": [...], '
+        '"verdicts": [...], "usage": {...}, "hitl": {...}}: the task itself (state, branch, '
+        "result_summary, ...), its step checkpoints, its reviewer verdicts (at most 100, oldest "
+        "first; conclave_get_task_verdicts returns up to 200), its token usage totals, and the "
+        "HITL pauses armed on it and waiting for approval.",
         {"task_id": _prop("string", "Task ID.")},
         required=["task_id"],
     ),
@@ -613,7 +617,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_task_events",
-        "Fetch execution events and live agent output chunks for a task.",
+        "Fetch execution events and live agent output chunks for a task. Returns at most 500 "
+        "events per call, oldest first after after_id, so loop: call again with after_id = the "
+        "last event's id until fewer than 500 come back.",
         {
             "task_id": _prop("string", "Task ID."),
             "after_id": _prop("integer", "Only return events with id > after_id.", default=0),
@@ -622,7 +628,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_task_verdicts",
-        "Fetch grounded reviewer verdicts for a task across attempts.",
+        "Fetch grounded reviewer verdicts for a task across attempts (at most 200, oldest "
+        "first).",
         {"task_id": _prop("string", "Task ID.")},
         required=["task_id"],
     ),
@@ -802,7 +809,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
     # --- Agent Personas ---
     _tool(
         "conclave_list_agents",
-        "List all global and project-scoped agent personas.",
+        "List global and project-scoped agent personas, by name (at most 200).",
         {"project_id": _prop("string", "Optional project ID to include project overrides.")},
     ),
     _tool(
@@ -842,7 +849,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
     # --- Multi-Agent Planning Sessions (Agent-ception) ---
     _tool(
         "conclave_list_planning_sessions",
-        "List multi-agent planning sessions for a project.",
+        "List multi-agent planning sessions for a project (the 50 newest).",
         {"project_id": _prop("string", "Project ID.")},
         required=["project_id"],
     ),
@@ -859,7 +866,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_get_planning_session",
-        "Get a planning session along with its discussion transcript and proposed task tree.",
+        'Get a planning session along with its discussion transcript and proposed task tree: '
+        '{"session": {...}, "messages": [...], "tasks": [...]}, at most 200 messages (in turn '
+        "order) and 200 task nodes.",
         {"session_id": _prop("string", "Planning session ID.")},
         required=["session_id"],
     ),
@@ -887,7 +896,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
     # --- Bug-Fixer & Quarantine ---
     _tool(
         "conclave_list_bug_candidates",
-        "List discovered/reproduced/fixed bug candidates from the autonomous Bug-Fixer ledger.",
+        "List discovered/reproduced/fixed bug candidates from the autonomous Bug-Fixer ledger "
+        "(the 100 newest; with needs_human_only, all of them).",
         {
             "project_id": _prop("string", "Project ID."),
             "needs_human_only": _prop(
@@ -898,7 +908,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_list_quarantine",
-        "List quarantined test patterns and gate health integrity for a project.",
+        'List quarantined test patterns and gate health integrity for a project: {"integrity": '
+        '{...}, "entries": [...]}, at most 100 entries, soonest expiry first.',
         {"project_id": _prop("string", "Project ID.")},
         required=["project_id"],
     ),
@@ -922,7 +933,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
     # --- Global Store (Workflows, Agents, Config Presets) ---
     _tool(
         "conclave_store_list",
-        "List reusable workflow diagrams, agent personas, and config presets in the Global Store.",
+        "List reusable workflow diagrams, agent personas, and config presets in the Global Store "
+        "(at most 200 items).",
         {
             "kind": _prop(
                 "string",
@@ -1089,14 +1101,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_list_interactions",
-        "List logged agent and MCP conversations from interaction_logs.",
+        "List logged agent and MCP conversations from interaction_logs, newest first.",
         {
             "project_id": _prop("string", "Optional project ID filter."),
             "task_id": _prop("string", "Optional task ID filter."),
             "agent": _prop("string", "Optional agent filter."),
             "model": _prop("string", "Optional model filter."),
             "search": _prop("string", "Optional full-text search query."),
-            "limit": _prop("integer", "Max rows to return (default 50).", default=50),
+            "limit": _prop("integer", "Max rows to return (1-500, default 50).", default=50),
         },
     ),
     _tool(
@@ -1112,7 +1124,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "Execute a read-only SQL SELECT query against interaction_logs and return rows.",
         {
             "sql": _prop("string", "Read-only SELECT or WITH SQL query against interaction_logs."),
-            "limit": _prop("integer", "Max rows to return (default 200).", default=200),
+            "limit": _prop("integer", "Max rows to return (1-5000, default 200).", default=200),
         },
         required=["sql"],
     ),
@@ -1939,7 +1951,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 payload={"message": message},
             )
             return {"steered": True, "task_id": task.id}
-        if task.state is not TaskState.in_progress:
+        if task.state != TaskState.in_progress:
             raise McpToolError(f"task is in state {task.state.value}, not in_progress")
         queued = await daemon.request_steer(task.id, message)
         if not queued:
@@ -1948,7 +1960,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
 
     if name == "conclave_delete_task":
         task = await _require_task(daemon, _opt_str(args, "task_id"))
-        if task.state is TaskState.in_progress:
+        if task.state == TaskState.in_progress:
             raise McpToolError("cannot delete an in_progress task — cancel it first")
         deleted = await repo.delete_task(daemon.db, task.id)
         if not deleted:
@@ -2486,11 +2498,11 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         if not item_name or not isinstance(raw_payload, dict):
             raise McpToolError("name and object payload are required")
         payload = normalize_config_keys(raw_payload)
-        if store_kind is StoreItemKind.workflow:
+        if store_kind == StoreItemKind.workflow:
             WorkflowGraph.model_validate(payload)
-        elif store_kind is StoreItemKind.config_preset:
+        elif store_kind == StoreItemKind.config_preset:
             load_project_config(payload)
-        elif store_kind is StoreItemKind.agent:
+        elif store_kind == StoreItemKind.agent:
             ag_role = str(payload.get("role") or "conditional")
             ag_md = str(payload.get("persona_md") or "").strip()
             if not ag_md:
@@ -2559,7 +2571,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             payload={"item": item.model_dump(mode="json"), "project_id": project.id},
         )
 
-        if item.kind is StoreItemKind.workflow:
+        if item.kind == StoreItemKind.workflow:
             resolved = await save_project_config(
                 daemon.db,
                 project,
@@ -2586,7 +2598,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
                 "kind": item.kind.value,
                 "workflow": wf_out,
             }
-        if item.kind is StoreItemKind.config_preset:
+        if item.kind == StoreItemKind.config_preset:
             resolved = await save_project_config(
                 daemon.db,
                 project,

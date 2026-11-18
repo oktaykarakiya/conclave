@@ -1,8 +1,12 @@
 """Stdio MCP entrypoint (`python -m conclave.mcp` or `conclave-mcp`).
 
 Forwards JSON-RPC 2.0 MCP messages over stdin/stdout to the running Conclave daemon
-(`CONCLAVE_URL`, default `http://127.0.0.1:8700`), or falls back to an in-process
-SQLite session if the HTTP daemon is unreachable.
+(`CONCLAVE_URL`, default `http://127.0.0.1:8700`). The bridge never opens Conclave's
+database or runs a tool itself: only the daemon, which holds the data-dir lock, does. While
+the daemon is unreachable (stopped, or restarting during a deploy), `initialize`, `ping`,
+`tools/list` and the pilot guide resource are answered from the same packaged definitions
+the daemon serves, and a tool call (or any other request) gets an error naming the URL and
+the reason. Every message tries the daemon first, so the bridge recovers once it is back.
 """
 
 from __future__ import annotations
@@ -15,11 +19,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from ..bootstrap import seed_global_defaults
-from ..db import Database
-from ..main import conclave_home, make_provider
-from ..runtime import Daemon
-from .server import handle_mcp_message
+from .server import handle_offline_mcp_message
 
 
 def _forward_http(
@@ -108,99 +108,94 @@ def _forward_http(
         raise
 
 
+def _answer_offline(
+    msg: dict[str, Any] | list[Any], unreachable: str
+) -> dict[str, Any] | list[Any] | None:
+    """Answer *msg* (one message or a batch) without the daemon; ``None``: nothing to send."""
+    if isinstance(msg, list):
+        replies: list[dict[str, Any]] = []
+        for item in msg:
+            if isinstance(item, dict):
+                reply = handle_offline_mcp_message(item, unreachable)
+                if reply is not None:
+                    replies.append(reply)
+        return replies if replies else None
+    return handle_offline_mcp_message(msg, unreachable)
+
+
 async def _run_stdio() -> None:
     base_url = os.environ.get("CONCLAVE_URL", "http://127.0.0.1:8700").rstrip("/")
     mcp_url = f"{base_url}/mcp"
-    fallback_daemon: Daemon | None = None
 
-    async def _get_fallback_daemon() -> Daemon:
-        nonlocal fallback_daemon
-        if fallback_daemon is None:
-            home = conclave_home()
-            db = Database(home / "conclave.db")
-            await db.connect()
-            await seed_global_defaults(db)
-            fallback_daemon = Daemon(db, home, make_provider(), workers_enabled=False)
-        return fallback_daemon
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as exc:
+            parse_err = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": f"Parse error: {exc.msg}"},
+            }
+            sys.stdout.write(json.dumps(parse_err) + "\n")
+            sys.stdout.flush()
+            continue
+        if not isinstance(msg, (dict, list)):
+            inv_err = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"},
+            }
+            sys.stdout.write(json.dumps(inv_err) + "\n")
+            sys.stdout.flush()
+            continue
 
-    try:
-        for raw_line in sys.stdin:
-            line = raw_line.strip()
-            if not line:
-                continue
+        response: dict[str, Any] | list[Any] | None = None
+        try:
+            response = await asyncio.to_thread(_forward_http, mcp_url, msg)
+        except urllib.error.HTTPError as exc:
             try:
-                msg = json.loads(line)
-            except json.JSONDecodeError as exc:
-                parse_err = {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": f"Parse error: {exc.msg}"},
-                }
-                sys.stdout.write(json.dumps(parse_err) + "\n")
-                sys.stdout.flush()
-                continue
-            if not isinstance(msg, (dict, list)):
-                inv_err = {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32600, "message": "Invalid Request"},
-                }
-                sys.stdout.write(json.dumps(inv_err) + "\n")
-                sys.stdout.flush()
-                continue
-
-            response: dict[str, Any] | list[Any] | None = None
-            try:
-                response = await asyncio.to_thread(_forward_http, mcp_url, msg)
-            except urllib.error.HTTPError as exc:
-                try:
-                    exc.close()
-                except Exception:
-                    pass
+                exc.close()
+            except Exception:
+                pass
+            msg_id = msg.get("id") if isinstance(msg, dict) else None
+            response = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32603, "message": f"HTTP {exc.code} {exc.reason}"},
+            }
+        except TimeoutError as exc:
+            msg_id = msg.get("id") if isinstance(msg, dict) else None
+            response = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32603, "message": f"MCP HTTP request timed out: {exc}"},
+            }
+        except (urllib.error.URLError, ConnectionError, OSError) as exc:
+            if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError):
                 msg_id = msg.get("id") if isinstance(msg, dict) else None
                 response = {
                     "jsonrpc": "2.0",
                     "id": msg_id,
-                    "error": {"code": -32603, "message": f"HTTP {exc.code} {exc.reason}"},
+                    "error": {
+                        "code": -32603,
+                        "message": f"MCP HTTP request timed out: {exc.reason}",
+                    },
                 }
-            except TimeoutError as exc:
-                msg_id = msg.get("id") if isinstance(msg, dict) else None
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "error": {"code": -32603, "message": f"MCP HTTP request timed out: {exc}"},
-                }
-            except (urllib.error.URLError, ConnectionError, OSError) as exc:
-                if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError):
-                    msg_id = msg.get("id") if isinstance(msg, dict) else None
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "error": {
-                            "code": -32603,
-                            "message": f"MCP HTTP request timed out: {exc.reason}",
-                        },
-                    }
-                else:
-                    daemon = await _get_fallback_daemon()
-                    if isinstance(msg, list):
-                        batch_responses: list[dict[str, Any]] = []
-                        for item in msg:
-                            if isinstance(item, dict):
-                                item_res = await handle_mcp_message(daemon, item)
-                                if item_res is not None:
-                                    batch_responses.append(item_res)
-                        response = batch_responses if batch_responses else None
-                    else:
-                        response = await handle_mcp_message(daemon, msg)
+            else:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                unreachable = (
+                    f"Conclave daemon unreachable at {base_url}: "
+                    f"{str(reason) or type(reason).__name__}. "
+                    "Start it (./conclave or systemctl --user start conclave) and retry."
+                )
+                response = _answer_offline(msg, unreachable)
 
-            if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
-    finally:
-        if fallback_daemon is not None:
-            await fallback_daemon.shutdown()
-            await fallback_daemon.db.close()
+        if response is not None:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
 
 
 def main() -> None:

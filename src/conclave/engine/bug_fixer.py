@@ -103,7 +103,7 @@ class CycleOutcome(StrEnum):
     @property
     def did_work(self) -> bool:
         """True when the cycle acted on a candidate (anything but a no-candidate idle turn)."""
-        return self is not CycleOutcome.idle
+        return self != CycleOutcome.idle
 
 
 @dataclass(frozen=True)
@@ -182,14 +182,14 @@ class BugFixerController:
             cancel_event=cancel_event,
         )
 
-        if result.outcome is ReproOutcome.reproduced:
+        if result.outcome == ReproOutcome.reproduced:
             return await self._fix_reproduced(
                 project, result.candidate, repro, config, cancel_event=cancel_event, waits=waits,
             )
-        if result.outcome is ReproOutcome.dismissed:
+        if result.outcome == ReproOutcome.dismissed:
             await self._log(project.id, result.candidate, "dismissed false positive (gate)")
             return CycleResult(CycleOutcome.dismissed, result.candidate)
-        if result.outcome is ReproOutcome.declined:
+        if result.outcome == ReproOutcome.declined:
             await self._log(project.id, result.candidate, "declined → needs human (gate)")
             return CycleResult(CycleOutcome.declined, result.candidate)
         # infra / rejected / ineligible — the gate changed nothing; skip and retry a later cycle.
@@ -582,9 +582,9 @@ def _decline_threshold_met(
     declines = sum(1 for v in verdicts.values() if v == "decline")
     usable = sum(1 for v in verdicts.values() if v in ("pass", "decline"))
 
-    if threshold is DeclineConsensus.any_two:
+    if threshold == DeclineConsensus.any_two:
         return declines >= 2
-    if threshold is DeclineConsensus.majority:
+    if threshold == DeclineConsensus.majority:
         # Strict majority of the agents that actually voted; an all-abstain round has no majority.
         return usable > 0 and declines * 2 > usable
     # all_mandatory: every polled agent must have cast a usable DECLINE vote (no abstains, no pass).

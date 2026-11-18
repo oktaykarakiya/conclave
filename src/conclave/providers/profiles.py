@@ -142,12 +142,12 @@ def build_invocation(profile: ResolvedProfile) -> Invocation:
     if profile.resume_session_id:
         args += ["--resume", profile.resume_session_id]
 
-    if profile.arg_mode is ArgMode.flag:
+    if profile.arg_mode == ArgMode.flag:
         if profile.model:
             args += ["--model", profile.model]
         if profile.effort:
             args += ["--effort", profile.effort]
-    elif profile.arg_mode is ArgMode.env:
+    elif profile.arg_mode == ArgMode.env:
         if profile.base_url:
             env["ANTHROPIC_BASE_URL"] = profile.base_url
         if profile.auth_token:

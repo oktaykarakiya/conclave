@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -597,3 +600,48 @@ async def test_bad_quality_first_values_are_rejected_over_mcp_and_rest(
 
     glob = await resolve_project_config(db, None)  # nothing bad was stored
     assert glob.system.hot_reload_watch is False and glob.ui.model_choices == []
+
+
+async def test_get_task_and_task_events_describe_what_they_return(
+    db: Database, tmp_path: Path
+) -> None:
+    """conclave_get_task names every key it returns; conclave_get_task_events states its page
+    bound and the after_id loop, and following that loop reads the whole history."""
+    daemon = Daemon(db, tmp_path / "home", _StubProvider(), workers_enabled=False)
+    project = await repo.create_project(db, name="p", path=str(tmp_path), default_branch="main")
+    task = await repo.create_task(db, project_id=project.id, title="t", request="r")
+    by_name = {t["name"]: t for t in MCP_TOOLS}
+
+    details = await call_mcp_tool(daemon, "conclave_get_task", {"task_id": task.id})
+    assert set(details) == {"task", "checkpoints", "verdicts", "usage", "hitl"}
+    get_task_doc = by_name["conclave_get_task"]["description"]
+    for key in details:
+        assert f'"{key}"' in get_task_doc, key
+    assert "at most 100" in get_task_doc
+
+    page = inspect.signature(repo.list_events).parameters["limit"].default
+    events_doc = by_name["conclave_get_task_events"]["description"]
+    assert f"at most {page} events per call, oldest first after after_id" in events_doc
+    assert f"until fewer than {page} come back" in events_doc
+
+    async with db.transaction() as conn:  # one commit for the whole history
+        await conn.executemany(
+            "INSERT INTO events(project_id, task_id, type, payload_json, ts) "
+            "VALUES (?, ?, 'log', ?, '2026-01-01T00:00:00+00:00')",
+            [(project.id, task.id, json.dumps({"i": i})) for i in range(page + 1)],
+        )
+    first = await call_mcp_tool(daemon, "conclave_get_task_events", {"task_id": task.id})
+    assert [e["payload"]["i"] for e in first] == list(range(page))
+    rest = await call_mcp_tool(
+        daemon, "conclave_get_task_events", {"task_id": task.id, "after_id": first[-1]["id"]}
+    )
+    assert [e["payload"]["i"] for e in rest] == [page]
+
+
+def test_every_limit_argument_states_its_range_and_default() -> None:
+    for tool in MCP_TOOLS:
+        limit = tool["inputSchema"]["properties"].get("limit")
+        if limit is not None:
+            assert re.search(rf"\(1-\d+, default {limit['default']}\)", limit["description"]), (
+                tool["name"]
+            )

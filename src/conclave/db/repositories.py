@@ -1494,10 +1494,10 @@ async def transition_bug_status(
         # placeholder, so it is appended to the fragments WITHOUT a matching param.
         sets = ["status = ?", "last_examined_at = ?"]
         params: list[Any] = [target.value, ts]
-        if target is BugStatus.fixed:
+        if target == BugStatus.fixed:
             sets.append("fixed_at = ?")
             params.append(ts)
-        if target is BugStatus.fixing:
+        if target == BugStatus.fixing:
             sets.append("attempts = attempts + 1")
         if task_id is not None:
             sets.append("task_id = ?")

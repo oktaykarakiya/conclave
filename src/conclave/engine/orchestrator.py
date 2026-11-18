@@ -2883,13 +2883,13 @@ class Orchestrator:
         held = bool(integrity) and integrity_mode == "block"
         if config.execution.auto_merge and not held:
             merge_result = await self._merge(repo_path, target_branch, task_branch, task.id)
-            if merge_result is MergeResult.success:
+            if merge_result == MergeResult.success:
                 await self._bus.emit(
                     type=EventType.task_merged, project_id=task.project_id, task_id=task.id,
                     payload={"target": target_branch},
                 )
                 merged = True
-            elif merge_result is MergeResult.conflict:
+            elif merge_result == MergeResult.conflict:
                 # Real merge conflict: task work committed but cannot be merged.
                 # Mark failed, KEEP the branch so the work is preserved, and emit
                 # a loud failure event so the operator can resolve it manually.
@@ -3181,7 +3181,7 @@ class Orchestrator:
         async with contextlib.nullcontext() if held else self.merge_lock(target_branch):
             res = await self._merge_locked(repo_path, target_branch, task_branch, task_id)
             if (
-                res is MergeResult.success
+                res == MergeResult.success
                 and self._reloader is not None
                 and (repo_path / "src" / "conclave").is_dir()
             ):

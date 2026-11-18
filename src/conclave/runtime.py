@@ -114,7 +114,7 @@ class ProjectWorker:
                 if project is None:
                     await self._idle_backoff()
                     continue
-                if project.mode is ProjectMode.autonomous_bug_fixer:
+                if project.mode == ProjectMode.autonomous_bug_fixer:
                     await self._bug_fixer_tick(project)
                 else:
                     config = await resolve_project_config(self._db, project)
@@ -141,7 +141,7 @@ class ProjectWorker:
             logger.exception("process_task escaped for task %s; marking failed", task.id)
             with contextlib.suppress(Exception):
                 current = await repo.get_task(self._db, task.id)
-                if current is not None and current.state is TaskState.in_progress:
+                if current is not None and current.state == TaskState.in_progress:
                     await repo.finalize_task(
                         self._db,
                         task.id,
