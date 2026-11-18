@@ -20,6 +20,7 @@ answer wakes it again), their per-turn counts are summed, see :func:`_merge_resu
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import json
 import os
@@ -176,22 +177,29 @@ class ClaudeCliProvider:
                 stdout = p.stdout
 
                 async def _write_stdin() -> None:
-                    """Drain the prompt into stdin and close it to signal EOF."""
-                    stdin.write(prompt.encode("utf-8"))
-                    await stdin.drain()
+                    """Drain the prompt into stdin and close it to signal EOF. A CLI that exits
+                    without reading it all (one rejecting its arguments) closes the pipe: ignored,
+                    as asyncio's communicate() does, so its own output and exit code tell why."""
+                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                        stdin.write(prompt.encode("utf-8"))
+                        await stdin.drain()
                     stdin.close()
 
                 async def _read_stdout() -> None:
-                    """Consume all stdout chunks, appending to parts and streaming on_chunk."""
+                    """Consume all stdout chunks, appending to parts and streaming on_chunk. One
+                    decoder reads every chunk, so a character split across two reads stays whole;
+                    a read that completes no character streams nothing."""
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     while True:
                         chunk = await stdout.read(4096)
+                        text = decoder.decode(chunk, final=not chunk)
+                        if text:
+                            parts.append(text)
+                            refusals.feed(text)
+                            if on_chunk is not None:
+                                await on_chunk(text)
                         if not chunk:
                             break
-                        text = chunk.decode("utf-8", errors="replace")
-                        parts.append(text)
-                        refusals.feed(text)
-                        if on_chunk is not None:
-                            await on_chunk(text)
 
                 # Run stdin-writing and stdout-reading concurrently so a chatty child
                 # that emits a large volume of stdout while stdin is still being
@@ -209,9 +217,18 @@ class ClaudeCliProvider:
             if cancel_event is not None:
                 cancel_wait_task = asyncio.create_task(_wait_cancel(cancel_event))
                 waiting.append(cancel_wait_task)
-            done, _pending = await asyncio.wait(
-                waiting, timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
-            )
+            try:
+                done, _pending = await asyncio.wait(
+                    waiting, timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
+                )
+            except asyncio.CancelledError:
+                # The task awaiting the dispatch was cancelled (a planning session's cancel, a
+                # worker's stop, shutdown): stop the run as a cancel event does, then re-raise.
+                await _kill_process_group(proc.pid)
+                with contextlib.suppress(ProcessLookupError):
+                    await proc.wait()
+                await _cancel_tasks(drive_task, refusal_task, cancel_wait_task)
+                raise
 
             # --- cancellation won the race ---
             if cancel_wait_task is not None and cancel_wait_task in done:
@@ -258,7 +275,15 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
     """Parse the CLI's output: a single ``--output-format json`` envelope, or the
     ``stream-json`` NDJSON stream whose final ``{"type": "result"}`` event carries the
     same fields. Tool calls, the session id and the rate-limit signals are collected from the
-    stream events."""
+    stream events.
+
+    The answer is the result's ``result`` text only. A run whose JSON output has none (an error
+    result such as ``error_during_execution`` or ``error_max_turns``, or a stream that ended
+    without a result event) gave no answer: its text is empty and it is never ok, whatever its
+    exit code, so nothing it streamed (a file it read, its own thinking) is taken for an answer.
+    Its error is the error result's ``errors`` (else its subtype), or the end of the stream.
+    Output that is not JSON at all is kept as the text.
+    """
     text = raw
     model_reported: str | None = None
     cost_usd: float | None = None
@@ -276,10 +301,16 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        parsed = None
+    # The envelope is a result; any other single JSON value is read as a stream of one line.
+    if not (isinstance(parsed, dict) and parsed.get("type", "result") == "result"):
         scan = _scan_stream(raw, tool_breakdown)
         parsed = scan.result
+    no_answer = False
     if isinstance(parsed, dict):
-        text = str(parsed.get("result", raw))
+        answer = parsed.get("result")
+        text = answer if isinstance(answer, str) else ""
+        no_answer = not isinstance(answer, str)
         is_error = parsed.get("is_error") is True
         model_usage = parsed.get("modelUsage") or {}
         if isinstance(model_usage, dict) and model_usage:
@@ -299,11 +330,15 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
             tokens["output_tokens"] = _as_int(usage.get("output_tokens"))
             tokens["cache_read_tokens"] = _as_int(usage.get("cache_read_input_tokens"))
             tokens["cache_creation_tokens"] = _as_int(usage.get("cache_creation_input_tokens"))
+    elif scan.events:  # a stream that ended without a result event
+        no_answer = True
+        text = ""
     session_id = session_id or scan.session_id
 
     quota = _detect_quota(scan, text)
     ok = (
-        (exit_code == 0 or bool(_SUCCESS_HINT.search(text)))
+        not no_answer
+        and (exit_code == 0 or bool(_SUCCESS_HINT.search(text)))
         and not is_error
         and quota is None
     )
@@ -311,6 +346,8 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
     if not ok:
         error = (
             text.strip()[-500:]
+            or _result_errors(parsed)
+            or (raw.strip()[-500:] if parsed is None else "")
             or (quota.message if quota is not None else "")
             or f"claude exited with code {exit_code}"
         )
@@ -342,6 +379,7 @@ class _StreamScan:
 
     # The last ``result`` event, with the per-turn counts of earlier ones of its session added
     result: dict[str, Any] | None = None
+    events: int = 0  # the JSON object lines read
     session_id: str | None = None  # the last session id any event carried
     rate_limit: dict[str, Any] | None = None  # the latest ``rate_limit_info``
     error: str | None = None  # the top-level ``error`` of the last assistant message, if any
@@ -351,11 +389,14 @@ class _StreamScan:
 def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> _StreamScan:
     """Walk ``stream-json`` lines: tally ``tool_use`` blocks into *tool_breakdown*, keep the last
     ``result`` event (``None`` when the stream never produced one, e.g. a killed process or
-    non-JSON output — the caller then keeps the raw text) and the rate-limit signals. A
+    non-JSON output), count the events read, and keep the rate-limit signals. A
     ``result`` that follows one of the same session is merged with it (:func:`_merge_results`):
-    a session woken for another turn after its answer ends each turn with its own."""
+    a session woken for another turn after its answer ends each turn with its own.
+
+    Lines end at a newline only: JSON leaves U+2028, U+2029 and U+0085 raw inside strings, so
+    :meth:`str.splitlines` would cut the event holding one in two."""
     scan = _StreamScan()
-    for line in raw.splitlines():
+    for line in raw.split("\n"):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -365,6 +406,7 @@ def _scan_stream(raw: str, tool_breakdown: dict[str, int]) -> _StreamScan:
             continue
         if not isinstance(obj, dict):
             continue
+        scan.events += 1
         sid = obj.get("session_id")
         if isinstance(sid, str) and sid:
             scan.session_id = sid
@@ -445,6 +487,18 @@ def _summed(a: dict[str, Any], b: dict[str, Any], keys: tuple[str, ...]) -> dict
 
 def _mapping(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _result_errors(result: dict[str, Any] | None) -> str:
+    """Why a ``result`` without an answer ended: its ``errors`` (an error result's messages), else
+    its subtype (``error_max_turns``, ...); ``""`` when it names neither."""
+    if result is None:
+        return ""
+    errors = result.get("errors")
+    if isinstance(errors, list) and (joined := "; ".join(str(e) for e in errors if e)):
+        return joined[-500:]
+    subtype = result.get("subtype")
+    return subtype if isinstance(subtype, str) and subtype != "success" else ""
 
 
 class _RefusalWatch:
@@ -634,17 +688,20 @@ async def _kill_process_group(pid: int | None) -> None:
 
     Descendant subagents (e.g. tools spawned by the CLI) share the process group
     so a targeted ``killpg`` ensures they are not orphaned.
+
+    *pid* must have been started with ``start_new_session=True`` (every caller does), so it
+    leads its own group and the group's id is *pid*. The group is signalled by that id, never
+    by a ``getpgid`` lookup, which fails once the leader has exited and been reaped: a
+    descendant still holding the CLI's output pipe is then killed all the same.
     """
     if pid is None:
         return
     try:
-        getpgid_fn = getattr(os, "getpgid", None)
         killpg_fn = getattr(os, "killpg", None)
-        if getpgid_fn is not None and killpg_fn is not None:
-            pgid = getpgid_fn(pid)
-            killpg_fn(pgid, signal.SIGTERM)
+        if killpg_fn is not None:
+            killpg_fn(pid, signal.SIGTERM)
             await asyncio.sleep(0.3)
-            killpg_fn(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            killpg_fn(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         else:
             killer = await asyncio.create_subprocess_exec(
                 "taskkill",

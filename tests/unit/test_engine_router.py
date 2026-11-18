@@ -233,7 +233,7 @@ def test_parse_stream_without_result_keeps_raw() -> None:
     raw = '{"type": "system", "subtype": "init"}\nKilled\n'
     r = _parse_envelope(raw, -9)
     assert not r.ok
-    assert r.text == raw
+    assert r.text == ""  # no result event, no answer: the stream is in the error
     assert r.error == "{\"type\": \"system\", \"subtype\": \"init\"}\nKilled"
 
 

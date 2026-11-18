@@ -24,6 +24,7 @@ servers its resolved config names (``opencode debug config``) are each disabled 
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import email.utils
 import json
@@ -39,6 +40,7 @@ from .base import UNKNOWN_SESSION_RE, AgentResult, OnChunk, QuotaExhausted
 from .claude_cli import (
     _SUCCESS_HINT,
     _WIN_SUBPROCESS_KW,
+    _cancel_tasks,
     _kill_process_group,
     _resolve_cli_exec,
     _wait_cancel,
@@ -169,6 +171,8 @@ class OpenCodeCliProvider:
             return AgentResult(ok=False, error="cancelled", cancelled=True)
         env = await self._dispatch_env(profile, cwd)
 
+        # The latest attempt's result, carrying the usage of every attempt so far: each run is paid
+        # for, so whatever this dispatch returns counts them all (see _plus_usage).
         last_result: AgentResult | None = None
         resume_session_id: str | None = profile.resume_session_id
         for attempt_idx in range(_MAX_DISPATCH_ATTEMPTS):
@@ -176,7 +180,9 @@ class OpenCodeCliProvider:
                 await asyncio.sleep(_TRANSIENT_RETRY_DELAY_S + random.random() * 0.25)
             # Never start a run once cancelled, so a transient or empty run is not retried.
             if cancel_event is not None and cancel_event.is_set():
-                return AgentResult(ok=False, error="cancelled", cancelled=True)
+                return _plus_usage(
+                    AgentResult(ok=False, error="cancelled", cancelled=True), last_result
+                )
             attempt_args = list(base_args)
             if resume_session_id:
                 attempt_args += ["--session", resume_session_id]
@@ -194,7 +200,9 @@ class OpenCodeCliProvider:
                     **_WIN_SUBPROCESS_KW,
                 )
             except FileNotFoundError:
-                return AgentResult(ok=False, error=f"CLI not found: {_OPENCODE_BIN!r}")
+                return _plus_usage(
+                    AgentResult(ok=False, error=f"CLI not found: {_OPENCODE_BIN!r}"), last_result
+                )
 
             async def drive(p: asyncio.subprocess.Process = proc) -> str:
                 assert p.stdin is not None
@@ -204,8 +212,12 @@ class OpenCodeCliProvider:
                 parts: list[str] = []
 
                 async def _write_stdin() -> None:
-                    stdin.write(prompt.encode("utf-8"))
-                    await stdin.drain()
+                    # A CLI that exits without reading it all (one rejecting its arguments)
+                    # closes the pipe: ignored, as asyncio's communicate() does, so its own
+                    # output and exit code tell why.
+                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                        stdin.write(prompt.encode("utf-8"))
+                        await stdin.drain()
                     stdin.close()
 
                 async def _read_stdout() -> None:
@@ -213,15 +225,18 @@ class OpenCodeCliProvider:
                     # a long tool result) can exceed asyncio's default 64 KiB StreamReader line
                     # limit, which raises LimitOverrunError and aborts the whole dispatch.
                     # _parse_events splits the accumulated output on newlines, so chunk boundaries
-                    # are harmless (mirrors the claude provider's raw-chunk read).
+                    # are harmless (mirrors the claude provider's raw-chunk read). One decoder
+                    # reads every chunk, so a character split across two reads stays whole.
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     while True:
                         chunk = await stdout.read(65536)
+                        text = decoder.decode(chunk, final=not chunk)
+                        if text:
+                            parts.append(text)
+                            if on_chunk is not None:
+                                await on_chunk(text)
                         if not chunk:
                             break
-                        text = chunk.decode("utf-8", errors="replace")
-                        parts.append(text)
-                        if on_chunk is not None:
-                            await on_chunk(text)
 
                 # Write stdin and read stdout concurrently so a chatty child cannot fill
                 # the OS pipe buffer and deadlock (mirrors the claude provider, CON-3).
@@ -231,17 +246,26 @@ class OpenCodeCliProvider:
 
             drive_task = asyncio.create_task(drive())
             cancel_wait_task: asyncio.Task[None] | None = None
-            if cancel_event is not None:
-                cancel_wait_task = asyncio.create_task(_wait_cancel(cancel_event))
-                done, _pending = await asyncio.wait(
-                    [drive_task, cancel_wait_task],
-                    timeout=timeout_seconds,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            else:
-                done, _pending = await asyncio.wait(
-                    [drive_task], timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
-                )
+            try:
+                if cancel_event is not None:
+                    cancel_wait_task = asyncio.create_task(_wait_cancel(cancel_event))
+                    done, _pending = await asyncio.wait(
+                        [drive_task, cancel_wait_task],
+                        timeout=timeout_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                else:
+                    done, _pending = await asyncio.wait(
+                        [drive_task], timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
+                    )
+            except asyncio.CancelledError:
+                # The task awaiting the dispatch was cancelled (a planning session's cancel, a
+                # worker's stop, shutdown): stop the run as a cancel event does, then re-raise.
+                await _kill_process_group(proc.pid)
+                with contextlib.suppress(ProcessLookupError):
+                    await proc.wait()
+                await _cancel_tasks(drive_task, cancel_wait_task)
+                raise
 
             if cancel_wait_task is not None and cancel_wait_task in done:
                 await _kill_process_group(proc.pid)
@@ -250,7 +274,9 @@ class OpenCodeCliProvider:
                 drive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await drive_task
-                return AgentResult(ok=False, error="cancelled", cancelled=True)
+                return _plus_usage(
+                    AgentResult(ok=False, error="cancelled", cancelled=True), last_result
+                )
 
             if drive_task in done:
                 raw = drive_task.result()
@@ -258,7 +284,9 @@ class OpenCodeCliProvider:
                     cancel_wait_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await cancel_wait_task
-                last_result = _parse_events(raw, proc.returncode, model_hint=model_hint)
+                last_result = _plus_usage(
+                    _parse_events(raw, proc.returncode, model_hint=model_hint), last_result
+                )
                 # Neither a usage limit nor a resume of a session opencode no longer has gets
                 # better on a quick re-run: the shared dispatch path waits for the reset, or
                 # starts afresh, instead.
@@ -291,7 +319,9 @@ class OpenCodeCliProvider:
             if cancel_wait_task is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await cancel_wait_task
-            return AgentResult(ok=False, error=f"timed out after {timeout_seconds}s")
+            return _plus_usage(
+                AgentResult(ok=False, error=f"timed out after {timeout_seconds}s"), last_result
+            )
 
         assert last_result is not None
         return last_result
@@ -445,6 +475,33 @@ def _add(acc: int | None, value: object) -> int | None:
     return value if acc is None else acc + value
 
 
+def _plus_usage(result: AgentResult, earlier: AgentResult | None) -> AgentResult:
+    """*result* with the usage of the *earlier* attempts of its dispatch added: their cost,
+    tokens, turns and tool calls. Everything else is *result*'s own. opencode reports each run's
+    own usage (``cost_is_session_total`` false), so a dispatch that ran again used the sum."""
+    if earlier is None:
+        return result
+    costs = [cost for cost in (earlier.cost_usd, result.cost_usd) if cost is not None]
+    tools = dict(earlier.tool_breakdown)
+    for name, count in result.tool_breakdown.items():
+        tools[name] = tools.get(name, 0) + count
+    return result.model_copy(
+        update={
+            "cost_usd": sum(costs) if costs else None,
+            "num_turns": _add(earlier.num_turns, result.num_turns),
+            "input_tokens": _add(earlier.input_tokens, result.input_tokens),
+            "output_tokens": _add(earlier.output_tokens, result.output_tokens),
+            "reasoning_tokens": _add(earlier.reasoning_tokens, result.reasoning_tokens),
+            "cache_read_tokens": _add(earlier.cache_read_tokens, result.cache_read_tokens),
+            "cache_creation_tokens": _add(
+                earlier.cache_creation_tokens, result.cache_creation_tokens
+            ),
+            "tool_calls_count": earlier.tool_calls_count + result.tool_calls_count,
+            "tool_breakdown": tools,
+        }
+    )
+
+
 def _as_float(value: object) -> float | None:
     if isinstance(value, bool):
         return None
@@ -458,17 +515,20 @@ def _as_float(value: object) -> float | None:
 
 def _retry_after(headers: object, now: datetime) -> datetime | None:
     """The time a 429's ``retry-after-ms`` (milliseconds) or ``retry-after`` (seconds, or an HTTP
-    date) response header says to retry at, else ``None``. Header names are case-insensitive."""
+    date) response header says to retry at, else ``None``. Header names are case-insensitive. A
+    value beyond what a datetime holds (an infinite or absurd delay) counts as absent."""
     if not isinstance(headers, dict):
         return None
     lowered = {str(name).lower(): value for name, value in headers.items()}
     millis = _as_float(lowered.get("retry-after-ms"))
     if millis is not None and millis >= 0:
-        return now + timedelta(milliseconds=millis)
+        with contextlib.suppress(OverflowError, ValueError):
+            return now + timedelta(milliseconds=millis)
     raw = lowered.get("retry-after")
     seconds = _as_float(raw)
     if seconds is not None and seconds >= 0:
-        return now + timedelta(seconds=seconds)
+        with contextlib.suppress(OverflowError, ValueError):
+            return now + timedelta(seconds=seconds)
     if isinstance(raw, str):
         with contextlib.suppress(TypeError, ValueError, IndexError, OverflowError):
             when = email.utils.parsedate_to_datetime(raw)
@@ -504,6 +564,10 @@ def _parse_events(
     lines are skipped so partial/garbled output never crashes a dispatch. An ``error`` event
     that refuses the request for a usage limit or balance sets ``quota``; a ``retry-after``
     reset is counted from *now* (the current time when omitted).
+
+    A failed run always says why: its ``error`` events, else the end of the CLI's own output
+    that is no event (a config error in plain text), else its exit code. Lines end at a newline
+    only: JSON leaves U+2028, U+2029 and U+0085 raw inside strings.
     """
     now = now if now is not None else datetime.now(UTC)
     quota: QuotaExhausted | None = None
@@ -521,14 +585,16 @@ def _parse_events(
     tool_calls_count = 0
     tool_breakdown: dict[str, int] = {}
     error_parts: list[str] = []
+    plain_lines: list[str] = []  # output that is no JSON event: the CLI's own messages
 
-    for line in raw.splitlines():
+    for line in raw.split("\n"):
         line = line.strip()
         if not line:
             continue
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
+            plain_lines.append(line)
             if _TRANSIENT_API_ERROR_RE.search(line) or UNKNOWN_SESSION_RE.search(line):
                 error_parts.append(line)
             continue
@@ -608,6 +674,9 @@ def _parse_events(
         and not (error_str and not text.strip())
         and quota is None
     )
+    error = error_str if not ok or has_transient_err else None
+    if not ok and not error:
+        error = "\n".join(plain_lines)[-500:] or f"opencode exited with code {exit_code}"
     return AgentResult(
         ok=ok,
         text=text,
@@ -619,7 +688,7 @@ def _parse_events(
         cache_read_tokens=cache_read,
         cache_creation_tokens=cache_write,
         exit_code=exit_code,
-        error=error_str if not ok or has_transient_err else None,
+        error=error,
         session_id=session_id,
         reasoning_tokens=reasoning_tok,
         tool_calls_count=tool_calls_count,

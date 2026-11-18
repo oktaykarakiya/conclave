@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import signal
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +16,7 @@ from typing import Any
 import pytest
 
 from conclave.config import ArgMode
+from conclave.engine.verdict import parse_verdict
 from conclave.providers import (
     AgentResult,
     ClaudeCliProvider,
@@ -1194,3 +1198,261 @@ async def test_the_refusal_watch_reads_each_complete_line_across_chunks() -> Non
     watch.feed(json.dumps(_rate_limit_event("allowed")) + "\n")
     with pytest.raises(TimeoutError):  # disarmed by a newer info that does not refuse
         await asyncio.wait_for(watch.outlasts(0.0), 0.1)
+
+
+# --- a run that gives no answer -----------------------------------------------------------------
+# A crashed reviewer's transcript can hold "VERDICT: pass" anywhere (a file it read, its own
+# thinking). Only the result's own text is the answer: without one, there is none.
+
+_CRASHED_TRANSCRIPT: tuple[dict[str, Any], ...] = (
+    {
+        "type": "assistant",
+        "session_id": "ses-1",
+        "message": {
+            "content": [
+                {"type": "text", "text": "I have to read the checklist first."},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "CHECKLIST.md"}},
+            ]
+        },
+    },
+    {
+        "type": "user",
+        "session_id": "ses-1",
+        "message": {
+            "content": [
+                {"type": "tool_result", "content": "A clean review ends with VERDICT: pass"}
+            ]
+        },
+    },
+)
+
+
+@pytest.mark.parametrize(
+    ("subtype", "is_error", "exit_code", "errors", "error"),
+    [
+        ("error_during_execution", True, 1, ["Error: ENOMEM: out of memory"], "ENOMEM"),
+        ("error_max_turns", False, 0, [], "error_max_turns"),
+    ],
+    ids=["crash", "max-turns"],
+)
+def test_a_crash_result_without_an_answer_is_no_answer(
+    subtype: str, is_error: bool, exit_code: int, errors: list[str], error: str
+) -> None:
+    raw = _stream(
+        *_CRASHED_TRANSCRIPT,
+        {
+            "type": "result",
+            "subtype": subtype,
+            "is_error": is_error,
+            "session_id": "ses-1",
+            "num_turns": 3,
+            "total_cost_usd": 0.07,
+            "errors": errors,
+        },
+    )
+
+    result = _parse_envelope(raw, exit_code)
+
+    assert result.ok is False
+    assert result.text == ""
+    assert error in (result.error or "")
+    assert (result.cost_usd, result.num_turns, result.session_id) == (0.07, 3, "ses-1")
+    assert result.quota is None
+    assert parse_verdict(result.text).verdict == "unknown"
+
+
+@pytest.mark.parametrize("exit_code", [-9, 0])
+def test_a_stream_without_a_result_event_is_never_an_answer(exit_code: int) -> None:
+    raw = _stream(*_CRASHED_TRANSCRIPT)
+
+    result = _parse_envelope(raw, exit_code)
+
+    assert result.ok is False
+    assert result.text == ""
+    assert result.error == raw.strip()[-500:]
+    assert result.session_id == "ses-1"
+    assert result.tool_breakdown == {"Read": 1}
+    assert parse_verdict(result.text).verdict == "unknown"
+
+
+# --- the CLI process: cancellation, a closed stdin, the process group ---------------------------
+
+
+def _running(pid: int) -> bool:
+    """Whether *pid* is a live process; a zombie (killed, not reaped yet) is not."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:  # gone since os.kill, unless there is no /proc to tell
+        return not Path("/proc/self").is_dir()
+    except OSError:
+        return True
+    return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+async def _gone_within(pid: int, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while _running(pid):
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
+async def _pid_from(path: Path, seconds: float = 10.0) -> int:
+    deadline = time.monotonic() + seconds
+    while not (path.exists() and path.read_text(encoding="utf-8").strip()):
+        assert time.monotonic() < deadline, f"{path} was never written"
+        await asyncio.sleep(0.05)
+    return int(path.read_text(encoding="utf-8"))
+
+
+def _kill_leftover(pid: int) -> None:
+    if _running(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness")
+async def test_cancelling_the_dispatch_task_kills_the_cli(tmp_path: Path) -> None:
+    """A planning session's cancel, a worker's stop and shutdown cancel the task awaiting the
+    dispatch: the CLI must not run on without a timeout."""
+    pid_file = tmp_path / "cli.pid"
+    body = f"""#!/usr/bin/env python3
+import os, sys, time
+sys.stdin.read()
+with open({str(pid_file)!r}, "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(30)
+"""
+    cli = _make_cli(tmp_path, body, name="sleepy.py")
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+    dispatch = asyncio.create_task(
+        ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=60)
+    )
+    pid = await _pid_from(pid_file)
+    try:
+        dispatch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch
+        assert await _gone_within(pid), f"the CLI ({pid}) still runs after the cancel"
+    finally:
+        _kill_leftover(pid)
+
+
+# A CLI that rejects its arguments (an older one that lacks an isolation flag) and exits before it
+# reads the prompt.
+_REJECTS_ITS_FLAGS_CLI = """#!/usr/bin/env python3
+import sys
+sys.stdout.write("error: unknown option '--exclude-dynamic-system-prompt-sections'\\n")
+sys.stdout.flush()
+sys.exit(1)
+"""
+
+
+async def test_a_cli_that_exits_before_reading_its_prompt_fails_with_its_own_error(
+    tmp_path: Path,
+) -> None:
+    cli = _make_cli(tmp_path, _REJECTS_ITS_FLAGS_CLI, name="old_claude.py")
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="x" * (1 << 20), timeout_seconds=30  # more than a pipe holds
+    )
+
+    assert result.ok is False
+    assert "unknown option" in (result.error or "")
+    assert result.exit_code == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+async def test_a_timeout_kills_the_group_after_its_leader_exited(tmp_path: Path) -> None:
+    """A descendant that outlives the CLI and holds its output pipe is killed on the timeout."""
+    pid_file = tmp_path / "child.pid"
+    body = f"""#!/usr/bin/env python3
+import os, subprocess, sys
+sys.stdin.read()
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open({str(pid_file)!r}, "w") as f:
+    f.write(str(child.pid))
+os._exit(0)
+"""
+    cli = _make_cli(tmp_path, body, name="leader_exits.py")
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+
+    result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=1)
+
+    child_pid = await _pid_from(pid_file)
+    try:
+        assert "timed out" in (result.error or "")
+        assert await _gone_within(child_pid), f"descendant {child_pid} survived the timeout"
+    finally:
+        _kill_leftover(child_pid)
+
+
+# --- text the CLI streams -----------------------------------------------------------------------
+
+
+async def test_a_character_split_across_reads_is_decoded_whole(tmp_path: Path) -> None:
+    """The provider reads 4096 bytes at a time: an em dash whose first byte ends one read reaches
+    the answer whole."""
+    marker = "<PAD>"
+    result_event = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "session_id": "ses-1",
+        "num_turns": 1,
+        "total_cost_usd": 0.01,
+        "result": marker + "\u2014 done",
+    }
+    template = json.dumps(_INIT) + "\n" + json.dumps(result_event, ensure_ascii=False) + "\n"
+    pad = 4095 - template.encode("utf-8").index(marker.encode())
+    answer = "x" * pad + "\u2014 done"
+    payload = template.replace(marker, "x" * pad).encode("utf-8")
+    assert payload[4095:4098] == "\u2014".encode()  # the first read ends inside the em dash
+    (tmp_path / "payload.bin").write_bytes(payload)
+    body = f"""#!/usr/bin/env python3
+import sys, time
+sys.stdin.read()
+data = open({str(tmp_path / "payload.bin")!r}, "rb").read()
+sys.stdout.buffer.write(data[:4096])
+sys.stdout.buffer.flush()
+time.sleep(0.2)
+sys.stdout.buffer.write(data[4096:])
+sys.stdout.buffer.flush()
+"""
+    cli = _make_cli(tmp_path, body, name="split.py")
+    profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
+    streamed: list[str] = []
+
+    async def collect(text: str) -> None:
+        streamed.append(text)
+
+    result = await ClaudeCliProvider().run_agent(
+        profile=profile, prompt="hi", timeout_seconds=30, on_chunk=collect
+    )
+
+    assert result.ok is True
+    assert result.text == answer
+    assert "\ufffd" not in "".join(streamed)
+    assert all(streamed)  # no empty chunk is streamed
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85"])
+def test_a_line_separator_inside_a_json_string_keeps_the_event(separator: str) -> None:
+    """JSON.stringify leaves U+2028, U+2029 and U+0085 raw inside strings: they end no line."""
+    answer = f"VERDICT: pass{separator}nothing else to add"
+    result_event = {**_result(answer), "total_cost_usd": 0.3, "num_turns": 4}
+    raw = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in (_INIT, result_event))
+
+    result = _parse_envelope(raw, 0)
+
+    assert result.ok is True
+    assert result.text == answer
+    assert (result.cost_usd, result.num_turns) == (0.3, 4)

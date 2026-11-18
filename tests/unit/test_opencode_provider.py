@@ -8,7 +8,11 @@ Fixtures mirror real ``opencode run --format json`` output: one JSON event per l
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
+import signal
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -495,3 +499,247 @@ async def test_resuming_an_unknown_session_is_not_rerun(
 
     assert len(spawns) == 1
     assert result.ok is False and "Session not found" in (result.error or "")
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"retry-after": "1e12"}, {"retry-after": "inf"}, {"retry-after-ms": "1e18"}],
+    ids=["seconds-past-year-9999", "infinite", "milliseconds-past-timedelta"],
+)
+def test_an_out_of_range_retry_after_is_an_unknown_reset(headers: dict[str, str]) -> None:
+    result = _parse_events(_rate_limited(headers), exit_code=1, now=_NOW)
+
+    assert result.ok is False
+    assert result.quota is not None and result.quota.kind == "rate_limit"
+    assert result.quota.resets_at is None  # the gate waits execution.quota_retry_minutes
+
+
+def test_an_out_of_range_retry_after_ms_falls_back_to_retry_after() -> None:
+    headers = {"retry-after-ms": "1e18", "retry-after": "30"}
+
+    quota = _parse_events(_rate_limited(headers), exit_code=1, now=_NOW).quota
+
+    assert quota is not None and quota.resets_at == _NOW + timedelta(seconds=30)
+
+
+def test_a_failed_run_without_an_error_event_reports_why() -> None:
+    config_error = (
+        "Error: Configuration is invalid at /home/u/.config/opencode/opencode.json\n"
+        '  Unrecognized key: "mcpp"\n'
+    )
+
+    failed = _parse_events(config_error, exit_code=1)
+    killed = _parse_events("", exit_code=-9)
+    served = _parse_events('{"type":"text","part":{"type":"text","text":"done"}}', exit_code=0)
+
+    assert failed.ok is False and "Configuration is invalid" in (failed.error or "")
+    assert killed.ok is False and killed.error == "opencode exited with code -9"
+    assert served.ok is True and served.error is None
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85"])
+def test_a_line_separator_inside_a_json_string_keeps_the_event(separator: str) -> None:
+    """JSON.stringify leaves U+2028, U+2029 and U+0085 raw inside strings: they end no line."""
+    text = f"line one{separator}line two"
+    event = {"type": "text", "sessionID": "ses_s", "part": {"type": "text", "text": text}}
+
+    result = _parse_events(json.dumps(event, ensure_ascii=False) + "\n", exit_code=0)
+
+    assert result.text == text
+    assert result.session_id == "ses_s"
+
+
+# --- the CLI process: cancellation, a closed stdin, streamed text -------------------------------
+
+
+def _running(pid: int) -> bool:
+    """Whether *pid* is a live process; a zombie (killed, not reaped yet) is not."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:  # gone since os.kill, unless there is no /proc to tell
+        return not Path("/proc/self").is_dir()
+    except OSError:
+        return True
+    return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+async def _gone_within(pid: int, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while _running(pid):
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness")
+async def test_cancelling_the_dispatch_task_kills_the_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planning session's cancel, a worker's stop and shutdown cancel the task awaiting the
+    dispatch: the CLI must not run on without a timeout."""
+    pid_file = tmp_path / "cli.pid"
+    _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "fake_opencode_sleepy.py",
+        f"import os\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(30)\n",
+    )
+    dispatch = asyncio.create_task(
+        OpenCodeCliProvider().run_agent(
+            profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+            prompt="hello",
+            timeout_seconds=60,
+        )
+    )
+    deadline = time.monotonic() + 10
+    while not (pid_file.exists() and pid_file.read_text().strip()):
+        assert time.monotonic() < deadline, "the fake opencode never started"
+        await asyncio.sleep(0.05)
+    pid = int(pid_file.read_text())
+    try:
+        dispatch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch
+        assert await _gone_within(pid), f"the CLI ({pid}) still runs after the cancel"
+    finally:
+        if _running(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+async def test_a_cli_that_exits_before_reading_its_prompt_fails_with_its_own_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "old_opencode.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        "sys.stdout.write(\"error: unknown option '--auto'\\n\")\nsys.stdout.flush()\n"
+        "sys.exit(1)\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(opencode_cli, "_OPENCODE_BIN", str(fake))
+    monkeypatch.setattr(opencode_cli, "_TRANSIENT_RETRY_DELAY_S", 0.0)
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+        prompt="x" * (1 << 20),  # more than a pipe holds
+        timeout_seconds=30,
+    )
+
+    assert result.ok is False
+    assert "unknown option" in (result.error or "")
+
+
+async def test_a_character_split_across_reads_is_decoded_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = "before \u2014 after"
+    line = json.dumps({"type": "text", "part": {"type": "text", "text": text}}, ensure_ascii=False)
+    payload = (line + "\n").encode("utf-8")
+    cut = payload.index("\u2014".encode()) + 1  # after the dash's first byte
+    (tmp_path / "payload.bin").write_bytes(payload)
+    _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "fake_opencode_split.py",
+        f"data = open({str(tmp_path / 'payload.bin')!r}, 'rb').read()\n"
+        f"sys.stdout.buffer.write(data[:{cut}])\nsys.stdout.buffer.flush()\n"
+        "time.sleep(0.3)\n"
+        f"sys.stdout.buffer.write(data[{cut}:])\nsys.stdout.buffer.flush()\n",
+    )
+    streamed: list[str] = []
+
+    async def collect(chunk: str) -> None:
+        streamed.append(chunk)
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+        prompt="hello",
+        timeout_seconds=30,
+        on_chunk=collect,
+    )
+
+    assert result.ok is True
+    assert result.text == text
+    assert "\ufffd" not in "".join(streamed)
+    assert all(streamed)  # no empty chunk is streamed
+
+
+# --- a dispatch's usage across its attempts -----------------------------------------------------
+
+
+def _step(cost: float, output: int, input_tokens: int = 10) -> dict[str, Any]:
+    return {
+        "type": "step_finish",
+        "sessionID": "ses_f9",
+        "part": {"cost": cost, "tokens": {"input": input_tokens, "output": output}},
+    }
+
+
+_BASH_CALL = {"type": "tool_use", "sessionID": "ses_f9", "part": {"type": "tool", "tool": "bash"}}
+_ANSWER = {"type": "text", "sessionID": "ses_f9", "part": {"type": "text", "text": "VERDICT: pass"}}
+_DROPPED = {
+    "type": "error",
+    "sessionID": "ses_f9",
+    "error": {"data": {"message": "Cannot connect to API: Unable to connect"}},
+}
+
+
+@pytest.mark.parametrize(
+    ("attempts", "runs", "cost", "output", "turns", "tools"),
+    [
+        # An empty reply (the tool call and its step were paid for), then the answer.
+        ([([_BASH_CALL, _step(0.4, 50)], 0), ([_ANSWER, _step(0.1, 7)], 0)], 2, 0.5, 57, 2, 1),
+        # A dropped connection after a paid step, then the answer.
+        ([([_step(0.2, 5), _DROPPED], 1), ([_ANSWER, _step(0.1, 7)], 0)], 2, 0.3, 12, 2, 0),
+        # Every attempt used, none with an answer: the last one is counted once.
+        ([([_step(0.1, 1)], 0)] * 3, 3, 0.3, 3, 3, 0),
+    ],
+    ids=["empty-reply", "transient-error", "every-attempt-used"],
+)
+async def test_a_rerun_dispatch_counts_the_usage_of_every_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attempts: list[tuple[list[dict[str, Any]], int]],
+    runs: int,
+    cost: float,
+    output: int,
+    turns: int,
+    tools: int,
+) -> None:
+    state = tmp_path / "runs"
+    fake = _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "fake_opencode_attempts.py",
+        f"import pathlib\nattempts = json.loads({json.dumps(attempts)!r})\n"
+        f"state = pathlib.Path({str(state)!r})\n"
+        "n = int(state.read_text()) if state.exists() else 0\n"
+        "state.write_text(str(n + 1))\n"
+        "events, code = attempts[n]\n"
+        "sys.stdout.write(''.join(json.dumps(e) + '\\n' for e in events))\n"
+        "sys.exit(code)\n",
+    )
+    monkeypatch.setattr(opencode_cli, "_TRANSIENT_RETRY_DELAY_S", 0.0)
+    spawns = _count_spawns(monkeypatch, fake)
+
+    result = await OpenCodeCliProvider().run_agent(
+        profile=ResolvedProfile(name="opencode", arg_mode=ArgMode.inherit),
+        prompt="review",
+        timeout_seconds=30,
+    )
+
+    assert len(spawns) == runs
+    assert result.cost_usd == pytest.approx(cost)
+    assert result.output_tokens == output
+    assert result.input_tokens == 10 * runs
+    assert result.num_turns == turns
+    assert result.tool_calls_count == tools
+    assert result.tool_breakdown == ({"bash": tools} if tools else {})
