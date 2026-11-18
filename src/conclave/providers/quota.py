@@ -7,7 +7,9 @@ and the planning sessions). On such a result it closes the daemon-wide :class:`Q
 engine account's key, waits until the gate reopens, and resumes the interrupted session with
 :data:`CONTINUATION_PROMPT` (or re-runs the original prompt when there is no session to resume),
 so a caller never sees a quota result. Every other dispatch for the same key waits for the gate
-before it starts, so parallel reviewers and other projects do not each hit the refused API.
+before it starts, so parallel reviewers and other projects do not each hit the refused API. Each
+result it hands on (the interrupted run's to the listener, the final one to the caller) carries its
+own run's cost, also when the engine reports a resumed session's running total.
 """
 
 from __future__ import annotations
@@ -206,27 +208,31 @@ async def _stop(future: asyncio.Future[Any]) -> None:
 class WaitTracker:
     """How long one task's dispatches waited for a usage limit, measured with the gate's clock.
 
-    Overlapping waits (parallel reviewers waiting for the same reset) are counted once.
+    Overlapping waits (parallel reviewers waiting for the same reset) are counted once. Each wait
+    also counts in the *parent* tracker, if any (a bug-fixer session's, which spans its tasks and
+    project-level dispatches), where overlapping waits are counted once too.
     """
 
-    def __init__(self, clock: Clock) -> None:
+    def __init__(self, clock: Clock, *, parent: WaitTracker | None = None) -> None:
         self._clock = clock
+        self._parent = parent
         self._active = 0
         self._since: datetime | None = None
         self._total = 0.0
 
     @contextlib.contextmanager
     def waiting(self) -> Iterator[None]:
-        if self._active == 0:
-            self._since = self._clock()
-        self._active += 1
-        try:
-            yield
-        finally:
-            self._active -= 1
-            if self._active == 0 and self._since is not None:
-                self._total += max((self._clock() - self._since).total_seconds(), 0.0)
-                self._since = None
+        with self._parent.waiting() if self._parent is not None else contextlib.nullcontext():
+            if self._active == 0:
+                self._since = self._clock()
+            self._active += 1
+            try:
+                yield
+            finally:
+                self._active -= 1
+                if self._active == 0 and self._since is not None:
+                    self._total += max((self._clock() - self._since).total_seconds(), 0.0)
+                    self._since = None
 
     def seconds(self) -> float:
         if self._since is None:
@@ -269,10 +275,15 @@ async def dispatch_with_quota(
     :data:`CONTINUATION_PROMPT`, or sends the original prompt again when there is none, or when
     the engine no longer knows the session. A wait ended by *cancel_event* returns the normal
     cancelled result. Each run gets the full *timeout_seconds*; waiting never happens inside one.
+
+    The cost of every result handed on (to the listener as *interrupted*, and the final one) is
+    that run's own: a run that continued a session whose cost the engine reports as a running total
+    (``AgentResult.cost_is_session_total``) is charged its total minus the one reported before it.
     """
     engine, key = quota_key(provider, profile)
     session_id: str | None = None  # the interrupted session to continue
     interrupted: AgentResult | None = None
+    reported: float | None = None  # the running total the session's last run reported
 
     # Only what the caller set is passed on, as each caller did before it came through here.
     optional: dict[str, Any] = {}
@@ -315,15 +326,36 @@ async def dispatch_with_quota(
         if cancel_event is not None and cancel_event.is_set():
             return AgentResult(ok=False, error="cancelled", cancelled=True)
         result = await run(session_id)
-        if session_id is not None and _unknown_session(result):
+        continued = session_id is not None
+        if continued and _unknown_session(result):
             logger.info("engine no longer has session %s; dispatching afresh", session_id)
             session_id = None
+            continued = False
             result = await run(None)
+        if not continued:
+            reported = None  # a fresh session's running total starts from nothing
+        result, reported = _own_cost(result, reported)
         if result.quota is None:
             return result
         gate.close(key, engine, result.quota, retry_minutes=retry_minutes)
         session_id = result.session_id or session_id
         interrupted = result
+
+
+def _own_cost(result: AgentResult, reported: float | None) -> tuple[AgentResult, float | None]:
+    """*result* charged its own run's cost, and the session's running total after it.
+
+    When the engine reports the session's running total, a run that continued a session whose
+    earlier run reported *reported* already includes that cost: its own share is the difference,
+    never below 0. A copy is returned, never the provider's object changed. Any other cost (a
+    per-run one, or none) passes through, and *reported* stays the last total known.
+    """
+    if not result.cost_is_session_total or result.cost_usd is None:
+        return result, reported
+    total = result.cost_usd
+    if reported is not None:
+        result = result.model_copy(update={"cost_usd": max(total - reported, 0.0)})
+    return result, total
 
 
 def _unknown_session(result: AgentResult) -> bool:

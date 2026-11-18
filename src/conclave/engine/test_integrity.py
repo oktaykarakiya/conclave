@@ -51,9 +51,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from itertools import accumulate
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -187,10 +189,24 @@ class _Test:
 
 
 @dataclass(frozen=True)
+class _Span:
+    """Tests of a JS suite by position: ``tests[lo:hi]``, or with *outside* all tests but those.
+
+    A focused or suite-wide marker covers a run of the file's tests, so it is kept as one span
+    instead of a set of names per marker, which would make a file with many markers quadratic.
+    """
+
+    lo: int
+    hi: int
+    outside: bool = False
+
+
+@dataclass(frozen=True)
 class _Marker:
     target: str  # the test, class or describe it is put on; "" for the module
     text: str  # its normalized source: what a moved, kept or edited marker is matched by
-    covers: frozenset[str]  # names of the tests it switches off
+    # The tests it switches off: their names, or a span over its suite's tests.
+    covers: frozenset[str] | _Span
 
 
 @dataclass
@@ -808,7 +824,12 @@ class _JsScan:
 
 
 def _js_suite(source: str) -> _Suite:
-    """Tests (``it`` / ``test`` calls, by title) and markers of a JS/TS file."""
+    """Tests (``it`` / ``test`` calls, by title) and markers of a JS/TS file.
+
+    Linear in the file after sorting: bracket matching nests the calls (two definitions are nested
+    or disjoint), so one sweep with a stack finds each test's suites and each marker's innermost
+    definition, and what a marker covers is a :class:`_Span` found by bisection.
+    """
     scan = _JsScan(source)
     scan.scan()
     definitions = sorted(scan.definitions, key=lambda d: d.open)
@@ -816,8 +837,8 @@ def _js_suite(source: str) -> _Suite:
     def inside(definition: _JsDefinition, index: int) -> bool:
         return definition.open < index <= definition.close
 
-    # Bracket matching nests the calls, so one pass with a stack finds each test's suites.
-    tests: list[tuple[_JsDefinition, _Test]] = []
+    tests: list[_Test] = []
+    opens: list[int] = []  # the open of each test's call, ascending like the tests
     open_suites: list[_JsDefinition] = []
     for definition in definitions:
         while open_suites and not inside(open_suites[-1], definition.open):
@@ -826,29 +847,36 @@ def _js_suite(source: str) -> _Suite:
             open_suites.append(definition)
         else:
             path = (*(suite.title for suite in open_suites), definition.title)
-            tests.append((definition, _Test(definition.title, path)))
+            tests.append(_Test(definition.title, path))
+            opens.append(definition.open)
 
-    def enclosing(index: int) -> _JsDefinition | None:
-        holders = [d for d in definitions if inside(d, index)]
-        return max(holders, key=lambda d: d.open) if holders else None
-
-    def covered(scope: _JsDefinition | None, focus: bool) -> frozenset[str]:
+    def covered(scope: _JsDefinition | None, focus: bool) -> frozenset[str] | _Span:
+        if scope is None:
+            return _Span(0, len(tests))
         if focus:  # a focused test or suite switches off every other test of the file
-            others = frozenset(
-                t.name for d, t in tests
-                if scope is None or not (d is scope or inside(scope, d.open))
+            others = _Span(
+                bisect_left(opens, scope.open), bisect_right(opens, scope.close), outside=True
             )
-            if others:
+            if others.lo > 0 or others.hi < len(tests):
                 return others
-        if scope is not None and not scope.is_suite:
+        if not scope.is_suite:
             return frozenset((scope.title,))
-        return frozenset(t.name for d, t in tests if scope is None or inside(scope, d.open))
+        return _Span(bisect_right(opens, scope.open), bisect_right(opens, scope.close))
 
     markers: list[_Marker] = []
+    holders: list[_JsDefinition] = []  # the definitions holding the current index, innermost last
+    pending = 0  # definitions[pending:] open at or after the current index
     for mark in sorted(scan.marks, key=lambda m: m.index):
-        scope = mark.definition or enclosing(mark.index)
+        while pending < len(definitions) and definitions[pending].open < mark.index:
+            while holders and not inside(holders[-1], definitions[pending].open):
+                holders.pop()
+            holders.append(definitions[pending])
+            pending += 1
+        while holders and not inside(holders[-1], mark.index):
+            holders.pop()
+        scope = mark.definition or (holders[-1] if holders else None)
         markers.append(_Marker(scope.title if scope else "", mark.text, covered(scope, mark.focus)))
-    return _Suite(" > ", [test for _, test in tests], markers)
+    return _Suite(" > ", tests, markers)
 
 
 # --- comparing a change -------------------------------------------------------
@@ -919,12 +947,27 @@ def _added_markers(
     reach older tests anyway (*reaches_old_tests*).
     """
     added = _marks(after) - _marks(before)
+    # moved_upto[i]: how many of after.tests[:i] moved here, so a span is checked in O(1).
+    moved_upto = list(
+        accumulate((1 if t.name in totals.moved else 0 for t in after.tests), initial=0)
+    )
     for marker in after.markers:
         key = (marker.target, marker.text)
         if key not in added or totals.marks_after[key] <= totals.marks_before[key]:
             continue
-        if reaches_old_tests or not marker.covers.isdisjoint(totals.moved):
+        if reaches_old_tests or _covers_moved(marker.covers, totals.moved, moved_upto):
             yield IntegrityFinding(file, marker.target, "skip_marker")
+
+
+def _covers_moved(
+    covers: frozenset[str] | _Span, moved: set[str], moved_upto: Sequence[int]
+) -> bool:
+    """Whether a marker covering *covers* switches off a moved test (*moved*, or for a span the
+    prefix counts *moved_upto* of the moved tests among its suite's tests)."""
+    if isinstance(covers, frozenset):
+        return not covers.isdisjoint(moved)
+    moved_inside = moved_upto[covers.hi] - moved_upto[covers.lo]
+    return (moved_upto[-1] - moved_inside if covers.outside else moved_inside) > 0
 
 
 def integrity_findings(changes: Sequence[FileChange]) -> list[IntegrityFinding]:

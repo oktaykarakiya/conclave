@@ -10,6 +10,7 @@ so the integrity metric (expired = unhealthy) is preserved.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import shlex
 from dataclasses import dataclass
@@ -28,9 +29,10 @@ if TYPE_CHECKING:
 _PYTEST_RE = re.compile(r"(^|[\s/])pytest([\s$]|$)")
 _JEST_RE = re.compile(r"(^|[\s/])jest([\s$]|$)")
 
-GateOutcome = Literal["passed", "failed", "timed_out", "missing_command"]
+GateOutcome = Literal["passed", "failed", "timed_out", "missing_command", "cancelled"]
 """Classification of a gate run so the orchestrator can distinguish infra failures
-(exit 124 = timeout, exit 127 = command not found) from real test failures."""
+(exit 124 = timeout, exit 127 = command not found) from real test failures. ``cancelled`` is a run
+stopped (or never started) by its cancel event: no evidence either way."""
 
 
 @dataclass(frozen=True)
@@ -48,18 +50,25 @@ async def run_tests(
     *,
     env: dict[str, str] | None = None,
     timeout_seconds: int = 1800,
+    cancel_event: asyncio.Event | None = None,
 ) -> GateResult:
     """Run the test command; ``passed`` is a clean (exit 0) run. No command => skipped.
 
     ``output`` is the command's complete combined output. Callers that put it in a prompt fit
-    it there (:mod:`conclave.engine.context_limits`), so no cut is hidden here.
+    it there (:mod:`conclave.engine.context_limits`), so no cut is hidden here. Once
+    *cancel_event* is set the command is stopped (its process group killed) or never started,
+    and the run is ``cancelled``.
     """
     if not command:
         return GateResult(
             passed=True, exit_code=0, output="(no test command configured)", skipped=True,
             outcome="passed",
         )
-    code, output = await run_shell(worktree, command, env=env, timeout_seconds=timeout_seconds)
+    code, output = await run_shell(
+        worktree, command, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        return GateResult(passed=False, exit_code=code, output=output, outcome="cancelled")
     return GateResult(
         passed=code == 0,
         exit_code=code,

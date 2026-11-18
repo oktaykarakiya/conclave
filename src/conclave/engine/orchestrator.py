@@ -16,7 +16,7 @@ import logging
 import re
 import shutil
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -26,9 +26,9 @@ from ..config import ConclaveConfig, WorkflowNode, resolve_agent, resolve_projec
 from ..db import CheckpointStatus, Database, Project, Task, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType, build_notification_sink
-from ..providers import AgentResult, Provider, QuotaGate
+from ..providers import AgentResult, Provider, QuotaGate, WaitTracker
 from .baseline import build_baseline_preamble
-from .context_limits import BulkBlock, BulkLimit, fit_block, resolve_bulk_limit
+from .context_limits import BulkBlock, BulkLimit, FitResult, fit_block, resolve_bulk_limit
 from .gate import GateResult, apply_quarantine, run_tests
 from .gitio import run_git, run_shell
 from .graph_executor import (
@@ -66,6 +66,11 @@ _VERDICT_REMINDER = (
 # Bound on the planner error quoted in a result summary; the planner_failed event has it whole.
 _PLANNER_FAILURE_NOTE_CHARS = 300
 
+# Bound on why an attempt failed (attempt.failed `reason`, and a failed task's "; last:" note),
+# and on each reviewer's own reason within it, so several blocking reviewers still fit.
+_ATTEMPT_REASON_CHARS = 300
+_REVIEWER_REASON_CHARS = 100
+
 # Bound on git's combined output captured in the result summary when a task commit fails,
 # so a noisy hook cannot bloat the task row while its diagnostic tail stays visible.
 _COMMIT_OUTPUT_TAIL_CHARS = 500
@@ -73,8 +78,8 @@ _COMMIT_OUTPUT_TAIL_CHARS = 500
 # Result summary of a task stopped because no test command resolves: a green gate that runs no
 # tests proves nothing, so the operator must configure one or opt out explicitly.
 _NO_TEST_COMMAND_SUMMARY = (
-    "no test command: the green gate would run no tests, so the task stopped before any agent "
-    "ran. Set execution.baseline_test_command (and execution.setup_command if the tests need an "
+    "no test command: the green gate would run no tests, so the task stopped without running it. "
+    "Set execution.baseline_test_command (and execution.setup_command if the tests need an "
     "environment), or set execution.allow_no_test_command: true to run deliberately without a "
     "gate."
 )
@@ -134,6 +139,14 @@ class _PlannerOutcome:
     failure: str | None = None
 
 
+@dataclass
+class _ReviewOutcome:
+    """How a review round went, beside the tuple :meth:`Orchestrator._review` returns."""
+
+    # Which reviewers failed the attempt and why (one line); None when the review did not fail it.
+    reason: str | None = None
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -153,10 +166,13 @@ class Orchestrator:
         self._quota_gate = quota_gate if quota_gate is not None else QuotaGate()
         # Serialize merges into the same target branch so two tasks merging
         # "main" concurrently can never race on a shared worktree path or
-        # clobber each other's ref update. Reference-counted (see _merge) so the
+        # clobber each other's ref update. Reference-counted (see merge_lock) so the
         # lock dict stays bounded — an entry is evicted once no merge references it.
         self._merge_locks: dict[str, asyncio.Lock] = {}
         self._merge_lock_refs: dict[str, int] = {}
+        # The asyncio task holding each target's lock, so a _merge it calls runs under the
+        # lock it already holds instead of waiting on itself.
+        self._merge_lock_holders: dict[str, asyncio.Task[Any]] = {}
         # Per-task cancellation events — set by the daemon through
         # :meth:`request_cancel` and checked by :meth:`process_task` between
         # every pipeline stage for cooperative cancellation.
@@ -217,30 +233,44 @@ class Orchestrator:
         fitted = fit_block(
             text, limit=limit.limit, field=limit.field, how_to_get_rest=how_to_get_rest
         )
-        if fitted.truncated:
-            await self._bus.emit(
-                type=EventType.log,
-                project_id=task.project_id,
-                task_id=task.id,
-                agent=agent,
-                payload={
-                    "stage": "context_truncated",
-                    "field": limit.field,
-                    "block": block,
-                    "original_chars": fitted.original_chars,
-                    "kept_chars": fitted.kept_chars,
-                    "agent": agent,
-                    "node_id": node.id if node is not None else agent,
-                    # The Live tab renders log rows as "[stage] message".
-                    "message": (
-                        f"{block} for {agent or 'the task'}: kept {fitted.kept_chars} of "
-                        f"{fitted.original_chars} chars (context.{limit.field} = {limit.limit})"
-                    ),
-                },
-            )
+        await self._report_cut(task, fitted, block=block, limit=limit, agent=agent, node=node)
         if cache is not None:
             cache[limit] = fitted.text
         return fitted.text
+
+    async def _report_cut(
+        self,
+        task: Task,
+        fitted: FitResult,
+        *,
+        block: BulkBlock,
+        limit: BulkLimit,
+        agent: str | None,
+        node: WorkflowNode | None = None,
+    ) -> None:
+        """Emit the ``context_truncated`` log event of *fitted* when it was actually cut."""
+        if not fitted.truncated:
+            return
+        await self._bus.emit(
+            type=EventType.log,
+            project_id=task.project_id,
+            task_id=task.id,
+            agent=agent,
+            payload={
+                "stage": "context_truncated",
+                "field": limit.field,
+                "block": block,
+                "original_chars": fitted.original_chars,
+                "kept_chars": fitted.kept_chars,
+                "agent": agent,
+                "node_id": node.id if node is not None else agent,
+                # The Live tab renders log rows as "[stage] message".
+                "message": (
+                    f"{block} for {agent or 'the task'}: kept {fitted.kept_chars} of "
+                    f"{fitted.original_chars} chars (context.{limit.field} = {limit.limit})"
+                ),
+            },
+        )
 
     async def _baseline_preamble(
         self,
@@ -257,10 +287,7 @@ class Orchestrator:
         failures = await self._fit_bulk(
             task, config, baseline.failures,
             block="gate_output",
-            how_to_get_rest=(
-                f"Re-run `{baseline.command}` in your working directory before changing "
-                "anything for the full output."
-            ),
+            how_to_get_rest=_baseline_rerun_hint(baseline.command),
             agent=agent,
             node=node,
             cache=baseline.fitted,
@@ -633,7 +660,18 @@ class Orchestrator:
         )
         return resolution
 
-    async def process_task(self, task: Task, *, cancel_event: asyncio.Event | None = None) -> bool:
+    async def process_task(
+        self,
+        task: Task,
+        *,
+        cancel_event: asyncio.Event | None = None,
+        quota_waits: WaitTracker | None = None,
+    ) -> bool:
+        """Run *task* through the whole loop; ``True`` when it ends done.
+
+        The time its dispatches wait for a usage limit is left out of its wall-clock budget, and
+        also counted in *quota_waits* when given (a bug-fixer session's tracker).
+        """
         project = await repo.get_project(self._db, task.project_id)
         if project is None:
             return False
@@ -642,7 +680,8 @@ class Orchestrator:
         self._repo_path = repo_path
         target_branch = _resolve_target_branch(project, config)
         runner = AgentRunner(
-            self._db, self._bus, self._provider, project.id, config, quota_gate=self._quota_gate
+            self._db, self._bus, self._provider, project.id, config,
+            quota_gate=self._quota_gate, waits=quota_waits,
         )
         wm = WorktreeManager(repo_path, self._home / "projects" / project.id / "worktrees")
         task_branch = f"{config.execution.branch_prefix}{task.id}"
@@ -662,12 +701,12 @@ class Orchestrator:
         # The test command is known from the config alone, so a task whose green gate would run
         # no tests stops here: no worktree, setup, baseline or agent dispatch is spent. A config
         # error must not evolve the workflow, so this returns before the main try (as a failed
-        # worktree setup does) and sends the terminal notification itself.
+        # worktree setup does) and runs the rest of its housekeeping itself.
         if _missing_test_command(config, None):
             await self._fail_early(
                 task, wm, task_branch, _NO_TEST_COMMAND_SUMMARY, reason="no_test_command"
             )
-            await self._notify_terminal(project.id, task.id, config)
+            await self._task_housekeeping(project.id, task.id, config)
             return False
 
         try:
@@ -679,7 +718,9 @@ class Orchestrator:
             # failure event — the worker then claimed the NEXT task, breaking the
             # one-task-at-a-time invariant. Fail the task properly instead.
             logger.exception("worktree creation failed for task %s", task.id)
-            return await self._fail_early(task, wm, task_branch, f"worktree setup failed: {exc!r}")
+            await self._fail_early(task, wm, task_branch, f"worktree setup failed: {exc!r}")
+            await self._task_housekeeping(project.id, task.id, config)
+            return False
 
         # Wrap the entire body after worktree creation so ANY unexpected exception
         # transitions the task to failed, cleans the worktree, and lets the worker
@@ -769,7 +810,7 @@ class Orchestrator:
                 payload={"node_id": "baseline", "attempt": 0},
             )
             baseline = await self._baseline(
-                project.id, worktree, checkpoint, target_branch, test_command, gate_timeout,
+                task, config, worktree, checkpoint, target_branch, test_command, gate_timeout,
             )
             await repo.save_task_checkpoint(
                 self._db,
@@ -865,6 +906,9 @@ class Orchestrator:
             # Test-integrity findings of the last checked attempt, and the mode they ran under.
             integrity: list[IntegrityFinding] = []
             integrity_mode = "off"
+            # Why the current attempt failed (its attempt.failed reason); a failed task ends
+            # its summary with the last one.
+            last_reason: str | None = None
 
             while attempts < max_retries:
                 config = await self._refresh_task_config(project.id, runner, config)
@@ -896,6 +940,7 @@ class Orchestrator:
                     return await self._finish_cancelled(task, wm, task_branch)
                 attempts += 1
                 failed = False
+                last_reason = None
                 await self._bus.emit(
                     type=EventType.attempt_started,
                     project_id=project.id,
@@ -1110,11 +1155,9 @@ class Orchestrator:
                         # A developer run stopped by a cancel is not a failed attempt to retry.
                         if cancel_event is not None and cancel_event.is_set():
                             return await self._finish_cancelled(task, wm, task_branch)
-                        await self._bus.emit(
-                            type=EventType.attempt_failed,
-                            project_id=project.id,
-                            task_id=task.id,
-                            payload={"n": attempts, "stage": "developer", "error": dev.error},
+                        last_reason = await self._attempt_failed(
+                            task, attempts, "developer",
+                            dev.error or "developer agent failed", error=dev.error,
                         )
                         failed = True
                         continue
@@ -1197,10 +1240,12 @@ class Orchestrator:
                 # One fitted diff per limit for this attempt, shared by the reviewers and the
                 # post-gate nodes, so each actual cut is made and reported once.
                 diff_cache: dict[BulkLimit, str] = {}
+                review = _ReviewOutcome()
                 failed, feedback, review_timed_out = await self._review(
                     runner, task, project.id, worktree, full_diff, attempts, config, knowledge,
                     rules, started, budget, cancel_event=cancel_event, diff_cmd=diff_cmd,
                     diff_cache=diff_cache, integrity_section=integrity_prompt_section(integrity),
+                    outcome=review,
                 )
                 # Cooperative cancellation — a review cut short by a cancel is not a failed attempt.
                 if cancel_event is not None and cancel_event.is_set():
@@ -1227,11 +1272,8 @@ class Orchestrator:
                         if has_enabled_developer
                         else 1
                     )
-                    await self._bus.emit(
-                        type=EventType.attempt_failed,
-                        project_id=project.id,
-                        task_id=task.id,
-                        payload={"n": attempts, "stage": "review"},
+                    last_reason = await self._attempt_failed(
+                        task, attempts, "review", review.reason or "review failed"
                     )
                     continue
 
@@ -1294,8 +1336,34 @@ class Orchestrator:
                         gate_commands.append(("check/lint", cmd))
 
                     if not gate_commands and has_enabled_developer:
-                        # Reached with execution.allow_no_test_command (or once the test command
-                        # was removed mid-task): the gate passes, but never silently.
+                        if not config.execution.allow_no_test_command:
+                            # The test command was removed while the task ran: a gate that runs
+                            # no tests proves nothing, so the task fails as the early check does.
+                            await repo.save_task_checkpoint(
+                                self._db,
+                                task_id=task.id,
+                                node_id="gate",
+                                attempt=attempts,
+                                status=CheckpointStatus.failed,
+                                git_tree_sha=review_tree,
+                            )
+                            await self._bus.emit(
+                                type=EventType.node_completed,
+                                project_id=project.id,
+                                task_id=task.id,
+                                payload={
+                                    "node_id": "gate",
+                                    "attempt": attempts,
+                                    "status": "failed",
+                                },
+                            )
+                            await self._attempt_failed(task, attempts, "gate", "no_test_command")
+                            return await self._fail_early(
+                                task, wm, task_branch, _NO_TEST_COMMAND_SUMMARY,
+                                reason="no_test_command",
+                            )
+                        # Reached with execution.allow_no_test_command: the gate passes, but
+                        # never silently.
                         await self._bus.emit(
                             type=EventType.log,
                             project_id=project.id,
@@ -1343,17 +1411,9 @@ class Orchestrator:
                                         worktree, cmd, timeout_seconds=gate_timeout
                                     )
                                     if not gate.passed:
-                                        reason = f"infra_{gate.outcome}"
-                                        await self._bus.emit(
-                                            type=EventType.attempt_failed,
-                                            project_id=project.id,
-                                            task_id=task.id,
-                                            payload={
-                                                "n": attempts,
-                                                "stage": "gate",
-                                                "reason": reason,
-                                                "exit_code": gate.exit_code,
-                                            },
+                                        last_reason = await self._attempt_failed(
+                                            task, attempts, "gate", f"infra_{gate.outcome}",
+                                            exit_code=gate.exit_code,
                                         )
                                         failed = True
                                         gate_mark = "infra"
@@ -1375,15 +1435,10 @@ class Orchestrator:
                                         f"(exit {gate.exit_code}). "
                                         f"Fix the failing {label}:\n{gate_output}"
                                     )
-                                    await self._bus.emit(
-                                        type=EventType.attempt_failed,
-                                        project_id=project.id,
-                                        task_id=task.id,
-                                        payload={
-                                            "n": attempts,
-                                            "stage": "gate",
-                                            "exit_code": gate.exit_code,
-                                        },
+                                    last_reason = await self._attempt_failed(
+                                        task, attempts, "gate",
+                                        f"{label} gate not green (exit {gate.exit_code})",
+                                        exit_code=gate.exit_code,
                                     )
                                     failed = True
                                     gate_mark = "real"
@@ -1595,6 +1650,7 @@ class Orchestrator:
                 return await self._finish_failure(
                     task, wm, task_branch, timed_out, attempts,
                     integrity=integrity, integrity_mode=integrity_mode, planner_note=planner_note,
+                    last_reason=last_reason,
                 )
             return await self._finish_success(
                 task, wm, task_branch, repo_path, target_branch, worktree, config, attempts,
@@ -1607,18 +1663,6 @@ class Orchestrator:
                 f"unhandled exception processing task {task.id}",
             )
         finally:
-            # Always clean the cancellation event so the dict doesn't leak memory
-            # — harmless no-op when the entry was already removed by _finish_cancelled.
-            self._cancel_events.pop(task.id, None)
-            # Drop any uninjected steer too (e.g. queued after the final dispatch) so
-            # _pending_steers stays bounded — harmless no-op when already consumed.
-            self._pending_steers.pop(task.id, None)
-            self._approval_waiters.pop(task.id, None)
-            self._dynamic_hitl.pop(task.id, None)
-            for k in [k for k in self._node_steers if k[0] == task.id]:
-                self._node_steers.pop(k, None)
-            for k in [k for k in self._approval_resolutions if k[0] == task.id]:
-                self._approval_resolutions.pop(k, None)
             # experimental.workflow_evolution decides: off skips this, suggest (default) stores a
             # proposal, auto applies the change as a workflow version.
             with contextlib.suppress(Exception):
@@ -1630,30 +1674,63 @@ class Orchestrator:
                     gate_failed_after_review=gate_failed_after_review,
                     automatic=True,
                 )
-            # Prune events/baselines unconditionally — every processed task, regardless of
-            # outcome (success/failure/cancel/exception) and crucially even for projects with
-            # NO test command (which never run a baseline). Folding GC into _baseline meant
-            # those projects' events/baselines grew unbounded. Both DELETEs are cheap when
-            # under the cap (the subquery returns all rows, so none match) and are best-effort:
-            # a sweep failure must never mask the task's real result.
-            try:
-                await repo.gc_events(
-                    self._db, project.id, keep=config.execution.retention_events_max
-                )
-                await repo.gc_baselines(self._db, project.id)
-            except Exception:
-                logger.warning("GC sweep failed for task %s", task.id, exc_info=True)
-            # Fire the terminal-task notification last, after the outcome is durably written.
-            # Reads the freshly-persisted task so the payload reflects the final state +
-            # summary; inert unless a webhook is configured, and fully best-effort.
-            await self._notify_terminal(project.id, task.id, config)
-            if (
-                self._reloader is not None
-                and self._daemon is not None
-                and getattr(self._reloader, "reload_pending", False)
-            ):
-                with contextlib.suppress(Exception):
-                    await self._reloader.on_task_complete(self._daemon)
+            await self._task_housekeeping(project.id, task.id, config)
+
+    async def _task_housekeeping(
+        self, project_id: str, task_id: str, config: ConclaveConfig
+    ) -> None:
+        """What every processed task ends with, whatever its outcome or where it stopped."""
+        # Always clean the cancellation event so the dict doesn't leak memory
+        # — harmless no-op when the entry was already removed by _finish_cancelled.
+        self._cancel_events.pop(task_id, None)
+        # Drop any uninjected steer too (e.g. queued after the final dispatch) so
+        # _pending_steers stays bounded — harmless no-op when already consumed.
+        self._pending_steers.pop(task_id, None)
+        self._approval_waiters.pop(task_id, None)
+        self._dynamic_hitl.pop(task_id, None)
+        for k in [k for k in self._node_steers if k[0] == task_id]:
+            self._node_steers.pop(k, None)
+        for k in [k for k in self._approval_resolutions if k[0] == task_id]:
+            self._approval_resolutions.pop(k, None)
+        # Prune events/baselines unconditionally — every processed task, regardless of
+        # outcome (success/failure/cancel/exception) and crucially even for projects with
+        # NO test command (which never run a baseline, and fail before any worktree exists).
+        # Folding GC into _baseline meant those projects' events/baselines grew unbounded.
+        # Both DELETEs are cheap when under the cap (the subquery returns all rows, so none
+        # match) and are best-effort: a sweep failure must never mask the task's real result.
+        try:
+            await repo.gc_events(self._db, project_id, keep=config.execution.retention_events_max)
+            await repo.gc_baselines(self._db, project_id)
+        except Exception:
+            logger.warning("GC sweep failed for task %s", task_id, exc_info=True)
+        # Fire the terminal-task notification last, after the outcome is durably written.
+        # Reads the freshly-persisted task so the payload reflects the final state +
+        # summary; inert unless a webhook is configured, and fully best-effort.
+        await self._notify_terminal(project_id, task_id, config)
+        if (
+            self._reloader is not None
+            and self._daemon is not None
+            and getattr(self._reloader, "reload_pending", False)
+        ):
+            with contextlib.suppress(Exception):
+                await self._reloader.on_task_complete(self._daemon)
+
+    async def _attempt_failed(
+        self, task: Task, attempt: int, stage: str, reason: str, **details: object
+    ) -> str:
+        """Emit ``attempt.failed`` for *attempt* with why it failed; return that reason.
+
+        The reason is one line of at most :data:`_ATTEMPT_REASON_CHARS`; *details* keep each
+        stage's own keys (a developer's ``error``, a gate's ``exit_code``).
+        """
+        line = _one_line(reason, _ATTEMPT_REASON_CHARS)
+        await self._bus.emit(
+            type=EventType.attempt_failed,
+            project_id=task.project_id,
+            task_id=task.id,
+            payload={"n": attempt, "stage": stage, **details, "reason": line},
+        )
+        return line
 
     async def _notify_terminal(
         self, project_id: str, task_id: str, config: ConclaveConfig
@@ -1688,7 +1765,8 @@ class Orchestrator:
 
     async def _baseline(
         self,
-        project_id: str,
+        task: Task,
+        config: ConclaveConfig,
         worktree: Path,
         checkpoint: str,
         target_branch: str,
@@ -1697,17 +1775,19 @@ class Orchestrator:
     ) -> _Baseline:
         """Snapshot the pre-existing test failures at *checkpoint* (cached per SHA).
 
-        The whole output is cached and returned; each reader fits it to its own limit when
-        the preamble is built (:meth:`_baseline_preamble`).
+        The cached row is fitted to ``context.bulk_max_chars``, marker included, so it stays
+        bounded and a reader at that limit shows it as stored; a cut is reported once, here.
+        This task keeps the whole output, and each reader fits it to its own limit when the
+        preamble is built (:meth:`_baseline_preamble`).
         """
         if not test_command:
             return _Baseline(target_branch)
-        cached = await repo.get_baseline(self._db, project_id, checkpoint)
+        cached = await repo.get_baseline(self._db, task.project_id, checkpoint)
         if cached is not None:
             return _Baseline(target_branch, test_command, cached.output)
         await self._bus.emit(
             type=EventType.baseline_snapshot,
-            project_id=project_id,
+            project_id=task.project_id,
             payload={"sha": checkpoint[:12]},
         )
         gate = await run_tests(worktree, test_command, timeout_seconds=gate_timeout)
@@ -1717,7 +1797,16 @@ class Orchestrator:
             failures = ""
         else:
             failures = gate.output
-        await repo.save_baseline(self._db, project_id, checkpoint, failures)
+        limit = BulkLimit("bulk_max_chars", config.context.bulk_max_chars)
+        stored = fit_block(
+            failures,
+            limit=limit.limit,
+            field=limit.field,
+            how_to_get_rest=_baseline_rerun_hint(test_command),
+            within_limit=True,
+        )
+        await self._report_cut(task, stored, block="baseline_output", limit=limit, agent=None)
+        await repo.save_baseline(self._db, task.project_id, checkpoint, stored.text)
         return _Baseline(target_branch, test_command, failures)
 
     async def _maybe_plan(
@@ -2313,6 +2402,7 @@ class Orchestrator:
         diff_cmd: str,
         diff_cache: dict[BulkLimit, str] | None = None,
         integrity_section: str = "",
+        outcome: _ReviewOutcome | None = None,
     ) -> tuple[bool, str, bool]:
         """Review the current diff through the derived agent pipeline.
 
@@ -2323,7 +2413,7 @@ class Orchestrator:
 
         Returns ``(failed, feedback, timed_out)``. ``timed_out`` is ``True`` when the
         wall-clock budget was exceeded mid-review — the caller must abort the task, not
-        retry the attempt.
+        retry the attempt. A review that fails the attempt says why in *outcome*.
         """
         effective_diff = grounding_diff if grounding_diff is not None else current_diff
         pass_through = is_pass_through_review(config)
@@ -2350,8 +2440,8 @@ class Orchestrator:
         base_prompt = f"Review the changes made for this task:\n{task.request}"
         passes = 0
         all_summaries: list[str] = []
-        # "AGENT: reason" of each mandatory reviewer left without a usable verdict.
-        missing: list[str] = []
+        # (AGENT, reason) of each mandatory reviewer left without a usable verdict.
+        missing: list[tuple[str, str]] = []
 
         def _is_mandatory(n: WorkflowNode) -> bool:
             return (n.agent or n.id) in config.agents.mandatory
@@ -2440,6 +2530,7 @@ class Orchestrator:
                 return True, "cancelled", False
 
             failures: list[str] = []
+            rejections: list[str] = []  # each blocking verdict, as the failure reason names it
             for node, (result, raw_verdict) in zip(review_nodes, dispatched, strict=True):
                 agent = node.agent or node.id
                 verdict = await self._record_reviewer_verdict(
@@ -2459,13 +2550,14 @@ class Orchestrator:
                 )
                 # The recorded verdict includes any operator override from a HITL pause.
                 if _is_mandatory(node) and verdict.source == "none":
-                    missing.append(f"{agent.upper()}: {verdict.reason}")
+                    missing.append((agent.upper(), verdict.reason))
                 all_summaries.append(
                     f"- {agent.upper()} ({verdict.verdict.upper()}): {verdict.reason}"
                 )
                 if verdict.verdict in ("fail", "block", "decline"):
                     header = f"{agent.upper()} FEEDBACK ({verdict.verdict.upper()})"
                     failures.append(f"\n{header}:\n{verdict.reason}\n")
+                    rejections.append(_rejection(agent, verdict))
                 elif verdict.verdict == "pass":
                     passes += 1
 
@@ -2489,6 +2581,8 @@ class Orchestrator:
                         "passes": passes,
                     },
                 )
+                if outcome is not None:
+                    outcome.reason = "; ".join(rejections)
                 return True, "".join(failures), False
         else:
             failures = []
@@ -2565,7 +2659,7 @@ class Orchestrator:
                 )
                 # The recorded verdict includes any operator override from a HITL pause.
                 if _is_mandatory(node) and verdict.source == "none":
-                    missing.append(f"{agent.upper()}: {verdict.reason}")
+                    missing.append((agent.upper(), verdict.reason))
                 all_summaries.append(
                     f"- {agent.upper()} ({verdict.verdict.upper()}): {verdict.reason}"
                 )
@@ -2592,6 +2686,8 @@ class Orchestrator:
                                 "passes": passes,
                             },
                         )
+                        if outcome is not None:
+                            outcome.reason = _rejection(agent, verdict)
                         return True, f"\n{header}:\n{verdict.reason}\n", False
                 if verdict.verdict == "pass":
                     passes += 1
@@ -2625,12 +2721,23 @@ class Orchestrator:
                 },
             )
             if missing:
+                if outcome is not None:
+                    names = ", ".join(name for name, _ in missing)
+                    whys = "; ".join(
+                        f"{name}: {_one_line(why, _REVIEWER_REASON_CHARS)}" for name, why in missing
+                    )
+                    outcome.reason = (
+                        f"inconclusive: mandatory reviewer(s) {names} gave no usable verdict "
+                        f"({whys})"
+                    )
                 return True, (
                     "\nREVIEW INCONCLUSIVE: mandatory reviewer(s) gave no usable verdict after "
                     f"{_REVIEWER_DISPATCH_RETRIES + 1} tries each:\n"
-                    + "".join(f"- {line}\n" for line in missing)
+                    + "".join(f"- {name}: {why}\n" for name, why in missing)
                     + "Not merging without every mandatory verdict; retrying.\n"
                 ), False
+            if outcome is not None:
+                outcome.reason = "no reviewer returned a usable verdict"
             return True, (
                 "\nREVIEW INCONCLUSIVE: no reviewer returned a usable verdict "
                 "(all 'unknown' — the model backend was likely unavailable). "
@@ -2879,9 +2986,13 @@ class Orchestrator:
         integrity: Sequence[IntegrityFinding] = (),
         integrity_mode: str = "off",
         planner_note: str = "",
+        last_reason: str | None = None,
     ) -> bool:
+        """Fail *task* after its attempts; the summary ends with why the last one failed."""
         reason = "timeout" if timed_out else "max_retries"
         note = planner_note + _integrity_note(integrity, integrity_mode)
+        if last_reason:
+            note += f"; last: {last_reason}"
         # One transaction: fail the task, record why, and block its descendants together so
         # a crash can't leave the task failed while children stay claimable. Announce only
         # once the transition is durably committed.
@@ -3015,19 +3126,13 @@ class Orchestrator:
         self._cancel_events.pop(task.id, None)
         return False
 
-    async def _merge(
-        self, repo_path: Path, target_branch: str, task_branch: str, task_id: str
-    ) -> MergeResult:
-        """Merge ``task_branch`` into ``target_branch`` without disturbing the user's
-        checkout. Serialises merges into the same target via an asyncio lock so two
-        concurrent tasks can never race on the shared merge-worktree path or clobber
-        each other's ref update.
+    @contextlib.asynccontextmanager
+    async def merge_lock(self, target_branch: str) -> AsyncIterator[None]:
+        """Hold the lock that serialises every merge into *target_branch*.
 
-        Returns a three-way :class:`MergeResult`:
-        * ``success`` — the target now contains the task work.
-        * ``conflict`` — a real merge conflict (caller must fail the task, preserve
-          the branch).
-        * ``error`` — transient infra failure (e.g. concurrent ref advance); retryable.
+        :meth:`_merge` takes it itself; a caller that must check the target and read its
+        result under the same lock (the operator merge) holds it around its own checks and
+        its :meth:`_merge` call, which then runs under the lock already held.
 
         The per-target lock is reference-counted so ``_merge_locks`` stays bounded: a
         long-running daemon merging into many ephemeral targets would otherwise accrue one
@@ -3041,16 +3146,13 @@ class Orchestrator:
         self._merge_lock_refs[target_branch] = self._merge_lock_refs.get(target_branch, 0) + 1
         try:
             async with lock:
-                res = await self._merge_locked(repo_path, target_branch, task_branch, task_id)
-                if (
-                    res is MergeResult.success
-                    and self._reloader is not None
-                    and (repo_path / "src" / "conclave").is_dir()
-                ):
-                    self._reloader.request_reload(
-                        self._daemon, reason=f"self_merge:{task_id}"
-                    )
-                return res
+                holder = asyncio.current_task()
+                if holder is not None:
+                    self._merge_lock_holders[target_branch] = holder
+                try:
+                    yield
+                finally:
+                    self._merge_lock_holders.pop(target_branch, None)
         finally:
             refs = self._merge_lock_refs[target_branch] - 1
             if refs <= 0:
@@ -3059,6 +3161,32 @@ class Orchestrator:
                 self._merge_locks.pop(target_branch, None)
             else:
                 self._merge_lock_refs[target_branch] = refs
+
+    async def _merge(
+        self, repo_path: Path, target_branch: str, task_branch: str, task_id: str
+    ) -> MergeResult:
+        """Merge ``task_branch`` into ``target_branch`` without disturbing the user's
+        checkout. Serialises merges into the same target via :meth:`merge_lock` so two
+        concurrent tasks can never race on the shared merge-worktree path or clobber
+        each other's ref update; a caller already holding that lock merges under it.
+
+        Returns a three-way :class:`MergeResult`:
+        * ``success`` — the target now contains the task work.
+        * ``conflict`` — a real merge conflict (caller must fail the task, preserve
+          the branch).
+        * ``error`` — transient infra failure (e.g. concurrent ref advance); retryable.
+        """
+        holder = self._merge_lock_holders.get(target_branch)
+        held = holder is not None and holder is asyncio.current_task()
+        async with contextlib.nullcontext() if held else self.merge_lock(target_branch):
+            res = await self._merge_locked(repo_path, target_branch, task_branch, task_id)
+            if (
+                res is MergeResult.success
+                and self._reloader is not None
+                and (repo_path / "src" / "conclave").is_dir()
+            ):
+                self._reloader.request_reload(self._daemon, reason=f"self_merge:{task_id}")
+            return res
 
     async def _merge_locked(
         self, repo_path: Path, target_branch: str, task_branch: str, task_id: str
@@ -3189,6 +3317,18 @@ def _one_line_tail(text: str, limit: int) -> str:
     return line if len(line) <= limit else "..." + line[-(limit - 3) :]
 
 
+def _one_line(text: str, limit: int) -> str:
+    """*text* on one line (whitespace runs collapsed), cut to its first *limit* chars."""
+    line = " ".join(text.split())
+    return line if len(line) <= limit else line[: limit - 3] + "..."
+
+
+def _rejection(agent: str, verdict: ParsedVerdict) -> str:
+    """How a blocking reviewer's verdict reads in an attempt's failure reason."""
+    why = _one_line(verdict.reason, _REVIEWER_REASON_CHARS)
+    return f"rejected by {agent.upper()} ({verdict.verdict}): {why}"
+
+
 def wm_merge_path(repo_path: Path, target_branch: str, task_id: str) -> Path:
     """Deterministic merge-worktree path unique per (repo, target, task).
 
@@ -3232,6 +3372,14 @@ def _diff_hint(diff_cmd: str) -> str:
 def _rerun_hint(command: str) -> str:
     """How an agent recovers the fitted output of a gate/test or setup *command*."""
     return f"Re-run `{command}` in your working directory for the full output."
+
+
+def _baseline_rerun_hint(command: str | None) -> str:
+    """How an agent recovers fitted baseline output: re-run *command* before changing anything."""
+    return (
+        f"Re-run `{command}` in your working directory before changing anything for the "
+        "full output."
+    )
 
 
 def _diff_stat(diff: str) -> str:

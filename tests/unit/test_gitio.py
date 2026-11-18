@@ -8,7 +8,14 @@ import signal
 from pathlib import Path
 from unittest.mock import patch
 
-from conclave.engine.gitio import _kill_process_group, _signal_group, run_shell
+import pytest
+
+from conclave.engine.gitio import (
+    CANCELLED_EXIT_CODE,
+    _kill_process_group,
+    _signal_group,
+    run_shell,
+)
 
 # ---------------------------------------------------------------------------
 # run_shell — process-group kill on timeout
@@ -51,6 +58,49 @@ async def test_run_shell_timeout_graceful_exit(tmp_path: Path) -> None:
     exit_code, output = await run_shell(tmp_path, "echo done", timeout_seconds=5)
     assert exit_code == 0
     assert "done" in output
+
+
+# ---------------------------------------------------------------------------
+# run_shell — process-group kill on cancel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("timeout_seconds", [60, None])
+async def test_run_shell_kills_process_group_on_cancel(
+    tmp_path: Path, timeout_seconds: int | None
+) -> None:
+    """Setting the cancel event stops the command at once, children included."""
+    pid_file = tmp_path / "child.pid"
+    script = f"sleep 300 & echo $! > {pid_file.as_posix()}; wait"
+    cancel = asyncio.Event()
+    run = asyncio.create_task(
+        run_shell(tmp_path, script, timeout_seconds=timeout_seconds, cancel_event=cancel)
+    )
+    child_pid = await _wait_for_pid(pid_file)
+
+    cancel.set()
+    exit_code, output = await asyncio.wait_for(run, timeout=5)
+
+    assert exit_code == CANCELLED_EXIT_CODE
+    assert output == "(command cancelled)"
+    await _wait_for_process_gone(child_pid)
+
+
+async def test_run_shell_starts_nothing_once_cancelled(tmp_path: Path) -> None:
+    cancel = asyncio.Event()
+    cancel.set()
+    exit_code, output = await run_shell(
+        tmp_path, "touch ran", timeout_seconds=60, cancel_event=cancel
+    )
+    assert (exit_code, output) == (CANCELLED_EXIT_CODE, "(command cancelled)")
+    assert not (tmp_path / "ran").exists()
+
+
+async def test_run_shell_with_an_unset_cancel_event_returns_the_result(tmp_path: Path) -> None:
+    exit_code, output = await run_shell(
+        tmp_path, "echo done; exit 3", cancel_event=asyncio.Event()
+    )
+    assert (exit_code, output.strip()) == (3, "done")
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +171,16 @@ async def test_kill_process_group_sigterm_then_sigkill() -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _wait_for_pid(pid_file: Path, deadline_seconds: float = 5.0) -> int:
+    """Poll until *pid_file* holds a pid (the shell wrote it) and return it."""
+    deadline = asyncio.get_event_loop().time() + deadline_seconds
+    while asyncio.get_event_loop().time() < deadline:
+        if pid_file.exists() and pid_file.read_text().strip():
+            return int(pid_file.read_text().strip())
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{pid_file} never got a pid")
 
 
 async def _wait_for_process_gone(pid: int, deadline_seconds: float = 3.0) -> None:

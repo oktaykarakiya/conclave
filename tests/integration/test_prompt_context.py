@@ -408,18 +408,24 @@ async def test_gate_output_keeps_its_first_and_last_line_in_the_developer_feedba
     assert all(c["agent"] == "developer" for c in gate_cuts)
 
 
-async def test_baseline_output_is_cached_whole_and_fitted_with_a_marker_for_each_reader(
+_BASELINE_COMMAND = "if [ ! -f FEATURE.txt ]; then cat baseline_output.txt; exit 1; fi"
+_BASELINE_HINT = (
+    f"Re-run `{_BASELINE_COMMAND}` in your working directory before changing anything for the "
+    "full output."
+)
+
+
+async def test_baseline_output_is_cached_bounded_and_fitted_with_a_marker_for_each_reader(
     db: Database, tmp_path: Path
 ) -> None:
     output = _numbered_output("FIRST baseline failure: test_legacy", "LAST baseline: 401 failed")
     base = await _init_repo(tmp_path / "repo", {"baseline_output.txt": output})
-    command = "if [ ! -f FEATURE.txt ]; then cat baseline_output.txt; exit 1; fi"
     provider = FakeProvider()
 
     task, ok = await _run_task(
         db, tmp_path, provider,
         {
-            "execution": {"target_branch": "main", "baseline_test_command": command},
+            "execution": {"target_branch": "main", "baseline_test_command": _BASELINE_COMMAND},
             "context": {"bulk_max_chars": 1_000},
         },
         use_planner=True,
@@ -428,25 +434,104 @@ async def test_baseline_output_is_cached_whole_and_fitted_with_a_marker_for_each
     assert ok is True and task.state is TaskState.done
     cached = await repo.get_baseline(db, task.project_id, base)
     assert cached is not None
-    assert cached.output.splitlines() == output.splitlines()  # nothing cut before caching
+    # The cache row is bounded, marker included, and keeps the head and tail.
+    assert len(cached.output) <= 1_000
+    assert cached.output.startswith("FIRST baseline failure: test_legacy\n")
+    assert cached.output.endswith("LAST baseline: 401 failed\n")
+    assert len(_MARKER_RE.findall(cached.output)) == 1
+    stored = _MARKER_RE.search(cached.output)
+    assert stored is not None
+    omitted, total, field, limit, hint = stored.groups()
+    assert (int(total), field, limit, hint) == (
+        len(output), "bulk_max_chars", "1000", _BASELINE_HINT
+    )
+    head, tail = cached.output[: stored.start()], cached.output[stored.end() + 1 :]
+    assert output.startswith(head) and output.endswith(tail)
+    assert int(omitted) == len(output) - len(head) - len(tail)
     planner = [p for p in provider.prompts if _PLAN in p]
     developer = _prompts_of(provider, "developer")
     assert len(planner) == 1 and len(developer) == 1
-    hint = (
-        f"Re-run `{command}` in your working directory before changing anything for the "
-        "full output."
-    )
     for prompt in (planner[0], developer[0]):
         preamble = prompt.split("PRE-EXISTING TEST FAILURES on `main`", 1)[1]
         assert "FIRST baseline failure: test_legacy" in preamble
         assert "LAST baseline: 401 failed" in preamble
         match = _MARKER_RE.search(preamble)
         assert match is not None
-        assert match.group(3, 4, 5) == ("bulk_max_chars", "1000", hint)
+        assert match.group(3, 4, 5) == ("bulk_max_chars", "1000", _BASELINE_HINT)
 
     cuts = await _cuts(db, task.id)
-    assert [(c["block"], c["agent"]) for c in cuts] == [("gate_output", "planner")]
-    assert cuts[0]["original_chars"] == len(cached.output)
+    assert [(c["block"], c["agent"]) for c in cuts] == [
+        ("baseline_output", None),
+        ("gate_output", "planner"),
+    ]
+    assert cuts[0]["field"] == "bulk_max_chars"
+    assert cuts[0]["original_chars"] == len(output)
+    # This task's readers fitted the whole output, not the stored copy.
+    assert cuts[1]["original_chars"] == len(output)
+
+
+async def test_baseline_output_under_the_limit_is_cached_unchanged(
+    db: Database, tmp_path: Path
+) -> None:
+    output = _numbered_output("FIRST baseline failure: test_legacy", "LAST baseline: 9 failed", 8)
+    assert len(output) < 1_000
+    base = await _init_repo(tmp_path / "repo", {"baseline_output.txt": output})
+
+    task, ok = await _run_task(
+        db, tmp_path, FakeProvider(),
+        {
+            "execution": {"target_branch": "main", "baseline_test_command": _BASELINE_COMMAND},
+            "context": {"bulk_max_chars": 1_000},
+        },
+    )
+
+    assert ok is True
+    cached = await repo.get_baseline(db, task.project_id, base)
+    assert cached is not None
+    assert cached.output == output
+    assert await _cuts(db, task.id) == []
+
+
+async def test_a_cached_bounded_baseline_reaches_the_next_task_as_stored(
+    db: Database, tmp_path: Path
+) -> None:
+    output = _numbered_output("FIRST baseline failure: test_legacy", "LAST baseline: 401 failed")
+    base = await _init_repo(tmp_path / "repo", {"baseline_output.txt": output})
+    provider = FakeProvider()
+    # Nothing merges, so the second task starts from the same checkpoint and hits the cache.
+    first, ok = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {
+                "target_branch": "main",
+                "baseline_test_command": _BASELINE_COMMAND,
+                "auto_merge": False,
+            },
+            "context": {"bulk_max_chars": 1_000},
+        },
+    )
+    assert ok is True
+    cached = await repo.get_baseline(db, first.project_id, base)
+    assert cached is not None and len(cached.output) <= 1_000
+
+    second = await repo.create_task(
+        db, project_id=first.project_id, request="add another feature file",
+        state=TaskState.approved,
+    )
+    claimed = await repo.claim_next_approved(db, first.project_id)
+    assert claimed is not None and claimed.id == second.id
+    provider.prompts.clear()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
+    assert await orchestrator.process_task(claimed) is True
+
+    events = await repo.list_events(db, project_id=first.project_id, limit=10_000)
+    assert [e.type for e in events].count("baseline.snapshot") == 1  # the first task's only
+    developer = _prompts_of(provider, "developer")
+    assert len(developer) == 1
+    preamble = developer[0].split("PRE-EXISTING TEST FAILURES on `main`", 1)[1]
+    assert f"```\n{cached.output}\n```" in preamble
+    assert len(_MARKER_RE.findall(preamble)) == 1
+    assert await _cuts(db, second.id) == []
 
 
 async def test_setup_failure_reason_carries_fitted_output_with_its_marker(

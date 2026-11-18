@@ -68,7 +68,7 @@ from ..config.models import BugFixerSessionConfig, DeclineConsensus
 from ..db import BugCandidate, BugStatus, Database, Project, Task, TaskOrigin, TaskState
 from ..db import repositories as repo
 from ..events import EventBus, EventType
-from ..providers import Provider, QuotaGate
+from ..providers import Provider, QuotaGate, WaitTracker
 from .discovery import discover_bug
 from .orchestrator import Orchestrator
 from .repro import ReproTest, parse_repro_test
@@ -137,6 +137,7 @@ class BugFixerController:
         config: ConclaveConfig,
         *,
         cancel_event: asyncio.Event | None = None,
+        waits: WaitTracker | None = None,
     ) -> CycleResult:
         """Run one discover → reproduce → fix cycle for *project*; return what it resolved.
 
@@ -144,20 +145,24 @@ class BugFixerController:
         controller would not, and the gate owns its own dismissed / declined / infra handling, so
         the controller only ever drives the discovered → fixing → {fixed, deferred} edges itself —
         always through the guarded :func:`transition_bug_status`. ``cancel_event`` is forwarded to
-        discovery, the ``repro`` dispatch, and (via the task's own registration) the fix, so a stop
-        request is honoured between and within stages.
+        discovery, the ``repro`` dispatch, the reproduction gate (which stops its running test
+        command) and (via the task's own registration) the fix, so a stop request is honoured
+        between and within stages. Every dispatch of the cycle, the fix task's included, counts
+        the time it waits for a usage limit in ``waits`` (the worker's session tracker).
         """
         # (a) Discover — a genuinely new `discovered` candidate, or nothing to hunt this turn.
         candidate = await discover_bug(
             self._db, self._bus, self._provider, project, config, cancel_event=cancel_event,
-            quota_gate=self._quota_gate,
+            quota_gate=self._quota_gate, waits=waits,
         )
         if candidate is None:
             return CycleResult(CycleOutcome.idle)
 
         # (b) Synthesize + parse the repro test. No usable repro → defer (a legal discovered edge),
         # never a forced illegal transition.
-        repro = await self._synthesize_repro(project, config, candidate, cancel_event=cancel_event)
+        repro = await self._synthesize_repro(
+            project, config, candidate, cancel_event=cancel_event, waits=waits
+        )
         if repro is None:
             deferred = await self._defer(
                 candidate, "no usable repro test synthesized — deferring for a later sweep"
@@ -174,11 +179,12 @@ class BugFixerController:
             wm=self._worktree_manager(project),
             test_command=self._repro_test_command(config, repro),
             timeout_seconds=self._gate_timeout(config),
+            cancel_event=cancel_event,
         )
 
         if result.outcome is ReproOutcome.reproduced:
             return await self._fix_reproduced(
-                project, result.candidate, repro, config, cancel_event=cancel_event,
+                project, result.candidate, repro, config, cancel_event=cancel_event, waits=waits,
             )
         if result.outcome is ReproOutcome.dismissed:
             await self._log(project.id, result.candidate, "dismissed false positive (gate)")
@@ -202,6 +208,7 @@ class BugFixerController:
         config: ConclaveConfig,
         *,
         cancel_event: asyncio.Event | None = None,
+        waits: WaitTracker | None = None,
     ) -> CycleResult:
         """Fix a ``reproduced`` candidate as a real ``bug_fixer`` Task; record the outcome.
 
@@ -223,7 +230,8 @@ class BugFixerController:
         # short-circuits the fix entirely.
         if config.bug_fixer.require_decline_consensus:
             declined = await self._decline_consensus(
-                project, candidate, config, pinned_path, pinned_body, cancel_event=cancel_event,
+                project, candidate, config, pinned_path, pinned_body,
+                cancel_event=cancel_event, waits=waits,
             )
             if declined is not None:
                 return CycleResult(CycleOutcome.declined, declined)
@@ -241,7 +249,7 @@ class BugFixerController:
             self._db, candidate.id, BugStatus.fixing, task_id=task.id,
         )
 
-        merged = await self._run_fix_task(task)
+        merged = await self._run_fix_task(task, waits=waits)
 
         if merged:
             fixed = await repo.transition_bug_status(self._db, candidate.id, BugStatus.fixed)
@@ -260,7 +268,7 @@ class BugFixerController:
         await self._log(project.id, deferred, f"fix task {task.id} failed → deferred")
         return CycleResult(CycleOutcome.deferred, deferred)
 
-    async def _run_fix_task(self, task: Task) -> bool:
+    async def _run_fix_task(self, task: Task, *, waits: WaitTracker | None = None) -> bool:
         """Run a fix task through the orchestrator with cancellation wired exactly like the worker.
 
         Registers a per-task cancel event in the orchestrator's table so an operator stop reaches
@@ -270,7 +278,9 @@ class BugFixerController:
         cancel_event = asyncio.Event()
         self._orchestrator._cancel_events[task.id] = cancel_event
         try:
-            return await self._orchestrator.process_task(task, cancel_event=cancel_event)
+            return await self._orchestrator.process_task(
+                task, cancel_event=cancel_event, quota_waits=waits
+            )
         finally:
             self._orchestrator._cancel_events.pop(task.id, None)
 
@@ -285,6 +295,7 @@ class BugFixerController:
         repro_body: str,
         *,
         cancel_event: asyncio.Event | None,
+        waits: WaitTracker | None = None,
     ) -> BugCandidate | None:
         """Poll the mandatory reviewers on a ``reproduced`` candidate before an auto-fix.
 
@@ -303,7 +314,8 @@ class BugFixerController:
         round + decline events), or ``None`` to let the caller proceed to the fix path unchanged.
         """
         verdicts = await self._collect_consensus_verdicts(
-            project, candidate, config, repro_path, repro_body, cancel_event=cancel_event,
+            project, candidate, config, repro_path, repro_body,
+            cancel_event=cancel_event, waits=waits,
         )
         threshold = config.agents.decline_consensus
         met = _decline_threshold_met(verdicts, threshold)
@@ -356,6 +368,7 @@ class BugFixerController:
         repro_body: str,
         *,
         cancel_event: asyncio.Event | None,
+        waits: WaitTracker | None = None,
     ) -> dict[str, str | None]:
         """Dispatch each mandatory reviewer and parse its verdict; map agent → verdict (or abstain).
 
@@ -364,7 +377,8 @@ class BugFixerController:
         single misbehaving dispatch can never crash the cycle.
         """
         runner = AgentRunner(
-            self._db, self._bus, self._provider, project.id, config, quota_gate=self._quota_gate
+            self._db, self._bus, self._provider, project.id, config,
+            quota_gate=self._quota_gate, waits=waits,
         )
         prompt = _consensus_prompt(candidate, repro_path, repro_body)
         worktree = Path(project.path)
@@ -418,6 +432,7 @@ class BugFixerController:
         candidate: BugCandidate,
         *,
         cancel_event: asyncio.Event | None,
+        waits: WaitTracker | None = None,
     ) -> ReproTest | None:
         """Dispatch the ``repro`` persona over the candidate and parse its single test block.
 
@@ -426,7 +441,8 @@ class BugFixerController:
         ``None``, which the caller turns into a *deferred* candidate rather than a forced edge.
         """
         runner = AgentRunner(
-            self._db, self._bus, self._provider, project.id, config, quota_gate=self._quota_gate
+            self._db, self._bus, self._provider, project.id, config,
+            quota_gate=self._quota_gate, waits=waits,
         )
         result = await runner.run(
             agent="repro",

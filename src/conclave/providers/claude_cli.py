@@ -319,6 +319,8 @@ def _parse_envelope(raw: str, exit_code: int | None) -> AgentResult:
         text=text,
         model_reported=model_reported,
         cost_usd=cost_usd,
+        # total_cost_usd is the session's running total: a --resume run continues it.
+        cost_is_session_total=True,
         num_turns=num_turns,
         input_tokens=tokens["input_tokens"],
         output_tokens=tokens["output_tokens"],

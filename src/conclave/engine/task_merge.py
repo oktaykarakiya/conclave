@@ -2,9 +2,11 @@
 
 When ``execution.auto_merge`` is off a done task keeps its committed branch. This
 helper merges that branch into the project's target branch through the orchestrator's
-own :meth:`Orchestrator._merge` (per-target lock, guarded fast-forward / merge commit,
-conflict abort), then finishes exactly like the auto-merge path: ``task.merged`` event
-and branch deletion.
+own :meth:`Orchestrator._merge` (guarded fast-forward / merge commit, conflict abort),
+then finishes exactly like the auto-merge path: ``task.merged`` event and branch deletion.
+Its checks, the merge, the read of the merged target and the cleanup all run under the
+per-target :meth:`Orchestrator.merge_lock`, so no concurrent merge into the same target can
+slip between them.
 """
 
 from __future__ import annotations
@@ -49,40 +51,50 @@ async def merge_task(
     target = _resolve_target_branch(project, config)
     repo_path = Path(project.path)
 
-    found = await _find_task_branch(repo_path, config, task) if repo_path.is_dir() else None
-    if found is None:
+    # The branch (and commit) this request is for, looked up before waiting on the lock: a
+    # concurrent merge of the same task may merge and delete the branch meanwhile, and its
+    # commit then still shows this request was already served.
+    requested = await _find_task_branch(repo_path, config, task) if repo_path.is_dir() else None
+    if requested is None:
         raise TaskMergeError("task branch not found", 404)
-    branch, branch_sha = found
 
-    # _merge assumes the target exists; without it git runs in a missing merge worktree.
-    target_sha = await _branch_sha(repo_path, target)
-    if target_sha is None:
-        raise TaskMergeError(f"target branch not found: {target}", 404)
-    code, _ = await run_git(repo_path, "merge-base", "--is-ancestor", branch_sha, target_sha)
-    if code == 0:
-        raise TaskMergeError(f"task branch {branch} is already merged into {target}", 409)
+    async with orchestrator.merge_lock(target):
+        # _merge assumes the target exists; without it git runs in a missing merge worktree.
+        target_sha = await _branch_sha(repo_path, target)
+        if target_sha is None:
+            raise TaskMergeError(f"target branch not found: {target}", 404)
+        found = await _find_task_branch(repo_path, config, task)
+        branch, branch_sha = found if found is not None else requested
+        code, _ = await run_git(repo_path, "merge-base", "--is-ancestor", branch_sha, target_sha)
+        if code == 0:
+            raise TaskMergeError(f"task branch {branch} is already merged into {target}", 409)
+        if found is None:
+            raise TaskMergeError("task branch not found", 404)
 
-    result = await orchestrator._merge(repo_path, target, branch, task.id)
-    if result == MergeResult.conflict:
-        raise TaskMergeError(
-            f"merge conflict merging {branch} into {target}; branch preserved", 409
+        result = await orchestrator._merge(repo_path, target, branch, task.id)
+        if result == MergeResult.conflict:
+            raise TaskMergeError(
+                f"merge conflict merging {branch} into {target}; branch preserved", 409
+            )
+        if result != MergeResult.success:
+            raise TaskMergeError(f"transient merge error into {target}; retry", 503)
+        merged_sha = await _branch_sha(repo_path, target)
+
+        await repo.update_task_fields(
+            orchestrator._db, task.id, result_summary=f"merged into {target} by operator"
         )
-    if result != MergeResult.success:
-        raise TaskMergeError(f"transient merge error into {target}; retry", 503)
-
-    await repo.update_task_fields(
-        orchestrator._db, task.id, result_summary=f"merged into {target} by operator"
-    )
-    await orchestrator._bus.emit(
-        type=EventType.task_merged, project_id=task.project_id, task_id=task.id,
-        payload={"target": target},
-    )
-    wm = WorktreeManager(repo_path, orchestrator._home / "projects" / project.id / "worktrees")
-    await wm.cleanup(task.id, branch)
+        await orchestrator._bus.emit(
+            type=EventType.task_merged, project_id=task.project_id, task_id=task.id,
+            payload={"target": target},
+        )
+        wm = WorktreeManager(
+            repo_path, orchestrator._home / "projects" / project.id / "worktrees"
+        )
+        await wm.cleanup(task.id, branch)
     return {
         "task_id": task.id,
         "merged": True,
         "target": target,
         "branch": branch,
-        "target_sha": await _branch_sha(repo_path, target),
+        "target_sha": merged_sha,
     }

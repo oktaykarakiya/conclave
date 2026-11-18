@@ -30,6 +30,8 @@ synthesized test alone — the test has to actually fail on the code as it stand
   - ``timed_out`` / ``missing_command`` (or a skipped, uncommanded run) → INFRA NOISE, not proof
     either way: mirror ENG-7 by retrying once and, if it persists, abort WITHOUT transitioning the
     candidate. A toolchain failure must never be mistaken for a reproduced (or dismissed) bug.
+  - a run stopped by the cycle's cancel event (its process group killed, no retry started) is no
+    proof either: the outcome is ``infra`` and the candidate keeps its status.
 
 A repro that asserts a behaviour CHANGE in already-covered code (signalled by the caller, the only
 layer with the coverage / existing-test context to judge it) is held back from the auto-
@@ -45,6 +47,7 @@ no new exfiltration surface.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from enum import StrEnum
 from pathlib import Path
@@ -100,6 +103,7 @@ async def reproduce_bug(
     test_command: str | None,
     timeout_seconds: int = 1800,
     asserts_covered_behavior_change: bool = False,
+    cancel_event: asyncio.Event | None = None,
 ) -> ReproResult:
     """Prove (or refute) one ``discovered`` candidate with its synthesized repro test.
 
@@ -109,7 +113,9 @@ async def reproduce_bug(
     (caller-scoped to the repro test, mirroring :func:`run_tests`); a ``None``/skipped command is
     treated as inconclusive infra, never as a pass. ``asserts_covered_behavior_change`` is the
     caller's heightened-scrutiny signal: when set, a genuine failure routes to a human review
-    (``declined_needs_human``) instead of auto-advancing to ``reproduced``.
+    (``declined_needs_human``) instead of auto-advancing to ``reproduced``. Once
+    ``cancel_event`` is set the gate stops: a running test command is killed, no retry starts, and
+    the outcome is ``infra`` with the candidate unchanged.
 
     The throwaway worktree is always cleaned up. The operator's own checkout is never touched.
     """
@@ -126,6 +132,9 @@ async def reproduce_bug(
     if safe_path is None:
         await _log(bus, project.id, candidate, "pathguard", "repro test path rejected by pathguard")
         return ReproResult(outcome=ReproOutcome.rejected, candidate=candidate)
+
+    if cancel_event is not None and cancel_event.is_set():
+        return await _cancelled(bus, project, candidate)
 
     base_branch = config.execution.target_branch or project.default_branch
     slug = f"repro-{candidate.id}"
@@ -146,12 +155,15 @@ async def reproduce_bug(
                 bus, project.id, candidate, "write", "repro test path escaped the worktree"
             )
             return ReproResult(outcome=ReproOutcome.rejected, candidate=candidate)
-        gate = await _run_with_infra_retry(worktree, test_command, timeout_seconds)
+        gate = await _run_with_infra_retry(worktree, test_command, timeout_seconds, cancel_event)
     finally:
         # The worktree is throwaway: always remove it (and its branch), success or failure, so a
         # proven/refuted candidate never strands a dangling checkout.
         await wm.cleanup(slug, branch)
 
+    # A run stopped by a cancel is no proof either way, whatever its exit code says.
+    if cancel_event is not None and cancel_event.is_set():
+        return await _cancelled(bus, project, candidate)
     return await _classify(
         db,
         bus,
@@ -218,10 +230,11 @@ async def _classify(
     asserts_covered_behavior_change: bool,
 ) -> ReproResult:
     """Map a final :class:`GateResult` to a status transition + event (or to a no-op)."""
-    # A skipped run (no command) or an infra outcome is NOT proof in either direction — checked
-    # BEFORE `passed`, so an uncommanded/skipped gate can never be mistaken for "passes on the
-    # unfixed code" and wrongly dismiss a real bug.
-    if gate.skipped or gate.outcome in _INFRA_OUTCOMES:
+    # Only a real run that passed or failed is proof. A skipped run (no command), an infra outcome
+    # or a cancelled run is NOT proof in either direction — checked BEFORE `passed`, so an
+    # uncommanded/skipped gate can never be mistaken for "passes on the unfixed code" and wrongly
+    # dismiss a real bug.
+    if gate.skipped or gate.outcome not in ("failed", "passed"):
         await _log(
             bus,
             project.id,
@@ -297,17 +310,26 @@ async def _reproduced_or_declined(
 
 
 async def _run_with_infra_retry(
-    worktree: Path, command: str | None, timeout_seconds: int
+    worktree: Path,
+    command: str | None,
+    timeout_seconds: int,
+    cancel_event: asyncio.Event | None = None,
 ) -> GateResult:
     """Run the repro gate, retrying once on an infra outcome (ENG-7 mirror).
 
     A single transient toolchain hiccup (a timeout, a momentarily missing command) must not be
     read as "couldn't reproduce", so an infra outcome buys exactly one retry before the caller
-    treats it as inconclusive.
+    treats it as inconclusive. Once *cancel_event* is set the running command is stopped and no
+    retry starts.
     """
-    gate = await run_tests(worktree, command, timeout_seconds=timeout_seconds)
-    if gate.outcome in _INFRA_OUTCOMES:
-        gate = await run_tests(worktree, command, timeout_seconds=timeout_seconds)
+    gate = await run_tests(
+        worktree, command, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+    )
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    if gate.outcome in _INFRA_OUTCOMES and not cancelled:
+        gate = await run_tests(
+            worktree, command, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+        )
     return gate
 
 
@@ -351,6 +373,12 @@ def _event_payload(candidate: BugCandidate, *, reason: str | None = None) -> dic
     if reason is not None:
         payload["reason"] = reason
     return payload
+
+
+async def _cancelled(bus: EventBus, project: Project, candidate: BugCandidate) -> ReproResult:
+    """The result of a gate stopped by its cancel event: inconclusive, the candidate unchanged."""
+    await _log(bus, project.id, candidate, "gate", "repro gate cancelled")
+    return ReproResult(outcome=ReproOutcome.infra, candidate=candidate)
 
 
 async def _log(

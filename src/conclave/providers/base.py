@@ -55,6 +55,9 @@ class AgentResult(BaseModel):
     text: str = ""
     model_reported: str | None = None
     cost_usd: float | None = None
+    # The engine's fact about cost_usd: True when it is the session's running total (Claude Code,
+    # whose --resume run continues the total), False when it is this run's own cost (opencode).
+    cost_is_session_total: bool = False
     num_turns: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None

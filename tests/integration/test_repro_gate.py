@@ -18,15 +18,20 @@ eligibility guard (only a ``discovered`` candidate is acted on). All determinist
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import shlex
 import sys
 from pathlib import Path
 
+import pytest
+
 from conclave.config import ConclaveConfig
 from conclave.db import BugCandidate, BugStatus, Database, EventRow, Project
 from conclave.db import repositories as repo
 from conclave.engine import ReproOutcome, ReproTest, WorktreeManager, reproduce_bug
+from conclave.engine import repro_gate as repro_gate_mod
+from conclave.engine.gate import GateResult
 from conclave.engine.gitio import run_git
 from conclave.events import EventBus, EventType
 
@@ -267,3 +272,97 @@ async def test_non_discovered_candidate_is_ineligible(db: Database, tmp_path: Pa
     assert not wm.path_for(f"repro-{candidate.id}").exists()
     events = await repo.list_events(db, project_id=project.id)
     assert _events(events, EventType.bug_reproduced) == []
+
+
+# --- cancellation -------------------------------------------------------------
+
+
+async def _assert_untouched(db: Database, project: Project, candidate: BugCandidate) -> None:
+    """No transition, no pin, and none of the gate's bug events."""
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None and stored.status is BugStatus.discovered
+    assert stored.repro_test_path is None
+    events = await repo.list_events(db, project_id=project.id)
+    for event_type in (EventType.bug_reproduced, EventType.bug_dismissed, EventType.bug_declined):
+        assert _events(events, event_type) == []
+
+
+async def test_cancel_stops_the_running_gate_without_a_retry(
+    db: Database, tmp_path: Path
+) -> None:
+    """A cancel during the gate kills its command at once; no retry runs, nothing transitions."""
+    project, config, wm, candidate = await _make(db, tmp_path)
+    runs = tmp_path / "runs.txt"
+    command = f"echo run >> {shlex.quote(runs.as_posix())}; sleep 300"
+    cancel = asyncio.Event()
+    gate = asyncio.create_task(
+        reproduce_bug(
+            db, EventBus(db), project, config, candidate,
+            ReproTest(path=_REPRO_PATH, body=_FAILING),
+            wm=wm, test_command=command, timeout_seconds=600, cancel_event=cancel,
+        )
+    )
+    for _ in range(200):
+        if runs.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert runs.exists(), "the gate command never started"
+
+    cancel.set()
+    result = await asyncio.wait_for(gate, timeout=5)
+
+    assert result.outcome is ReproOutcome.infra
+    assert result.candidate.status is BugStatus.discovered
+    assert runs.read_text().splitlines() == ["run"]  # the one run, and no retry
+    await _assert_untouched(db, project, candidate)
+    assert not wm.path_for(f"repro-{candidate.id}").exists()
+    logs = [e.payload for e in await repo.list_events(db, project_id=project.id) if e.type == "log"]
+    assert {"stage": "repro/gate", "message": "repro gate cancelled",
+            "candidate_id": candidate.id} in logs
+
+
+async def test_cancelled_before_the_gate_runs_nothing(db: Database, tmp_path: Path) -> None:
+    project, config, wm, candidate = await _make(db, tmp_path)
+    runs = tmp_path / "runs.txt"
+    cancel = asyncio.Event()
+    cancel.set()
+
+    result = await reproduce_bug(
+        db, EventBus(db), project, config, candidate,
+        ReproTest(path=_REPRO_PATH, body=_FAILING),
+        wm=wm, test_command=f"echo run >> {shlex.quote(runs.as_posix())}", cancel_event=cancel,
+    )
+
+    assert result.outcome is ReproOutcome.infra
+    assert not runs.exists()
+    assert not (tmp_path / "home").exists()  # no worktree was created
+    await _assert_untouched(db, project, candidate)
+
+
+async def test_no_infra_retry_starts_once_cancelled(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An infra outcome buys a retry, but not once the cycle was cancelled meanwhile."""
+    project, config, wm, candidate = await _make(db, tmp_path)
+    cancel = asyncio.Event()
+    calls: list[str | None] = []
+
+    async def _timed_out_then_cancelled(
+        worktree: Path, command: str | None, **kwargs: object
+    ) -> GateResult:
+        calls.append(command)
+        cancel.set()
+        return GateResult(passed=False, exit_code=124, output="timed out", outcome="timed_out")
+
+    monkeypatch.setattr(repro_gate_mod, "run_tests", _timed_out_then_cancelled)
+
+    result = await reproduce_bug(
+        db, EventBus(db), project, config, candidate,
+        ReproTest(path=_REPRO_PATH, body=_FAILING),
+        wm=wm, test_command="pytest -q", cancel_event=cancel,
+    )
+
+    assert calls == ["pytest -q"]
+    assert result.outcome is ReproOutcome.infra
+    await _assert_untouched(db, project, candidate)
+    assert not wm.path_for(f"repro-{candidate.id}").exists()

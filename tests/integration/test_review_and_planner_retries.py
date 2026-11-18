@@ -8,6 +8,7 @@ answers as usual. The retry backoff the reviewers and the planner share is patch
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from collections.abc import Callable
@@ -45,6 +46,7 @@ _PLAN_HEADER = "=== PLAN (from the Planner — follow its scope strictly) ===\n"
 _PLANNER_CRASH = AgentResult(ok=False, text="", error="planner crashed")
 _FEEDBACK = "LATEST REVIEWER FEEDBACK (must fix these issues):\n"
 _AGENT = re.compile(r"You are the (\S+) agent of")
+_REVIEWERS = ("tester", "security", "reviewer")
 
 
 @pytest.fixture(autouse=True)
@@ -187,7 +189,14 @@ async def test_a_mandatory_reviewer_that_never_renders_a_verdict_fails_the_task(
     )
 
     assert ok is False and task.state is TaskState.failed
-    assert task.result_summary == "failed (max_retries) after 2 attempt(s)"
+    why = (
+        f"inconclusive: mandatory reviewer(s) SECURITY gave no usable verdict (SECURITY: {reason})"
+    )
+    assert task.result_summary == f"failed (max_retries) after 2 attempt(s); last: {why}"
+    assert [e.payload for e in await _events(db, task.id, "attempt.failed")] == [
+        {"n": 1, "stage": "review", "reason": why},
+        {"n": 2, "stage": "review", "reason": why},
+    ]
     types = {e.type for e in await repo.list_events(db, task_id=task.id, limit=10_000)}
     assert not {"task.committed", "task.merged", "task.done"} & types
     assert task.branch is None
@@ -409,9 +418,13 @@ async def test_a_failed_task_summary_also_says_it_ran_without_a_plan(
     assert ok is False and task.state is TaskState.failed
     summary = task.result_summary or ""
     prefix = "failed (max_retries) after 1 attempt(s); planned: no (planner failed: ..."
-    assert summary.startswith(prefix) and summary.endswith("trace line the planner gave up)")
-    # One line, bounded; the event keeps the whole error.
-    assert "\n" not in summary and len(summary) <= len(prefix) + 300
+    # The planner note, then why the last attempt failed.
+    noted, last = summary.split("; last: ")
+    assert noted.startswith(prefix) and noted.endswith("trace line the planner gave up)")
+    assert last.startswith("inconclusive: mandatory reviewer(s) SECURITY gave no usable verdict")
+    # One line, each part bounded; the event keeps the whole error.
+    assert "\n" not in summary
+    assert len(noted) <= len(prefix) + 300 and len(last) <= 300
     (failed,) = await _planner_failed(db, task.id)
     assert failed["error"] == long_error
 
@@ -478,3 +491,154 @@ async def test_planner_retry_checks_the_cancel_after_the_backoff(
     assert len(runner.prompts) == 1
     assert outcome.failure is None
     assert await _planner_failed(db, task.id) == []
+
+
+# --- why an attempt failed --------------------------------------------------------------------
+
+
+def _verdict(verdict: str, reason: str) -> AgentResult:
+    body = f'{{"verdict": "{verdict}", "reason": {json.dumps(reason)}, "evidence": []}}'
+    return AgentResult(ok=True, text=f"```json\n{body}\n```", model_reported="fake")
+
+
+async def _failure_payloads(db: Database, task_id: str) -> list[dict[str, Any]]:
+    return [e.payload for e in await _events(db, task_id, "attempt.failed")]
+
+
+async def _pipeline(db: Database, task_id: str) -> list[str]:
+    (derived,) = await _events(db, task_id, "pipeline.derived")
+    return [str(agent) for agent in derived.payload["pipeline"]]
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
+async def test_a_rejecting_reviewer_is_named_with_its_reason(
+    db: Database, tmp_path: Path, parallel: bool
+) -> None:
+    provider = FakeProvider(
+        replies={"reviewer:security": [_verdict("fail", "the input is never\nvalidated")]}
+    )
+
+    task, ok = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {"parallel_reviewers": parallel},
+            "agent_overrides": {"developer": {"max_retries": 2}},
+        },
+    )
+
+    assert ok is False and task.state is TaskState.failed
+    why = "rejected by SECURITY (fail): the input is never validated"
+    assert await _failure_payloads(db, task.id) == [
+        {"n": 1, "stage": "review", "reason": why},
+        {"n": 2, "stage": "review", "reason": why},
+    ]
+    assert task.result_summary == f"failed (max_retries) after 2 attempt(s); last: {why}"
+
+
+async def test_parallel_reviewers_rejecting_together_are_all_named(
+    db: Database, tmp_path: Path
+) -> None:
+    provider = FakeProvider(
+        replies={
+            "reviewer:tester": [_verdict("fail", "no test covers the empty file")],
+            "reviewer:security": [_verdict("block", "the path is not sanitized")],
+        }
+    )
+
+    task, _ = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {"parallel_reviewers": True},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+        },
+    )
+
+    assert await _failure_payloads(db, task.id) == [
+        {
+            "n": 1,
+            "stage": "review",
+            "reason": (
+                "rejected by TESTER (fail): no test covers the empty file; "
+                "rejected by SECURITY (block): the path is not sanitized"
+            ),
+        }
+    ]
+
+
+async def test_no_usable_verdict_at_all_is_said_so(db: Database, tmp_path: Path) -> None:
+    # No mandatory reviewer: the new file brings in the optional architect alone, who never
+    # renders a verdict.
+    provider = FakeProvider(replies={"reviewer:architect": [_PROSE]})
+
+    task, _ = await _run_task(
+        db, tmp_path, provider,
+        {"agents": {"mandatory": []}, "agent_overrides": {"developer": {"max_retries": 1}}},
+    )
+
+    assert await _pipeline(db, task.id) == ["architect"]
+    assert await _failure_payloads(db, task.id) == [
+        {"n": 1, "stage": "review", "reason": "no reviewer returned a usable verdict"}
+    ]
+    assert task.result_summary == (
+        "failed (max_retries) after 1 attempt(s); last: no reviewer returned a usable verdict"
+    )
+
+
+async def test_long_reviewer_reasons_give_a_one_line_reason_of_at_most_300_chars(
+    db: Database, tmp_path: Path
+) -> None:
+    long_reason = "the change breaks this case\n" * 72  # about 2,000 characters on many lines
+    assert len(long_reason) >= 2_000
+    provider = FakeProvider(
+        replies={f"reviewer:{a}": [_verdict("fail", long_reason)] for a in _REVIEWERS}
+    )
+
+    task, _ = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {"parallel_reviewers": True},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+        },
+    )
+
+    (failure,) = await _failure_payloads(db, task.id)
+    reason = failure["reason"]
+    assert "\n" not in reason and "  " not in reason
+    assert len(reason) == 300 and reason.endswith("...")
+    assert reason.startswith("rejected by TESTER (fail): the change breaks this case the change")
+    assert "; rejected by SECURITY (fail): " in reason
+    assert (task.result_summary or "").endswith(f"; last: {reason}")
+
+
+async def test_a_red_gate_is_named_with_its_exit_code(db: Database, tmp_path: Path) -> None:
+    task, ok = await _run_task(
+        db, tmp_path, FakeProvider(),
+        {
+            "execution": {"baseline_test_command": "if [ -f FEATURE.txt ]; then exit 3; fi"},
+            "agent_overrides": {"developer": {"max_retries": 1}},
+        },
+    )
+
+    assert ok is False and task.state is TaskState.failed
+    assert await _failure_payloads(db, task.id) == [
+        {"n": 1, "stage": "gate", "exit_code": 3, "reason": "test gate not green (exit 3)"}
+    ]
+    assert task.result_summary == (
+        "failed (max_retries) after 1 attempt(s); last: test gate not green (exit 3)"
+    )
+
+
+async def test_a_developer_error_is_the_reason_on_one_line(db: Database, tmp_path: Path) -> None:
+    error = "exit 1:\n  Traceback (most recent call last):\n    RuntimeError: boom\n"
+    provider = FakeProvider(replies={"developer": [AgentResult(ok=False, error=error)]})
+
+    task, ok = await _run_task(
+        db, tmp_path, provider, {"agent_overrides": {"developer": {"max_retries": 1}}}
+    )
+
+    assert ok is False and task.state is TaskState.failed
+    why = "exit 1: Traceback (most recent call last): RuntimeError: boom"
+    assert await _failure_payloads(db, task.id) == [
+        {"n": 1, "stage": "developer", "error": error, "reason": why}
+    ]
+    assert task.result_summary == f"failed (max_retries) after 1 attempt(s); last: {why}"

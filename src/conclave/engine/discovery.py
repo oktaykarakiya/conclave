@@ -34,7 +34,7 @@ from ..config import ConclaveConfig
 from ..db import BugCandidate, Database, Project
 from ..db import repositories as repo
 from ..events import EventBus, EventType
-from ..providers import Provider, QuotaGate
+from ..providers import Provider, QuotaGate, WaitTracker
 from .coverage_ingest import ingest_coverage
 from .hunter import parse_hunter_candidate
 from .region_scheduler import select_hunt_region
@@ -50,6 +50,7 @@ async def discover_bug(
     *,
     cancel_event: asyncio.Event | None = None,
     quota_gate: QuotaGate | None = None,
+    waits: WaitTracker | None = None,
 ) -> BugCandidate | None:
     """Run one hunter sweep; record and announce a genuinely new candidate, else ``None``.
 
@@ -58,7 +59,7 @@ async def discover_bug(
     gets no rendered knowledge preamble — repo conventions now come from AGENTS.md, which the
     engine reads natively. ``cancel_event`` is forwarded to the dispatch so a sweep is
     interruptible once a worker drives it; the dispatch waits out a usage limit on
-    ``quota_gate`` (the daemon's shared gate).
+    ``quota_gate`` (the daemon's shared gate), and the wait also counts in ``waits`` when given.
     """
     repo_path = Path(project.path)
 
@@ -78,7 +79,9 @@ async def discover_bug(
         # Empty project, or every region ignored — nothing to sweep this turn.
         return None
 
-    runner = AgentRunner(db, bus, provider, project.id, config, quota_gate=quota_gate)
+    runner = AgentRunner(
+        db, bus, provider, project.id, config, quota_gate=quota_gate, waits=waits
+    )
     result = await runner.run(
         agent="hunter",
         prompt=_hunt_prompt(region.region),

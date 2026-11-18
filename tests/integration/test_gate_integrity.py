@@ -9,6 +9,7 @@ never merged automatically. Deterministic: a throwaway git repo and the FakeProv
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,10 @@ from conclave.config import EdgeCondition, NodeKind, WorkflowEdge, WorkflowGraph
 from conclave.db import Database, Project, Task, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
+from conclave.engine.orchestrator import _NO_TEST_COMMAND_SUMMARY
 from conclave.engine.task_merge import merge_task
 from conclave.events import EventBus
+from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 
 _EXISTING_TEST = "tests/test_existing.py"
 _REVIEW_PROMPT = "Review the changes made for this task"
@@ -92,6 +95,120 @@ async def test_no_test_command_fails_the_task_before_any_dispatch(
     assert not worktree.exists()
     code, _ = await run_git(tmp_path / "repo", "rev-parse", "--verify", f"conclave/{task.id}")
     assert code != 0
+
+
+async def _count(db: Database, table: str, project_id: str) -> int:
+    row = await db.fetchone(
+        f"SELECT COUNT(*) AS n FROM {table} WHERE project_id = ?", (project_id,)
+    )
+    assert row is not None
+    return int(row["n"])
+
+
+async def test_no_test_command_failure_still_runs_the_task_housekeeping(
+    db: Database, tmp_path: Path
+) -> None:
+    """The early return skips the worktree, not the pruning and per-task cleanup every task gets."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    project = await repo.create_project(
+        db, name="t", path=str(repo_path), default_branch="main",
+        config={"execution": {"retention_events_max": 100}},
+    )
+    for i in range(150):
+        await repo.append_event(db, type="log", project_id=project.id, payload={"i": i})
+    for i in range(25):
+        await repo.save_baseline(db, project.id, f"sha-{i}", "old failures")
+    await repo.create_task(
+        db, project_id=project.id, request="add a feature file", state=TaskState.approved
+    )
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None
+    orchestrator._cancel_events[claimed.id] = asyncio.Event()  # as the worker registers it
+    assert orchestrator.request_steer(claimed.id, "use the existing helper")
+
+    assert await orchestrator.process_task(claimed) is False
+
+    task = await repo.get_task(db, claimed.id)
+    assert task is not None and task.state is TaskState.failed
+    assert task.result_summary == _NO_TEST_COMMAND_SUMMARY
+    assert await _count(db, "events", project.id) == 100
+    assert await _count(db, "baselines", project.id) == 20
+    types = [e.type for e in await repo.list_events(db, task_id=task.id)]
+    assert types == ["task.started", "task.failed"]
+    worktrees = tmp_path / "home" / "projects" / project.id / "worktrees"
+    assert not (worktrees / task.id).exists()
+    assert task.id not in orchestrator._cancel_events
+    assert task.id not in orchestrator._pending_steers
+
+
+class _DeveloperDropsTestCommand(FakeProvider):
+    """A developer dispatch during which the operator removes the project's test command."""
+
+    def __init__(self, db: Database) -> None:
+        super().__init__()
+        self.db = db
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        if self.role_of(prompt) == "developer":
+            (project,) = await repo.list_projects(self.db)
+            execution = {**project.config["execution"], "baseline_test_command": ""}
+            await repo.update_project_config(
+                self.db, project.id, {**project.config, "execution": execution}
+            )
+        return await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+
+
+async def test_test_command_removed_mid_task_fails_the_task_like_the_early_check(
+    db: Database, tmp_path: Path
+) -> None:
+    provider = _DeveloperDropsTestCommand(db)
+    config = {"execution": {"baseline_test_command": "echo ok", "auto_merge": True}}
+    _, _, task, ok = await _run(db, tmp_path, provider, config)
+
+    assert ok is False and task.state is TaskState.failed
+    assert task.result_summary == _NO_TEST_COMMAND_SUMMARY
+    assert await _payloads(db, task.id, "task.failed") == [{"reason": "no_test_command"}]
+    assert await _payloads(db, task.id, "attempt.failed") == [
+        {"n": 1, "stage": "gate", "reason": "no_test_command"}
+    ]
+    assert [FakeProvider.role_of(p) for p in provider.prompts].count("developer") == 1
+    assert await _gate_skipped(db, task.id) == []
+    assert await _payloads(db, task.id, "task.committed") == []
+    assert await _payloads(db, task.id, "task.merged") == []
+    code, _ = await run_git(tmp_path / "repo", "show", "main:FEATURE.txt")
+    assert code != 0
+
+
+async def test_test_command_removed_mid_task_passes_logged_when_allowed(
+    db: Database, tmp_path: Path
+) -> None:
+    provider = _DeveloperDropsTestCommand(db)
+    config = {
+        "execution": {
+            "baseline_test_command": "echo ok",
+            "allow_no_test_command": True,
+            "auto_merge": True,
+        }
+    }
+    _, _, task, ok = await _run(db, tmp_path, provider, config)
+
+    assert ok is True and task.state is TaskState.done
+    assert len(await _gate_skipped(db, task.id)) == 1
+    assert await _payloads(db, task.id, "attempt.failed") == []
 
 
 async def test_blank_test_command_counts_as_none(db: Database, tmp_path: Path) -> None:

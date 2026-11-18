@@ -304,6 +304,27 @@ def test_wait_tracker_counts_overlapping_waits_once() -> None:
     assert waits.seconds() == 36 * 60
 
 
+def test_a_parent_tracker_counts_its_childrens_overlapping_waits_once() -> None:
+    """A bug-fixer session's tracker spans the trackers of its tasks and project dispatches."""
+    clock = FakeClock()
+    session = WaitTracker(clock.now)
+    task = WaitTracker(clock.now, parent=session)
+    hunter = WaitTracker(clock.now, parent=session)
+    with task.waiting():
+        clock.current += timedelta(minutes=10)
+        with hunter.waiting():  # waits for the same reset meanwhile
+            clock.current += timedelta(minutes=20)
+        assert session.seconds() == 30 * 60
+        clock.current += timedelta(minutes=5)
+    clock.current += timedelta(hours=1)  # nobody waits
+    with hunter.waiting():
+        clock.current += timedelta(minutes=1)
+
+    assert task.seconds() == 35 * 60
+    assert hunter.seconds() == 21 * 60
+    assert session.seconds() == 36 * 60
+
+
 # --- the shared dispatch path ------------------------------------------------------------
 
 
@@ -512,3 +533,142 @@ async def test_allowed_warning_only_updates_the_rate_limit_info() -> None:
     (row,) = gate.snapshot()
     assert (row["key"], row["engine"]) == ("claude-code", "claude")
     assert row["closed"] is False and row["rate_limit"] == info
+
+
+# --- a resumed session's cost --------------------------------------------------------------
+# Claude Code reports total_cost_usd as the session's running total, and a --resume run
+# continues it (measured: 4.52 refused, then 8.49 after the resume, for a planner that cost 8.49).
+
+
+def _run_cost(
+    cost: float | None, *, refused: bool, session_total: bool = True, session: str = "ses-1"
+) -> AgentResult:
+    quota = _limit() if refused else None
+    return AgentResult(
+        ok=not refused,
+        text="" if refused else "done",
+        error=quota.message if quota is not None else None,
+        quota=quota,
+        session_id=session,
+        cost_usd=cost,
+        cost_is_session_total=session_total,
+    )
+
+
+def _interrupted_costs(listener: RecordingListener) -> list[float | None]:
+    return [
+        event["interrupted"].cost_usd
+        for kind, event in listener.events
+        if kind == "waiting" and event["interrupted"] is not None
+    ]
+
+
+async def test_a_resumed_session_total_is_charged_as_the_resumed_runs_own_share() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    script = [_run_cost(4.52, refused=True), _run_cost(8.49, refused=False)]
+    provider = ScriptedProvider(clock, list(script))
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert result.ok is True and result.text == "done"
+    assert _interrupted_costs(listener) == [4.52]
+    assert result.cost_usd == pytest.approx(3.97)
+    assert result.cost_is_session_total is True
+    # The provider's own results are left as they were: the shares are copies.
+    assert [r.cost_usd for r in script] == [4.52, 8.49]
+
+
+async def test_two_waits_in_one_session_charge_each_run_its_share() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock,
+        [
+            _run_cost(4.52, refused=True),
+            _run_cost(6.00, refused=True),
+            _run_cost(8.49, refused=False),
+        ],
+    )
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert _interrupted_costs(listener) == [4.52, pytest.approx(1.48)]
+    assert result.cost_usd == pytest.approx(2.49)
+    assert sum(c or 0.0 for c in _interrupted_costs(listener)) + (
+        result.cost_usd or 0.0
+    ) == pytest.approx(8.49)
+
+
+async def test_a_run_reporting_no_cost_keeps_the_last_known_total() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock,
+        [
+            _run_cost(4.52, refused=True),
+            _run_cost(None, refused=True),  # stopped before its result event
+            _run_cost(8.49, refused=False),
+        ],
+    )
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert _interrupted_costs(listener) == [4.52, None]
+    assert result.cost_usd == pytest.approx(3.97)
+
+
+async def test_a_fresh_session_after_an_unknown_one_is_charged_in_full() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock,
+        [
+            _run_cost(4.52, refused=True),
+            AgentResult(
+                ok=False,
+                error="No conversation found with session ID: ses-1",
+                cost_is_session_total=True,
+            ),
+            _run_cost(3.00, refused=False, session="ses-2"),
+        ],
+    )
+
+    result = await _dispatch(provider, gate)
+
+    assert [c.profile.resume_session_id for c in provider.calls] == [None, "ses-1", None]
+    assert result.cost_usd == 3.00
+
+
+async def test_a_resumed_total_below_the_reported_one_is_charged_nothing() -> None:
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock, [_run_cost(4.52, refused=True), _run_cost(3.00, refused=False)]
+    )
+
+    result = await _dispatch(provider, gate)
+
+    assert result.cost_usd == 0.0
+
+
+async def test_per_run_costs_pass_through_unchanged() -> None:
+    """An engine whose cost is each run's own (opencode sums its own run's steps)."""
+    clock = FakeClock()
+    gate = QuotaGate(clock=clock.now, sleep=clock.sleep)
+    provider = ScriptedProvider(
+        clock,
+        [
+            _run_cost(0.40, refused=True, session_total=False),
+            _run_cost(0.30, refused=False, session_total=False),
+        ],
+    )
+    listener = RecordingListener()
+
+    result = await _dispatch(provider, gate, listener=listener)
+
+    assert _interrupted_costs(listener) == [0.40]
+    assert result.cost_usd == 0.30

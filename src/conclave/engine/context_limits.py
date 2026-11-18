@@ -4,7 +4,8 @@ Irreplaceable content (the task request, the plan, reviewer feedback, operator s
 cut. Recoverable bulk (the current diff, the previous attempt's diff, gate/test output and setup
 output) can be regenerated in the agent's working directory, so a block longer than its limit
 keeps its head and tail, and a marker in place of the omitted middle says how much was omitted,
-which setting limited it and how to get the rest.
+which setting limited it and how to get the rest. The baseline failure output cached per
+checkpoint is fitted the same way before it is stored (``baseline_output``).
 
 The limit for a dispatch is ``context.compaction_max_chars`` when compaction resolves on for the
 agent and ``context.bulk_max_chars`` otherwise. ``compact_before_start`` resolves with the
@@ -19,7 +20,7 @@ from typing import Literal
 
 from ..config import ConclaveConfig, resolve_agent
 
-BulkBlock = Literal["diff", "previous_diff", "gate_output", "setup_output"]
+BulkBlock = Literal["diff", "previous_diff", "gate_output", "setup_output", "baseline_output"]
 LimitField = Literal["compaction_max_chars", "bulk_max_chars"]
 
 # Share of the budget kept from the start of a block; the rest is kept from its end, where test
@@ -74,7 +75,14 @@ def resolve_bulk_limit(
     return BulkLimit("bulk_max_chars", config.context.bulk_max_chars)
 
 
-def fit_block(text: str, *, limit: int, field: LimitField, how_to_get_rest: str) -> FitResult:
+def fit_block(
+    text: str,
+    *,
+    limit: int,
+    field: LimitField,
+    how_to_get_rest: str,
+    within_limit: bool = False,
+) -> FitResult:
     """Fit *text* to *limit* characters, keeping its head and tail around a marker.
 
     Text at or below the limit is returned unchanged. Above it, about 40% of the budget is kept
@@ -82,14 +90,20 @@ def fit_block(text: str, *, limit: int, field: LimitField, how_to_get_rest: str)
     drop more than half of that side's budget. The marker
     ``[... {omitted} of {total} chars omitted (limit: context.{field} = {limit}).
     {how_to_get_rest} ...]`` replaces the middle on a line of its own, so the result is at most
-    ``limit + len(marker)`` characters long.
+    ``limit + len(marker)`` characters long. With *within_limit* the budget also pays for the
+    marker, so the result is at most *limit* characters long (unless the marker alone is longer)
+    and fitting it again to the same limit leaves it unchanged.
     """
     total = len(text)
     if total <= limit:
         return FitResult(text=text, original_chars=total, kept_chars=total)
 
-    head_budget = int(limit * _HEAD_SHARE)
-    tail_budget = max(0, limit - head_budget - _SEPARATOR_CHARS)
+    budget = limit
+    if within_limit:
+        # The longest marker this text can get: the omitted count has at most total's digits.
+        budget = max(0, limit - len(_marker(total, total, field, limit, how_to_get_rest)))
+    head_budget = int(budget * _HEAD_SHARE)
+    tail_budget = max(0, budget - head_budget - _SEPARATOR_CHARS)
 
     head = text[:head_budget]
     head_end = head.rfind("\n") + 1  # 0 when the head holds no newline
@@ -104,10 +118,7 @@ def fit_block(text: str, *, limit: int, field: LimitField, how_to_get_rest: str)
     tail = text[tail_start:]
 
     kept = len(head) + len(tail)
-    marker = (
-        f"[... {total - kept} of {total} chars omitted "
-        f"(limit: context.{field} = {limit}). {how_to_get_rest} ...]"
-    )
+    marker = _marker(total - kept, total, field, limit, how_to_get_rest)
     parts = [head]
     if head and not head.endswith("\n"):
         parts.append("\n")
@@ -115,3 +126,11 @@ def fit_block(text: str, *, limit: int, field: LimitField, how_to_get_rest: str)
     if tail:
         parts.append("\n" + tail)
     return FitResult(text="".join(parts), original_chars=total, kept_chars=kept)
+
+
+def _marker(omitted: int, total: int, field: LimitField, limit: int, how_to_get_rest: str) -> str:
+    """The line that replaces a fitted block's omitted middle."""
+    return (
+        f"[... {omitted} of {total} chars omitted "
+        f"(limit: context.{field} = {limit}). {how_to_get_rest} ...]"
+    )

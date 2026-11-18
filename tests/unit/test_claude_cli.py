@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,10 @@ from conclave.config import ArgMode
 from conclave.providers import (
     AgentResult,
     ClaudeCliProvider,
+    Engine,
+    EngineRouter,
     QuotaGate,
+    QuotaWait,
     ResolvedProfile,
     claude_cli,
     dispatch_with_quota,
@@ -837,6 +840,85 @@ async def test_a_run_served_on_paid_extra_usage_is_kept_and_waits_for_nothing(
     (row,) = gate.snapshot()
     assert (row["key"], row["closed"]) == ("claude-code", False)
     assert row["rate_limit"]["isUsingOverage"] is True
+
+
+# A fake "claude" whose first run the five-hour limit refuses after it spent 4.52, and whose
+# resumed session then reports the session's running total, 8.49 (as the CLI does).
+_RESUMED_TOTAL_CLI = """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+init = {"type": "system", "subtype": "init", "session_id": "ses-r"}
+if "--resume" in sys.argv:
+    events = [init, {"type": "result", "subtype": "success", "is_error": False,
+                     "session_id": "ses-r", "result": "VERDICT: pass",
+                     "total_cost_usd": 8.49, "num_turns": 18}]
+else:
+    events = [init,
+              {"type": "rate_limit_event", "session_id": "ses-r",
+               "rate_limit_info": {"status": "rejected", "resetsAt": 1794924600,
+                                   "rateLimitType": "five_hour"}},
+              {"type": "result", "is_error": True, "session_id": "ses-r",
+               "result": "You've hit your limit", "total_cost_usd": 4.52, "num_turns": 71}]
+print("\\n".join(json.dumps(e) for e in events))
+"""
+
+
+class _ClockedSleep:
+    """The gate's clock, moved by the gate's own sleeps only: a wait takes no real time."""
+
+    def __init__(self) -> None:
+        self.current = datetime(2026, 11, 17, 15, 0, tzinfo=UTC)  # half an hour before the reset
+
+    def now(self) -> datetime:
+        return self.current
+
+    async def sleep(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds)
+
+
+class _InterruptedCosts:
+    def __init__(self) -> None:
+        self.costs: list[float | None] = []
+
+    async def waiting(self, wait: QuotaWait, interrupted: AgentResult | None) -> None:
+        if interrupted is not None:
+            self.costs.append(interrupted.cost_usd)
+
+    async def resumed(
+        self, wait: QuotaWait, *, waited_seconds: float, resumed_session: bool
+    ) -> None:
+        pass
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["claude-provider", "engine-router"])
+async def test_a_resumed_session_is_charged_only_what_its_resumed_run_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, routed: bool
+) -> None:
+    cli = _make_cli(tmp_path, _RESUMED_TOTAL_CLI, name="resumed_total.py")
+    spawns = _capture_spawns(monkeypatch, cli)
+    clock = _ClockedSleep()
+    listener = _InterruptedCosts()
+    provider = EngineRouter(Engine.opencode, claude_bin=cli) if routed else ClaudeCliProvider()
+    profile = ResolvedProfile(
+        name="claude-code", arg_mode=ArgMode.inherit, cli=cli, model="claude-code/opus"
+    )
+
+    result = await dispatch_with_quota(
+        provider,
+        QuotaGate(clock=clock.now, sleep=clock.sleep),
+        profile=profile,
+        prompt="plan it",
+        timeout_seconds=30,
+        retry_minutes=15,
+        listener=listener,
+    )
+
+    assert [("--resume" in args) for args, _env in spawns] == [False, True]
+    assert result.ok is True and result.text == "VERDICT: pass"
+    assert result.cost_is_session_total is True
+    assert listener.costs == [4.52]
+    assert result.cost_usd == pytest.approx(3.97)  # 8.49 for the session, 4.52 already charged
+    assert result.num_turns == 18  # per run, as reported
 
 
 async def test_a_session_to_resume_is_passed_as_resume(

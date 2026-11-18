@@ -249,7 +249,8 @@ class AgentRunner:
 
     Dispatches wait out usage limits on *quota_gate*, the daemon's shared gate (a private one
     when none is given), and the runner adds up the time they waited (:meth:`quota_waited_seconds`)
-    so the task's wall-clock budget can leave it out.
+    so the task's wall-clock budget can leave it out. Those waits also count in *waits* when given
+    (the bug-fixer session's tracker, so the session's budget leaves them out too).
     """
 
     def __init__(
@@ -261,6 +262,7 @@ class AgentRunner:
         config: ConclaveConfig,
         *,
         quota_gate: QuotaGate | None = None,
+        waits: WaitTracker | None = None,
     ) -> None:
         self._db = db
         self._bus = bus
@@ -268,7 +270,7 @@ class AgentRunner:
         self._project_id = project_id
         self._config = config
         self._quota_gate = quota_gate if quota_gate is not None else QuotaGate()
-        self._quota_waits = WaitTracker(self._quota_gate.now)
+        self._quota_waits = WaitTracker(self._quota_gate.now, parent=waits)
 
     def quota_waited_seconds(self) -> float:
         """Seconds this runner's dispatches spent waiting for a usage limit (overlaps once)."""

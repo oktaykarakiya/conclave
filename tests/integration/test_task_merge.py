@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
@@ -19,7 +20,9 @@ from conclave.db import Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine.gitio import run_git
 from conclave.engine.orchestrator import MergeResult, Orchestrator
+from conclave.engine.task_merge import TaskMergeError, merge_task
 from conclave.engine.worktree import WorktreeManager
+from conclave.events import EventBus
 from conclave.runtime import Daemon
 from conclave.web import create_app
 
@@ -312,3 +315,120 @@ async def test_tool_schema_listed_by_tools_list(client: httpx.AsyncClient) -> No
     assert schema["type"] == "object"
     assert schema["required"] == ["task_id"]
     assert schema["properties"]["task_id"]["type"] == "string"
+
+
+async def _project_and_task(db: Database, project_id: str, task_id: str) -> tuple[Any, Any]:
+    project = await repo.get_project(db, project_id)
+    task = await repo.get_task(db, task_id)
+    assert project is not None and task is not None
+    return project, task
+
+
+def _assert_no_merge_lock_left(orchestrator: Orchestrator) -> None:
+    assert orchestrator._merge_locks == {}
+    assert orchestrator._merge_lock_refs == {}
+    assert orchestrator._merge_lock_holders == {}
+
+
+@pytest.mark.parametrize("checkout", ["main", "side"])
+async def test_concurrent_merges_of_one_task_merge_it_once(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path, checkout: str
+) -> None:
+    """Both requests pass the old unlocked checks; under the lock the second sees the merge."""
+    repo_path, project_id, task_id, branch = await _task(client, db, tmp_path)
+    await _commit_file(repo_path, "main-only.txt", "later\n", "main moves on")
+    if checkout != "main":
+        await _git(repo_path, "checkout", "-b", checkout)  # merges in a temporary worktree
+    project, task = await _project_and_task(db, project_id, task_id)
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+
+    results = await asyncio.gather(
+        merge_task(orchestrator, project, task),
+        merge_task(orchestrator, project, task),
+        return_exceptions=True,
+    )
+
+    merged = [r for r in results if isinstance(r, dict)]
+    refused = [r for r in results if isinstance(r, TaskMergeError)]
+    assert len(merged) == 1 and len(refused) == 1, results
+    assert refused[0].status_code == 409
+    assert "already merged" in refused[0].detail
+    assert merged[0]["target_sha"] == await _git(repo_path, "rev-parse", "main")
+    assert await _git(repo_path, "show", "main:task.txt") == "task change"
+    assert await _git(repo_path, "show", "main:main-only.txt") == "later"
+    assert await _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD") == checkout
+    assert await _ref(repo_path, branch) is None
+    assert len(await _merged_events(client, task_id)) == 1
+    assert list(tmp_path.glob(".conclave-merge-*")) == []
+    assert len((await _git(repo_path, "worktree", "list")).splitlines()) == 1
+    _assert_no_merge_lock_left(orchestrator)
+
+
+async def test_merge_reports_its_own_commit_when_a_worker_merge_follows(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """A worker merge queued behind the operator's runs only after its target SHA is read."""
+    repo_path, project_id, task_id, branch = await _task(client, db, tmp_path)
+    await _git(repo_path, "checkout", "-b", "other")
+    await _commit_file(repo_path, "other.txt", "other work\n", "other task work")
+    await _git(repo_path, "checkout", "main")
+    await _commit_file(repo_path, "main-only.txt", "later\n", "main moves on")
+    branch_sha = await _ref(repo_path, branch)
+    project, task = await _project_and_task(db, project_id, task_id)
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    real_merge_locked = orchestrator._merge_locked
+    worker: list[asyncio.Task[MergeResult]] = []
+
+    async def _merge_locked_then_queue_worker(
+        repo: Path, target: str, task_branch: str, merging_task: str
+    ) -> MergeResult:
+        result = await real_merge_locked(repo, target, task_branch, merging_task)
+        if not worker:  # the operator merge: a worker's merge into main queues behind it
+            worker.append(
+                asyncio.create_task(orchestrator._merge(repo, "main", "other", "worker-task"))
+            )
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert orchestrator._merge_lock_refs["main"] == 2
+        return result
+
+    orchestrator._merge_locked = _merge_locked_then_queue_worker  # type: ignore[method-assign]
+
+    body = await merge_task(orchestrator, project, task)
+    assert await worker[0] is MergeResult.success
+
+    # The operator's merge commit, not the worker's later one.
+    assert await _git(repo_path, "rev-parse", f"{body['target_sha']}^2") == branch_sha
+    assert await _git(repo_path, "rev-parse", "main^1") == body["target_sha"]
+    assert await _git(repo_path, "show", "main:other.txt") == "other work"
+    _assert_no_merge_lock_left(orchestrator)
+
+
+async def test_merge_under_the_held_merge_lock_runs_without_waiting_on_itself(
+    db: Database, tmp_path: Path
+) -> None:
+    orchestrator = Orchestrator(db, EventBus(db), FakeProvider(), tmp_path / "home")
+    merged: list[str] = []
+
+    async def _fake_locked(
+        repo: Path, target: str, task_branch: str, merging_task: str
+    ) -> MergeResult:
+        merged.append(task_branch)
+        return MergeResult.success
+
+    orchestrator._merge_locked = _fake_locked  # type: ignore[method-assign]
+
+    async with asyncio.timeout(5), orchestrator.merge_lock("main"):
+        assert orchestrator._merge_lock_holders["main"] is asyncio.current_task()
+        # Another task's merge into the same target still waits for the lock.
+        other = asyncio.create_task(orchestrator._merge(tmp_path, "main", "other", "task-2"))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not other.done()
+        assert await orchestrator._merge(tmp_path, "main", "feature", "task-1") is (
+            MergeResult.success
+        )
+        assert merged == ["feature"]
+    assert await other is MergeResult.success
+    assert merged == ["feature", "other"]
+    _assert_no_merge_lock_left(orchestrator)

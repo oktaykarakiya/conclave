@@ -93,6 +93,47 @@ def test_fit_block_does_not_snap_away_more_than_half_of_a_side() -> None:
     assert head == text[:400] + "\n"
 
 
+_LONG_HINT = f"Re-run `{'pytest -q tests/' * 20}` in your working directory for the full output."
+
+
+@pytest.mark.parametrize("size", [1_001, 5_000, 123_456])
+@pytest.mark.parametrize("hint", [_GATE_HINT, _LONG_HINT])
+def test_fit_block_within_limit_pays_for_its_marker(size: int, hint: str) -> None:
+    first, last = "FIRST failure: test_alpha\n", "LAST: 401 failed\n"
+    body = "".join(f"case {i:06d}: expected value differs\n" for i in range(size // 30 + 1))
+    text = first + body[: size - len(first) - len(last)] + last
+    assert len(text) == size
+    limit = 1_000
+
+    fitted = fit_block(
+        text, limit=limit, field="bulk_max_chars", how_to_get_rest=hint, within_limit=True
+    )
+
+    assert fitted.truncated is True
+    assert len(fitted.text) <= limit
+    assert fitted.text.startswith(first) and fitted.text.endswith(last)
+    head, match, tail = _split(fitted.text)
+    assert text.startswith(head) and text.endswith(tail)
+    assert fitted.kept_chars == len(head) + len(tail)
+    assert int(match.group(1)) == fitted.original_chars - fitted.kept_chars
+    assert int(match.group(2)) == size
+    assert (match.group(3), int(match.group(4)), match.group(5)) == (
+        "bulk_max_chars", limit, hint
+    )
+    # A reader at the same limit keeps it as it is: no second cut, no second marker.
+    again = fit_block(fitted.text, limit=limit, field="bulk_max_chars", how_to_get_rest=hint)
+    assert again.text == fitted.text and again.truncated is False
+
+
+def test_fit_block_within_limit_keeps_only_a_marker_longer_than_the_limit() -> None:
+    hint = "Re-run `" + "x" * 1_200 + "` in your working directory for the full output."
+    fitted = fit_block(
+        "y" * 5_000, limit=1_000, field="bulk_max_chars", how_to_get_rest=hint, within_limit=True
+    )
+    assert fitted.kept_chars == 0
+    assert _MARKER_RE.fullmatch(fitted.text) is not None
+
+
 # --- resolve_bulk_limit -------------------------------------------------------
 
 _LIMITS: dict[str, Any] = {"compaction_max_chars": 5_000, "bulk_max_chars": 50_000}

@@ -32,7 +32,7 @@ from .engine import AgentRunner, BugFixerController, Orchestrator, SessionBudget
 from .events import EventBus, EventType
 from .hot_reload import HotReloader
 from .planning.session import PlanningOrchestrator
-from .providers import Provider, QuotaGate
+from .providers import Provider, QuotaGate, WaitTracker
 from .util import new_id
 
 logger = logging.getLogger("conclave.runtime")
@@ -92,6 +92,8 @@ class ProjectWorker:
         self._bug_fixer = BugFixerController(orchestrator)
         self._session_budget: SessionBudget | None = None
         self._session_started: float | None = None
+        # How long the session's dispatches waited for a usage limit: not part of its budget.
+        self._session_waits: WaitTracker | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._reloader: HotReloader | None = getattr(orchestrator, "_reloader", None)
         self._daemon: Daemon | None = getattr(orchestrator, "_daemon", None)
@@ -212,7 +214,9 @@ class ProjectWorker:
         # Surface a stop request for whatever fix task this cycle spawns: the controller registers
         # the task's own id in the same _cancel_events table, but we also honour a worker stop by
         # signalling between stages through the event threaded into the cycle.
-        result = await self._bug_fixer.run_cycle(project, config, cancel_event=cancel_event)
+        result = await self._bug_fixer.run_cycle(
+            project, config, cancel_event=cancel_event, waits=self._session_waits
+        )
         budget.record(result)
 
         if result.outcome.did_work:
@@ -223,17 +227,20 @@ class ProjectWorker:
             await self._idle_backoff()
 
     def _ensure_session(self, config: ConclaveConfig) -> SessionBudget:
-        """Lazily build (and remember) this autonomous session's budget + start time."""
+        """Lazily build (and remember) this autonomous session's budget, start time and waits."""
         if self._session_budget is None:
             self._session_budget = SessionBudget.from_config(resolve_bug_fixer_session(config))
             self._session_started = time.monotonic()
+            self._session_waits = WaitTracker(self._orchestrator._quota_gate.now)
         return self._session_budget
 
     def _session_elapsed(self) -> float:
-        """Seconds since the current autonomous session began (0 before one starts)."""
+        """Seconds since the current autonomous session began (0 before one starts), leaving out
+        the time its dispatches waited for a usage limit to reset: a wait never uses the budget."""
         if self._session_started is None:
             return 0.0
-        return time.monotonic() - self._session_started
+        waited = self._session_waits.seconds() if self._session_waits is not None else 0.0
+        return time.monotonic() - self._session_started - waited
 
     # --- Internal helpers ----------------------------------------------------
 

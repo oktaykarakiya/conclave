@@ -30,6 +30,12 @@ def _build_win_subprocess_kw() -> dict[str, Any]:
 
 _WIN_SUBPROCESS_KW: dict[str, Any] = _build_win_subprocess_kw()
 
+# What run_shell returns for a command stopped by its cancel event: a shell's code for an
+# interrupted command (128 + SIGINT), so never a pass (0), a timeout (124) or a missing
+# command (127).
+CANCELLED_EXIT_CODE = 130
+_CANCELLED_OUTPUT = "(command cancelled)"
+
 GIT_ENV = {
     # Deterministic, non-interactive git for unattended operation.
     "GIT_TERMINAL_PROMPT": "0",
@@ -82,12 +88,16 @@ async def run_shell(
     *,
     env: dict[str, str] | None = None,
     timeout_seconds: int | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> tuple[int, str]:
     """Run a shell command (e.g. the project's test command) in ``cwd``.
 
-    On timeout the whole process group is killed so that child processes spawned
-    by the shell (pipelines, subshells, background jobs) are not orphaned.
+    On timeout, or once *cancel_event* is set, the whole process group is killed so that child
+    processes spawned by the shell (pipelines, subshells, background jobs) are not orphaned. A
+    cancelled command returns :data:`CANCELLED_EXIT_CODE`, and none starts once the event is set.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        return CANCELLED_EXIT_CODE, _CANCELLED_OUTPUT
     # start_new_session=True gives the shell its own process group (pgid == pid).
     # When the timeout fires we can killpg the entire group rather than just the
     # shell leader, which prevents orphaned grandchildren from outliving the parent.
@@ -135,24 +145,35 @@ async def run_shell(
             start_new_session=True,
             **_WIN_SUBPROCESS_KW,
         )
-    if timeout_seconds is None:
+    if timeout_seconds is None and cancel_event is None:
         stdout, _ = await proc.communicate()
         return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
-    # Shield communicate() so a timeout does not *cancel* it — cancelling mid-read
-    # leaves the subprocess pipe transport dangling, which asyncio later GC-warns
-    # about ("Exception ignored in BaseSubprocessTransport.__del__"). Instead we let
-    # it keep running, kill the process, then await it so the transport closes cleanly.
+    # Neither a timeout nor a cancel *cancels* communicate(): cancelling it mid-read leaves the
+    # subprocess pipe transport dangling, which asyncio later GC-warns about ("Exception ignored
+    # in BaseSubprocessTransport.__del__"). asyncio.wait (unlike wait_for) cancels nothing, so it
+    # keeps running while the process is killed, and is then awaited so the transport closes.
     comm = asyncio.ensure_future(proc.communicate())
+    stop = asyncio.ensure_future(cancel_event.wait()) if cancel_event is not None else None
     try:
-        stdout, _ = await asyncio.wait_for(asyncio.shield(comm), timeout=timeout_seconds)
-    except TimeoutError:
-        await _kill_process_group(proc, timeout_seconds)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(comm, timeout=1.0)
-        if not comm.done():
-            comm.cancel()
-        return 124, f"(command timed out after {timeout_seconds}s)"
-    return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
+        await asyncio.wait(
+            {comm} if stop is None else {comm, stop},
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        if stop is not None:
+            stop.cancel()
+    if comm.done():
+        stdout, _ = comm.result()
+        return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
+    await _kill_process_group(proc, timeout_seconds or 0)
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(comm, timeout=1.0)
+    if not comm.done():
+        comm.cancel()
+    if cancel_event is not None and cancel_event.is_set():
+        return CANCELLED_EXIT_CODE, _CANCELLED_OUTPUT
+    return 124, f"(command timed out after {timeout_seconds}s)"
 
 
 # --- Internal helpers ---------------------------------------------------------

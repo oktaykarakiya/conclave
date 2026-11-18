@@ -102,6 +102,7 @@ class _BugFixerProvider:
 
     ``cancel_during_repro`` sets the cancel event the repro synthesis dispatch receives, as an
     operator stop landing while that reply comes back (the reply is still returned).
+    ``cancel_during_consensus`` does the same in the first consensus dispatch.
     """
 
     def __init__(
@@ -111,11 +112,13 @@ class _BugFixerProvider:
         fix_succeeds: bool = True,
         consensus_verdicts: dict[str, str] | None = None,
         cancel_during_repro: bool = False,
+        cancel_during_consensus: bool = False,
     ) -> None:
         self._repro_block = repro_block
         self._fix_succeeds = fix_succeeds
         self._consensus_verdicts = consensus_verdicts or {}
         self._cancel_during_repro = cancel_during_repro
+        self._cancel_during_consensus = cancel_during_consensus
         self.consensus_calls = 0
         self.developer_calls = 0
 
@@ -149,6 +152,8 @@ class _BugFixerProvider:
         # Decline-consensus round (controller-issued, read-only — must NOT touch the worktree).
         if "Before we AUTO-FIX it autonomously" in prompt:
             self.consensus_calls += 1
+            if self._cancel_during_consensus and cancel_event is not None:
+                cancel_event.set()
             agent = _consensus_agent(prompt)
             return self._consensus_reply(self._consensus_verdicts.get(agent, "pass"))
         # Planner (orchestrator) — keyed on its unique instruction.
@@ -484,12 +489,11 @@ async def test_decline_consensus_any_two_threshold_declines(
 async def test_decline_consensus_cancel_aborts_round_without_declining(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cancel set before the round makes every reviewer ABSTAIN — never a manufactured decline.
+    """A cancel set before the round never manufactures a decline.
 
-    Honouring ``cancel_event`` between dispatches must not look like a unanimous decline: with the
-    event set (here while the repro reply comes back, so the cycle still reaches the round), no
-    reviewer is polled, the round abstains, and the candidate is NOT routed to a human by the
-    consensus gate (the fix path is reached, where the wired task cancellation owns the stop).
+    Here the event is set while the repro reply comes back, so the reproduction gate (which gets
+    the cycle's cancel event) runs nothing: the cycle skips the candidate, unchanged, before the
+    round. No reviewer is polled and the candidate is NOT routed to a human.
     """
     provider = _BugFixerProvider(
         consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "decline"},
@@ -505,6 +509,45 @@ async def test_decline_consensus_cancel_aborts_round_without_declining(
     assert cancel.is_set()
     assert provider.consensus_calls == 0  # no reviewer was dispatched
     # The consensus gate did NOT route to a human (cancellation is not a decline).
+    assert result.outcome is not CycleOutcome.declined
+    assert result.outcome is CycleOutcome.skipped  # stopped at the reproduction gate
+    stored = await repo.get_bug_candidate(db, candidate.id)
+    assert stored is not None
+    assert stored.status is not BugStatus.declined_needs_human
+    assert stored.status is BugStatus.discovered
+
+
+async def test_decline_consensus_cancel_during_the_round_abstains_the_rest(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel landing in the round's first dispatch makes the remaining reviewers ABSTAIN.
+
+    Honouring ``cancel_event`` between dispatches must not look like a unanimous decline: one
+    decline and two abstains never meet ``all_mandatory``, so the candidate is NOT routed to a
+    human by the consensus gate (the fix path is reached, where the wired task cancellation owns
+    the stop).
+    """
+    provider = _BugFixerProvider(
+        consensus_verdicts={"tester": "decline", "security": "decline", "reviewer": "decline"},
+        cancel_during_consensus=True,
+    )
+    project, config, controller = await _make(db, tmp_path, provider)
+    candidate = await _seed_candidate(db, project)
+    _patch_discovery(monkeypatch, candidate)
+
+    cancel = asyncio.Event()
+    result = await controller.run_cycle(project, config, cancel_event=cancel)
+
+    assert cancel.is_set()
+    assert provider.consensus_calls == 1  # only the first reviewer was dispatched
+    rounds = [
+        e.payload for e in await repo.list_events(db, project_id=project.id)
+        if e.type == "consensus.round"
+    ]
+    assert [r["verdicts"] for r in rounds] == [
+        {"tester": "decline", "security": None, "reviewer": None}
+    ]
+    assert rounds[0]["declined"] is False
     assert result.outcome is not CycleOutcome.declined
     stored = await repo.get_bug_candidate(db, candidate.id)
     assert stored is not None

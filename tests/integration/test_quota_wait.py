@@ -23,7 +23,7 @@ from fake_provider import FakeProvider
 from httpx import ASGITransport
 
 from conclave.config import ConclaveConfig
-from conclave.db import Database, EventRow, Project, Task, TaskState
+from conclave.db import Database, EventRow, Project, ProjectMode, Task, TaskState
 from conclave.db import repositories as repo
 from conclave.db.planning_models import PlanningSessionStatus
 from conclave.engine import Orchestrator, discover_bug, run_git
@@ -31,8 +31,15 @@ from conclave.engine import runner as runner_module
 from conclave.events import EventBus
 from conclave.mcp.server import handle_mcp_message
 from conclave.planning.session import PlanningOrchestrator
-from conclave.providers import CONTINUATION_PROMPT, QuotaExhausted, QuotaGate
-from conclave.runtime import Daemon
+from conclave.providers import (
+    CONTINUATION_PROMPT,
+    AgentResult,
+    OnChunk,
+    QuotaExhausted,
+    QuotaGate,
+    ResolvedProfile,
+)
+from conclave.runtime import Daemon, ProjectWorker
 from conclave.web import create_app
 
 T0 = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
@@ -236,6 +243,48 @@ async def test_a_gate_fix_up_hitting_the_limit_waits_and_fixes(
     assert code == 0 and out == "fixed\n"
 
 
+class _SessionTotalCosts(FakeProvider):
+    """Reports the developer's cost as Claude Code does, as the session's running total: 4.52
+    when the limit refuses its run, 8.49 for the whole session once the resumed run ends."""
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        result = await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+        if result.quota is not None:
+            return result.model_copy(update={"cost_usd": 4.52, "cost_is_session_total": True})
+        if profile.resume_session_id is not None:
+            return result.model_copy(update={"cost_usd": 8.49, "cost_is_session_total": True})
+        return result
+
+
+async def test_a_resumed_sessions_usage_rows_add_up_to_its_real_cost(
+    db: Database, tmp_path: Path
+) -> None:
+    project, task = await _project_and_task(db, tmp_path)
+    provider = _SessionTotalCosts(quota_once={"developer"})
+
+    assert await _process(_orchestrator(db, tmp_path, provider, FakeClock()), project) is True
+
+    rows = await db.fetchall(
+        "SELECT cost_usd FROM usage WHERE task_id = ? AND agent = 'developer' ORDER BY rowid",
+        (task.id,),
+    )
+    assert [row["cost_usd"] for row in rows] == [4.52, pytest.approx(3.97)]
+    # Every other dispatch of the task cost nothing: the rows sum to the session's real total.
+    assert (await repo.usage_summary(db, project.id))["total_cost_usd"] == pytest.approx(8.49)
+
+
 # --- budgets, cancellation, restart ------------------------------------------------------
 
 
@@ -398,6 +447,41 @@ async def test_a_hunter_dispatch_hitting_the_limit_waits_and_records_its_find(
     assert waiting.agent == "hunter" and waiting.task_id is None
     (resumed,) = _of(events, "quota.resumed")
     assert resumed.payload["resumed_session"] is True
+
+
+async def test_a_wait_does_not_consume_the_bug_fixer_sessions_budget(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A two-hour wait for the session's hunter leaves its one-hour session budget unspent."""
+    project = await repo.create_project(
+        db, name="b", path=str(tmp_path), default_branch="main",
+        config={"bug_fixer": {"wall_clock_budget_minutes": 60}},
+    )
+    await repo.set_project_mode(db, project.id, ProjectMode.autonomous_bug_fixer)
+    await repo.upsert_coverage_region(db, project_id=project.id, region="src")
+    claim = {"file": "src/app.py", "symbol": "f", "claim": "f breaks", "severity": "high"}
+    provider = FakeProvider(
+        quota_once={"hunter"},
+        quota_resets_at=T0 + timedelta(hours=2),
+        hunter_text=f"```json\n{json.dumps(claim)}\n```",
+        developer_writes=False,  # the repro dispatch answers without a test: the cycle defers
+    )
+    clock = FakeClock()
+    monkeypatch.setattr("conclave.runtime.time", _ShiftedTime(clock))
+    worker = ProjectWorker(db, _orchestrator(db, tmp_path, provider, clock), project.id)
+    started = time.monotonic()
+
+    await worker._bug_fixer_tick(project)
+
+    assert time.monotonic() - started < 10  # the wait took no real time
+    assert clock.current >= T0 + timedelta(hours=2)  # but two hours on the gate's clock
+    assert provider.quota_hits == ["hunter"]
+    assert worker._session_elapsed() < 3600
+    assert worker._session_budget is not None
+    assert worker._session_budget.candidates_pursued == 1
+    assert not worker._session_budget.exhausted(elapsed_seconds=worker._session_elapsed())
+    assert worker._session_waits is not None
+    assert worker._session_waits.seconds() >= 2 * 3600
 
 
 class _RecordingSink:

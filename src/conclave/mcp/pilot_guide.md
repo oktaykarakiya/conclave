@@ -66,9 +66,12 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      `execution.max_parallel_tasks`, `execution.review_rounds_max`
    - `execution.allow_no_test_command` (default `false`): with `require_full_green` on and no test
      command, a task with a developer fails with reason `no_test_command` before any worktree or
-     agent is spent; its summary names the fix. Set it to `true` only to run deliberately without
-     a gate (the gate then passes, and a `gate_skipped_no_tests` log event says it ran no tests).
-     Review-only workflows (no developer) and `require_full_green: false` are not affected.
+     agent is spent; its summary names the fix. A test command removed while a task runs fails
+     that task at its gate the same way (`attempt.failed` and `task.failed` with reason
+     `no_test_command`, the same summary): nothing is committed or merged ungated. Set it to
+     `true` only to run deliberately without a gate (the gate then passes, and a
+     `gate_skipped_no_tests` log event says it ran no tests). Review-only workflows (no developer)
+     and `require_full_green: false` are not affected.
    - `execution.test_integrity` (`block` | `warn` | `off`, default `block`): after each developer
      attempt Conclave checks, from git, whether the change deleted a pre-existing test file,
      removed a test without adding it back elsewhere, or added a skip / xfail / todo / `.only`
@@ -136,7 +139,8 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      recoverable bulk (diffs, gate/test and setup output) is fitted, per block: to
      `compaction_max_chars` when compaction is on for that agent, else to `bulk_max_chars`. A
      fitted block keeps its head and tail, and a marker in the middle says how much was omitted,
-     which setting limited it and the command that shows the rest.
+     which setting limited it and the command that shows the rest. The baseline failure output
+     Conclave caches per target commit is stored fitted to `bulk_max_chars`, marker included.
    - `compact_before_start` (on an agent or a workflow node): `true` turns compaction on for that
      agent, `false` turns it off, `null` defers to the next layer: node → `agent_overrides.<agent>`
      → `agent_defaults` → `context.compaction_enabled`. A stored `true` (older saved settings and
@@ -272,7 +276,13 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   `conclave_get_task(task_id)` (the task is under the `task` key) for state and `result_summary`.
 - `conclave_get_task_events(task_id, after_id)` returns events in **pages**: loop, passing the
   last seen `id` as `after_id`, until the page is empty. Useful types:
-  `task.started`, `plan.artifact`, `attempt.started`, `agent.dispatched` (configured `model`,
+  `task.started`, `plan.artifact`, `attempt.started`, `attempt.failed` (`n`, `stage`:
+  `developer` | `review` | `gate`, and `reason`: why, on one line of at most 300 characters,
+  e.g. `rejected by SECURITY (fail): <its reason>`,
+  `inconclusive: mandatory reviewer(s) SECURITY gave no usable verdict (...)`,
+  `no reviewer returned a usable verdict`, `test gate not green (exit 1)`, the developer's
+  error, `infra_timed_out` or `no_test_command`; a developer failure also has `error`, a gate
+  failure `exit_code`), `agent.dispatched` (configured `model`,
   and `effort`: the level it runs with after auto and clamping, `null` when no flag is passed),
   `agent.result` (`ok`, `model_reported`, `cost_usd`, `error`), `agent.verdict`
   (`verdict`, `reason`), `pipeline.derived` (which reviewers will run), `node.started`,
@@ -282,11 +292,13 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   `agent.output_chunk` (live output) unless debugging. A `log` event with
   `stage: "gate_skipped_no_tests"` means the gate ran no tests (`allow_no_test_command`). A
   `log` event with `stage: "context_truncated"` marks every cut of a diff or gate/setup output
-  in an agent's prompt (`block`, `field`, `original_chars`, `kept_chars`, `agent`, `node_id`);
-  there is none when nothing was cut. A `log` event with `stage: "effort_clamped"` marks a
-  dispatch whose explicit effort the model does not support (`requested`, `used`, `model`,
-  `agent`, `node_id`); the dispatch ran with `used`. `quota.waiting` and `quota.resumed` mark a
-  dispatch waiting out a usage limit (see Usage limits below).
+  in an agent's prompt (`block`, `field`, `original_chars`, `kept_chars`, `agent`, `node_id`),
+  and the cut of the baseline output cached for later tasks (`block: "baseline_output"`,
+  `agent: null`); there is none when nothing was cut. A `log` event with
+  `stage: "effort_clamped"` marks a dispatch whose explicit effort the model does not support
+  (`requested`, `used`, `model`, `agent`, `node_id`); the dispatch ran with `used`.
+  `quota.waiting` and `quota.resumed` mark a dispatch waiting out a usage limit (see Usage
+  limits below).
 - `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review.
 - **Mandatory reviewers block until they answer.** A reviewer's reply counts only when it ends
   with its JSON verdict block (`pass`, `fail`, `block`, `decline`; a block that declines to judge
@@ -310,10 +322,15 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   (the reason cut to its last 300 characters). With `experimental.planner_enabled: false`, a task's
   `use_planner: false` or a workflow without a planner node, no planner runs and nothing is
   reported.
+- **A failed task says why its last attempt failed.** Its `result_summary` ends with that
+  attempt's `attempt.failed` reason, after any planner and test-integrity notes:
+  `failed (max_retries) after 3 attempt(s); last: rejected by SECURITY (fail): <its reason>`.
+  Read the `attempt.failed` events for every attempt's reason.
 - Typical timeline: setup + baseline test run, planner, developer, each reviewer in turn, the
   gate, commit. Poll every 15–60 s; long silences during planning or development are normal.
 - Costs are reported per dispatch in `agent.result.cost_usd`. Subscription-backed engines
-  report a notional cost that counts against plan limits, not money.
+  report a notional cost that counts against plan limits, not money. A dispatch that waited out
+  a usage limit has one usage row per run, each that run's own cost (see Usage limits below).
 
 ### Usage limits
 - When an engine refuses work because a usage limit or the balance ran out (Claude Code's
@@ -343,8 +360,14 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   `conclave_get_engine_quota` (REST `GET /api/engines/quota`) for every gate, until when, and
   Claude Code's latest rate-limit windows (`rate_limit`); the UI's banner; and the webhook
   (`notifications.webhook_url`) receives `quota.waiting` once per gate closing and project.
-- Waiting does not count against a task's `execution.wall_clock_budget_minutes` or an agent's
-  `timeout_minutes`. An autonomous bug-fixer session's own wall-clock cap still counts it.
+- Waiting does not count against a task's `execution.wall_clock_budget_minutes`, an agent's
+  `timeout_minutes` or an autonomous bug-fixer session's wall-clock cap
+  (`bug_fixer.wall_clock_budget_minutes`).
+- Costs: the run a limit interrupted keeps a usage row of its own, and each row is that run's own
+  cost. Claude Code reports a resumed session's running total, so the resumed run's
+  `agent.result.cost_usd` (and its usage row) is that total minus what the session's earlier runs
+  already reported (never below 0): the rows add up to the session's real cost. A session the
+  engine no longer has starts afresh and counts in full. opencode reports each run's own cost.
 - To stop a wait, cancel as usual: `conclave_cancel_task` or `conclave_cancel_planning_session`
   ends it at once. A daemon restart during a wait puts the task back to `approved`; it runs
   again and waits again.
@@ -463,7 +486,8 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   project's `target_branch`, or pass `apply_to_all_projects: true` (§3).
 - A task that fails at **baseline** usually means the test or setup command is wrong for the
   target branch — fix the config, not the code.
-- A task that fails at once with reason `no_test_command` never ran an agent: set
+- A task that fails with reason `no_test_command` had no test command: at once, before any agent
+  ran, or at its gate when the command was removed while it ran (nothing was committed). Set
   `execution.baseline_test_command` (or `allow_no_test_command: true`) and approve it again
   (`conclave_approve_task`).
 - A `done` task whose summary says `merged=False` waits for you: `auto_merge` is off by default,
