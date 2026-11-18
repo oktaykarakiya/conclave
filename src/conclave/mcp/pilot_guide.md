@@ -288,6 +288,28 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   `agent`, `node_id`); the dispatch ran with `used`. `quota.waiting` and `quota.resumed` mark a
   dispatch waiting out a usage limit (see Usage limits below).
 - `conclave_get_task_verdicts`, `conclave_get_task_checkpoints` summarize the review.
+- **Mandatory reviewers block until they answer.** A reviewer's reply counts only when it ends
+  with its JSON verdict block (`pass`, `fail`, `block`, `decline`; a block that declines to judge
+  or abstains also counts, as a non-blocking `unknown`). A mandatory reviewer
+  (`agents.mandatory`, default `tester`, `security`, `reviewer`) that crashes, times out, comes
+  back empty or ends without that block is re-run alone, up to 2 more times, its prompt then
+  reminding it to end with the verdict block. If it still has none, its verdict is recorded
+  `unknown` (`source: none`, the reason names its last error), a `grounding.warning` names it, and
+  the review round fails: the attempt is retried with feedback starting `REVIEW INCONCLUSIVE`
+  that names the reviewer, and nothing reaches the gate, commit or merge on that round. This holds
+  in review-only workflows too. A conditional reviewer without a verdict is recorded `unknown`
+  and does not block; a `grounding.warning` names it and says `non-blocking`. A round in which no
+  reviewer gave a usable verdict fails the same way.
+- **A failed planner is retried, then reported.** A planner node that fails (a crash, timeout or
+  CLI error, an empty reply, or no parsable JSON plan block) is tried up to the planner's
+  `max_retries` times in total (`agent_overrides.planner`, else `agent_defaults`; default 3),
+  with a short pause between tries. In a custom `workflow`, a prose reply counts as the planner's
+  brief. If every try fails, the developer runs without a plan, a `log` event with
+  `stage: "planner_failed"` (`attempts`, `error`, `agent`, `node_id`) says so, the planner's
+  checkpoint is `failed`, and the result summary says `planned: no (planner failed: <reason>)`
+  (the reason cut to its last 300 characters). With `experimental.planner_enabled: false`, a task's
+  `use_planner: false` or a workflow without a planner node, no planner runs and nothing is
+  reported.
 - Typical timeline: setup + baseline test run, planner, developer, each reviewer in turn, the
   gate, commit. Poll every 15–60 s; long silences during planning or development are normal.
 - Costs are reported per dispatch in `agent.result.cost_usd`. Subscription-backed engines
@@ -470,6 +492,16 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   still run the command named in the marker, but for whole-diff review raise
   `context.bulk_max_chars` (or `compaction_max_chars`), or make the task smaller or the test
   output quieter.
+- A repository that commits build output (minified bundles, generated code) should mark it
+  `-diff` in its `.gitattributes`, e.g. `dist/** -diff linguist-generated=true`. `git diff` then
+  shows each such file as one `Binary files ... differ` line, so the reviewers' diff (and
+  `conclave_get_task_diff`) keeps its room for the real change instead of being cut around the
+  bundle. Merges still merge those files as text. Conclave marks its own committed UI bundle
+  this way.
+- A task whose attempts keep failing with `REVIEW INCONCLUSIVE` feedback naming a mandatory
+  reviewer never got that reviewer's verdict (§6): read its `agent.result` errors (engine down, a
+  wrong model string) and its persona. A custom persona for a reviewer must keep the JSON verdict
+  block its built-in ends with.
 - `conclave_compact_session` on a task only records a summary and a size estimate; it never
   changes the request or plan that agents receive.
 - With the default `experimental.workflow_evolution: suggest` the evolver never changes a

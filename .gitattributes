@@ -6,3 +6,7 @@ conclave text eol=lf
 *.ico binary
 *.woff binary
 *.woff2 binary
+# The committed SPA build (minified bundles) is generated: `git diff` prints one "Binary files ...
+# differ" line per file instead of its text, so review diffs stay on the real change. Merges still
+# merge it as text.
+src/conclave/web/static/** -diff linguist-generated=true

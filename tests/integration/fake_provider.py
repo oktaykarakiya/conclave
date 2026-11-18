@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -115,6 +115,10 @@ class FakeProvider:
     resume of an unknown session fails the way the CLIs report it. ``fixup_content`` is
     what the developer writes when its prompt carries a red gate's feedback (``"GATE is not
     green"``), and ``hunter_text`` what the hunter answers (else it answers as the developer).
+
+    ``replies`` scripts a role's answers (keyed like ``quota_once``, e.g. ``"planner"`` or
+    ``"reviewer:security"``): its dispatches get them in order, then the last one again. It
+    applies after the usage-limit handling, so a refused role answers from its script on resume.
     """
 
     def __init__(
@@ -131,6 +135,7 @@ class FakeProvider:
         quota_resets_at: datetime | None = None,
         fixup_content: str | None = None,
         hunter_text: str | None = None,
+        replies: Mapping[str, Sequence[AgentResult]] | None = None,
     ) -> None:
         self.developer_writes = developer_writes
         self.developer_content = developer_content
@@ -150,6 +155,8 @@ class FakeProvider:
         self.hunter_text = hunter_text
         self.quota_hits: list[str] = []
         self._refused: dict[str, str] = {}  # session id -> the prompt the engine refused
+        self.replies = {role: list(script) for role, script in (replies or {}).items() if script}
+        self._replied: dict[str, int] = {}  # role -> scripted replies given so far
 
     @staticmethod
     def role_of(prompt: str) -> str:
@@ -221,6 +228,11 @@ class FakeProvider:
                 model_reported="fake",
                 cost_usd=0.0,
             )
+        script = self.replies.get(role)
+        if script:
+            given = self._replied.get(role, 0)
+            self._replied[role] = given + 1
+            return script[min(given, len(script) - 1)]
         if role == "hunter" and self.hunter_text is not None:
             return AgentResult(ok=True, text=self.hunter_text, model_reported="fake")
         # --- orchestrator flows (matched FIRST) ---

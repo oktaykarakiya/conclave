@@ -1427,7 +1427,7 @@ async def test_cancel_event_checked_between_stages(
             cancel_event: asyncio.Event | None = None,
         ) -> AgentResult:
             if "Produce a structured plan" in prompt:
-                return AgentResult(ok=True, text="{}", model_reported="fake")
+                return AgentResult(ok=True, text="```json\n{}\n```", model_reported="fake")
             if "Review the changes" in prompt:
                 return AgentResult(
                     ok=True,
@@ -1509,7 +1509,7 @@ async def test_cancel_on_final_attempt_lands_in_cancelled_not_failed(
             cancel_event: asyncio.Event | None = None,
         ) -> AgentResult:
             if "Produce a structured plan" in prompt:
-                return AgentResult(ok=True, text="{}", model_reported="fake")
+                return AgentResult(ok=True, text="```json\n{}\n```", model_reported="fake")
             if "Review the changes" in prompt:
                 # Should never be reached: the cancel check inside _review fires first.
                 return AgentResult(
@@ -1879,7 +1879,7 @@ async def test_cancel_via_api_endpoint(
             cancel_event: asyncio.Event | None = None,
         ) -> AgentResult:
             if "Produce a structured plan" in prompt:
-                return AgentResult(ok=True, text="{}", model_reported="fake")
+                return AgentResult(ok=True, text="```json\n{}\n```", model_reported="fake")
             if "Review the changes" in prompt:
                 return AgentResult(ok=True, text=_PASS, model_reported="fake")
             if "Repository Analysis" in prompt and "AI Enrichment" in prompt:
@@ -2028,7 +2028,7 @@ async def test_steer_via_api_endpoint_injects_into_in_flight_task(
             cancel_event: asyncio.Event | None = None,
         ) -> AgentResult:
             if "Produce a structured plan" in prompt:
-                return AgentResult(ok=True, text="{}", model_reported="fake")
+                return AgentResult(ok=True, text="```json\n{}\n```", model_reported="fake")
             if "Review the changes" in prompt:
                 return AgentResult(ok=True, text=_PASS, model_reported="fake")
             # Developer dispatch — block until released so the steer is queued first.

@@ -7,6 +7,7 @@ FakeProvider (zero LLM cost), asserting on the full prompts the provider receive
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -32,6 +33,7 @@ from conclave.engine.compactor import compact_task_context
 from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
 from conclave.mcp.server import handle_mcp_message
+from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 from conclave.runtime import Daemon
 from conclave.web import create_app
 
@@ -63,6 +65,7 @@ async def _init_repo(path: Path, files: dict[str, str] | None = None) -> str:
     await run_git(path, "config", "user.name", "Test")
     (path / "README.md").write_text("# test repo\n", encoding="utf-8")
     for name, content in (files or {}).items():
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
         (path / name).write_text(content, encoding="utf-8")
     await run_git(path, "add", "-A")
     await run_git(path, "commit", "-m", "initial commit")
@@ -311,6 +314,60 @@ async def test_previous_diff_is_fitted_and_recoverable_with_the_command_in_its_m
     # The previous attempt was reset, yet its full diff is still recoverable.
     rc, recovered = await run_git(tmp_path / "repo", "diff", checkpoint, tree)
     assert rc == 0 and len(recovered) == cuts[0]["original_chars"]
+
+
+class _RebuildsTheBundle(FakeProvider):
+    """FakeProvider whose developer also rewrites committed build output, as a rebuild does."""
+
+    def __init__(self, bundle: str, content: str) -> None:
+        super().__init__()
+        self.bundle = bundle
+        self.bundle_content = content
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        if cwd is not None and self.role_of(prompt) == "developer":
+            (Path(cwd) / self.bundle).write_text(self.bundle_content, encoding="utf-8")
+        return await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+
+
+async def test_output_marked_diff_unset_reaches_reviewers_as_one_binary_line(
+    db: Database, tmp_path: Path
+) -> None:
+    """Build output a repository marks ``-diff`` (as Conclave marks its own SPA bundle) is one
+    ``Binary files ... differ`` line in every reviewer's diff, so the real change keeps the room."""
+    bundle = "dist/app.min.js"
+    await _init_repo(
+        tmp_path / "repo",
+        {
+            ".gitattributes": "dist/** -diff linguist-generated=true\n",
+            bundle: "!function(){var a=1}();\n",
+        },
+    )
+    marker = "REBUILT_BUNDLE_MARKER_4f1c"
+    provider = _RebuildsTheBundle(bundle, f"!function(){{var {marker}=2}}();\n")
+
+    task, ok = await _run_task(db, tmp_path, provider, {})
+
+    assert ok is True and task.state is TaskState.done
+    reviewers = [p for p in provider.prompts if _REVIEW in p]
+    assert len(reviewers) >= 3
+    for prompt in reviewers:
+        assert f"Binary files a/{bundle} and b/{bundle} differ" in prompt
+        assert "+++ b/FEATURE.txt\n@@ -0,0 +1 @@\n+done\n" in prompt
+        assert marker not in prompt
+    assert [c for c in await _cuts(db, task.id) if c["block"] == "diff"] == []
 
 
 # --- recoverable bulk: gate, baseline and setup output ------------------------------------

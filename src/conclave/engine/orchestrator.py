@@ -53,9 +53,18 @@ from .worktree import WorktreeManager
 
 # A single reviewer dispatch can transiently return empty/non-ok (provider hiccup).
 # Retry it a few times before giving up, so one flaky call doesn't discard the
-# developer's work and re-run the whole develop→review loop.
+# developer's work and re-run the whole develop→review loop. The planner's retries wait
+# the same backoff.
 _REVIEWER_DISPATCH_RETRIES = 2
 _REVIEWER_RETRY_BACKOFF_S = 3.0
+
+# Appended to a mandatory reviewer's prompt when it is re-run for want of a usable verdict.
+_VERDICT_REMINDER = (
+    "Your previous reply had no verdict block; end with exactly the required JSON verdict block."
+)
+
+# Bound on the planner error quoted in a result summary; the planner_failed event has it whole.
+_PLANNER_FAILURE_NOTE_CHARS = 300
 
 # Bound on git's combined output captured in the result summary when a task commit fails,
 # so a noisy hook cannot bloat the task row while its diagnostic tail stays visible.
@@ -115,6 +124,14 @@ class _GateNote:
     gate: GateResult
     # One fitted output per limit, so each actual cut is made and reported once.
     fitted: dict[BulkLimit, str] = field(default_factory=dict)
+
+
+@dataclass
+class _PlannerOutcome:
+    """How the planner stage went, beside the preamble :meth:`Orchestrator._maybe_plan` returns."""
+
+    # Why the planner gave no plan after every try (one line, bounded); None when it did not fail.
+    failure: str | None = None
 
 
 class Orchestrator:
@@ -781,9 +798,14 @@ class Orchestrator:
             if cancel_event is not None and cancel_event.is_set():
                 return await self._finish_cancelled(task, wm, task_branch)
             config = await self._refresh_task_config(project.id, runner, config)
+            planner = _PlannerOutcome()
             plan_preamble = await self._maybe_plan(
                 runner, task, worktree, knowledge, rules, baseline, config,
-                cancel_event=cancel_event, checkpoint=checkpoint,
+                cancel_event=cancel_event, checkpoint=checkpoint, outcome=planner,
+            )
+            # The task ran without the plan it should have had: every summary says so.
+            planner_note = (
+                f"; planned: no (planner failed: {planner.failure})" if planner.failure else ""
             )
 
             # Cooperative cancellation — check after planning, before developer loop.
@@ -1572,11 +1594,11 @@ class Orchestrator:
                 )
                 return await self._finish_failure(
                     task, wm, task_branch, timed_out, attempts,
-                    integrity=integrity, integrity_mode=integrity_mode,
+                    integrity=integrity, integrity_mode=integrity_mode, planner_note=planner_note,
                 )
             return await self._finish_success(
                 task, wm, task_branch, repo_path, target_branch, worktree, config, attempts,
-                integrity=integrity, integrity_mode=integrity_mode,
+                integrity=integrity, integrity_mode=integrity_mode, planner_note=planner_note,
             )
         except Exception:
             logger.exception("Unhandled exception processing task %s", task.id)
@@ -1710,7 +1732,17 @@ class Orchestrator:
         *,
         cancel_event: asyncio.Event | None = None,
         checkpoint: str | None = None,
+        outcome: _PlannerOutcome | None = None,
     ) -> str:
+        """Run the workflow's planner stage; return the plan preamble for the developer.
+
+        A planner-kind node that fails (the dispatch is not ok, or its reply yields no plan) is
+        re-tried up to ``resolve_agent(config, "planner").max_retries`` tries in total, each
+        after the reviewers' backoff and never once cancelled. If every try fails, the
+        developer runs without a plan, a ``log`` event with stage ``planner_failed`` says so,
+        and *outcome* gets the reason for the result summary. A custom pre-developer node is
+        dispatched once, as before.
+        """
         existing_cp = await repo.get_task_checkpoint(self._db, task.id, "planner", attempt=0)
         if (
             existing_cp is not None
@@ -1843,54 +1875,82 @@ class Orchestrator:
                 "attempt": 0,
             },
         )
-        result = await runner.run(
-            agent=planner_agent,
-            prompt=prompt,
-            task_id=task.id,
-            worktree=worktree,
-            repo_knowledge=knowledge,
-            project_rules=rules,
-            cancel_event=cancel_event,
-            node_id=planner_node.id,
-            model_override=planner_node.model,
-            effort_override=planner_node.effort,
-            cli_agent_override=planner_node.cli_agent,
-            skills_override=planner_node.skills or None,
-            thinking_override=planner_node.thinking,
-        )
+        # A planner-kind node is re-tried until a reply yields a plan; a custom pre-developer
+        # node is dispatched once.
+        is_planner = planner_node.kind.value == "planner"
+        tries = resolve_agent(config, "planner").max_retries if is_planner else 1
         plan_preamble = ""
-        if result.ok:
-            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result.text, re.DOTALL)
-            if match:
-                try:
-                    plan = json.loads(match.group(1))
-                except (json.JSONDecodeError, ValueError):
-                    plan = None
-                if plan is not None:
-                    await repo.update_task_fields(self._db, task.id, plan=plan)
-                    await self._bus.emit(
-                        type=EventType.plan_artifact,
-                        project_id=task.project_id,
-                        task_id=task.id,
-                        payload={"plan": plan},
-                    )
-                    plan_preamble = (
-                        "\n\n=== PLAN (from the Planner — follow its scope strictly) ===\n"
-                        f"```json\n{match.group(1)}\n```\n=== END PLAN ===\n"
-                    )
-            if not plan_preamble and config.workflow is not None and result.text.strip():
-                plan_preamble = (
-                    "\n\n=== PLANNER CONTEXT BRIEF ===\n"
-                    f"{result.text.strip()}\n=== END PLANNER BRIEF ===\n"
+        failure = ""
+        made = 0
+        stopped = False  # cancelled: not a planner failure
+        for attempt in range(tries):
+            if attempt:
+                logger.info(
+                    "planner %s gave no plan (try %d/%d: %s); retrying",
+                    planner_agent, attempt, tries, failure,
                 )
+                await asyncio.sleep(_REVIEWER_RETRY_BACKOFF_S)
+                if cancel_event is not None and cancel_event.is_set():
+                    stopped = True
+                    break
+            result = await runner.run(
+                agent=planner_agent,
+                prompt=prompt,
+                task_id=task.id,
+                worktree=worktree,
+                repo_knowledge=knowledge,
+                project_rules=rules,
+                cancel_event=cancel_event,
+                node_id=planner_node.id,
+                model_override=planner_node.model,
+                effort_override=planner_node.effort,
+                cli_agent_override=planner_node.cli_agent,
+                skills_override=planner_node.skills or None,
+                thinking_override=planner_node.thinking,
+            )
+            made += 1
+            plan_preamble, failure = await self._plan_from_reply(task, config, result)
+            if plan_preamble:
+                break
+            if result.cancelled or (cancel_event is not None and cancel_event.is_set()):
+                stopped = True
+                break
+        planner_failed = is_planner and not plan_preamble and not stopped
+        if planner_failed:
+            reason = _one_line_tail(failure, _PLANNER_FAILURE_NOTE_CHARS)
+            await self._bus.emit(
+                type=EventType.log,
+                project_id=task.project_id,
+                task_id=task.id,
+                agent=planner_agent,
+                payload={
+                    "stage": "planner_failed",
+                    "attempts": made,
+                    "error": failure,
+                    "agent": planner_agent,
+                    "node_id": planner_node.id,
+                    # The Live tab renders log rows as "[stage] message".
+                    "message": (
+                        f"{planner_agent} gave no plan in {made} tries, so the developer runs "
+                        f"without one: {reason}"
+                    ),
+                },
+            )
+            if outcome is not None:
+                outcome.failure = reason
+        status = (
+            CheckpointStatus.completed
+            if plan_preamble
+            else CheckpointStatus.failed
+            if planner_failed
+            else CheckpointStatus.skipped
+        )
         await repo.save_task_checkpoint(
             self._db,
             task_id=task.id,
             node_id="planner",
             attempt=0,
-            status=(
-                CheckpointStatus.completed if plan_preamble else CheckpointStatus.skipped
-            ),
+            status=status,
             git_tree_sha=checkpoint,
             artifact={"plan_preamble": plan_preamble},
         )
@@ -1900,9 +1960,7 @@ class Orchestrator:
                 task_id=task.id,
                 node_id=planner_node.id,
                 attempt=0,
-                status=(
-                    CheckpointStatus.completed if plan_preamble else CheckpointStatus.skipped
-                ),
+                status=status,
                 git_tree_sha=checkpoint,
                 artifact={"plan_preamble": plan_preamble},
             )
@@ -1916,7 +1974,7 @@ class Orchestrator:
                 "workflow_node_id": planner_node.id,
                 "agent": planner_agent,
                 "attempt": 0,
-                "status": "completed" if plan_preamble else "skipped",
+                "status": status.value,
             },
         )
         plan_res = await self._await_human_approval(
@@ -1933,6 +1991,42 @@ class Orchestrator:
             plan_preamble += f"\n\n=== OPERATOR PLAN NOTES ===\n{plan_res['output']}\n"
         return plan_preamble
 
+    async def _plan_from_reply(
+        self, task: Task, config: ConclaveConfig, result: AgentResult
+    ) -> tuple[str, str]:
+        """``(plan_preamble, "")`` for a planner reply that yields a plan, else ``("", why)``.
+
+        A fenced JSON plan is stored on the task and announced (``plan.artifact``). In a custom
+        workflow, whose planning personas may answer in prose, any other non-empty reply is
+        passed on as a brief.
+        """
+        if not result.ok:
+            return "", result.error or "dispatch failed"
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result.text, re.DOTALL)
+        if match:
+            try:
+                plan = json.loads(match.group(1))
+            except (json.JSONDecodeError, ValueError):
+                plan = None
+            if plan is not None:
+                await repo.update_task_fields(self._db, task.id, plan=plan)
+                await self._bus.emit(
+                    type=EventType.plan_artifact,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    payload={"plan": plan},
+                )
+                return (
+                    "\n\n=== PLAN (from the Planner — follow its scope strictly) ===\n"
+                    f"```json\n{match.group(1)}\n```\n=== END PLAN ===\n"
+                ), ""
+        text = result.text.strip()
+        if not text:
+            return "", "empty reply"
+        if config.workflow is not None:
+            return f"\n\n=== PLANNER CONTEXT BRIEF ===\n{text}\n=== END PLANNER BRIEF ===\n", ""
+        return "", "no parsable plan block in the reply"
+
     async def _dispatch_reviewer(
         self,
         runner: AgentRunner,
@@ -1945,21 +2039,28 @@ class Orchestrator:
         *,
         cancel_event: asyncio.Event | None = None,
         node: WorkflowNode | None = None,
+        mandatory: bool = False,
     ) -> tuple[AgentResult, ParsedVerdict]:
-        """Run one reviewer; retry ONLY a genuinely empty/timeout/CLI-missing dispatch.
+        """Run one reviewer, re-running it while its reply carries no usable verdict.
 
         ENG-4: the retry signal is "could we extract a verdict?", not the provider's
         ``result.ok`` success-hint heuristic. We parse the output each try and stop early
         when it carries an answer:
           * a real verdict (``source != "none"``) is returned immediately even if the
             process exited non-zero — re-dispatching a parseable pass/fail/block/decline
-            just burns opus calls; and
-          * any non-empty text is returned too — usable-but-unparseable output is not a
-            transient infra failure (the caller records it as a non-blocking 'unknown').
-        Only a response with no verdict AND no text (genuine empty/timeout/CLI-missing) is
-        retried with the existing backoff, and never once cancelled: a dispatch that ended
-        because of cancellation, or any response after the task was cancelled, is returned
-        as is. ``parsed`` is seeded so it is never unbound.
+            just burns opus calls;
+          * a *mandatory* reviewer (``config.agents.mandatory``) is re-run on any other reply
+            (a crash, timeout, CLI error, empty reply, or text without a parseable verdict
+            block), its prompt then ending with :data:`_VERDICT_REMINDER`: the round cannot
+            pass without its verdict; and
+          * any other reviewer's non-empty text is returned as is — usable-but-unparseable
+            output is not a transient infra failure (the caller records it as a non-blocking
+            'unknown') — and only its empty reply is retried, with the same prompt.
+        At most ``_REVIEWER_DISPATCH_RETRIES + 1`` dispatches, each re-run after the backoff.
+        Nothing is re-run once cancelled: a dispatch that ended because of cancellation, or any
+        response after the task was cancelled, is returned as is, and the cancel event is
+        checked again after the backoff, before each re-run. ``parsed`` is seeded so it is
+        never unbound.
         """
         result = AgentResult(ok=False, error="not dispatched")
         parsed = ParsedVerdict()
@@ -1973,10 +2074,19 @@ class Orchestrator:
                 "skills_override": node.skills or None,
                 "thinking_override": node.thinking,
             }
-        for attempt in range(_REVIEWER_DISPATCH_RETRIES + 1):
+        tries = _REVIEWER_DISPATCH_RETRIES + 1
+        for attempt in range(tries):
+            if attempt:
+                logger.info(
+                    "reviewer %s returned no usable verdict (try %d/%d); retrying",
+                    agent, attempt, tries,
+                )
+                await asyncio.sleep(_REVIEWER_RETRY_BACKOFF_S)
+                if cancel_event is not None and cancel_event.is_set():
+                    return result, parsed
             result = await runner.run(
                 agent=agent,
-                prompt=prompt,
+                prompt=f"{prompt}\n\n{_VERDICT_REMINDER}" if attempt and mandatory else prompt,
                 task_id=task.id,
                 worktree=worktree,
                 repo_knowledge=knowledge,
@@ -1985,16 +2095,12 @@ class Orchestrator:
                 **run_kwargs,
             )
             parsed = parse_verdict(result.text)
-            if parsed.source != "none" or result.text.strip():
+            if parsed.source != "none":
                 return result, parsed
             if result.cancelled or (cancel_event is not None and cancel_event.is_set()):
                 return result, parsed
-            if attempt < _REVIEWER_DISPATCH_RETRIES:
-                logger.info(
-                    "reviewer %s returned no usable response (try %d/%d); retrying",
-                    agent, attempt + 1, _REVIEWER_DISPATCH_RETRIES + 1,
-                )
-                await asyncio.sleep(_REVIEWER_RETRY_BACKOFF_S)
+            if result.text.strip() and not mandatory:
+                return result, parsed
         return result, parsed
 
     async def _record_reviewer_verdict(
@@ -2012,23 +2118,39 @@ class Orchestrator:
         grounding_diff: str | None = None,
         pass_through: bool = False,
         cancel_event: asyncio.Event | None = None,
+        mandatory: bool = False,
     ) -> ParsedVerdict:
         agent = node.agent or node.id
         effective_diff = grounding_diff if grounding_diff is not None else current_diff
-        if verdict.source == "none" and not result.text.strip():
-            verdict = ParsedVerdict(
-                verdict="unknown",
-                reason=f"{agent} agent unavailable after retries: {result.error}",
-                source="none",
-            )
+        if verdict.source == "none":
+            # No usable verdict: the reviewer crashed, timed out, came back empty, or never
+            # ended with a parseable verdict block. Record 'unknown' with why, and warn: it
+            # blocks the round for a mandatory reviewer (see _review), never for the others.
+            replied = bool(result.text.strip())
+            if replied:
+                reason = f"{agent} replied without a verdict block"
+                if result.error:
+                    reason += f" (error: {result.error})"
+            else:
+                reason = f"{agent} agent unavailable after retries: {result.error}"
+            verdict = ParsedVerdict(verdict="unknown", reason=reason, source="none")
+            if mandatory:
+                warning = (
+                    f"{agent} is a mandatory reviewer and gave no usable verdict after "
+                    f"{_REVIEWER_DISPATCH_RETRIES + 1} tries; the review round fails"
+                )
+            elif replied:
+                warning = (
+                    f"{agent} replied without a verdict block; recorded unknown (non-blocking)"
+                )
+            else:
+                warning = f"{agent} dispatch failed after retries; skipped (non-blocking)"
             await self._bus.emit(
                 type=EventType.grounding_warning,
                 project_id=project_id,
                 task_id=task.id,
                 agent=agent,
-                payload={
-                    "warning": f"{agent} dispatch failed after retries; skipped (non-blocking)"
-                },
+                payload={"warning": warning},
             )
         warnings: list[str] = []
         if config.experimental.grounding_checks:
@@ -2228,6 +2350,11 @@ class Orchestrator:
         base_prompt = f"Review the changes made for this task:\n{task.request}"
         passes = 0
         all_summaries: list[str] = []
+        # "AGENT: reason" of each mandatory reviewer left without a usable verdict.
+        missing: list[str] = []
+
+        def _is_mandatory(n: WorkflowNode) -> bool:
+            return (n.agent or n.id) in config.agents.mandatory
 
         async def _with_diff(n: WorkflowNode) -> str:
             """*base_prompt* plus the diff fitted for reviewer *n* (nothing to show if blank),
@@ -2304,6 +2431,7 @@ class Orchestrator:
                         rules,
                         cancel_event=cancel_event,
                         node=node,
+                        mandatory=_is_mandatory(node),
                     )
                     for node, rev_prompt in zip(review_nodes, rev_prompts, strict=True)
                 )
@@ -2327,7 +2455,11 @@ class Orchestrator:
                     grounding_diff=effective_diff,
                     pass_through=pass_through,
                     cancel_event=cancel_event,
+                    mandatory=_is_mandatory(node),
                 )
+                # The recorded verdict includes any operator override from a HITL pause.
+                if _is_mandatory(node) and verdict.source == "none":
+                    missing.append(f"{agent.upper()}: {verdict.reason}")
                 all_summaries.append(
                     f"- {agent.upper()} ({verdict.verdict.upper()}): {verdict.reason}"
                 )
@@ -2412,7 +2544,7 @@ class Orchestrator:
                 # ENG-4: _dispatch_reviewer already parsed the output; the verdict is used as-is.
                 result, raw_verdict = await self._dispatch_reviewer(
                     runner, agent, reviewer_prompt, task, worktree, knowledge, rules,
-                    cancel_event=cancel_event, node=node,
+                    cancel_event=cancel_event, node=node, mandatory=_is_mandatory(node),
                 )
                 if cancel_event is not None and cancel_event.is_set():
                     return True, "cancelled", False
@@ -2429,7 +2561,11 @@ class Orchestrator:
                     grounding_diff=effective_diff,
                     pass_through=pass_through,
                     cancel_event=cancel_event,
+                    mandatory=_is_mandatory(node),
                 )
+                # The recorded verdict includes any operator override from a HITL pause.
+                if _is_mandatory(node) and verdict.source == "none":
+                    missing.append(f"{agent.upper()}: {verdict.reason}")
                 all_summaries.append(
                     f"- {agent.upper()} ({verdict.verdict.upper()}): {verdict.reason}"
                 )
@@ -2463,17 +2599,19 @@ class Orchestrator:
         # ENG-3: never merge on an all-'unknown' round. If reviewers were derived but
         # none rendered a usable verdict — e.g. the model backend was rate-limited/degraded
         # and every reviewer fell back to non-blocking 'unknown' — the review tier is
-        # effectively offline. Fail the attempt so the retry loop re-runs it (giving the
-        # backend time to recover) rather than auto-merging unvetted code.
+        # effectively offline. Nor without a mandatory reviewer's verdict: one that still had
+        # none after its re-runs (it crashed, timed out, or never ended with a verdict block)
+        # never reviewed the change. Either way fail the attempt so the retry loop re-runs it
+        # (giving the backend time to recover) rather than auto-merging unvetted code.
         usable_verdicts = passes + (len(failures) if pass_through else 0)
-        if pipeline and usable_verdicts == 0:
+        if pipeline and (missing or usable_verdicts == 0):
             await repo.save_task_checkpoint(
                 self._db,
                 task_id=task.id,
                 node_id="review",
                 attempt=attempt,
                 status=CheckpointStatus.failed,
-                artifact={"passes": 0, "pipeline": pipeline},
+                artifact={"passes": passes, "pipeline": pipeline},
             )
             await self._bus.emit(
                 type=EventType.node_completed,
@@ -2483,9 +2621,16 @@ class Orchestrator:
                     "node_id": "review",
                     "attempt": attempt,
                     "status": "failed",
-                    "passes": 0,
+                    "passes": passes,
                 },
             )
+            if missing:
+                return True, (
+                    "\nREVIEW INCONCLUSIVE: mandatory reviewer(s) gave no usable verdict after "
+                    f"{_REVIEWER_DISPATCH_RETRIES + 1} tries each:\n"
+                    + "".join(f"- {line}\n" for line in missing)
+                    + "Not merging without every mandatory verdict; retrying.\n"
+                ), False
             return True, (
                 "\nREVIEW INCONCLUSIVE: no reviewer returned a usable verdict "
                 "(all 'unknown' — the model backend was likely unavailable). "
@@ -2530,13 +2675,15 @@ class Orchestrator:
         *,
         integrity: Sequence[IntegrityFinding] = (),
         integrity_mode: str = "off",
+        planner_note: str = "",
     ) -> bool:
         """Commit the reviewed work, then merge it when ``execution.auto_merge`` allows.
 
         A change with test-integrity findings under ``block`` mode is never merged here: it ends
-        ``done`` on its committed branch for a human to review and merge.
+        ``done`` on its committed branch for a human to review and merge. *planner_note* (a
+        failed planner's) leads the notes every result summary ends with.
         """
-        note = _integrity_note(integrity, integrity_mode)
+        note = planner_note + _integrity_note(integrity, integrity_mode)
         has_merge_node = config.workflow is None or any(
             n.enabled and n.kind.value == "merge" for n in config.workflow.nodes
         )
@@ -2731,9 +2878,10 @@ class Orchestrator:
         *,
         integrity: Sequence[IntegrityFinding] = (),
         integrity_mode: str = "off",
+        planner_note: str = "",
     ) -> bool:
         reason = "timeout" if timed_out else "max_retries"
-        note = _integrity_note(integrity, integrity_mode)
+        note = planner_note + _integrity_note(integrity, integrity_mode)
         # One transaction: fail the task, record why, and block its descendants together so
         # a crash can't leave the task failed while children stay claimable. Announce only
         # once the transition is durably committed.
@@ -3033,6 +3181,12 @@ def _integrity_note(findings: Sequence[IntegrityFinding], mode: str) -> str:
     if hidden > 0:
         note += f" +{hidden} more (see the test_integrity.flagged event)"
     return note
+
+
+def _one_line_tail(text: str, limit: int) -> str:
+    """*text* on one line (whitespace runs collapsed), cut to its last *limit* chars."""
+    line = " ".join(text.split())
+    return line if len(line) <= limit else "..." + line[-(limit - 3) :]
 
 
 def wm_merge_path(repo_path: Path, target_branch: str, task_id: str) -> Path:
