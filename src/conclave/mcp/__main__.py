@@ -12,6 +12,7 @@ the reason. Every message tries the daemon first, so the bridge recovers once it
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import os
 import sys
@@ -51,10 +52,23 @@ def _forward_http(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 202 or resp.status == 204:
                 return None
-            raw = resp.read().decode("utf-8").strip()
-            if not raw:
-                return None
-            parsed = json.loads(raw)
+            try:
+                raw = resp.read().decode("utf-8").strip()
+                parsed = json.loads(raw) if raw else None
+            except (ValueError, http.client.HTTPException) as exc:
+                # Not JSON (a proxy's error page) or cut short (the daemon died mid-reply):
+                # an error for this request, never an exception that ends the bridge.
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32603,
+                        "message": (
+                            f"Unreadable reply from the Conclave daemon at {mcp_url}: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    },
+                }
             return parsed if isinstance(parsed, (dict, list)) else None
     except urllib.error.HTTPError as exc:
         try:

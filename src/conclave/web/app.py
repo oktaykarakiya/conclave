@@ -224,7 +224,12 @@ async def _send_json(
 
 
 class _IdempotencyMiddleware:
-    """Persist and replay 2xx JSON responses for mutating requests carrying ``Idempotency-Key``."""
+    """Persist and replay 2xx JSON responses for mutating requests carrying ``Idempotency-Key``.
+
+    A request whose key is still being processed by an earlier request gets 409 rather than
+    running a second time: the key is marked in flight before its record is looked up, and the
+    record is saved before the mark is cleared, so a retry gets either that 409 or the replay.
+    """
 
     _METHODS = frozenset({"POST", "PUT", "PATCH"})
     _MAX_KEY_LEN = 128
@@ -232,6 +237,7 @@ class _IdempotencyMiddleware:
     def __init__(self, app: _ASGIApp, daemon: Daemon) -> None:
         self._app = app
         self._daemon = daemon
+        self._in_flight: set[str] = set()
 
     async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
         if scope.get("type") != "http":
@@ -261,6 +267,30 @@ class _IdempotencyMiddleware:
             )
             return
 
+        # Checked and marked with no await in between, so two concurrent requests with one key
+        # can never both run.
+        if key in self._in_flight:
+            await _send_json(
+                send,
+                409,
+                {
+                    "detail": (
+                        "A request with this Idempotency-Key is still being processed; "
+                        "retry once it has finished"
+                    )
+                },
+            )
+            return
+        self._in_flight.add(key)
+        try:
+            await self._run_once(key, method, scope, receive, send)
+        finally:
+            self._in_flight.discard(key)
+
+    async def _run_once(
+        self, key: str, method: str, scope: _Scope, receive: _Receive, send: _Send
+    ) -> None:
+        """Replay *key*'s stored response, or run the request and store its 2xx response."""
         path = str(scope.get("path", ""))
         existing = await repo.get_idempotency_record(self._daemon.db, key)
         if existing is not None:

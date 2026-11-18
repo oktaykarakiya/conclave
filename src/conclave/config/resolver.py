@@ -23,6 +23,8 @@ but fully typed and validated.
 
 from __future__ import annotations
 
+import asyncio
+import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -245,6 +247,22 @@ def _remove_path(node: dict[str, Any], segments: list[str]) -> None:
             del node[head]
 
 
+def _check_agent_overrides(config: ConclaveConfig) -> None:
+    """``ValueError`` naming every field of an agent override that :func:`resolve_agent`
+    refuses: the field's type (a dict of anything) lets such an override through, and stored
+    it would fail every dispatch of that agent."""
+    for agent in config.agent_overrides:
+        try:
+            resolve_agent(config, agent)
+        except ValidationError as exc:
+            problems = "; ".join(
+                f"agent_overrides.{agent}.{'.'.join(str(part) for part in err['loc'])}: "
+                f"{err['msg']}"
+                for err in exc.errors()
+            )
+            raise ValueError(problems) from exc
+
+
 def apply_project_overrides(
     global_overrides: dict[str, Any] | None,
     stored: dict[str, Any] | None,
@@ -256,16 +274,17 @@ def apply_project_overrides(
     """Apply one write to a project's stored layer; return ``(effective config, minimal delta)``.
 
     The *unset* paths are removed from the stored layer first, then *patch* is merged onto the
-    resolved document and the result is validated, so bad input raises ``ValueError``
-    (including pydantic's ``ValidationError``) before anything is stored. The delta keeps only
-    what differs from built-in + global + *default_branch* (the project's branch column, after
-    this write): a full resolved document reduces to ``{}``, a key set back to the inherited
-    value is dropped, and an ``execution.target_branch`` survives only when it names another
-    branch than the column, so the branch the project merges into never changes.
+    resolved document and the result is validated, every agent override included, so bad input
+    raises ``ValueError`` (including pydantic's ``ValidationError``) before anything is stored.
+    The delta keeps only what differs from built-in + global + *default_branch* (the project's
+    branch column, after this write): a full resolved document reduces to ``{}``, a key set back
+    to the inherited value is dropped, and an ``execution.target_branch`` survives only when it
+    names another branch than the column, so the branch the project merges into never changes.
     """
     inherited = _inherited_dict(global_overrides, default_branch)
     layer = remove_config_paths(stored or {}, validate_unset_paths(unset))
     effective = ConclaveConfig.model_validate(_apply_layer(_apply_layer(inherited, layer), patch))
+    _check_agent_overrides(effective)
     baseline = ConclaveConfig.model_validate(inherited).model_dump(mode="json")
     return effective, config_delta(effective.model_dump(mode="json"), baseline)
 
@@ -275,11 +294,16 @@ def apply_global_overrides(
     patch: dict[str, Any] | None = None,
     unset: Iterable[str] = (),
 ) -> tuple[ConclaveConfig, dict[str, Any]]:
-    """Apply one write to the global layer; return ``(resolved global config, new payload)``."""
+    """Apply one write to the global layer; return ``(resolved global config, new payload)``.
+
+    Validated like :func:`apply_project_overrides` (unset first, then the patch): bad input
+    raises ``ValueError``."""
     payload = _apply_layer(
         remove_config_paths(global_overrides or {}, validate_unset_paths(unset)), patch
     )
-    return load_layered_config(payload), payload
+    resolved = load_layered_config(payload)
+    _check_agent_overrides(resolved)
+    return resolved, payload
 
 
 def _stored_workflow(
@@ -328,6 +352,30 @@ def patched_branch(project: Project, patch: dict[str, Any] | None) -> str | None
 
 # --- DB-aware entry points --------------------------------------------------
 
+# Every config read-modify-write (a project's stored layer, the global layer, an attach's path
+# check) runs under its Database's lock: each computes the new layer from what it read, so two
+# writes over one snapshot would keep only the last one's change. One lock per Database, held
+# weakly (an asyncio.Lock belongs to one event loop), never one module-level lock. Not
+# re-entrant: code that holds it writes through the ``*_locked`` helpers.
+_CONFIG_WRITE_LOCKS: weakref.WeakKeyDictionary[Database, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _config_write_lock(db: Database) -> asyncio.Lock:
+    lock = _CONFIG_WRITE_LOCKS.get(db)
+    if lock is None:
+        lock = _CONFIG_WRITE_LOCKS[db] = asyncio.Lock()
+    return lock
+
+
+class ProjectAlreadyAttachedError(ValueError):
+    """An attach of a path that is already attached; *project* is the project attached there."""
+
+    def __init__(self, project: Project) -> None:
+        super().__init__(already_attached_message(project))
+        self.project = project
+
 
 async def load_global_overrides(db: Database) -> dict[str, Any]:
     """The global layer: the ``global-defaults`` config preset payload (``{}`` when unset)."""
@@ -367,8 +415,45 @@ async def _write_project_config(
 
     Stores the minimal delta and, when the write changes the project's effective workflow, a
     version (the graph before and after it) in the same transaction; with
-    *approves_proposal* that proposal is marked approved in it too.
+    *approves_proposal* that proposal is marked approved in it too. The write applies to the
+    project's current row, read under the config write lock, never to the caller's possibly
+    stale *project*; ``ValueError`` when the project no longer exists.
     """
+    from ..db import repositories as repo
+
+    async with _config_write_lock(db):
+        current = await repo.get_project(db, project.id)
+        if current is None:
+            raise ValueError(f"project not found: {project.id}")
+        return await _write_project_config_locked(
+            db,
+            current,
+            patch,
+            unset=unset,
+            name=name,
+            default_branch=default_branch,
+            workflow_source=workflow_source,
+            workflow_reason=workflow_reason,
+            approves_proposal=approves_proposal,
+            decision_reason=decision_reason,
+        )
+
+
+async def _write_project_config_locked(
+    db: Database,
+    project: Project,
+    patch: dict[str, Any] | None,
+    *,
+    unset: Iterable[str] = (),
+    name: str | None = None,
+    default_branch: str | None = None,
+    workflow_source: WorkflowVersionSource | None = None,
+    workflow_reason: str | None = None,
+    approves_proposal: str | None = None,
+    decision_reason: str | None = None,
+) -> tuple[ConclaveConfig, WorkflowVersion | None]:
+    """:func:`_write_project_config` for a caller that holds the config write lock and read
+    *project* under it."""
     from ..db import WorkflowVersionSource
     from ..db import repositories as repo
 
@@ -471,15 +556,24 @@ async def create_project_with_config(
     default_branch: str,
     patch: dict[str, Any] | None = None,
 ) -> Project:
-    """Insert a project whose stored config is the minimal delta of *patch* (validated first)."""
+    """Insert a project whose stored config is the minimal delta of *patch* (validated first).
+
+    :class:`ProjectAlreadyAttachedError` when *path* is already attached: the check and the
+    insert run under the config write lock, so two concurrent attaches of one path create one
+    project.
+    """
     from ..db import repositories as repo
 
-    _, delta = apply_project_overrides(
-        await load_global_overrides(db), None, patch, default_branch=default_branch
-    )
-    return await repo.create_project(
-        db, name=name, path=path, default_branch=default_branch, config=delta
-    )
+    async with _config_write_lock(db):
+        existing = await repo.get_project_by_path(db, path)
+        if existing is not None:
+            raise ProjectAlreadyAttachedError(existing)
+        _, delta = apply_project_overrides(
+            await load_global_overrides(db), None, patch, default_branch=default_branch
+        )
+        return await repo.create_project(
+            db, name=name, path=path, default_branch=default_branch, config=delta
+        )
 
 
 def already_attached_message(project: Project) -> str:
@@ -510,11 +604,32 @@ async def save_global_config(
     delta is validated before the first write, so a bad input changes nothing. A project
     whose own workflow this removes records a version (reason *workflow_reason*).
     """
+    norm_patch: dict[str, Any] = normalize_config_keys(patch or {})
+    clean_unset = validate_unset_paths(unset)
+    async with _config_write_lock(db):
+        return await _save_global_config_locked(
+            db,
+            norm_patch,
+            clean_unset,
+            apply_to_all_projects=apply_to_all_projects,
+            workflow_reason=workflow_reason,
+        )
+
+
+async def _save_global_config_locked(
+    db: Database,
+    norm_patch: dict[str, Any],
+    clean_unset: list[str],
+    *,
+    apply_to_all_projects: bool,
+    workflow_reason: str | None,
+) -> tuple[ConclaveConfig, list[Project]]:
+    """:func:`save_global_config`'s body, run under the config write lock: the global layer
+    and the projects are read under it, and each project is written through
+    :func:`_write_project_config_locked` (the lock is not re-entrant)."""
     from ..db import StoreItemKind
     from ..db import repositories as repo
 
-    norm_patch: dict[str, Any] = normalize_config_keys(patch or {})
-    clean_unset = validate_unset_paths(unset)
     resolved, payload = apply_global_overrides(
         await load_global_overrides(db), norm_patch, clean_unset
     )
@@ -543,9 +658,10 @@ async def save_global_config(
     )
     updated: list[Project] = []
     for proj in projects:
-        await save_project_config(
+        await _write_project_config_locked(
             db,
             proj,
+            None,
             unset=cleared,
             default_branch=new_branch or None,
             workflow_reason=workflow_reason or "global settings applied to all projects",

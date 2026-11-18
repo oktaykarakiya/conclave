@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -297,3 +298,45 @@ async def test_pause_after_node_and_source_branch_pr_review(
         final_task = await repo.get_task(db, tid)
         assert final_task is not None
         assert final_task.state == TaskState.done
+
+
+async def test_a_concurrent_retry_with_the_same_idempotency_key_runs_once(
+    db: Database, tmp_path: Path
+) -> None:
+    """A retry sent while the request with its Idempotency-Key is still being processed gets
+    409 instead of running the request a second time; a retry after it finished replays it.
+    Before the fix both concurrent requests found no record and each created a task."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    await seed_global_defaults(db)
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            created = await client.post(
+                "/api/projects", json={"name": "demo", "path": str(repo_path)}
+            )
+            assert created.status_code == 200, created.text
+            pid = created.json()["id"]
+            url = f"/api/projects/{pid}/tasks"
+            body = {"request": "implement feature", "title": "Feat"}
+            headers = {"Idempotency-Key": "idem-concurrent-001"}
+
+            responses = await asyncio.gather(
+                client.post(url, json=body, headers=headers),
+                client.post(url, json=body, headers=headers),
+            )
+            assert sorted(r.status_code for r in responses) == [200, 409], [
+                r.text for r in responses
+            ]
+            tasks = await repo.list_tasks(db, pid)
+            assert len(tasks) == 1
+
+            replay = await client.post(url, json=body, headers=headers)
+            assert replay.status_code == 200
+            assert replay.headers.get("x-idempotency-replayed") == "true"
+            assert replay.json()["id"] == tasks[0].id
+    finally:
+        await daemon.shutdown()

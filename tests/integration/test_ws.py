@@ -211,3 +211,42 @@ async def test_planning_stream_forwards_planning_events_only_then_unsubscribes(
         assert daemon.bus.subscriber_count() == 0
     finally:
         await daemon.shutdown()
+
+
+async def test_streams_at_the_subscriber_cap_close_with_try_again_later(
+    db: Database, tmp_path: Path,
+) -> None:
+    """With the event bus at its subscriber cap, both stream handlers close the accepted
+    socket with 1013 (Try Again Later) and return, instead of letting the bus's RuntimeError
+    escape from the handler."""
+    daemon = _make_daemon(db, tmp_path)
+    fillers = []
+    try:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        project = await repo.create_project(
+            db, name="t", path=str(repo_path), default_branch="main",
+        )
+        session = await repo.create_planning_session(
+            db, project_id=project.id, title="plan", prompt="do things",
+        )
+        for _ in range(10_000):
+            try:
+                fillers.append(daemon.bus.subscribe())
+            except RuntimeError:
+                break
+
+        live = _FakeWebSocket(_AppShim(daemon))
+        await asyncio.wait_for(stream(live, project_id=project.id), timeout=5.0)
+        planning = _FakeWebSocket(_AppShim(daemon))
+        await asyncio.wait_for(planning_stream(planning, session_id=session.id), timeout=5.0)
+
+        for ws in (live, planning):
+            assert ws.accepted is True
+            assert ws.closed_code == 1013
+            assert ws.received == []
+        assert daemon.bus.subscriber_count() == len(fillers)
+    finally:
+        for subscriber in fillers:
+            subscriber.close()
+        await daemon.shutdown()

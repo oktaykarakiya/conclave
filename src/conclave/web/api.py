@@ -22,6 +22,7 @@ from .. import __version__
 from ..agents import DEFAULT_PERSONAS
 from ..config import (
     ConclaveConfig,
+    ProjectAlreadyAttachedError,
     WorkflowGraph,
     already_attached_message,
     build_default_workflow,
@@ -58,6 +59,7 @@ from ..db import (
     WorkflowVersionSource,
 )
 from ..db import repositories as repo
+from ..db.database import SQLITE_INT_MAX
 from ..db.planning_models import PlanningMessage, PlanningSession, PlanningTaskNode
 from ..engine.compactor import compact_planning_session_context, compact_task_context
 from ..engine.task_diff import (
@@ -107,7 +109,7 @@ from .schemas import (
 
 async def _pagination(
     limit: int = Query(50, ge=1, le=500, description="Max items per page"),
-    offset: int = Query(0, ge=0, description="Items to skip"),
+    offset: int = Query(0, ge=0, le=SQLITE_INT_MAX, description="Items to skip"),
 ) -> PaginationParams:
     """Shared pagination dependency — bounds every list endpoint (DoS hardening — WEB-1)."""
     return PaginationParams(limit=limit, offset=offset)
@@ -246,7 +248,10 @@ async def stream_events_sse(
 ) -> StreamingResponse:
     norm_pid = project_id.strip() if project_id and project_id.strip() else None
     norm_tid = task_id.strip() if task_id and task_id.strip() else None
-    subscriber = daemon.bus.subscribe(project_id=norm_pid, task_id=norm_tid)
+    try:
+        subscriber = daemon.bus.subscribe(project_id=norm_pid, task_id=norm_tid)
+    except RuntimeError as exc:  # the bus is at its subscriber cap
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     async def _event_generator() -> AsyncIterator[str]:
         try:
@@ -334,6 +339,8 @@ async def create_project(
             default_branch=default_branch,
             patch=initial_cfg,
         )
+    except ProjectAlreadyAttachedError as exc:  # attached meanwhile, by a concurrent request
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise _invalid_config(exc) from exc
     await daemon.start_worker(project.id)
@@ -854,9 +861,11 @@ async def approve_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> di
 async def cancel_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
     task = await _require_task(daemon, task_id)
     if task.state in (TaskState.inbox, TaskState.approved):
-        await repo.set_task_state(daemon.db, task_id, TaskState.cancelled)
-        await daemon.bus.emit(type=EventType.task_cancelled, task_id=task_id)
-        return {"cancelled": True}
+        if await repo.cancel_task_if_pending(daemon.db, task_id):
+            await daemon.bus.emit(type=EventType.task_cancelled, task_id=task_id)
+            return {"cancelled": True}
+        # A worker claimed it (or it moved on) after the read: answer for its state now.
+        task = await _require_task(daemon, task_id)
     if task.state in (TaskState.in_progress, TaskState.waiting_for_approval):
         cancelled = await daemon.request_cancel(task_id)
         if cancelled:
@@ -1173,7 +1182,9 @@ async def delete_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dic
 
 @router.get("/tasks/{task_id}/events")
 async def list_task_events(
-    task_id: str, after_id: int = 0, daemon: Daemon = Depends(get_daemon)
+    task_id: str,
+    after_id: int = Query(0, ge=0, le=SQLITE_INT_MAX),
+    daemon: Daemon = Depends(get_daemon),
 ) -> list[EventRow]:
     return await repo.list_events(daemon.db, task_id=task_id, after_id=after_id)
 
@@ -1249,7 +1260,7 @@ async def list_task_verdicts(
 @router.get("/tasks/{task_id}/checkpoints")
 async def list_task_checkpoints(
     task_id: str,
-    attempt: int | None = None,
+    attempt: int | None = Query(None, ge=0, le=SQLITE_INT_MAX),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[TaskCheckpoint]:
     await _require_task(daemon, task_id)
@@ -1325,6 +1336,8 @@ async def list_agents(
 async def upsert_agent(
     name: str, body: AgentUpsert, daemon: Daemon = Depends(get_daemon)
 ) -> AgentPersona:
+    if body.project_id is not None:
+        await _require_project(daemon, body.project_id)
     persona = await repo.upsert_agent(
         daemon.db,
         name=name,
@@ -1761,7 +1774,7 @@ async def list_observability_sessions(
     model: str | None = None,
     search: str | None = None,
     limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=SQLITE_INT_MAX),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[dict[str, Any]]:
     norm_pid = project_id.strip() if project_id and project_id.strip() else None

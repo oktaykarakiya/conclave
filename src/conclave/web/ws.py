@@ -14,6 +14,7 @@ from ..events.bus import Subscriber
 from ..runtime import Daemon
 
 _WS_POLICY_VIOLATION = 1008
+_WS_TRY_AGAIN_LATER = 1013  # the event bus is at its subscriber cap
 
 router = APIRouter()
 
@@ -59,7 +60,11 @@ async def stream(
     daemon: Daemon = websocket.app.state.daemon
     norm_pid = project_id.strip() if project_id and project_id.strip() else None
     norm_tid = task_id.strip() if task_id and task_id.strip() else None
-    subscriber = daemon.bus.subscribe(project_id=norm_pid, task_id=norm_tid)
+    try:
+        subscriber = daemon.bus.subscribe(project_id=norm_pid, task_id=norm_tid)
+    except RuntimeError:  # the bus is at its subscriber cap
+        await websocket.close(code=_WS_TRY_AGAIN_LATER)
+        return
     with subscriber:  # unsubscribes on exit
         await _forward_until_disconnect(websocket, subscriber)
 
@@ -77,9 +82,13 @@ async def planning_stream(
         return
     await websocket.accept()
     planning_types = [str(t) for t in EventType if t.value.startswith("planning.")]
-    subscriber = daemon.bus.subscribe(
-        planning_session_id=session_id,
-        types=planning_types,
-    )
+    try:
+        subscriber = daemon.bus.subscribe(
+            planning_session_id=session_id,
+            types=planning_types,
+        )
+    except RuntimeError:  # the bus is at its subscriber cap
+        await websocket.close(code=_WS_TRY_AGAIN_LATER)
+        return
     with subscriber:
         await _forward_until_disconnect(websocket, subscriber)

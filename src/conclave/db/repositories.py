@@ -492,6 +492,22 @@ async def approve_task(db: Database, task_id: str) -> bool:
         return cur.rowcount > 0
 
 
+async def cancel_task_if_pending(db: Database, task_id: str) -> bool:
+    """Atomically set state to ``cancelled`` only while the task is ``inbox`` or ``approved``.
+
+    Conditional at the row level like :func:`approve_task`: a worker that claims the task
+    between a caller's read and this UPDATE keeps its ``in_progress`` row (zero rows match).
+    Returns ``True`` if the task was cancelled.
+    """
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE tasks SET state = ?, updated_at = ? "
+            "WHERE id = ? AND state IN ('inbox', 'approved')",
+            (TaskState.cancelled.value, now_iso(), task_id),
+        )
+        return cur.rowcount > 0
+
+
 async def update_task_fields(
     db: Database,
     task_id: str,
@@ -1005,23 +1021,28 @@ async def upsert_agent(
     db: Database, *, name: str, role: str, persona_md: str, project_id: str | None = None
 ) -> AgentPersona:
     scope = project_id or ""
-    existing = await db.fetchone(
-        "SELECT id FROM agents WHERE IFNULL(project_id, '') = ? AND name = ?", (scope, name)
-    )
-    if existing is not None:
-        await db.execute(
-            "UPDATE agents SET role = ?, persona_md = ? WHERE id = ?",
-            (role, persona_md, existing["id"]),
+    # One transaction: two concurrent first writes of a name would both read no row and the
+    # second INSERT would hit the unique (scope, name) index.
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT id FROM agents WHERE IFNULL(project_id, '') = ? AND name = ?", (scope, name)
         )
-        aid = str(existing["id"])
-    else:
-        aid = new_id()
-        await db.execute(
-            "INSERT INTO agents(id, project_id, name, role, persona_md, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (aid, project_id, name, role, persona_md, now_iso()),
-        )
-    row = await db.fetchone("SELECT * FROM agents WHERE id = ?", (aid,))
+        existing = await cur.fetchone()
+        if existing is not None:
+            aid = str(existing["id"])
+            await conn.execute(
+                "UPDATE agents SET role = ?, persona_md = ? WHERE id = ?",
+                (role, persona_md, aid),
+            )
+        else:
+            aid = new_id()
+            await conn.execute(
+                "INSERT INTO agents(id, project_id, name, role, persona_md, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (aid, project_id, name, role, persona_md, now_iso()),
+            )
+        cur = await conn.execute("SELECT * FROM agents WHERE id = ?", (aid,))
+        row = await cur.fetchone()
     assert row is not None
     return AgentPersona.from_row(row)
 
@@ -1799,43 +1820,48 @@ async def upsert_store_item(
 ) -> StoreItem:
     ts = now_iso()
     norm_payload = normalize_dict_keys(payload)
-    existing = await db.fetchone(
-        "SELECT id, created_at FROM store_items WHERE kind = ? AND name = ?",
-        (kind.value, name),
-    )
-    if existing is not None:
-        sid = str(existing["id"])
-        await db.execute(
-            "UPDATE store_items SET description = ?, tags_json = ?, payload_json = ?, "
-            "built_in = ?, updated_at = ? WHERE id = ?",
-            (
-                description,
-                json.dumps(tags or []),
-                json.dumps(norm_payload),
-                int(built_in),
-                ts,
-                sid,
-            ),
+    # One transaction: two concurrent first writes of a name would both read no row and the
+    # second INSERT would hit the unique (kind, name) index.
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT id, created_at FROM store_items WHERE kind = ? AND name = ?",
+            (kind.value, name),
         )
-    else:
-        sid = new_id()
-        await db.execute(
-            "INSERT INTO store_items("
-            "id, kind, name, description, tags_json, payload_json, built_in, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                sid,
-                kind.value,
-                name,
-                description,
-                json.dumps(tags or []),
-                json.dumps(norm_payload),
-                int(built_in),
-                ts,
-                ts,
-            ),
-        )
-    row = await db.fetchone("SELECT * FROM store_items WHERE id = ?", (sid,))
+        existing = await cur.fetchone()
+        if existing is not None:
+            sid = str(existing["id"])
+            await conn.execute(
+                "UPDATE store_items SET description = ?, tags_json = ?, payload_json = ?, "
+                "built_in = ?, updated_at = ? WHERE id = ?",
+                (
+                    description,
+                    json.dumps(tags or []),
+                    json.dumps(norm_payload),
+                    int(built_in),
+                    ts,
+                    sid,
+                ),
+            )
+        else:
+            sid = new_id()
+            await conn.execute(
+                "INSERT INTO store_items("
+                "id, kind, name, description, tags_json, payload_json, built_in, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sid,
+                    kind.value,
+                    name,
+                    description,
+                    json.dumps(tags or []),
+                    json.dumps(norm_payload),
+                    int(built_in),
+                    ts,
+                    ts,
+                ),
+            )
+        cur = await conn.execute("SELECT * FROM store_items WHERE id = ?", (sid,))
+        row = await cur.fetchone()
     assert row is not None
     return StoreItem.from_row(row)
 

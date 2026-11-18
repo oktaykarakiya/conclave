@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from ..config import WorkflowGraph
 from ..db import ProjectMode, StoreItemKind
+from ..db.database import SQLITE_INT_MAX
+from ..db.planning_models import MAX_PLANNING_ROUNDS
 from ..engine.workflow_evolver import REASON_MAX_CHARS
 
 
@@ -106,7 +108,7 @@ class NodeCompleteInput(BaseModel):
     verdict: str | None = None
     output: str | None = None
     edge_id: str | None = None
-    attempt: int | None = None
+    attempt: int | None = Field(default=None, ge=0, le=SQLITE_INT_MAX)
 
 
 class HitlToggleInput(BaseModel):
@@ -143,7 +145,7 @@ class AgentUpsert(BaseModel):
 class PlanningSessionCreate(BaseModel):
     title: str = ""
     prompt: str
-    max_rounds: int = 5
+    max_rounds: int = Field(default=5, ge=1, le=MAX_PLANNING_ROUNDS)
 
 
 class PlanningMessageInput(BaseModel):
@@ -186,4 +188,4 @@ class PaginationParams(BaseModel):
     """
 
     limit: int = Field(50, ge=1, le=500, description="Max items per page")
-    offset: int = Field(0, ge=0, description="Items to skip")
+    offset: int = Field(0, ge=0, le=SQLITE_INT_MAX, description="Items to skip")

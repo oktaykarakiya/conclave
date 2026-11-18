@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -985,3 +986,139 @@ async def test_models_fallback_lists_only_the_engines_on_this_host(
     # only when opencode is installed.
     assert other_models[0] == "deepseek/deepseek-flash"
     assert (len(other_models) > 1) is opencode
+
+
+async def test_agent_upsert_for_an_unknown_project_is_404(
+    client: httpx.AsyncClient, db: Database
+) -> None:
+    """A persona scoped to a project that does not exist is refused with 404 and stores
+    nothing (before the fix the FOREIGN KEY constraint escaped as a 500)."""
+    resp = await client.put(
+        "/api/agents/scoped", json={"persona_md": "# Scoped", "project_id": "nope"}
+    )
+    assert resp.status_code == 404, resp.text
+    assert "project not found" in resp.text
+    assert await db.fetchval("SELECT COUNT(*) FROM agents WHERE name = 'scoped'") == 0
+
+
+async def test_concurrent_attach_of_one_path_creates_one_project(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Two concurrent attaches of one repository create one project; the other gets the 409
+    an attached path always gets (before the fix both checked the path, found nothing, and
+    both inserted a project)."""
+    repo_path = tmp_path / "shared"
+    await _init_repo(repo_path)
+    body = {"name": "twin", "path": str(repo_path)}
+    responses = await asyncio.gather(
+        client.post("/api/projects", json=body), client.post("/api/projects", json=body)
+    )
+    assert sorted(r.status_code for r in responses) == [200, 409], [r.text for r in responses]
+    created = next(r for r in responses if r.status_code == 200).json()
+    refused = next(r for r in responses if r.status_code == 409).json()
+    assert created["id"] in refused["detail"]
+    rows = await db.fetchall("SELECT id FROM projects WHERE path = ?", (str(repo_path),))
+    assert [row["id"] for row in rows] == [created["id"]]
+
+
+_HUGE = 10**30  # beyond SQLite's 64-bit INTEGER: binding it raised OverflowError (a 500)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "params", "body"),
+    [
+        ("GET", "/api/projects", {"offset": _HUGE}, None),
+        ("GET", "/api/projects/{pid}/tasks", {"offset": _HUGE}, None),
+        ("GET", "/api/agents", {"offset": _HUGE}, None),
+        ("GET", "/api/store", {"offset": _HUGE}, None),
+        ("GET", "/api/observability/sessions", {"offset": _HUGE}, None),
+        ("GET", "/api/tasks/{tid}/verdicts", {"offset": _HUGE}, None),
+        ("GET", "/api/tasks/{tid}/events", {"after_id": _HUGE}, None),
+        ("GET", "/api/tasks/{tid}/events", {"after_id": -_HUGE}, None),
+        ("GET", "/api/tasks/{tid}/checkpoints", {"attempt": _HUGE}, None),
+        ("POST", "/api/tasks/{tid}/nodes/developer/complete", None, {"attempt": _HUGE}),
+        *(
+            (
+                "POST",
+                "/api/projects/{pid}/planning/sessions",
+                None,
+                {"prompt": "p", "max_rounds": n},
+            )
+            for n in (_HUGE, 0, -1)
+        ),
+    ],
+)
+async def test_out_of_range_integer_inputs_are_422_not_500(
+    client: httpx.AsyncClient,
+    db: Database,
+    tmp_path: Path,
+    method: str,
+    path: str,
+    params: dict[str, int] | None,
+    body: dict[str, object] | None,
+) -> None:
+    project = await repo.create_project(
+        db, name="p", path=str(tmp_path / "p"), default_branch="main"
+    )
+    task = await repo.create_task(db, project_id=project.id, request="r")
+    resp = await client.request(
+        method, path.format(pid=project.id, tid=task.id), params=params, json=body
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_sse_stream_at_the_subscriber_cap_is_429(db: Database, tmp_path: Path) -> None:
+    """With the event bus at its subscriber cap, the SSE stream answers 429 with the cap's
+    message instead of letting the bus's RuntimeError escape as a 500."""
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    fillers = []
+    try:
+        for _ in range(10_000):
+            try:
+                fillers.append(daemon.bus.subscribe())
+            except RuntimeError:
+                break
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            resp = await c.get("/api/events/stream")
+        assert resp.status_code == 429, resp.text
+        assert "subscriber cap" in resp.json()["detail"]
+        assert daemon.bus.subscriber_count() == len(fillers)
+    finally:
+        for subscriber in fillers:
+            subscriber.close()
+        await daemon.shutdown()
+
+
+async def test_cancel_never_overwrites_a_task_claimed_after_the_read(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that claims an approved task between the cancel's read and its write keeps
+    its in_progress row: the cancel answers for the claimed task (409, nothing in flight to
+    signal here) instead of writing cancelled over a running task and answering success."""
+    from conclave.web import api as api_module
+
+    project = await repo.create_project(
+        db, name="p", path=str(tmp_path / "p"), default_branch="main"
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="r", state=TaskState.approved
+    )
+    real_require_task = api_module._require_task
+    claimed: list[object] = []
+
+    async def read_then_claim(daemon: Daemon, task_id: str) -> object:
+        found = await real_require_task(daemon, task_id)
+        if not claimed:  # the worker claims the task right after the cancel read it
+            claimed.append(await repo.claim_next_approved(db, project.id))
+        return found
+
+    monkeypatch.setattr(api_module, "_require_task", read_then_claim)
+    resp = await client.post(f"/api/tasks/{task.id}/cancel")
+
+    assert claimed and getattr(claimed[0], "id", None) == task.id
+    assert resp.status_code == 409, resp.text
+    after = await repo.get_task(db, task.id)
+    assert after is not None and after.state == TaskState.in_progress

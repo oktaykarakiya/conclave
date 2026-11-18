@@ -12,6 +12,7 @@ import pytest
 import conclave
 from conclave.config import (
     ConclaveConfig,
+    apply_global_overrides,
     apply_project_overrides,
     config_delta,
     deep_merge,
@@ -92,6 +93,30 @@ def test_a_global_agent_override_beats_the_project_agent_defaults() -> None:
 
     assert resolve_agent(cfg, "reviewer").model == "g/reviewer"
     assert resolve_agent(cfg, "tester").model == "p/default"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"timeout_minutes": 0}, {"bogus": 1}],
+    ids=["out-of-range", "unknown-key"],
+)
+def test_an_agent_override_that_does_not_validate_is_refused(override: dict[str, Any]) -> None:
+    """A write never stores an agent override that resolve_agent refuses, which would fail
+    every dispatch of that agent: the layer's type (a dict of anything) let it through."""
+    patch = {"agent_overrides": {"reviewer": override}}
+    with pytest.raises(ValueError, match=r"agent_overrides\.reviewer"):
+        apply_project_overrides(None, None, patch)
+    with pytest.raises(ValueError, match=r"agent_overrides\.reviewer"):
+        apply_global_overrides(None, patch)
+
+    valid = {"agent_overrides": {"reviewer": {"timeout_minutes": 5, "model": "x/y"}}}
+    _, delta = apply_project_overrides(None, None, valid)
+    assert delta == valid
+    _, payload = apply_global_overrides(None, valid)
+    assert payload == valid
+    # Unset runs first, so a stored override that does not validate can still be removed.
+    _, delta = apply_project_overrides(None, patch, unset=["agent_overrides.reviewer"])
+    assert delta == {}
 
 
 def test_a_workflow_is_replaced_whole_across_layers() -> None:

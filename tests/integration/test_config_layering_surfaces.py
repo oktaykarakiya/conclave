@@ -5,6 +5,7 @@ Global settings flow to every project at resolution time; a project stores only 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -21,10 +22,13 @@ from httpx import ASGITransport
 from conclave.config import (
     GLOBAL_DEFAULTS_PRESET,
     deep_merge,
+    load_global_overrides,
     load_layered_config,
     load_project_config,
     resolve_agent,
     resolve_project_config,
+    save_global_config,
+    save_project_config,
     workflow_templates,
 )
 from conclave.db import Database, Project, StoreItemKind
@@ -754,3 +758,95 @@ async def test_a_fresh_database_runs_migration_13_once(db: Database) -> None:
     applied = await db.fetchall("SELECT version, name FROM schema_version WHERE version = 13")
     assert [(r[0], r[1]) for r in applied] == [(13, "normalise_project_config_deltas")]
     assert await db.fetchval("SELECT COUNT(*) FROM pending_data_migrations") == 0
+
+
+# --- concurrent writes ----------------------------------------------------------
+
+
+async def test_concurrent_config_writes_keep_every_change(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """Concurrent config writes each keep their change.
+
+    Every write computed the new layer from a snapshot read before its first await (the
+    caller's project row, or the global payload), so of two writes racing over one snapshot
+    only the last one's key was stored, and both answered success.
+    """
+    stale = await _project(db, tmp_path, "racy")
+    await asyncio.gather(
+        save_project_config(db, stale, {"execution": {"max_parallel_tasks": 4}}),
+        save_project_config(db, stale, {"execution": {"branch_prefix": "race/"}}),
+    )
+    assert (await _stored(db, stale.id))["execution"] == {
+        "max_parallel_tasks": 4,
+        "branch_prefix": "race/",
+    }
+
+    await asyncio.gather(
+        save_global_config(db, {"execution": {"setup_timeout_seconds": 60}}),
+        save_global_config(db, {"context": {"bulk_max_chars": 5_000}}),
+    )
+    global_layer = await load_global_overrides(db)
+    assert global_layer["execution"]["setup_timeout_seconds"] == 60
+    assert global_layer["context"]["bulk_max_chars"] == 5_000
+
+    other = await _project(db, tmp_path, "racy-rest")
+    responses = await asyncio.gather(
+        client.patch(
+            f"/api/projects/{other.id}/config",
+            json={"config": {"execution": {"max_parallel_tasks": 3}}},
+        ),
+        client.patch(
+            f"/api/projects/{other.id}/config",
+            json={"config": {"execution": {"branch_prefix": "rest/"}}},
+        ),
+    )
+    assert [r.status_code for r in responses] == [200, 200], [r.text for r in responses]
+    assert (await _stored(db, other.id))["execution"] == {
+        "max_parallel_tasks": 3,
+        "branch_prefix": "rest/",
+    }
+
+
+async def test_an_invalid_agent_override_is_refused_over_rest_and_mcp(
+    client: httpx.AsyncClient, daemon: Daemon, db: Database, tmp_path: Path
+) -> None:
+    """An agent override that resolve_agent refuses is a 422 or a tool error and stores
+    nothing; before the fix it was stored and then failed every dispatch of that agent. One
+    stored earlier can still be unset."""
+    project = await _project(
+        db, tmp_path, "agents", {"agent_overrides": {"tester": {"model": "p/tester"}}}
+    )
+    rows_before = await _raw_rows(db)
+    bad = {"reviewer": {"timeout_minutes": 0, "bogus": 1}}
+
+    res = await client.patch(
+        f"/api/projects/{project.id}/config", json={"config": {"agent_overrides": bad}}
+    )
+    assert res.status_code == 422, res.text
+    assert "agent_overrides.reviewer" in res.text
+    res = await client.patch("/api/config/global", json={"config": {"agent_overrides": bad}})
+    assert res.status_code == 422, res.text
+    is_error, text = await _mcp(
+        daemon, "conclave_patch_config", {"project_id": project.id, "agent_overrides": bad}
+    )
+    assert is_error is True and "agent_overrides.reviewer" in text, text
+    is_error, text = await _mcp(
+        daemon,
+        "conclave_configure_agent",
+        {"project_id": project.id, "agent": "reviewer", "timeout_minutes": 0},
+    )
+    assert is_error is True and "agent_overrides.reviewer" in text, text
+
+    assert await _raw_rows(db) == rows_before
+    assert (
+        await repo.get_store_item_by_name(db, StoreItemKind.config_preset, GLOBAL_DEFAULTS_PRESET)
+        is None
+    )
+
+    legacy = await _project(db, tmp_path, "legacy", {"agent_overrides": bad})
+    res = await client.patch(
+        f"/api/projects/{legacy.id}/config", json={"unset": ["agent_overrides.reviewer"]}
+    )
+    assert res.status_code == 200, res.text
+    assert await _stored(db, legacy.id) == {}

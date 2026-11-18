@@ -61,6 +61,10 @@ def _enum[E: StrEnum](enum_cls: type[E], value: Any, default: E) -> E:
         return default
 
 
+# The most discussion rounds a planning session started over the API or MCP may run.
+MAX_PLANNING_ROUNDS = 50
+
+
 class PlanningSession(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

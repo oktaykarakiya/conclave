@@ -187,6 +187,12 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
   target layer before `config` is applied, so they inherit again; this is the only way to drop
   a project-only entry such as `agent_overrides.<agent>`. `null` is a value, not a delete:
   `setup_command: null` means "no setup command" even when the global settings set one.
+- An `agent_overrides.<agent>` entry must be valid agent settings: a write that would leave an
+  unknown field or a value out of range (e.g. `timeout_minutes: 0`) in the effective config is
+  refused with `isError` (REST `422`) naming each `agent_overrides.<agent>.<field>`, and stores
+  nothing. An invalid override stored earlier makes every write that resolves it fail until it
+  is fixed or unset in the layer that holds it (`include_layers: true` shows which); `unset`
+  runs before the check, so removing it always works.
 - Dicts merge key by key; lists and `workflow` are replaced whole. A project `workflow: null`
   (or the `standard` template) derives the graph from the agents policy even when the global
   settings hold a custom workflow; unset `workflow` to inherit the global graph instead.
@@ -431,7 +437,8 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   `operator rejected: <message>` (one line), which a task that then fails ends its summary with.
 - `conclave_cancel_task(task_id)`: stop a task (its worktree is cleaned up). What it runs stops at
   once, a dispatch or a setup, baseline or gate command (its process group is killed), and the
-  task ends `cancelled`; a baseline stopped this way is not cached.
+  task ends `cancelled`; a baseline stopped this way is not cached. `cancelled: false` means
+  nothing was stopped, for example a task a worker claimed at that moment: call it again.
 - `conclave_approve_task` / `conclave_cascade_approve_task` for tasks created without
   `auto_approve` (e.g. a planning session's task tree).
 
@@ -523,7 +530,8 @@ raise the threshold so that only longer requests are planned. Prefer several sma
 ## 9. Planning big goals
 
 `conclave_create_planning_session(project_id, prompt, title, max_rounds)` runs a panel of
-specialists that debate and build a task tree. Follow it with `conclave_get_planning_session`,
+specialists that debate and build a task tree, for at most `max_rounds` discussion rounds (1–50,
+default 5; anything else is refused). Follow it with `conclave_get_planning_session`,
 add guidance with `conclave_interject_planning_message`, then `conclave_approve_planning_session`
 (creates the tasks) or `conclave_cancel_planning_session`. Review the tree before approving.
 

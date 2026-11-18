@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import http.server
 import io
 import json
@@ -132,6 +133,59 @@ def test_forward_http_supports_batch_list_response() -> None:
         res = _forward_http("http://127.0.0.1:8700/mcp", [{"jsonrpc": "2.0", "id": 1}])
 
     assert res == batch_payload
+
+
+def _reply(read: Any) -> MagicMock:
+    """A fake 200 response whose ``read`` is *read* (a side effect: a callable or exception)."""
+    fake_resp = MagicMock()
+    fake_resp.status = 200
+    fake_resp.read.side_effect = read
+    fake_resp.__enter__.return_value = fake_resp
+    fake_resp.__exit__.return_value = False
+    return fake_resp
+
+
+def test_forward_http_turns_a_reply_that_is_not_complete_json_into_an_error() -> None:
+    """A reply that is not complete JSON (a proxy's HTML page, or a body cut short because the
+    daemon died mid-reply) is a -32603 error for that request, never an exception: before the
+    fix the JSONDecodeError or IncompleteRead escaped and ended the bridge."""
+    cases = [
+        (9, _reply(lambda *_: b"<html>502 Bad Gateway</html>")),
+        (10, _reply(lambda *_: b'{"jsonrpc": "2.0", "id": 10, "res')),
+        (11, _reply(http.client.IncompleteRead(b'{"jsonrpc": "2.0", "id": 11'))),
+    ]
+    for msg_id, fake_resp in cases:
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            res = _forward_http(
+                "http://127.0.0.1:8700/mcp",
+                {"jsonrpc": "2.0", "id": msg_id, "method": "tools/call"},
+            )
+        assert isinstance(res, dict), msg_id
+        assert res["id"] == msg_id
+        assert res["error"]["code"] == -32603
+
+
+async def test_run_stdio_keeps_answering_after_a_reply_that_is_not_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unreadable reply does not end the bridge: the next message is still forwarded."""
+    replies = iter(
+        [
+            _reply(lambda *_: b"<html>oops</html>"),
+            _reply(lambda *_: json.dumps({"jsonrpc": "2.0", "id": 2, "result": {}}).encode()),
+        ]
+    )
+    messages = [{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in (1, 2)]
+    fake_stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdin", io.StringIO("".join(json.dumps(m) + "\n" for m in messages)))
+    monkeypatch.setattr("sys.stdout", fake_stdout)
+    with patch("urllib.request.urlopen", side_effect=lambda *_a, **_k: next(replies)):
+        await _run_stdio()
+
+    out = [json.loads(line) for line in fake_stdout.getvalue().splitlines() if line.strip()]
+    assert [line["id"] for line in out] == [1, 2]
+    assert out[0]["error"]["code"] == -32603
+    assert out[1] == {"jsonrpc": "2.0", "id": 2, "result": {}}
 
 
 async def test_run_stdio_no_duplicate_execution_on_timeout_or_http_error_and_offline_on_refused(

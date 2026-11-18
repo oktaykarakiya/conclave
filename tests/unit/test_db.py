@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from pathlib import Path
@@ -17,6 +18,7 @@ from conclave.db import (
     Database,
     IllegalBugTransition,
     ProjectMode,
+    StoreItemKind,
     TaskOrigin,
     TaskState,
     WorkflowConflictError,
@@ -1533,3 +1535,61 @@ async def test_delete_agent_and_recover_fixing_bug_candidates(db: Database) -> N
     await repo.recover_in_progress(db, p.id)
     bc = await repo.get_bug_candidate(db, cid)
     assert bc is not None and bc.status is BugStatus.reproduced
+
+
+async def test_a_transaction_cancelled_while_beginning_leaves_no_transaction_open(
+    db: Database,
+) -> None:
+    """A cancellation that lands on transaction()'s BEGIN must not leave the shared
+    connection inside a transaction nobody owns.
+
+    aiosqlite still runs a queued statement whose await was cancelled, so the BEGIN executes
+    after its caller is gone. Before the fix the BEGIN was awaited outside the try, nothing
+    rolled it back, and every later transaction() failed with "cannot start a transaction
+    within a transaction".
+    """
+    p = await repo.create_project(db, name="demo", path="/tmp/demo", default_branch="main")
+
+    async def writer() -> None:
+        async with db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO tasks(id, project_id, title, request, state, origin, created_at, "
+                "updated_at) VALUES ('ghost', ?, '', 'r', 'inbox', 'operator', 'x', 'x')",
+                (p.id,),
+            )
+
+    pending = asyncio.create_task(writer())
+    await asyncio.sleep(0)  # the writer holds the lock and awaits its BEGIN
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    async with db.transaction() as conn:
+        await conn.execute("UPDATE projects SET name = 'renamed' WHERE id = ?", (p.id,))
+    assert not db.conn.in_transaction
+    renamed = await repo.get_project(db, p.id)
+    assert renamed is not None and renamed.name == "renamed"
+    assert await repo.get_task(db, "ghost") is None
+
+
+async def test_concurrent_first_upserts_of_one_agent_or_store_item_never_conflict(
+    db: Database,
+) -> None:
+    """Two concurrent first writes of one name both succeed and leave exactly one row.
+
+    Before the fix each upsert read and then inserted outside a transaction, so both saw no
+    row and the second INSERT hit the unique index (an IntegrityError, a 500 over REST).
+    """
+    first, second = await asyncio.gather(
+        repo.upsert_agent(db, name="twin", role="reviewer", persona_md="one"),
+        repo.upsert_agent(db, name="twin", role="reviewer", persona_md="two"),
+    )
+    assert first.id == second.id
+    assert await db.fetchval("SELECT COUNT(*) FROM agents WHERE name = 'twin'") == 1
+
+    item_a, item_b = await asyncio.gather(
+        repo.upsert_store_item(db, kind=StoreItemKind.workflow, name="twin", payload={"a": 1}),
+        repo.upsert_store_item(db, kind=StoreItemKind.workflow, name="twin", payload={"b": 2}),
+    )
+    assert item_a.id == item_b.id
+    assert await db.fetchval("SELECT COUNT(*) FROM store_items WHERE name = 'twin'") == 1

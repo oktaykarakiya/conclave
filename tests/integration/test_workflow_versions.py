@@ -8,6 +8,7 @@ is still the one it was computed from. Deterministic: the FakeProvider, no LLM.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -943,3 +944,25 @@ def test_mcp_exposes_the_history_tools_and_their_enums() -> None:
         "conclave_decide_workflow_proposal",
     ):
         assert by_name[name]["properties"]["reason"]["type"] == "string", name
+
+
+async def test_concurrent_mcp_graph_edits_keep_every_change(
+    client: httpx.AsyncClient, daemon: Daemon, db: Database, tmp_path: Path
+) -> None:
+    """Two concurrent node upserts both land. Each graph edit reads the workflow, changes it
+    and saves the whole graph, so before the fix the second save, computed from the same read,
+    silently dropped the first one's node while both calls succeeded."""
+    project = await _project(db, tmp_path)
+    results = await asyncio.gather(
+        *(
+            _mcp(
+                daemon,
+                "conclave_workflow_upsert_node",
+                {"project_id": project.id, "id": node_id, "kind": "reviewer", "agent": "security"},
+            )
+            for node_id in ("sec-a", "sec-b")
+        )
+    )
+    assert [is_error for is_error, _ in results] == [False, False], results
+    nodes = {node["id"] for node in (await _live(client, project.id))["workflow"]["nodes"]}
+    assert {"sec-a", "sec-b"} <= nodes

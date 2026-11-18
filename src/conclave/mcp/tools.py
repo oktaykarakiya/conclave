@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import math
 import re
+import weakref
 from datetime import date
 from importlib import resources
 from pathlib import Path
@@ -34,6 +37,7 @@ from ..config import (
 )
 from ..db import (
     CheckpointStatus,
+    Database,
     Project,
     ProjectMode,
     StoreItem,
@@ -46,6 +50,8 @@ from ..db import (
     WorkflowVersionSource,
 )
 from ..db import repositories as repo
+from ..db.database import SQLITE_INT_MAX
+from ..db.planning_models import MAX_PLANNING_ROUNDS
 from ..engine.compactor import compact_planning_session_context, compact_task_context
 from ..engine.task_diff import (
     DEFAULT_DIFF_MAX_BYTES,
@@ -149,10 +155,17 @@ def _opt_str(args: dict[str, Any], key: str, default: str = "") -> str:
 
 
 def _opt_int(args: dict[str, Any], key: str, default: int) -> int:
+    """*key* as an int that SQLite can hold; Infinity (which the JSON parser accepts) and values
+    beyond 64 bits are tool errors, not an OverflowError."""
     val = args.get(key)
     if val is None or isinstance(val, bool):
         return default
-    return int(val)
+    if isinstance(val, float) and not math.isfinite(val):
+        raise McpToolError(f"{key} must be a finite integer, got {val!r}")
+    number = int(val)
+    if not -SQLITE_INT_MAX - 1 <= number <= SQLITE_INT_MAX:
+        raise McpToolError(f"{key} is out of range: {number}")
+    return number
 
 
 def _opt_bool(args: dict[str, Any], key: str, default: bool) -> bool:
@@ -560,7 +573,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "use_planner": _prop("boolean", "Force or skip the pre-developer planner."),
             "parent_task_id": _prop(
                 "string",
-                "Optional parent task ID to create a child/subtask in a dependency tree.",
+                "Optional ID of an existing task to create this one as its child/subtask in a "
+                "dependency tree; the child runs only after its parent is done.",
             ),
             "source_branch": _prop(
                 "string",
@@ -948,7 +962,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "project_id": _prop("string", "Project ID."),
             "prompt": _prop("string", "Feature or architectural goal to plan."),
             "title": _prop("string", "Short session title.", default=""),
-            "max_rounds": _prop("integer", "Max discussion rounds.", default=5),
+            "max_rounds": _prop(
+                "integer",
+                f"Max discussion rounds (1-{MAX_PLANNING_ROUNDS}, default 5).",
+                default=5,
+            ),
         },
         required=["project_id", "prompt"],
     ),
@@ -985,7 +1003,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
     _tool(
         "conclave_list_bug_candidates",
         "List discovered/reproduced/fixed bug candidates from the autonomous Bug-Fixer ledger "
-        "(the 100 newest; with needs_human_only, all of them).",
+        "(the 100 newest, also with needs_human_only).",
         {
             "project_id": _prop("string", "Project ID."),
             "needs_human_only": _prop(
@@ -1449,6 +1467,34 @@ MCP_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+# The graph edit tools read a project's workflow, change it and save the whole graph, so they
+# run one at a time per Database (each re-reads the project under the lock), or a concurrent
+# edit would be lost. Taken before the config resolver's write lock, never inside it. One lock
+# per Database, held weakly (an asyncio.Lock belongs to one event loop).
+_GRAPH_EDIT_TOOLS = frozenset(
+    {
+        "conclave_workflow_upsert_node",
+        "conclave_upsert_workflow_node",
+        "conclave_workflow_remove_node",
+        "conclave_remove_workflow_node",
+        "conclave_workflow_upsert_edge",
+        "conclave_upsert_workflow_edge",
+        "conclave_workflow_remove_edge",
+        "conclave_remove_workflow_edge",
+    }
+)
+_GRAPH_EDIT_LOCKS: weakref.WeakKeyDictionary[Database, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _graph_edit_lock(db: Database) -> asyncio.Lock:
+    lock = _GRAPH_EDIT_LOCKS.get(db)
+    if lock is None:
+        lock = _GRAPH_EDIT_LOCKS[db] = asyncio.Lock()
+    return lock
+
+
 async def _require_project(daemon: Daemon, project_id: str) -> Project:
     if not project_id:
         raise McpToolError("project_id is required")
@@ -1580,6 +1626,233 @@ async def _emit_projects_updated(daemon: Daemon, projects: list[Project]) -> Non
                 "config": resolved.model_dump(mode="json"),
             },
         )
+
+
+async def _edit_workflow_graph(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
+    """Run one graph edit tool (upsert or remove a node or an edge) under the graph edit lock:
+    the project and its workflow are read under it, so the saved graph keeps every earlier
+    edit."""
+    if name in ("conclave_workflow_upsert_node", "conclave_upsert_workflow_node"):
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        current = await _resolve_active_workflow(daemon, project)
+        node_id = _opt_str(args, "id")
+        existing_node = next((n for n in current.nodes if n.id == node_id), None)
+        kind = NodeKind(
+            _opt_str(
+                args,
+                "kind",
+                existing_node.kind.value if existing_node else "reviewer",
+            )
+        )
+        raw_triggers = args.get("triggers")
+        triggers = (
+            [str(t) for t in raw_triggers if t is not None]
+            if isinstance(raw_triggers, list)
+            else (list(existing_node.triggers) if existing_node else [])
+        )
+        raw_skills = args.get("skills")
+        skills = (
+            [str(s) for s in raw_skills if s is not None]
+            if isinstance(raw_skills, list)
+            else (list(existing_node.skills) if existing_node else [])
+        )
+        model_val = (
+            _opt_str(args, "model") or None
+            if args.get("model") is not None
+            else (existing_node.model if existing_node else None)
+        )
+        effort_val = (
+            _opt_str(args, "effort") or None
+            if args.get("effort") is not None
+            else (existing_node.effort if existing_node else None)
+        )
+        cli_agent_val = (
+            _opt_str(args, "cli_agent") or None
+            if args.get("cli_agent") is not None
+            else (existing_node.cli_agent if existing_node else None)
+        )
+        thinking_val = (
+            bool(args["thinking"])
+            if isinstance(args.get("thinking"), bool)
+            else (existing_node.thinking if existing_node else None)
+        )
+        compact_val = (
+            bool(args["compact_before_start"])
+            if isinstance(args.get("compact_before_start"), bool)
+            else (existing_node.compact_before_start if existing_node else None)
+        )
+        has_pause_arg = (
+            args.get("pause_after") is not None
+            or args.get("await_human_approval") is not None
+        )
+        pause_val = (
+            bool(
+                _opt_bool(args, "pause_after", False)
+                or _opt_bool(args, "await_human_approval", False)
+            )
+            if has_pause_arg
+            else (existing_node.pause_after if existing_node else False)
+        )
+        raw_pos_x = args.get("position_x")
+        pos_x = (
+            float(raw_pos_x)
+            if raw_pos_x is not None
+            else (existing_node.position_x if existing_node else 560.0)
+        )
+        raw_pos_y = args.get("position_y")
+        pos_y = (
+            float(raw_pos_y)
+            if raw_pos_y is not None
+            else (existing_node.position_y if existing_node else 220.0)
+        )
+        new_node = WorkflowNode(
+            id=node_id,
+            label=_opt_str(
+                args,
+                "label",
+                existing_node.label if existing_node else node_id,
+            ),
+            kind=kind,
+            agent=(
+                _opt_str(args, "agent")
+                or (existing_node.agent if existing_node else node_id)
+            ),
+            output_contract=OutputContract(
+                _opt_str(
+                    args,
+                    "output_contract",
+                    existing_node.output_contract.value
+                    if existing_node
+                    else "verdict",
+                )
+            ),
+            prompt_template=(
+                str(args["prompt_template"])
+                if args.get("prompt_template") is not None
+                else (existing_node.prompt_template if existing_node else None)
+            ),
+            triggers=triggers,
+            optional=_opt_bool(
+                args,
+                "optional",
+                existing_node.optional if existing_node else False,
+            ),
+            enabled=_opt_bool(
+                args, "enabled", existing_node.enabled if existing_node else True
+            ),
+            position_x=pos_x,
+            position_y=pos_y,
+            model=model_val,
+            effort=effort_val,
+            cli_agent=cli_agent_val,
+            skills=skills,
+            thinking=thinking_val,
+            compact_before_start=compact_val,
+            pause_after=pause_val,
+            await_human_approval=pause_val,
+        )
+        nodes = [n for n in current.nodes if n.id != node_id] + [new_node]
+        updated_graph = WorkflowGraph(
+            version=current.version,
+            name=current.name,
+            description=current.description,
+            template_id=current.template_id,
+            parallel_reviewers=current.parallel_reviewers,
+            nodes=nodes,
+            edges=current.edges,
+        )
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"node upserted: {node_id}"
+        )
+
+    if name in ("conclave_workflow_remove_node", "conclave_remove_workflow_node"):
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        node_id = _opt_str(args, "node_id")
+        current = await _resolve_active_workflow(daemon, project)
+        nodes = [n for n in current.nodes if n.id != node_id]
+        edges = [
+            e for e in current.edges if e.source != node_id and e.target != node_id
+        ]
+        updated_graph = WorkflowGraph(
+            version=current.version,
+            name=current.name,
+            description=current.description,
+            template_id=current.template_id,
+            parallel_reviewers=current.parallel_reviewers,
+            nodes=nodes,
+            edges=edges,
+        )
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"node removed: {node_id}"
+        )
+
+    if name in ("conclave_workflow_upsert_edge", "conclave_upsert_workflow_edge"):
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        source = _opt_str(args, "source")
+        target = _opt_str(args, "target")
+        condition = EdgeCondition(_opt_str(args, "condition", "always"))
+        edge_id = _opt_str(args, "id") or f"e-{source}-{target}-{condition.value}"
+        require_human = _opt_bool(args, "require_human", False)
+        new_edge = WorkflowEdge(
+            id=edge_id,
+            source=source,
+            target=target,
+            condition=condition,
+            max_iterations=_opt_int(args, "max_iterations", 3),
+            label=_opt_str(args, "label"),
+            require_human=require_human,
+        )
+        current = await _resolve_active_workflow(daemon, project)
+        edges = [
+            e
+            for e in current.edges
+            if e.id != edge_id
+            and not (
+                e.source == source and e.target == target and e.condition == condition
+            )
+        ] + [new_edge]
+        updated_graph = WorkflowGraph(
+            version=current.version,
+            name=current.name,
+            description=current.description,
+            template_id=current.template_id,
+            parallel_reviewers=current.parallel_reviewers,
+            nodes=current.nodes,
+            edges=edges,
+        )
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"edge upserted: {edge_id}"
+        )
+
+    if name in ("conclave_workflow_remove_edge", "conclave_remove_workflow_edge"):
+        project = await _require_project(daemon, _opt_str(args, "project_id"))
+        edge_id = _opt_str(args, "edge_id")
+        source = _opt_str(args, "source")
+        target = _opt_str(args, "target")
+        current = await _resolve_active_workflow(daemon, project)
+        edges = [
+            e
+            for e in current.edges
+            if not (
+                (edge_id and e.id == edge_id)
+                or (source and target and e.source == source and e.target == target)
+            )
+        ]
+        updated_graph = WorkflowGraph(
+            version=current.version,
+            name=current.name,
+            description=current.description,
+            template_id=current.template_id,
+            parallel_reviewers=current.parallel_reviewers,
+            nodes=current.nodes,
+            edges=edges,
+        )
+        removed = edge_id or f"{source} -> {target}"
+        return await _save_workflow(
+            daemon, project, updated_graph, _opt_reason(args) or f"edge removed: {removed}"
+        )
+
+    raise McpToolError(f"unknown MCP tool: {name!r}")
 
 
 async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
@@ -1879,6 +2152,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         use_planner_raw = args.get("use_planner")
         use_planner = bool(use_planner_raw) if isinstance(use_planner_raw, bool) else None
         parent_task_id = _opt_str(args, "parent_task_id") or None
+        if parent_task_id is not None and await repo.get_task(daemon.db, parent_task_id) is None:
+            # A child runs only once its parent is done, so it would wait forever.
+            raise McpToolError(f"parent task not found: {parent_task_id}")
         source_branch = _opt_str(args, "source_branch") or None
         state = TaskState.approved if auto_approve else TaskState.inbox
         task = await repo.create_task(
@@ -2126,13 +2402,15 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     if name == "conclave_cancel_task":
         task = await _require_task(daemon, _opt_str(args, "task_id"))
         if task.state in (TaskState.inbox, TaskState.approved):
-            await repo.set_task_state(daemon.db, task.id, TaskState.cancelled)
-            await daemon.bus.emit(
-                type=EventType.task_cancelled,
-                project_id=task.project_id,
-                task_id=task.id,
-            )
-            return {"cancelled": True, "task_id": task.id}
+            if await repo.cancel_task_if_pending(daemon.db, task.id):
+                await daemon.bus.emit(
+                    type=EventType.task_cancelled,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                )
+                return {"cancelled": True, "task_id": task.id}
+            # A worker claimed it (or it moved on) after the read: answer for its state now.
+            task = await _require_task(daemon, task.id)
         if task.state in (TaskState.in_progress, TaskState.waiting_for_approval):
             cancelled = await daemon.request_cancel(task.id)
             if not cancelled and task.state == TaskState.waiting_for_approval:
@@ -2307,225 +2585,9 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             daemon, project, graph, _opt_reason(args) or "workflow replaced"
         )
 
-    if name in ("conclave_workflow_upsert_node", "conclave_upsert_workflow_node"):
-        project = await _require_project(daemon, _opt_str(args, "project_id"))
-        current = await _resolve_active_workflow(daemon, project)
-        node_id = _opt_str(args, "id")
-        existing_node = next((n for n in current.nodes if n.id == node_id), None)
-        kind = NodeKind(
-            _opt_str(
-                args,
-                "kind",
-                existing_node.kind.value if existing_node else "reviewer",
-            )
-        )
-        raw_triggers = args.get("triggers")
-        triggers = (
-            [str(t) for t in raw_triggers if t is not None]
-            if isinstance(raw_triggers, list)
-            else (list(existing_node.triggers) if existing_node else [])
-        )
-        raw_skills = args.get("skills")
-        skills = (
-            [str(s) for s in raw_skills if s is not None]
-            if isinstance(raw_skills, list)
-            else (list(existing_node.skills) if existing_node else [])
-        )
-        model_val = (
-            _opt_str(args, "model") or None
-            if args.get("model") is not None
-            else (existing_node.model if existing_node else None)
-        )
-        effort_val = (
-            _opt_str(args, "effort") or None
-            if args.get("effort") is not None
-            else (existing_node.effort if existing_node else None)
-        )
-        cli_agent_val = (
-            _opt_str(args, "cli_agent") or None
-            if args.get("cli_agent") is not None
-            else (existing_node.cli_agent if existing_node else None)
-        )
-        thinking_val = (
-            bool(args["thinking"])
-            if isinstance(args.get("thinking"), bool)
-            else (existing_node.thinking if existing_node else None)
-        )
-        compact_val = (
-            bool(args["compact_before_start"])
-            if isinstance(args.get("compact_before_start"), bool)
-            else (existing_node.compact_before_start if existing_node else None)
-        )
-        has_pause_arg = (
-            args.get("pause_after") is not None
-            or args.get("await_human_approval") is not None
-        )
-        pause_val = (
-            bool(
-                _opt_bool(args, "pause_after", False)
-                or _opt_bool(args, "await_human_approval", False)
-            )
-            if has_pause_arg
-            else (existing_node.pause_after if existing_node else False)
-        )
-        raw_pos_x = args.get("position_x")
-        pos_x = (
-            float(raw_pos_x)
-            if raw_pos_x is not None
-            else (existing_node.position_x if existing_node else 560.0)
-        )
-        raw_pos_y = args.get("position_y")
-        pos_y = (
-            float(raw_pos_y)
-            if raw_pos_y is not None
-            else (existing_node.position_y if existing_node else 220.0)
-        )
-        new_node = WorkflowNode(
-            id=node_id,
-            label=_opt_str(
-                args,
-                "label",
-                existing_node.label if existing_node else node_id,
-            ),
-            kind=kind,
-            agent=(
-                _opt_str(args, "agent")
-                or (existing_node.agent if existing_node else node_id)
-            ),
-            output_contract=OutputContract(
-                _opt_str(
-                    args,
-                    "output_contract",
-                    existing_node.output_contract.value
-                    if existing_node
-                    else "verdict",
-                )
-            ),
-            prompt_template=(
-                str(args["prompt_template"])
-                if args.get("prompt_template") is not None
-                else (existing_node.prompt_template if existing_node else None)
-            ),
-            triggers=triggers,
-            optional=_opt_bool(
-                args,
-                "optional",
-                existing_node.optional if existing_node else False,
-            ),
-            enabled=_opt_bool(
-                args, "enabled", existing_node.enabled if existing_node else True
-            ),
-            position_x=pos_x,
-            position_y=pos_y,
-            model=model_val,
-            effort=effort_val,
-            cli_agent=cli_agent_val,
-            skills=skills,
-            thinking=thinking_val,
-            compact_before_start=compact_val,
-            pause_after=pause_val,
-            await_human_approval=pause_val,
-        )
-        nodes = [n for n in current.nodes if n.id != node_id] + [new_node]
-        updated_graph = WorkflowGraph(
-            version=current.version,
-            name=current.name,
-            description=current.description,
-            template_id=current.template_id,
-            parallel_reviewers=current.parallel_reviewers,
-            nodes=nodes,
-            edges=current.edges,
-        )
-        return await _save_workflow(
-            daemon, project, updated_graph, _opt_reason(args) or f"node upserted: {node_id}"
-        )
-
-    if name in ("conclave_workflow_remove_node", "conclave_remove_workflow_node"):
-        project = await _require_project(daemon, _opt_str(args, "project_id"))
-        node_id = _opt_str(args, "node_id")
-        current = await _resolve_active_workflow(daemon, project)
-        nodes = [n for n in current.nodes if n.id != node_id]
-        edges = [
-            e for e in current.edges if e.source != node_id and e.target != node_id
-        ]
-        updated_graph = WorkflowGraph(
-            version=current.version,
-            name=current.name,
-            description=current.description,
-            template_id=current.template_id,
-            parallel_reviewers=current.parallel_reviewers,
-            nodes=nodes,
-            edges=edges,
-        )
-        return await _save_workflow(
-            daemon, project, updated_graph, _opt_reason(args) or f"node removed: {node_id}"
-        )
-
-    if name in ("conclave_workflow_upsert_edge", "conclave_upsert_workflow_edge"):
-        project = await _require_project(daemon, _opt_str(args, "project_id"))
-        source = _opt_str(args, "source")
-        target = _opt_str(args, "target")
-        condition = EdgeCondition(_opt_str(args, "condition", "always"))
-        edge_id = _opt_str(args, "id") or f"e-{source}-{target}-{condition.value}"
-        require_human = _opt_bool(args, "require_human", False)
-        new_edge = WorkflowEdge(
-            id=edge_id,
-            source=source,
-            target=target,
-            condition=condition,
-            max_iterations=_opt_int(args, "max_iterations", 3),
-            label=_opt_str(args, "label"),
-            require_human=require_human,
-        )
-        current = await _resolve_active_workflow(daemon, project)
-        edges = [
-            e
-            for e in current.edges
-            if e.id != edge_id
-            and not (
-                e.source == source and e.target == target and e.condition == condition
-            )
-        ] + [new_edge]
-        updated_graph = WorkflowGraph(
-            version=current.version,
-            name=current.name,
-            description=current.description,
-            template_id=current.template_id,
-            parallel_reviewers=current.parallel_reviewers,
-            nodes=current.nodes,
-            edges=edges,
-        )
-        return await _save_workflow(
-            daemon, project, updated_graph, _opt_reason(args) or f"edge upserted: {edge_id}"
-        )
-
-    if name in ("conclave_workflow_remove_edge", "conclave_remove_workflow_edge"):
-        project = await _require_project(daemon, _opt_str(args, "project_id"))
-        edge_id = _opt_str(args, "edge_id")
-        source = _opt_str(args, "source")
-        target = _opt_str(args, "target")
-        current = await _resolve_active_workflow(daemon, project)
-        edges = [
-            e
-            for e in current.edges
-            if not (
-                (edge_id and e.id == edge_id)
-                or (source and target and e.source == source and e.target == target)
-            )
-        ]
-        updated_graph = WorkflowGraph(
-            version=current.version,
-            name=current.name,
-            description=current.description,
-            template_id=current.template_id,
-            parallel_reviewers=current.parallel_reviewers,
-            nodes=current.nodes,
-            edges=edges,
-        )
-        removed = edge_id or f"{source} -> {target}"
-        return await _save_workflow(
-            daemon, project, updated_graph, _opt_reason(args) or f"edge removed: {removed}"
-        )
+    if name in _GRAPH_EDIT_TOOLS:
+        async with _graph_edit_lock(daemon.db):
+            return await _edit_workflow_graph(daemon, name, args)
 
     # --- Agent Personas ---
     if name == "conclave_list_agents":
@@ -2540,6 +2602,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         pid_opt = _opt_str(args, "project_id") or None
         if not agent_name or not persona_md:
             raise McpToolError("name and persona_md are required")
+        if pid_opt is not None:
+            await _require_project(daemon, pid_opt)
         agent = await repo.upsert_agent(
             daemon.db,
             name=agent_name,
@@ -2633,6 +2697,8 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             raise McpToolError("prompt is required")
         title = _opt_str(args, "title")
         max_rounds = _opt_int(args, "max_rounds", 5)
+        if not 1 <= max_rounds <= MAX_PLANNING_ROUNDS:
+            raise McpToolError(f"max_rounds must be between 1 and {MAX_PLANNING_ROUNDS}")
         session = await daemon.planning_orchestrator.create_and_start(
             project_id=project.id,
             title=title,
@@ -2676,7 +2742,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
     if name == "conclave_list_bug_candidates":
         project = await _require_project(daemon, _opt_str(args, "project_id"))
         if _opt_bool(args, "needs_human_only", False):
-            cands = await repo.list_needs_human(daemon.db, project.id)
+            cands = await repo.list_needs_human(daemon.db, project.id, limit=100)
         else:
             cands = await repo.list_bug_candidates(daemon.db, project.id, limit=100)
         return [c.model_dump(mode="json") for c in cands]

@@ -22,7 +22,7 @@ import pytest_asyncio
 from fake_provider import FakeProvider
 from httpx import ASGITransport
 
-from conclave.db import BugStatus, Database
+from conclave.db import BugStatus, Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import run_git
 from conclave.runtime import Daemon
@@ -679,3 +679,138 @@ async def test_workflow_decisions_leave_graphs_out_by_default(
         "is_custom": True,
     }
     assert _graphs(reverted_full) == 3  # workflow, graph_after, graph_before
+
+
+async def test_upsert_agent_for_an_unknown_project_is_a_tool_error(
+    client: httpx.AsyncClient, db: Database
+) -> None:
+    """A persona scoped to an unknown project is a handled tool error, like the REST 404, not
+    the FOREIGN KEY failure surfacing as an internal error."""
+    text = await _tool_error(
+        client,
+        "conclave_upsert_agent",
+        {"name": "scoped", "persona_md": "# Scoped", "project_id": "nope"},
+    )
+    assert text.startswith("Error:") and "project not found" in text, text
+    assert await db.fetchval("SELECT COUNT(*) FROM agents WHERE name = 'scoped'") == 0
+
+
+async def _call_raw(
+    client: httpx.AsyncClient, name: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Like :func:`_call`, with the body written by ``json.dumps``, which spells Infinity
+    (httpx's ``json=`` refuses it; the server's JSON parser accepts it)."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }
+    resp = await client.post(
+        "/mcp", content=json.dumps(body), headers={"Content-Type": "application/json"}
+    )
+    assert resp.status_code == 200, resp.text
+    result: dict[str, Any] = resp.json()["result"]
+    return result
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("conclave_get_task_events", {"after_id": 10**30}),
+        ("conclave_list_projects", {"limit": float("inf")}),
+        ("conclave_get_task_diff", {"max_bytes": float("-inf")}),
+        ("conclave_launch_swarm", {"prompt": "split it", "concurrency": float("inf")}),
+        (
+            "conclave_workflow_upsert_edge",
+            {"source": "developer", "target": "tester", "max_iterations": float("inf")},
+        ),
+        ("conclave_create_planning_session", {"prompt": "plan it", "max_rounds": 10**30}),
+        ("conclave_create_planning_session", {"prompt": "plan it", "max_rounds": 0}),
+    ],
+)
+async def test_out_of_range_integer_arguments_are_tool_errors_not_internal_errors(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path, name: str, arguments: dict[str, Any]
+) -> None:
+    """An integer argument SQLite or int() cannot hold (beyond 64 bits, or Infinity, which
+    the JSON parser accepts) is a handled tool error; before the fix it surfaced as
+    "Internal error: OverflowError". A planning session needs 1 to 50 rounds, like over REST."""
+    project = await repo.create_project(db, name="p", path=str(tmp_path), default_branch="main")
+    task = await repo.create_task(db, project_id=project.id, request="r")
+    result = await _call_raw(
+        client, name, {"project_id": project.id, "task_id": task.id, **arguments}
+    )
+    text = result["content"][0]["text"]
+    assert result["isError"] is True, text
+    assert text.startswith("Error:"), text
+    assert await repo.list_planning_sessions(db, project.id) == []
+
+
+async def test_cancel_tool_never_overwrites_a_task_claimed_after_the_read(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Like REST: a task a worker claims between the tool's read and its write stays
+    in_progress, and the tool does not report it cancelled."""
+    from conclave.mcp import tools as tools_module
+
+    project = await repo.create_project(db, name="p", path=str(tmp_path), default_branch="main")
+    task = await repo.create_task(
+        db, project_id=project.id, request="r", state=TaskState.approved
+    )
+    real_require_task = tools_module._require_task
+    claimed: list[Any] = []
+
+    async def read_then_claim(daemon: Daemon, task_id: str) -> Any:
+        found = await real_require_task(daemon, task_id)
+        if not claimed:  # the worker claims the task right after the tool read it
+            claimed.append(await repo.claim_next_approved(db, project.id))
+        return found
+
+    monkeypatch.setattr(tools_module, "_require_task", read_then_claim)
+    answer = await _tool(client, "conclave_cancel_task", {"task_id": task.id})
+
+    assert claimed and claimed[0] is not None and claimed[0].id == task.id
+    assert answer == {"cancelled": False, "task_id": task.id}
+    after = await repo.get_task(db, task.id)
+    assert after is not None and after.state == TaskState.in_progress
+
+
+async def test_create_task_with_an_unknown_parent_is_a_tool_error(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """A child of a task that does not exist is refused: claim_next_approved only claims a
+    child whose parent is done, so it would have waited forever without an error."""
+    project = await repo.create_project(db, name="p", path=str(tmp_path), default_branch="main")
+    text = await _tool_error(
+        client,
+        "conclave_create_task",
+        {"project_id": project.id, "request": "child work", "parent_task_id": "nope"},
+    )
+    assert text.startswith("Error:") and "nope" in text, text
+    assert await repo.list_tasks(db, project.id) == []
+
+
+async def test_list_bug_candidates_needs_human_only_is_bounded(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    """needs_human_only returns at most 100 candidates, newest first, like the unfiltered
+    list (W15: every list result is bounded)."""
+    project = await repo.create_project(db, name="p", path=str(tmp_path), default_branch="main")
+    ids: list[str] = []
+    for idx in range(101):
+        cand = await repo.create_bug_candidate(
+            db, project_id=project.id, fingerprint=f"fp-{idx}", claim=f"bug {idx}"
+        )
+        await repo.transition_bug_status(db, cand.id, BugStatus.declined_needs_human)
+        await db.execute(  # distinct times, so "newest first" has one answer
+            "UPDATE bug_candidates SET discovered_at = ? WHERE id = ?",
+            (f"2026-01-01T00:{idx // 60:02d}:{idx % 60:02d}+00:00", cand.id),
+        )
+        ids.append(cand.id)
+
+    rows = await _tool(
+        client,
+        "conclave_list_bug_candidates",
+        {"project_id": project.id, "needs_human_only": True},
+    )
+    assert [c["id"] for c in rows] == ids[::-1][:100]

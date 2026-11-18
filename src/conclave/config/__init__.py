@@ -36,6 +36,7 @@ from .models import (
 )
 from .resolver import (
     GLOBAL_DEFAULTS_PRESET,
+    ProjectAlreadyAttachedError,
     already_attached_message,
     apply_global_overrides,
     apply_project_overrides,
@@ -81,6 +82,7 @@ __all__ = [
     "NotificationSettings",
     "OutputContract",
     "PlanningSettings",
+    "ProjectAlreadyAttachedError",
     "ProtectedSettings",
     "SystemSettings",
     "UiSettings",

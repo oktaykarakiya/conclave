@@ -21,6 +21,7 @@ interleave with, or be flushed by, ours.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -31,6 +32,10 @@ import aiosqlite
 
 from ..util import now_iso
 from .migrations import MIGRATIONS
+
+# The largest value SQLite stores in an INTEGER (signed 64-bit). Binding a larger Python int
+# raises OverflowError, so API inputs that reach SQL (offsets, ids, attempts) are bounded by it.
+SQLITE_INT_MAX = 2**63 - 1
 
 
 class Database:
@@ -147,14 +152,21 @@ class Database:
         an open transaction on the same :class:`Database` would deadlock on the lock. The
         composer functions that use this own their transaction end to end — pass them data,
         never an already-open connection.
+
+        The ``BEGIN`` sits inside the ``try``: aiosqlite still runs a queued statement whose
+        await was cancelled, so a cancellation landing on the ``BEGIN`` must roll it back too,
+        or the connection would stay inside a transaction nobody owns. The ``ROLLBACK``'s own
+        error (no transaction open, or one SQLite already rolled back) never masks the
+        original exception.
         """
         async with self._write_lock:
             conn = self.conn
-            await conn.execute("BEGIN")
             try:
+                await conn.execute("BEGIN")
                 yield conn
             except BaseException:
-                await conn.execute("ROLLBACK")
+                with contextlib.suppress(sqlite3.Error):
+                    await conn.execute("ROLLBACK")
                 raise
             else:
                 await conn.execute("COMMIT")
