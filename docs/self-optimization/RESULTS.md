@@ -135,3 +135,64 @@ Observations:
   405 or a 404), instead of trusting the spec.
 - The test-integrity guard flagged one removed test (W14): the rewrite of the stdio fallback
   test, intended by the spec; the duplicate-execution guarantees it held were kept.
+
+## Run 3, part 2 (2026-11-18) — audits A1–A3 and their follow-ups (W19)
+
+After W18 was pushed, Conclave audited its own providers (A1), engine (A2) and MCP/web/database
+layers (A3). Each audit task asked for defects against the repository's own contracts, every one
+demonstrated by a test that fails on the old code before it is fixed, plus a SUSPECTED list (could
+not demonstrate) and a NOT A DEFECT list (checked and found correct). An empty diff was an
+acceptable answer. The planners did the reproduction themselves (throwaway scripts against HEAD,
+deleted afterwards), so the plan was already a list of confirmed defects.
+
+| Task | Attempts | Defects fixed | Tests after | Reported cost (planner / developer / reviewers) |
+|---|---|---|---|---|
+| A1 providers | 1 | 9 | 1332 (+1 skipped) | 10.05 / 7.14 / 7.50 |
+| A2 engine | 1 | 13 | 1374 (+1 skipped) | 10.01 / 12.10 / 8.07 |
+| A3 MCP, web, database | 1 | 15 | 1413 (+1 skipped) | 11.55 / 11.76 / 7.57 |
+| W19 audit follow-ups | 1 | 8 items | 1448 (+1 skipped) | 2.19² / 17.17 / 8.90 |
+
+The most serious defects found:
+- A1: a crashed or error-ended Claude Code run kept its raw transcript as the answer and could be
+  ok, so a crashed reviewer whose transcript contained "VERDICT: pass" counted as a pass.
+  Cancelling a dispatch left the CLI running; a large prompt to a CLI that exited early crashed
+  the dispatch; the process group was looked up after its leader was reaped; UTF-8 characters
+  split across reads and JSON lines split on U+2028 were garbled; the usage of opencode attempts
+  that were retried was dropped.
+- A2: a failed `git worktree add` during a merge deleted the committed, reviewed branch and
+  answered 500; a workflow with a developer but no merge node deleted the work and still ended
+  `done`; a target branch that moved during a fast-forward lost the commit that moved it; a target
+  checked out in a linked worktree was moved underneath it; the first verdict block in a reply
+  decided instead of the last; quarantine exclusions were appended to whatever command came last
+  (`pytest && mypy` passed them to mypy); a cancel did not stop a running setup, baseline or gate
+  command; one raising parallel reviewer left the others running unawaited; a retry's history cut
+  the previous diff to 1,500 characters without a marker.
+- A3: a cancel landing on a transaction's `BEGIN` left the shared connection inside a transaction nobody owned, so every later transaction failed; two concurrent config writes (project or global) both answered 200 and kept only the last one's change, and the same for two MCP workflow edits; two requests with one `Idempotency-Key`, or two attaches of one path, both ran; an invalid agent override was stored and then failed every dispatch of that agent; a cancel could overwrite a task a worker had just claimed; huge or non-finite numbers, an unknown project or a dead parent task reached SQLite or waited forever instead of a 4xx; the stdio bridge died on a reply that was not JSON.
+
+Found while piloting the audits, fixed in W19:
+- parallel reviewers share one worktree: in A1, two reviewers swapped the old provider files in to
+  prove the new tests fail on them while a third ran the full suite, which showed 14 unexplained
+  failures (the commit was safe: the reviewed tree is restored before the gate);
+- an isolated worker's isolation variables could be overridden by an `env` block in the
+  repository's `.claude/settings(.local).json` (Claude Code applies it over the inherited
+  environment; `--settings` outranks it);
+- `execution.review_rounds_max` and an `on_fail` edge's `max_iterations` were accepted, shown and
+  raised by the evolver, but never bounded anything;
+- since A2, a retry prompt sent the newest rejected diff twice (A2's performance reviewer).
+
+Efficiency: after A1, the run's usage was 34% developer, 32% planner, 13% tester, and 22% for the
+other seven reviewers, which had not failed a change in 13 tasks. The owner delegated the trade-off
+to the pilot; five reviewers (architect, risk, legal, devops, performance) went from `xhigh` to
+`high`, and W19's planner ran at `high` on a fully verified spec. Risk stayed mandatory. In A2,
+right after the change, the risk reviewer cost 0.70 against 1.35 in A1 and still verified the gate.
+
+Usage limits, live: A2's planner hit the five-hour limit at 16:21 UTC, waited 3,577 s and resumed
+the same session at 17:21; W19's developer hit it at 21:32, waited 2,894 s and resumed at 22:21
+(`resumed_session: true` both times); nothing failed. With the reviewers at `high`, the five-hour
+window lasted about four hours of this work instead of about two.
+
+Verified live after deploy: a query on `secrets` answers 400; the real Claude Code CLI accepts the
+isolated invocation with its inline `--settings` (one Haiku call answered normally).
+
+² W19's planner at `high` on a spec the pilot had verified line by line (A1–A3's planners ran at
+`max`: 10–11.55). Run 3 in all: 15 tasks, 406.68 reported.

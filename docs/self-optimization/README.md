@@ -57,13 +57,18 @@ full gate is green.
   - W16 interaction-log retention and an honest export
     (`specs/w16_interaction_log_retention.md`);
   - W18 the evolver respects a rejection and learns only from quality failures, plus the W12/W13
-    review follow-ups (`specs/w18_evolver_respects_rejections.md`).
+    review follow-ups (`specs/w18_evolver_respects_rejections.md`);
+  - audits A1–A3: Conclave audited its providers, engine and MCP/web/database layers and fixed the
+    37 defects it could demonstrate, each with a test that fails on the old code
+    (`specs/a1_audit_providers.md`, `specs/a2_audit_engine.md`, `specs/a3_audit_mcp_web_db.md`);
+  - W19 the audits' follow-ups: isolation no settings file can undo, reviewers that cannot disturb
+    each other unseen, retry bounds that bind, operator SQL that cannot stall the daemon or read
+    secrets (`specs/w19_audit_followups.md`).
 
 ## Remaining work, in order (one task at a time, pilot review before each merge)
 
-1. **Audits** — Conclave audits its own providers, engine, and MCP/web/database layers
-   (`specs/a1..a3`), fixing every defect it can demonstrate with a failing test.
-2. The open items in `backlog.md`.
+1. The open items in `backlog.md` (two deferred from earlier runs, seven reported by the audits
+   and not demonstrated or out of their scope).
 
 ## Run 3 (2026-11-17/18): worker isolation, usage limits, review completeness, backlog
 
@@ -88,6 +93,7 @@ then merges; deploy between waves when the daemon's other project is idle):
 | C | W18 the evolver respects a rejection and learns only from quality failures, plus review follow-ups (`specs/w18_evolver_respects_rejections.md`) | found live: the same "make risk optional" proposal came back after every clean task (ten times) although the owner rejected each one; found in W13's review: a removed test command or an infra gate failure read as a quality failure, a resumed run whose total restarted charged 0, operator rejections without a reason |
 | C | W16 interaction-log retention and honest export (`specs/w16_interaction_log_retention.md`) | 38.5 MB never pruned; a JSONL file named `.parquet` rewritten after every dispatch |
 | D | audits A1 providers, A2 engine, A3 MCP/web/database (`specs/a1..a3`): Conclave hunts for defects, fixes each one it can demonstrate with a failing test | "all flaws fixed, even newly discovered ones" |
+| D | W19 audit follow-ups (`specs/w19_audit_followups.md`) | found while piloting the audits: parallel reviewers swapped files in the shared worktree under another reviewer's test run; a repository settings file could undo worker isolation; `review_rounds_max` and `max_iterations` bound nothing; plus A1–A3's leftovers |
 
 Deferred with reasons: persona-first prompt order (it only helps prefix-cached engines; Claude Code
 sends the prompt as one block, so there is nothing to gain there, and a DeepSeek A/B needs a funded
@@ -107,3 +113,13 @@ out by the gate and resumed in the same session (`quota.waiting` → `quota.resu
 - W12's `risk` reviewer, 20:05 UTC: waited 14,728 s (overnight), resumed at 00:11, rendered its
   verdict; the task committed at 00:15. The laptop was rebooted at 00:35: the systemd user service
   brought the daemon back at boot with nothing in flight and nothing lost.
+- A2's planner, 2026-11-18 16:21 UTC: waited 3,577 s, resumed and finished its plan.
+- W19's developer, 21:32 UTC: waited 2,894 s, resumed and finished; the task passed on its first
+  attempt.
+
+Efficiency (owner, 2026-11-18: "do whatever is most efficient, you are the pilot"): after 13 tasks
+the usage was 34% developer, 32% planner, 13% tester and 22% for the seven other reviewers, which
+had not failed a change. Architect, risk, legal, devops and performance moved from `xhigh` to
+`high` (risk stays mandatory); the planner ran at `high` for W19, whose spec the pilot had verified,
+and is back at `max` for audits. The five-hour window then lasted about four hours of this work
+instead of about two.
