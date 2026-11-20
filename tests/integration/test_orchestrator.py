@@ -17,7 +17,7 @@ from httpx import ASGITransport
 
 from conclave.bootstrap import seed_global_defaults
 from conclave.config import load_project_config, resolve_project_config
-from conclave.db import CheckpointStatus, Database, TaskState
+from conclave.db import CheckpointStatus, Database, Task, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
 from conclave.engine.gate import GateResult
@@ -31,7 +31,7 @@ from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
 from conclave.mcp.tools import call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
-from conclave.runtime import Daemon
+from conclave.runtime import Daemon, ProjectWorker
 from conclave.web import create_app
 from waits import wait_until, within
 
@@ -2182,6 +2182,255 @@ async def test_an_approve_while_the_wait_is_announced_reaches_the_run_and_leaves
     final = await repo.get_task(db, task.id)
     assert final is not None and final.state is TaskState.done
     assert len([p for p in provider.prompts if "You are the developer agent of" in p]) == 1
+
+
+# --- an operator approval never stores approved for a run that is still live --------------
+
+_OPERATOR_ACTIONS = [
+    ("rest", "approve"), ("rest", "complete"), ("mcp", "approve"), ("mcp", "complete")
+]
+
+
+async def _operator_call(
+    client: httpx.AsyncClient,
+    daemon: Daemon,
+    task_id: str,
+    surface: str,
+    action: str,
+    node_id: str = "developer",
+) -> tuple[int, dict[str, Any]]:
+    """The operator's ``approve`` of *task_id*, or ``complete`` of its *node_id*, over *surface*
+    (``rest`` or ``mcp``): the HTTP status (200 for a tool that answered) and the answer."""
+    if surface == "rest":
+        if action == "approve":
+            resp = await client.post(f"/api/tasks/{task_id}/approve")
+        else:
+            resp = await client.post(
+                f"/api/tasks/{task_id}/nodes/{node_id}/complete", json={"status": "completed"}
+            )
+        return resp.status_code, resp.json()
+    if action == "approve":
+        answer = await call_mcp_tool(daemon, "conclave_approve_task", {"task_id": task_id})
+    else:
+        answer = await call_mcp_tool(
+            daemon,
+            "conclave_complete_node",
+            {"task_id": task_id, "node_id": node_id, "status": "completed"},
+        )
+    return 200, answer
+
+
+async def _what_a_swarm_tick_finds(db: Database, task: Task) -> tuple[TaskState | None, Any]:
+    """*task*'s stored state now, and what a ``max_parallel_tasks: 2`` worker tick claims."""
+    now = await repo.get_task(db, task.id)
+    claimed = await repo.claim_next_approved(db, task.project_id, max_parallel=2)
+    return (now.state if now is not None else None), claimed
+
+
+_Act = Callable[[httpx.AsyncClient, Daemon, Task], Awaitable[None]]
+
+
+async def _run_live_paused_at_the_developer(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    as_it_waits: _Act,
+    as_it_resumes: _Act | None = None,
+) -> tuple[str, FakeProvider]:
+    """Run a task as the daemon's worker does (``ProjectWorker._run_claimed_task``, so its cancel
+    event is registered and the run is live) in a project with ``max_parallel_tasks: 2`` and a
+    pause armed on the developer. *as_it_waits* runs as the run announces the wait
+    (``hitl.waiting``, its waiter registered); *as_it_resumes* once the released wait has removed
+    its waiters, before the run writes ``in_progress``. Returns the task id and the provider."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    provider = FakeProvider()
+    daemon = Daemon(db, tmp_path / "home", provider, workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            project = await repo.create_project(
+                db, name="t", path=str(repo_path), default_branch="main",
+                config={"execution": {**_UNGATED_EXECUTION, "max_parallel_tasks": 2}},
+            )
+            task = await repo.create_task(
+                db, project_id=project.id, request="add a feature file",
+                state=TaskState.approved,
+            )
+            real_emit = daemon.bus.emit
+            real_set_task_state = repo.set_task_state
+            reached: set[str] = set()
+
+            async def emit(**kwargs: Any) -> Any:
+                row = await real_emit(**kwargs)
+                if str(kwargs.get("type")) == "hitl.waiting" and "wait" not in reached:
+                    reached.add("wait")
+                    await as_it_waits(client, daemon, task)
+                return row
+
+            async def set_task_state(db_: Database, task_id: str, state: TaskState) -> None:
+                # The run's first in_progress write after the wait ends it: its waiters are gone.
+                if "wait" in reached and "resume" not in reached and state == TaskState.in_progress:
+                    reached.add("resume")
+                    if as_it_resumes is not None:
+                        await as_it_resumes(client, daemon, task)
+                await real_set_task_state(db_, task_id, state)
+
+            monkeypatch.setattr(daemon.bus, "emit", emit)
+            monkeypatch.setattr(repo, "set_task_state", set_task_state)
+            daemon.set_hitl_checkpoint(task.id, "developer", True)
+            claimed = await repo.claim_next_approved(db, project.id, max_parallel=2)
+            assert claimed is not None
+            worker = ProjectWorker(db, daemon.orchestrator, project.id)
+            await within(worker._run_claimed_task(claimed), "the task's run never ended")
+    finally:
+        await daemon.shutdown()
+    assert reached == {"wait", "resume"}
+    return task.id, provider
+
+
+async def _assert_ran_once_to_done(db: Database, task_id: str, provider: FakeProvider) -> None:
+    """The task ended ``done`` in one run: each agent dispatched once, one ``task.started`` and
+    one ``task.done``."""
+    final = await repo.get_task(db, task_id)
+    assert final is not None and final.state is TaskState.done
+    roles = [FakeProvider.role_of(prompt) for prompt in provider.prompts]
+    assert "developer" in roles and len(roles) == len(set(roles)), roles
+    types = [e.type for e in await repo.list_events(db, task_id=task_id, limit=10_000)]
+    assert (types.count("task.started"), types.count("task.done")) == (1, 1)
+
+
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+async def test_completing_another_node_releases_a_live_run_and_leaves_nothing_to_claim(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    """Backlog (open 4): completing a node other than the one a running task waits at signals no
+    waiter, and the fallback stored ``approved``. The task read approved until its wait polled,
+    and a swarm tick (max_parallel_tasks > 1) could claim it and run it a second time beside the
+    run. The run waits at the developer; the operator completes the gate."""
+    seen: list[tuple[int, object, TaskState | None, Any]] = []
+
+    async def complete_the_gate(client: httpx.AsyncClient, daemon: Daemon, task: Task) -> None:
+        status, answer = await _operator_call(client, daemon, task.id, surface, "complete", "gate")
+        state, claimed = await _what_a_swarm_tick_finds(db, task)
+        seen.append((status, answer.get("signaled"), state, claimed))
+
+    task_id, provider = await _run_live_paused_at_the_developer(
+        db, tmp_path, monkeypatch, as_it_waits=complete_the_gate
+    )
+
+    assert seen == [(200, False, TaskState.waiting_for_approval, None)]
+    await _assert_ran_once_to_done(db, task_id, provider)
+
+
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+async def test_a_live_wait_released_by_another_nodes_completion_takes_its_own_resolution(
+    db: Database, tmp_path: Path, surface: str
+) -> None:
+    """The release stores no resolution for the waiting node: it takes the one posted for its
+    pass before it paused, as it did when the stored ``approved`` released it."""
+    daemon, client, task, config = await _reviewer_waits_setup(db, tmp_path)
+    orchestrator = daemon.orchestrator
+    orchestrator._cancel_events[task.id] = asyncio.Event()  # live, as the worker registers it
+    try:
+        posted = await client.post(
+            f"/api/tasks/{task.id}/nodes/reviewer/complete",
+            json={"status": "failed", "message": "not good enough", "attempt": 2},
+        )
+        assert posted.status_code == 200, posted.text
+        daemon.set_hitl_checkpoint(task.id, "reviewer", True)
+        waiting = asyncio.create_task(
+            orchestrator._await_human_approval(task, "reviewer", 2, config)
+        )
+
+        async def paused() -> bool:
+            current = await repo.get_task(db, task.id)
+            return current is not None and current.state is TaskState.waiting_for_approval
+
+        await wait_until(paused, "the reviewer never paused for approval")
+        status, answer = await _operator_call(client, daemon, task.id, surface, "complete", "gate")
+        after = await repo.get_task(db, task.id)
+        resolution = await within(waiting, "the reviewer's wait was never released")
+    finally:
+        await client.aclose()
+        await daemon.shutdown()
+
+    assert (status, answer["signaled"]) == (200, False)
+    assert after is not None and after.state is not TaskState.approved
+    assert resolution is not None
+    assert (resolution["status"], resolution["message"]) == ("failed", "not good enough")
+
+
+@pytest.mark.parametrize(("surface", "action"), _OPERATOR_ACTIONS)
+async def test_an_approval_after_a_live_wait_removed_its_waiters_leaves_nothing_to_claim(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str, action: str
+) -> None:
+    """An approve or node completion that lands after an approval released the run's wait (its
+    waiters removed) and before the run writes in_progress finds no waiter. The fallback stored
+    ``approved`` there, claimable beside the run; it writes and signals nothing now, and the run
+    goes on."""
+    released: list[int] = []
+    seen: list[tuple[int, object, TaskState | None, Any]] = []
+
+    async def approve(client: httpx.AsyncClient, daemon: Daemon, task: Task) -> None:
+        status, _ = await _operator_call(client, daemon, task.id, "rest", "approve")
+        released.append(status)
+
+    async def act_again(client: httpx.AsyncClient, daemon: Daemon, task: Task) -> None:
+        status, answer = await _operator_call(client, daemon, task.id, surface, action)
+        state, claimed = await _what_a_swarm_tick_finds(db, task)
+        seen.append((status, answer.get("signaled"), state, claimed))
+
+    task_id, provider = await _run_live_paused_at_the_developer(
+        db, tmp_path, monkeypatch, as_it_waits=approve, as_it_resumes=act_again
+    )
+
+    assert released == [200]
+    signaled = None if action == "approve" else False  # an approve's answer has no "signaled"
+    assert seen == [(200, signaled, TaskState.waiting_for_approval, None)]
+    await _assert_ran_once_to_done(db, task_id, provider)
+
+
+@pytest.mark.parametrize(("surface", "action"), _OPERATOR_ACTIONS)
+async def test_an_approval_resumes_a_waiting_task_whose_run_is_gone(
+    db: Database, tmp_path: Path, surface: str, action: str
+) -> None:
+    """A task stored waiting_for_approval that no run of this daemon waits for (the daemon
+    restarted while it waited): an approve or a node completion still stores ``approved``, so a
+    worker claims it and resumes it from its checkpoints."""
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    project = await repo.create_project(
+        db, name="t", path=str(tmp_path), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="r", state=TaskState.waiting_for_approval
+    )
+    await repo.save_task_checkpoint(
+        db, task_id=task.id, node_id="developer", attempt=1,
+        status=CheckpointStatus.waiting_for_approval,
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            status, answer = await _operator_call(client, daemon, task.id, surface, action)
+    finally:
+        await daemon.shutdown()
+
+    assert status == 200, answer
+    if action == "approve":
+        assert answer == {"approved": task.id}
+    else:
+        assert (answer["ok"], answer["signaled"]) == (True, False)
+    after = await repo.get_task(db, task.id)
+    assert after is not None and after.state is TaskState.approved
+    claimed = await repo.claim_next_approved(db, project.id)
+    assert claimed is not None and claimed.id == task.id
 
 
 async def test_runner_starts_no_dispatch_once_cancelled(db: Database, tmp_path: Path) -> None:

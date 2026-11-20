@@ -60,6 +60,18 @@ numbers; each shown first by a test that fails on the old code):
   lands first keeps the task approved (REST `409` naming the state, MCP `cancelled: false` with
   `state`).
 
+Resolved after the backlog follow-up (the former open item 4, shown first by tests that fail on
+the old code):
+- The other double-claim window: an approve or node completion that signalled no waiter of a task
+  read `waiting_for_approval` stored `approved` while the task's run was still live (completing a
+  node other than the one the run waits at, or an approval landing after a wait removed its
+  waiters and before the run wrote `in_progress`), which a `max_parallel_tasks` > 1 tick could
+  claim and run a second time. While the run is live (its cancel event registered), the four
+  fallbacks (REST approve and complete-node, MCP `conclave_approve_task` and
+  `conclave_complete_node`) signal the run's waiters instead (`release_or_approve`), with no
+  resolution stored for them, and write nothing between waits; each releases the waits it
+  released before. A task whose run is gone (a daemon restart) is still set `approved`.
+
 Open:
 
 1. [engine] Persona-first prompt order: only helps engines with prefix caching; Claude Code sends
@@ -67,9 +79,3 @@ Open:
 2. [engine] Staggered parallel reviewers (to spread a usage window): needs a measurement first.
 3. [web] The WebSocket stream has no `after_id` backfill and ignores the subscriber's gap flag; no
    contract promises replay (A3).
-4. [engine] Another double-claim window, found while fixing the former 5: completing a node other
-   than the one a running task waits at (REST or MCP complete-node) signals no waiter and falls
-   back to `approve_task`, so the task reads `approved` until the wait polls (up to 0.25 s) and a
-   `max_parallel_tasks` > 1 tick can claim it (shown by a throwaway probe, not fixed: it changes
-   complete-node semantics). A likely fix: when a run is waiting, release it by signalling its
-   waiters (as an approve does) instead of writing `approved`.

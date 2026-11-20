@@ -495,7 +495,11 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   waits for that pass; once that pass has run, the node's pass in a later attempt drops it
   instead of applying it, with a `log` event (`stage: operator_resolution_dropped`, `node_id`,
   `posted_attempt`, `attempt`). To decide an upcoming pass, arm a pause on it and complete it
-  there. `conclave_approve_task` applies to whatever is waiting.
+  there. `conclave_approve_task` applies to whatever is waiting. Completing a node that is not
+  paused also resumes the node the task is paused at, if any: that node takes the completion
+  posted for it, else completes. A task still `waiting_for_approval` after a daemon restart has
+  no run waiting (`waiting` is empty): an approve or a completion sets it `approved`, and the
+  worker resumes it from its checkpoints.
 - `conclave_cancel_task(task_id)`: stop a task (its worktree is cleaned up). What it runs stops at
   once, a dispatch or a setup, baseline or gate command (its process group is killed), and the
   task ends `cancelled`; a baseline stopped this way is not cached. `cancelled: false` means

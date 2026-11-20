@@ -521,6 +521,25 @@ class Orchestrator:
                     signaled = True
         return signaled
 
+    async def release_or_approve(self, task_id: str) -> None:
+        """Let *task_id* go on after an operator approve or node completion that found it
+        ``waiting_for_approval`` and signalled no waiter (:meth:`resolve_node` returned False).
+
+        While its run is live in this daemon (its cancel event registered), this signals every
+        approval waiter the run has now and stores no resolution for them: each waiting node
+        takes its own stored resolution, else completes. A run between waits gets nothing; the
+        resolution :meth:`resolve_node` stored applies when its node's pass takes it. Writing
+        ``approved`` for a live run would let a worker tick (``max_parallel_tasks`` > 1) claim
+        the task and run it a second time beside it. A task whose run is gone (the daemon
+        restarted while it waited) is set ``approved``, so a worker resumes it from its
+        checkpoints.
+        """
+        if task_id in self._cancel_events:
+            for waiter in self._approval_waiters.get(task_id, {}).values():
+                waiter.set()
+            return
+        await repo.approve_task(self._db, task_id)
+
     def _should_pause_after_node(
         self,
         task_id: str,
@@ -668,8 +687,9 @@ class Orchestrator:
             while not wait_ev.is_set():
                 if cancel_event is not None and cancel_event.is_set():
                     break
-                # Also allow external DB state transition (e.g. approve_task flipping state
-                # from waiting_for_approval -> approved) to release the pause.
+                # Also allow external DB state transition to release the pause, e.g. the
+                # ``approved`` an operator approval stores for a run with no registered cancel
+                # event (see release_or_approve; a registered run is signalled instead).
                 cur_task = await repo.get_task(self._db, task.id)
                 if cur_task is not None and cur_task.state in (
                     TaskState.approved,

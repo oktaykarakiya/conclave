@@ -555,6 +555,12 @@ class Daemon:
             attempt=attempt,
         )
 
+    async def release_or_approve(self, task_id: str) -> None:
+        """Let *task_id*, read ``waiting_for_approval``, go on after an approval that signalled
+        no waiter: signal the waits of its run when that is live in this daemon, else set it
+        ``approved`` (:meth:`Orchestrator.release_or_approve` decides)."""
+        await self.orchestrator.release_or_approve(task_id)
+
     def set_hitl_checkpoint(self, task_id: str, target_id: str, enabled: bool) -> list[str]:
         """Dynamically arm or disarm a HITL pause on *target_id* (node_id or edge_id)."""
         return self.orchestrator.set_hitl_checkpoint(task_id, target_id, enabled)

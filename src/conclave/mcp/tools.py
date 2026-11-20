@@ -2214,7 +2214,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         if task.state == TaskState.waiting_for_approval:
             signaled = daemon.resolve_node(task.id, "*", status="completed")
             if not signaled:
-                await repo.approve_task(daemon.db, task.id)
+                await daemon.release_or_approve(task.id)
             await daemon.bus.emit(
                 type=EventType.task_approved,
                 project_id=task.project_id,
@@ -2346,7 +2346,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             attempt=attempt,
         )
         if not signaled and task.state == TaskState.waiting_for_approval:
-            await repo.approve_task(daemon.db, task.id)
+            await daemon.release_or_approve(task.id)
         await daemon.bus.emit(
             type=EventType.hitl_resolved,
             project_id=task.project_id,

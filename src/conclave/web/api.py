@@ -855,7 +855,7 @@ async def approve_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> di
     if task.state == TaskState.waiting_for_approval:
         signaled = daemon.resolve_node(task_id, "*", status="completed")
         if not signaled:
-            await repo.approve_task(daemon.db, task_id)
+            await daemon.release_or_approve(task_id)
         await daemon.bus.emit(type=EventType.task_approved, task_id=task_id)
         return {"approved": task_id}
     updated = await repo.approve_task(daemon.db, task_id)
@@ -1104,7 +1104,7 @@ async def complete_task_node(
         attempt=attempt,
     )
     if not signaled and task.state == TaskState.waiting_for_approval:
-        await repo.approve_task(daemon.db, task_id)
+        await daemon.release_or_approve(task_id)
 
     summary_text = (
         f"Node '{clean_node}' marked {cp_status.value}"
