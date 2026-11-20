@@ -64,11 +64,23 @@ full gate is green.
   - W19 the audits' follow-ups: isolation no settings file can undo, reviewers that cannot disturb
     each other unseen, retry bounds that bind, operator SQL that cannot stall the daemon or read
     secrets (`specs/w19_audit_followups.md`).
+- Run 3, part 3 (2026-11-20), the backlog's leftovers (`RESULTS.md`, run 3 part 3):
+  - W20 reviewers told which failures predate the task; unknown ids answer 404 on REST; a cancel
+    that cannot overwrite an approval; operator overrides scoped to their attempt; no double claim
+    while a wait is announced; one lock for every workflow-graph writer
+    (`specs/w20_backlog_leftovers.md`);
+  - W21 the test suite passes on a loaded host: every wait for background work polls for its
+    condition (`specs/w21_deterministic_waits.md`);
+  - W22 no operator action writes `approved` for a task whose run is live
+    (`specs/w22_live_run_never_approved.md`);
+  - W23 a complete event stream: replay after a reconnect, gaps announced, the SPA handles every
+    event; the SPA's first unit tests (`specs/w23_event_stream_completeness.md`).
 
 ## Remaining work, in order (one task at a time, pilot review before each merge)
 
-1. The open items in `backlog.md` (two deferred from earlier runs, seven reported by the audits
-   and not demonstrated or out of their scope).
+1. The two open items in `backlog.md`, each waiting on an outside resource: a persona-first
+   prompt-order A/B (needs a funded DeepSeek account) and staggered parallel reviewers (needs a
+   usage measurement first).
 
 ## Run 3 (2026-11-17/18): worker isolation, usage limits, review completeness, backlog
 
@@ -94,6 +106,10 @@ then merges; deploy between waves when the daemon's other project is idle):
 | C | W16 interaction-log retention and honest export (`specs/w16_interaction_log_retention.md`) | 38.5 MB never pruned; a JSONL file named `.parquet` rewritten after every dispatch |
 | D | audits A1 providers, A2 engine, A3 MCP/web/database (`specs/a1..a3`): Conclave hunts for defects, fixes each one it can demonstrate with a failing test | "all flaws fixed, even newly discovered ones" |
 | D | W19 audit follow-ups (`specs/w19_audit_followups.md`) | found while piloting the audits: parallel reviewers swapped files in the shared worktree under another reviewer's test run; a repository settings file could undo worker isolation; `review_rounds_max` and `max_iterations` bound nothing; plus A1–A3's leftovers |
+| E | W20 backlog leftovers (`specs/w20_backlog_leftovers.md`) | backlog 3–7 and 9, each demonstrated first: reviewers blamed pre-existing failures on the diff; `DELETE /api/projects/<unknown>` answered 200 and emitted `project.deleted`; a cancel could overwrite an approval; an override could apply to a later attempt; an approve could let a parallel tick claim a running task; REST and the evolver could undo MCP graph edits |
+| E | W21 deterministic waits (`specs/w21_deterministic_waits.md`) | found live: with another project compiling on the host, a planning test failed on every run, on master too (a fixed 0.1 s sleep before asserting background work) |
+| E | W22 live runs never approved (`specs/w22_live_run_never_approved.md`) | found by W20: completing another node, or an approval between two waits, wrote `approved` for a live run |
+| E | W23 event stream completeness (`specs/w23_event_stream_completeness.md`) | backlog's WebSocket item, checked: the SPA handled only the last event of a burst, a reconnect lost what was emitted meanwhile, an overflow went unannounced |
 
 Deferred with reasons: persona-first prompt order (it only helps prefix-cached engines; Claude Code
 sends the prompt as one block, so there is nothing to gain there, and a DeepSeek A/B needs a funded

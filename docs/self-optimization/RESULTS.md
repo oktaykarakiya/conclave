@@ -196,3 +196,64 @@ isolated invocation with its inline `--settings` (one Haiku call answered normal
 
 ² W19's planner at `high` on a spec the pilot had verified line by line (A1–A3's planners ran at
 `max`: 10–11.55). Run 3 in all: 15 tasks, 406.68 reported.
+
+## Run 3, part 3 (2026-11-20) — the backlog's leftovers (W20–W23)
+
+After the audits the backlog held nine open items. Two wait on outside resources and stay open: a
+persona-first prompt-order A/B needs a funded DeepSeek account, and staggered parallel reviewers
+need a usage measurement first. The rest were fixed in four tasks, each item first demonstrated by
+a test that fails on the old code. W20 ran with the planner (two of its items were only suspected
+and had to be reproduced first). W21–W23 ran without it, because the pilot had checked against the
+code everything their specs named. Every task passed on its first attempt.
+
+| Task | Attempts | Fixed | Tests after | Reported cost (planner / developer / reviewers) |
+|---|---|---|---|---|
+| W20 backlog leftovers | 1 | 6 items | 1471 (+1 skipped) | 9.58 / 11.74 / 9.23 |
+| W21 deterministic waits | 1 | every fixed wait in 18 test files | 1476 (+1 skipped) | – / 14.20 / 7.57 |
+| W22 live runs never approved | 1 | 1 | 1488 (+1 skipped) | – / 6.28 / 4.50 |
+| W23 event stream completeness | 1 | 3 | 1520 (+1 skipped), 15 SPA | – / 10.74 / 7.07 |
+
+What changed:
+- W20 fixed six items. W20's planner reproduced all six on HEAD before planning, including the
+  two that were only suspected.
+  - Reviewers now get the baseline's pre-existing failures, so they no longer blame those on the
+    diff.
+  - An unknown id answers 404 on REST, where MCP already answered `isError`: tasks, quarantine,
+    events and verdicts, project delete, pause and resume. A project delete for an unknown id had
+    emitted `project.deleted` for a project that never existed. The SPA now treats a 404 on
+    detach as already detached.
+  - The cancel fallback for a task waiting for approval is now conditional, so it cannot
+    overwrite an approval.
+  - An operator's node completion applies only to the attempt it was posted for. One posted for
+    an earlier attempt is dropped with a `log` event.
+  - The approval waiter is registered before the task reads `waiting_for_approval`, so an
+    approval landing meanwhile cannot let a parallel tick claim the running task.
+  - Every writer of a workflow graph takes one lock: MCP edits, REST `PUT`, the evolver,
+    templates, reverts and config writes.
+- W21 makes the suite pass on a loaded host.
+  - Found live: while another project compiled on the host (load average about 40), a planning
+    test failed on every run, on master too. It slept a fixed 0.1 s, then asserted that background
+    work had happened. The full suite took 24 minutes instead of 6.
+  - Every wait for background work now polls for its condition through one helper,
+    `tests/waits.py`. Its 60 s deadline only bounds a failure.
+  - The complexity check compares two input sizes on CPU time instead of an absolute time.
+  - The pilot's check: with pytest and two busy loops pinned to one core, master's test failed
+    2 runs of 3, while W21 passed 3 of 3 and its full suite passed (1,475 passed in 26 minutes).
+- W22: found by W20. Completing a node other than the one a live run waits at, or an approval
+  landing between two waits, fell back to writing `approved` for a running task. While the run
+  is live, the four fallbacks now signal its waits instead (`release_or_approve`). A task whose
+  run is gone (after a daemon restart) is still set `approved`, so a worker resumes it.
+- W23: the backlog's WebSocket item, checked, was a real defect with two more behind it:
+  - the SPA reacted only to the last event of a burst (an effect over React state holding the
+    latest event);
+  - a reconnect lost what was emitted meanwhile;
+  - the bus's overflow flag was never sent.
+
+  The fixes:
+  - `/ws/stream` and SSE `/api/events/stream` replay the persisted events after `after_id`,
+    capped at 1,000. SSE also takes `Last-Event-ID` and sends `id:` lines.
+  - A `stream.gap` frame marks lost events.
+  - The SPA handles each event through stream listeners and refetches on a gap.
+  - The SPA has its first unit tests: vitest in the node environment, on a pure module.
+
+No usage limit was hit in this part. Run 3 in all: 19 tasks, 487.58 reported.

@@ -74,14 +74,20 @@ def test_focus_marker_findings_unchanged() -> None:
 
 
 def test_focus_marker_scan_is_linear() -> None:
-    small = _focus_change(4_000)
-    t = time.perf_counter()
-    assert len(integrity_findings([small])) == 4_000
-    assert time.perf_counter() - t < 0.8, "4k markers already slow (master: ~2.3 s)"
-    big = _focus_change(20_000)
-    t = time.perf_counter()
-    assert len(integrity_findings([big])) == 20_000
-    assert time.perf_counter() - t < 2.0
+    """5x the markers must cost well under 25x the time (a quadratic scan's ratio), measured on
+    this host against itself, so a loaded machine does not fail it (best of three runs each)."""
+
+    def best(n: int) -> float:
+        change = _focus_change(n)
+        times = []
+        for _ in range(3):
+            t = time.perf_counter()
+            assert len(integrity_findings([change])) == n
+            times.append(time.perf_counter() - t)
+        return min(times)
+
+    small, big = best(4_000), best(20_000)
+    assert big < 12 * small, f"4k: {small:.3f}s, 20k: {big:.3f}s (linear ~5x, quadratic ~25x)"
 
 
 # --- 1. concurrent merges --------------------------------------------------------------------
