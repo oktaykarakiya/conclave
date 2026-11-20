@@ -39,22 +39,37 @@ Resolved in run 3 (see `README.md`, `RESULTS.md`):
   read-only connection with a deadline and no access to secrets; unknown attach presets refused;
   the stdio bridge never answers a notification (W19).
 
+Resolved in the backlog follow-up after run 3 (the former open items 3-7 and 9, by their old
+numbers; each shown first by a test that fails on the old code):
+- 3: an operator node completion applies only to the node's pass in the attempt it was posted
+  for (the REST body's `attempt`, else the node's latest checkpoint attempt); one whose pass has
+  run is dropped by the next attempt's pass with a `log` event (`operator_resolution_dropped`).
+  Before, an operator pass meant for attempt 1's rejected review also passed attempt 2's.
+- 4: every reviewer prompt (parallel, sequential, any reviewer node, re-runs) carries the baseline
+  preamble when the baseline has failures, fitted per reviewer like the developer's.
+- 5: the approval waiter is registered before the task reads `waiting_for_approval`, so an
+  approve while the wait is announced signals the run instead of storing `approved`, which a
+  `max_parallel_tasks` > 1 tick claimed and ran a second time.
+- 6: REST answers 404 for an unknown project or task id on the tasks, quarantine, events and
+  verdicts lists, project delete and pause/resume, and emits nothing (the SPA's Detach treats a
+  404 as already detached).
+- 7: every writer of a workflow graph (REST `PUT /workflow`, config and global writes, the MCP
+  graph tools, the evolver's compare-and-apply) runs under one `graph_edit_lock` per database,
+  so a race ends in one of the serial outcomes.
+- 9: the cancel fallback for a task waiting for approval is a conditional write; an approval that
+  lands first keeps the task approved (REST `409` naming the state, MCP `cancelled: false` with
+  `state`).
+
 Open:
 
 1. [engine] Persona-first prompt order: only helps engines with prefix caching; Claude Code sends
    the prompt as one block. Needs an A/B on a funded DeepSeek account.
 2. [engine] Staggered parallel reviewers (to spread a usage window): needs a measurement first.
-3. [engine] An operator node override posted while the node is not paused is stored without an
-   attempt, so it can apply to a later pause of that node (A2, suspected).
-4. [engine] Reviewers never get the baseline preamble, although `baseline.py` says the snapshot
-   exists for them: a prompt decision (A2).
-5. [engine] Swarm double-claim window: an approve landing between the waiting state and the
-   waiter's registration could let a parallel tick claim the task (A2, not reproduced).
-6. [web] Several REST endpoints answer 200 with an empty or false result for an unknown id where
-   MCP answers `isError` (tasks, quarantine, events, project delete, pause/resume) (A3).
-7. [web] Whole-graph writers stay last-writer-wins: MCP graph edits against REST
-   `PUT /workflow` and the evolver's compare-and-apply (A3).
-8. [web] The WebSocket stream has no `after_id` backfill and ignores the subscriber's gap flag; no
+3. [web] The WebSocket stream has no `after_id` backfill and ignores the subscriber's gap flag; no
    contract promises replay (A3).
-9. [web] The cancel fallback for a task waiting for approval writes its state unconditionally, the
-   shape A3 fixed for pending tasks (A3, not demonstrated).
+4. [engine] Another double-claim window, found while fixing the former 5: completing a node other
+   than the one a running task waits at (REST or MCP complete-node) signals no waiter and falls
+   back to `approve_task`, so the task reads `approved` until the wait polls (up to 0.25 s) and a
+   `max_parallel_tasks` > 1 tick can claim it (shown by a throwaway probe, not fixed: it changes
+   complete-node semantics). A likely fix: when a run is waiting, release it by signalling its
+   waiters (as an approve does) instead of writing `approved`.

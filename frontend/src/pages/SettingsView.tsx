@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { api } from "../api";
+import { ApiError, api } from "../api";
 import { diffConfig, isEmptyDiff, isPlainObject } from "../configDiff";
 import type { Integrity, Quarantine } from "../types";
 import { Badge, Button, Card, Spinner, input } from "../ui";
@@ -292,6 +292,11 @@ export function SettingsView({
       await api.detachProject(projectId);
       onProjectDeleted?.();
     } catch (err) {
+      // Already detached elsewhere (another tab, MCP) while this page was open: done too.
+      if (err instanceof ApiError && err.status === 404) {
+        onProjectDeleted?.();
+        return;
+      }
       setNotice({ kind: "err", text: String(err) });
       setDetaching(false);
     }

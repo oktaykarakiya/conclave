@@ -8,6 +8,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -15,8 +16,8 @@ from fake_provider import FakeProvider
 from httpx import ASGITransport
 
 from conclave.bootstrap import seed_global_defaults
-from conclave.config import load_project_config
-from conclave.db import Database, TaskState
+from conclave.config import load_project_config, resolve_project_config
+from conclave.db import CheckpointStatus, Database, TaskState
 from conclave.db import repositories as repo
 from conclave.engine import Orchestrator, run_git
 from conclave.engine.gate import GateResult
@@ -28,6 +29,7 @@ from conclave.engine.orchestrator import (
 from conclave.engine.project_rules import ProjectRules
 from conclave.engine.runner import AgentRunner
 from conclave.events import EventBus
+from conclave.mcp.tools import call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 from conclave.runtime import Daemon
 from conclave.web import create_app
@@ -1921,6 +1923,251 @@ async def test_a_node_reached_after_a_cancel_does_not_wait_for_approval(
     final = await repo.get_task(db, task.id)
     assert final is not None
     assert final.state is TaskState.cancelled
+
+
+# --- operator node completions apply to the attempt they were posted for -----------------
+
+_SECURITY_REJECTS = AgentResult(
+    ok=True,
+    text='```json\n{"verdict": "fail", "reason": "leaks a token", "evidence": []}\n```',
+    model_reported="fake",
+)
+
+
+class _ActsAsTheRetryStarts(FakeProvider):
+    """Runs ``act`` (what the operator does meanwhile) once, as the developer's second dispatch
+    (the retry) starts."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.act: Callable[[], Awaitable[None]] | None = None
+        self.developer_runs = 0
+
+    async def run_agent(
+        self,
+        *,
+        profile: ResolvedProfile,
+        prompt: str,
+        timeout_seconds: int,
+        cwd: Path | None = None,
+        on_chunk: OnChunk | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentResult:
+        if self.role_of(prompt) == "developer":
+            self.developer_runs += 1
+            if self.developer_runs == 2 and self.act is not None:
+                await self.act()
+        return await super().run_agent(
+            profile=profile, prompt=prompt, timeout_seconds=timeout_seconds, cwd=cwd,
+            on_chunk=on_chunk, cancel_event=cancel_event,
+        )
+
+
+async def _dropped_resolutions(db: Database, task_id: str) -> list[dict[str, Any]]:
+    events = await repo.list_events(db, task_id=task_id, limit=10_000)
+    return [
+        e.payload for e in events
+        if e.type == "log" and e.payload.get("stage") == "operator_resolution_dropped"
+    ]
+
+
+async def test_an_override_posted_for_one_attempt_never_decides_the_next(
+    db: Database, tmp_path: Path
+) -> None:
+    """Backlog 3: completing a node that is not paused stored the resolution without its
+    attempt, and the node's next pass consumed it. The operator accepts attempt 1's rejected
+    security review while the retry runs: attempt 2's own rejection must stand."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    provider = _ActsAsTheRetryStarts(replies={"reviewer:security": [_SECURITY_REJECTS]})
+    daemon = Daemon(db, tmp_path / "home", provider, workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    answers: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            project = await repo.create_project(
+                db, name="t", path=str(repo_path), default_branch="main",
+                config={
+                    "execution": _UNGATED_EXECUTION,
+                    "agent_overrides": {"developer": {"max_retries": 2}},
+                },
+            )
+            task = await repo.create_task(
+                db, project_id=project.id, request="add a feature file",
+                state=TaskState.approved,
+            )
+
+            async def accept_attempt_1() -> None:
+                resp = await client.post(
+                    f"/api/tasks/{task.id}/nodes/security/complete",
+                    json={"status": "completed", "message": "acceptable for this attempt"},
+                )
+                assert resp.status_code == 200, resp.text
+                answers.append(resp.json())
+
+            provider.act = accept_attempt_1
+            claimed = await repo.claim_next_approved(db, project.id)
+            assert claimed is not None
+            ok = await daemon.orchestrator.process_task(claimed)
+    finally:
+        await daemon.shutdown()
+
+    assert provider.developer_runs == 2
+    assert [(a["signaled"], a["checkpoint"]["attempt"]) for a in answers] == [(False, 1)]
+    assert ok is False
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state is TaskState.failed
+    security = [
+        (v.attempt, v.verdict, v.source)
+        for v in await repo.list_verdicts(db, task.id)
+        if v.agent == "security"
+    ]
+    assert security == [(1, "fail", "json"), (2, "fail", "json")]
+    dropped = await _dropped_resolutions(db, task.id)
+    assert [(d["node_id"], d["posted_attempt"], d["attempt"], d["status"]) for d in dropped] == [
+        ("security", 1, 2, "completed")
+    ]
+
+
+async def _reviewer_waits_setup(
+    db: Database, tmp_path: Path
+) -> tuple[Daemon, httpx.AsyncClient, Any, Any]:
+    """A daemon, its REST client, an in_progress task whose reviewer finished attempt 1, and
+    the project's config (no pause armed anywhere)."""
+    daemon = Daemon(db, tmp_path / "home", FakeProvider(), workers_enabled=False)
+    client = httpx.AsyncClient(
+        transport=ASGITransport(app=create_app(daemon, manage_lifecycle=False)),
+        base_url="http://test",
+    )
+    project = await repo.create_project(
+        db, name="t", path=str(tmp_path), default_branch="main",
+        config={"execution": _UNGATED_EXECUTION},
+    )
+    task = await repo.create_task(
+        db, project_id=project.id, request="r", state=TaskState.in_progress
+    )
+    await repo.save_task_checkpoint(
+        db, task_id=task.id, node_id="reviewer", attempt=1, status=CheckpointStatus.completed,
+        artifact={"agent": "reviewer", "verdict": "fail", "reason": "missing tests"},
+    )
+    return daemon, client, task, await resolve_project_config(db, project)
+
+
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+async def test_a_node_completion_posted_for_an_earlier_attempt_is_dropped(
+    db: Database, tmp_path: Path, surface: str
+) -> None:
+    daemon, client, task, config = await _reviewer_waits_setup(db, tmp_path)
+    try:
+        if surface == "rest":
+            resp = await client.post(
+                f"/api/tasks/{task.id}/nodes/reviewer/complete",
+                json={"status": "failed", "message": "not good enough"},
+            )
+            assert resp.status_code == 200, resp.text
+            signaled = resp.json()["signaled"]
+        else:
+            answer = await call_mcp_tool(
+                daemon, "conclave_complete_node",
+                {"task_id": task.id, "node_id": "reviewer", "status": "failed",
+                 "message": "not good enough"},
+            )
+            signaled = answer["signaled"]
+        assert signaled is False  # the reviewer is not paused: the resolution is stored
+
+        orchestrator = daemon.orchestrator
+        assert await orchestrator._await_human_approval(task, "reviewer", 2, config) is None
+        assert await orchestrator._await_human_approval(task, "reviewer", 2, config) is None
+    finally:
+        await client.aclose()
+        await daemon.shutdown()
+
+    dropped = await _dropped_resolutions(db, task.id)
+    assert len(dropped) == 1
+    assert {k: dropped[0][k] for k in ("node_id", "posted_attempt", "attempt", "status")} == {
+        "node_id": "reviewer", "posted_attempt": 1, "attempt": 2, "status": "failed"
+    }
+    assert "attempt 1" in dropped[0]["message"]
+
+
+async def test_a_node_completion_applies_only_to_the_attempt_it_was_posted_for(
+    db: Database, tmp_path: Path
+) -> None:
+    daemon, client, task, config = await _reviewer_waits_setup(db, tmp_path)
+    orchestrator = daemon.orchestrator
+    try:
+        for attempt, message in ((2, "fine for 2"), (3, "fine for 3")):
+            resp = await client.post(
+                f"/api/tasks/{task.id}/nodes/reviewer/complete",
+                json={"status": "completed", "message": message, "attempt": attempt},
+            )
+            assert resp.status_code == 200, resp.text
+            if attempt == 2:
+                taken = await orchestrator._await_human_approval(task, "reviewer", 2, config)
+                assert taken is not None and taken["message"] == "fine for 2"
+
+        # Posted for attempt 3: attempt 2's pass leaves it stored for its own attempt.
+        assert await orchestrator._await_human_approval(task, "reviewer", 2, config) is None
+        taken = await orchestrator._await_human_approval(task, "reviewer", 3, config)
+        assert taken is not None and taken["message"] == "fine for 3"
+    finally:
+        await client.aclose()
+        await daemon.shutdown()
+
+    assert await _dropped_resolutions(db, task.id) == []
+
+
+async def test_an_approve_while_the_wait_is_announced_reaches_the_run_and_leaves_nothing_to_claim(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backlog 5: the task was set waiting_for_approval and its waiter registered only after two
+    events. An approve in between found no waiter, so it stored ``approved``, and a swarm tick
+    (max_parallel_tasks > 1) could claim the still-running task and run it a second time."""
+    repo_path = tmp_path / "repo"
+    await _init_repo(repo_path)
+    provider = FakeProvider()
+    daemon = Daemon(db, tmp_path / "home", provider, workers_enabled=False)
+    app = create_app(daemon, manage_lifecycle=False)
+    window: list[tuple[int, TaskState | None, object]] = []
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            project = await repo.create_project(
+                db, name="t", path=str(repo_path), default_branch="main",
+                config={"execution": {**_UNGATED_EXECUTION, "max_parallel_tasks": 2}},
+            )
+            task = await repo.create_task(
+                db, project_id=project.id, request="add a feature file",
+                state=TaskState.approved,
+            )
+            real_emit = daemon.bus.emit
+
+            async def emit(**kwargs: Any) -> Any:
+                row = await real_emit(**kwargs)
+                if str(kwargs.get("type")) == "node.waiting_for_approval" and not window:
+                    # The operator approves as the wait is announced; a swarm tick follows.
+                    resp = await client.post(f"/api/tasks/{task.id}/approve")
+                    now = await repo.get_task(db, task.id)
+                    second = await repo.claim_next_approved(db, project.id, max_parallel=2)
+                    window.append((resp.status_code, now.state if now else None, second))
+                return row
+
+            monkeypatch.setattr(daemon.bus, "emit", emit)
+            daemon.set_hitl_checkpoint(task.id, "developer", True)
+            claimed = await repo.claim_next_approved(db, project.id, max_parallel=2)
+            assert claimed is not None
+            ok = await asyncio.wait_for(daemon.orchestrator.process_task(claimed), timeout=60)
+    finally:
+        await daemon.shutdown()
+
+    assert window == [(200, TaskState.waiting_for_approval, None)]
+    assert ok is True
+    final = await repo.get_task(db, task.id)
+    assert final is not None and final.state is TaskState.done
+    assert len([p for p in provider.prompts if "You are the developer agent of" in p]) == 1
 
 
 async def test_runner_starts_no_dispatch_once_cancelled(db: Database, tmp_path: Path) -> None:

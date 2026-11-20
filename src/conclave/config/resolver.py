@@ -24,6 +24,7 @@ but fully typed and validated.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -369,6 +370,26 @@ def _config_write_lock(db: Database) -> asyncio.Lock:
     return lock
 
 
+# Every writer of a project's workflow graph runs under its Database's graph edit lock, taken
+# before the config write lock (lock order: graph, config, database). A graph edit reads the
+# workflow, changes it and saves the whole graph, so another write landing between its read and
+# its save would be undone by it, or undo it. The config writers here take it themselves; a
+# caller that reads a graph and saves a change of it (the MCP graph edits, the evolver's
+# compare-and-apply) holds it across both and saves with ``graph_locked=True``. Held weakly per
+# Database and not re-entrant, like the config write lock.
+_GRAPH_WRITE_LOCKS: weakref.WeakKeyDictionary[Database, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def graph_edit_lock(db: Database) -> asyncio.Lock:
+    """The lock every write of *db*'s project workflow graphs runs under (see above)."""
+    lock = _GRAPH_WRITE_LOCKS.get(db)
+    if lock is None:
+        lock = _GRAPH_WRITE_LOCKS[db] = asyncio.Lock()
+    return lock
+
+
 class ProjectAlreadyAttachedError(ValueError):
     """An attach of a path that is already attached; *project* is the project attached there."""
 
@@ -410,6 +431,7 @@ async def _write_project_config(
     workflow_reason: str | None = None,
     approves_proposal: str | None = None,
     decision_reason: str | None = None,
+    graph_locked: bool = False,
 ) -> tuple[ConclaveConfig, WorkflowVersion | None]:
     """The one write of a project's stored layer, so no path can skip workflow versioning.
 
@@ -417,11 +439,13 @@ async def _write_project_config(
     version (the graph before and after it) in the same transaction; with
     *approves_proposal* that proposal is marked approved in it too. The write applies to the
     project's current row, read under the config write lock, never to the caller's possibly
-    stale *project*; ``ValueError`` when the project no longer exists.
+    stale *project*; ``ValueError`` when the project no longer exists. It runs under the graph
+    edit lock, which a caller that holds it already says with *graph_locked*.
     """
     from ..db import repositories as repo
 
-    async with _config_write_lock(db):
+    graph_guard = contextlib.nullcontext() if graph_locked else graph_edit_lock(db)
+    async with graph_guard, _config_write_lock(db):
         current = await repo.get_project(db, project.id)
         if current is None:
             raise ValueError(f"project not found: {project.id}")
@@ -529,6 +553,7 @@ async def save_project_workflow(
     reason: str,
     approves_proposal: str | None = None,
     decision_reason: str | None = None,
+    graph_locked: bool = False,
 ) -> tuple[ConclaveConfig, WorkflowVersion | None]:
     """Replace *project*'s workflow (``None`` derives it from the agents policy, even over a
     global custom workflow).
@@ -536,6 +561,7 @@ async def save_project_workflow(
     Returns ``(effective config, version)``; the version is ``None`` when the workflow did
     not change. With *approves_proposal*, that pending proposal is marked approved in the same
     transaction (:class:`~conclave.db.WorkflowConflictError` when it is no longer pending).
+    *graph_locked*: the caller holds :func:`graph_edit_lock` (it read the graph it changes).
     """
     return await _write_project_config(
         db,
@@ -545,6 +571,7 @@ async def save_project_workflow(
         workflow_reason=reason,
         approves_proposal=approves_proposal,
         decision_reason=decision_reason,
+        graph_locked=graph_locked,
     )
 
 
@@ -606,7 +633,8 @@ async def save_global_config(
     """
     norm_patch: dict[str, Any] = normalize_config_keys(patch or {})
     clean_unset = validate_unset_paths(unset)
-    async with _config_write_lock(db):
+    # The global layer is part of every project's graph (and an apply to all writes each one).
+    async with graph_edit_lock(db), _config_write_lock(db):
         return await _save_global_config_locked(
             db,
             norm_patch,

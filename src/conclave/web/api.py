@@ -368,6 +368,7 @@ async def get_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -> 
 
 @router.delete("/projects/{project_id}")
 async def detach_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, str]:
+    await _require_project(daemon, project_id)
     await daemon.stop_worker(project_id)
     await daemon.cleanup_in_progress_work(project_id)
     await repo.delete_project(daemon.db, project_id)
@@ -493,11 +494,13 @@ async def patch_config(
 
 @router.post("/projects/{project_id}/pause")
 async def pause_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, bool]:
+    await _require_project(daemon, project_id)
     return {"paused": daemon.set_paused(project_id, True)}
 
 
 @router.post("/projects/{project_id}/resume")
 async def resume_project(project_id: str, daemon: Daemon = Depends(get_daemon)) -> dict[str, bool]:
+    await _require_project(daemon, project_id)
     return {"running": daemon.set_paused(project_id, False)}
 
 
@@ -767,6 +770,7 @@ async def list_quarantine(
     pagination: PaginationParams = Depends(_pagination),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[QuarantineEntry]:
+    await _require_project(daemon, project_id)
     return await repo.list_quarantine(
         daemon.db, project_id, limit=pagination.limit, offset=pagination.offset
     )
@@ -806,6 +810,7 @@ async def list_tasks(
     pagination: PaginationParams = Depends(_pagination),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[Task]:
+    await _require_project(daemon, project_id)
     return await repo.list_tasks(
         daemon.db, project_id, state, limit=pagination.limit, offset=pagination.offset
     )
@@ -880,9 +885,18 @@ async def cancel_task(task_id: str, daemon: Daemon = Depends(get_daemon)) -> dic
         if cancelled:
             return {"cancelled": True}
         if task.state == TaskState.waiting_for_approval:
-            await repo.set_task_state(daemon.db, task_id, TaskState.cancelled)
-            await daemon.bus.emit(type=EventType.task_cancelled, task_id=task_id)
-            return {"cancelled": True}
+            if await repo.cancel_task_if_waiting(daemon.db, task_id):
+                await daemon.bus.emit(type=EventType.task_cancelled, task_id=task_id)
+                return {"cancelled": True}
+            # An approval (or another cancel) landed after the read: answer for its state now.
+            task = await _require_task(daemon, task_id)
+            if task.state == TaskState.cancelled:
+                return {"cancelled": True}
+            raise HTTPException(
+                status_code=409,
+                detail=f"task is now {task.state.value}, not cancelled — refresh and retry if "
+                "needed",
+            )
         # The task finished between the state check and the cancel request — the
         # event was already cleaned up. Report what actually happened.
         updated = await repo.get_task(daemon.db, task_id)
@@ -1087,6 +1101,7 @@ async def complete_task_node(
         verdict=body.verdict,
         output=body.output,
         edge_id=body.edge_id,
+        attempt=attempt,
     )
     if not signaled and task.state == TaskState.waiting_for_approval:
         await repo.approve_task(daemon.db, task_id)
@@ -1195,6 +1210,7 @@ async def list_task_events(
     after_id: int = Query(0, ge=0, le=SQLITE_INT_MAX),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[EventRow]:
+    await _require_task(daemon, task_id)
     return await repo.list_events(daemon.db, task_id=task_id, after_id=after_id)
 
 
@@ -1261,6 +1277,7 @@ async def list_task_verdicts(
     pagination: PaginationParams = Depends(_pagination),
     daemon: Daemon = Depends(get_daemon),
 ) -> list[VerdictRow]:
+    await _require_task(daemon, task_id)
     return await repo.list_verdicts(
         daemon.db, task_id, limit=pagination.limit, offset=pagination.offset
     )

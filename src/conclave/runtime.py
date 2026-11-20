@@ -540,8 +540,10 @@ class Daemon:
         verdict: str | None = None,
         output: str | None = None,
         edge_id: str | None = None,
+        attempt: int | None = None,
     ) -> bool:
-        """Approve/complete or override a node or HITL connector on *task_id*."""
+        """Approve/complete or override a node or HITL connector on *task_id* (for the node's
+        pass in *attempt* only, when given)."""
         return self.orchestrator.resolve_node(
             task_id,
             node_id,
@@ -550,6 +552,7 @@ class Daemon:
             verdict=verdict,
             output=output,
             edge_id=edge_id,
+            attempt=attempt,
         )
 
     def set_hitl_checkpoint(self, task_id: str, target_id: str, enabled: bool) -> list[str]:

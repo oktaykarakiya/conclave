@@ -966,3 +966,118 @@ async def test_concurrent_mcp_graph_edits_keep_every_change(
     assert [is_error for is_error, _ in results] == [False, False], results
     nodes = {node["id"] for node in (await _live(client, project.id))["workflow"]["nodes"]}
     assert {"sec-a", "sec-b"} <= nodes
+
+
+# --- whole-graph writers take the graph edit lock too -------------------------------------
+
+
+def _without_node(graph: dict[str, Any], node_id: str) -> dict[str, Any]:
+    """*graph* without node *node_id* and the edges that touch it."""
+    return {
+        **graph,
+        "nodes": [n for n in graph["nodes"] if n["id"] != node_id],
+        "edges": [e for e in graph["edges"] if node_id not in (e["source"], e["target"])],
+    }
+
+
+def _has_node(graph: dict[str, Any], node_id: str) -> bool:
+    return any(n["id"] == node_id for n in graph["nodes"])
+
+
+async def _edit_stopped_after_its_read(
+    daemon: Daemon, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[asyncio.Task[tuple[bool, Any]], asyncio.Event]:
+    """Start an MCP upsert of node ``sec-x`` that stops right after it read the workflow;
+    return the running call and the event that lets it go on to save."""
+    from conclave.mcp import tools as tools_module
+
+    real_resolve = tools_module._resolve_active_workflow
+    read, release = asyncio.Event(), asyncio.Event()
+
+    async def read_then_wait(daemon: Daemon, project: Project) -> Any:
+        graph = await real_resolve(daemon, project)
+        read.set()
+        await release.wait()
+        return graph
+
+    monkeypatch.setattr(tools_module, "_resolve_active_workflow", read_then_wait)
+    edit = asyncio.create_task(
+        _mcp(
+            daemon,
+            "conclave_workflow_upsert_node",
+            {"project_id": pid, "id": "sec-x", "kind": "reviewer", "agent": "security"},
+        )
+    )
+    await asyncio.wait_for(read.wait(), timeout=10)
+    return edit, release
+
+
+async def test_an_mcp_graph_edit_racing_a_rest_put_ends_in_a_serial_outcome(
+    client: httpx.AsyncClient,
+    daemon: Daemon,
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backlog 7: REST's whole-graph PUT did not take the graph edit lock, so a PUT that landed
+    between an MCP edit's read and its save was silently undone by that save. Now the result is
+    one of the two serial outcomes: the edit then the PUT, or the PUT then the edit."""
+    project = await _project(db, tmp_path)
+    g0 = (await _live(client, project.id))["workflow"]
+    assert _has_node(g0, "security")
+    edit, release = await _edit_stopped_after_its_read(daemon, project.id, monkeypatch)
+    put = asyncio.create_task(
+        client.put(
+            f"/api/projects/{project.id}/workflow",
+            json={"workflow": _without_node(g0, "security")},
+        )
+    )
+    await asyncio.wait({put}, timeout=0.5)  # time enough for a PUT that does not wait to land
+    release.set()
+    put_resp = await put
+    is_error, payload = await edit
+
+    assert put_resp.status_code == 200, put_resp.text
+    assert is_error is False, payload
+    put_graph = put_resp.json()["workflow"]
+    final = (await _live(client, project.id))["workflow"]
+    edit_then_put = final == put_graph
+    put_then_edit = _has_node(final, "sec-x") and _without_node(final, "sec-x") == put_graph
+    assert edit_then_put or put_then_edit, final
+
+
+async def test_an_mcp_graph_edit_racing_an_evolver_apply_ends_in_a_serial_outcome(
+    client: httpx.AsyncClient,
+    daemon: Daemon,
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backlog 7: the evolver compared and applied without the graph edit lock, so an apply
+    between an MCP edit's read and its save answered "evolved" and was undone by that save.
+    Whole graphs are compared: the grow flips ``optional`` flags and edges, not node ids."""
+    project = await _project(db, tmp_path)
+    g0 = (await _live(client, project.id))["workflow"]
+    edit, release = await _edit_stopped_after_its_read(daemon, project.id, monkeypatch)
+    evolve = asyncio.create_task(
+        client.post(
+            f"/api/projects/{project.id}/workflow/evolve",
+            json={"task_failed": True, "apply": True},
+        )
+    )
+    await asyncio.wait({evolve}, timeout=0.5)  # time enough for an apply that does not wait
+    release.set()
+    evolve_resp = await evolve
+    is_error, payload = await edit
+
+    assert is_error is False, payload
+    final = (await _live(client, project.id))["workflow"]
+    assert _has_node(final, "sec-x")  # the edit lands in either order
+    if evolve_resp.status_code == 409:  # the edit, then the apply: refused as stale
+        assert _without_node(final, "sec-x") == g0
+    else:  # the apply, then the edit
+        assert evolve_resp.status_code == 200, evolve_resp.text
+        body = evolve_resp.json()
+        assert body["evolved"] is True
+        assert body["workflow"] != g0
+        assert _without_node(final, "sec-x") == body["workflow"]

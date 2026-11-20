@@ -24,6 +24,7 @@ from conclave.config import (
     WorkflowEdge,
     WorkflowGraph,
     WorkflowNode,
+    build_default_workflow,
     load_project_config,
 )
 from conclave.db import Database, EventRow, Task, TaskState
@@ -657,6 +658,127 @@ async def test_a_cached_bounded_baseline_reaches_the_next_task_as_stored(
     assert f"```\n{cached.output}\n```" in preamble
     assert len(_MARKER_RE.findall(preamble)) == 1
     assert await _cuts(db, second.id) == []
+
+
+_NO_VERDICT = AgentResult(
+    ok=True, text="I read the diff but forgot the verdict block.", model_reported="fake"
+)
+
+
+def _preamble_of(prompt: str) -> str:
+    """The pre-existing-failures section of a reviewer *prompt* (up to its diff)."""
+    section = prompt.split("PRE-EXISTING TEST FAILURES on `main`", 1)[1]
+    return section.split("\n\nDIFF:\n", 1)[0]
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
+async def test_every_reviewer_prompt_carries_the_pre_existing_failures(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parallel: bool
+) -> None:
+    """A reviewer that runs the suite and sees a pre-existing failure is told it is not this
+    task's: every reviewer prompt, re-runs included, carries the developer's preamble, fitted
+    to the reviewer's limit and cut (and reported) once for every reader at that limit."""
+    monkeypatch.setattr("conclave.engine.orchestrator._REVIEWER_RETRY_BACKOFF_S", 0.0)
+    output = _numbered_output("FIRST baseline failure: test_legacy", "LAST baseline: 401 failed")
+    await _init_repo(tmp_path / "repo", {"baseline_output.txt": output})
+    # The mandatory security reviewer first replies without a verdict, so it is re-run.
+    provider = FakeProvider(replies={"reviewer:security": [_NO_VERDICT, _SECURITY_PASSES]})
+
+    task, ok = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {
+                "target_branch": "main",
+                "baseline_test_command": _BASELINE_COMMAND,
+                "parallel_reviewers": parallel,
+            },
+            "context": {"bulk_max_chars": 1_000},
+        },
+    )
+
+    assert ok is True and task.state is TaskState.done
+    pipeline = await _pipeline(db, task.id)
+    assert "security" in pipeline and len(pipeline) >= 3
+    reviewers = [p for p in provider.prompts if _REVIEW in p]
+    assert len(reviewers) == len(pipeline) + 1  # the security re-run
+    assert len(_prompts_of(provider, "security")) == 2
+    for prompt in reviewers:
+        preamble = _preamble_of(prompt)
+        assert "FIRST baseline failure: test_legacy" in preamble
+        assert "LAST baseline: 401 failed" in preamble
+        match = _MARKER_RE.search(preamble)
+        assert match is not None
+        assert match.group(3, 4, 5) == ("bulk_max_chars", "1000", _BASELINE_HINT)
+        # The request comes first, then the preamble, as the planner and developer get it.
+        assert prompt.index(task.request) < prompt.index("PRE-EXISTING TEST FAILURES")
+
+    # The planner (it plans every task by default) is the first reader at bulk_max_chars: the
+    # developer and every reviewer reuse its cut, so it is made and reported once.
+    cuts = await _cuts(db, task.id)
+    assert [(c["block"], c["agent"]) for c in cuts] == [
+        ("baseline_output", None),
+        ("gate_output", "planner"),
+    ]
+
+
+async def test_a_reviewer_node_fits_the_baseline_to_its_own_limit(
+    db: Database, tmp_path: Path
+) -> None:
+    output = _numbered_output("FIRST baseline failure: test_legacy", "LAST baseline: 401 failed")
+    await _init_repo(tmp_path / "repo", {"baseline_output.txt": output})
+    workflow = build_default_workflow()
+    for node in workflow.nodes:
+        if node.id == "security":
+            node.compact_before_start = True
+    provider = FakeProvider()
+
+    task, ok = await _run_task(
+        db, tmp_path, provider,
+        {
+            "execution": {"target_branch": "main", "baseline_test_command": _BASELINE_COMMAND},
+            "context": {"compaction_max_chars": 1_000},
+            "workflow": workflow.model_dump(mode="json"),
+        },
+    )
+
+    assert ok is True and task.state is TaskState.done
+    security = _prompts_of(provider, "security")
+    assert len(security) == 1
+    match = _MARKER_RE.search(_preamble_of(security[0]))
+    assert match is not None
+    assert match.group(3, 4, 5) == ("compaction_max_chars", "1000", _BASELINE_HINT)
+    others = [p for p in provider.prompts if _REVIEW in p and p not in security]
+    assert len(others) >= 2
+    for prompt in others:
+        preamble = _preamble_of(prompt).replace("\r\n", "\n")
+        assert f"```\n{output}" in preamble
+        assert _MARKER_RE.search(preamble) is None
+
+    cuts = await _cuts(db, task.id)
+    assert [(c["block"], c["field"], c["agent"], c["node_id"]) for c in cuts] == [
+        ("gate_output", "compaction_max_chars", "security", "security")
+    ]
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [{"baseline_test_command": "true"}, {"allow_no_test_command": True}],
+    ids=["green", "absent"],
+)
+async def test_no_reviewer_prompt_carries_a_preamble_without_baseline_failures(
+    db: Database, tmp_path: Path, execution: dict[str, Any]
+) -> None:
+    await _init_repo(tmp_path / "repo")
+    provider = FakeProvider()
+
+    task, ok = await _run_task(
+        db, tmp_path, provider, {"execution": {"target_branch": "main", **execution}}
+    )
+
+    assert ok is True and task.state is TaskState.done
+    reviewers = [p for p in provider.prompts if _REVIEW in p]
+    assert len(reviewers) >= 3
+    assert all("PRE-EXISTING TEST FAILURES" not in p for p in provider.prompts)
 
 
 async def test_setup_failure_reason_carries_fitted_output_with_its_marker(

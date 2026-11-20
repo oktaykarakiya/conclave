@@ -510,6 +510,22 @@ async def cancel_task_if_pending(db: Database, task_id: str) -> bool:
         return cur.rowcount > 0
 
 
+async def cancel_task_if_waiting(db: Database, task_id: str) -> bool:
+    """Atomically set state to ``cancelled`` only while the task is ``waiting_for_approval``.
+
+    For a paused task with no run to signal: an approval that lands between a caller's read
+    and this UPDATE keeps its ``approved`` row (zero rows match), like
+    :func:`cancel_task_if_pending`. Returns ``True`` if the task was cancelled.
+    """
+    async with db._write() as conn:
+        cur = await conn.execute(
+            "UPDATE tasks SET state = ?, updated_at = ? "
+            "WHERE id = ? AND state = 'waiting_for_approval'",
+            (TaskState.cancelled.value, now_iso(), task_id),
+        )
+        return cur.rowcount > 0
+
+
 async def update_task_fields(
     db: Database,
     task_id: str,

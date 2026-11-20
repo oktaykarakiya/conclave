@@ -29,8 +29,10 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
   skips the post-task evolution. Every change to a project's workflow, whoever makes it, is
   recorded as a **version** with its source and reason, and can be reverted (§8).
 - **Gate** = the project's `execution.baseline_test_command`, run on a baseline before work and
-  again after review. Verdicts from reviewers are **grounded**: claims must cite evidence that
-  exists in the diff, or they are downgraded.
+  again after review. Failures the baseline already had reach the planner, the developer and
+  every reviewer as pre-existing, so no reviewer blames them on the task's diff. Verdicts from
+  reviewers are **grounded**: claims must cite evidence that exists in the diff, or they are
+  downgraded.
 - **Branches**: each task gets `<branch_prefix><task_id>` (default `conclave/<id>`) from the
   project's `execution.target_branch`. `auto_merge` is off by default: a green task ends `done`
   on its committed branch and **you** merge it. With `auto_merge` on, a green task merges itself.
@@ -488,10 +490,18 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   or the gate's checkpoint, or overriding a reviewer to `fail`, fails the attempt: its
   `attempt.failed` has that `stage` (`developer`, `gate`, `review`) and the reason
   `operator rejected: <message>` (one line), which a task that then fails ends its summary with.
+  A completion applies to the node's pass in one attempt only: the node's latest checkpoint
+  attempt (over REST, the body's `attempt` when given). Posted while the node is not paused, it
+  waits for that pass; once that pass has run, the node's pass in a later attempt drops it
+  instead of applying it, with a `log` event (`stage: operator_resolution_dropped`, `node_id`,
+  `posted_attempt`, `attempt`). To decide an upcoming pass, arm a pause on it and complete it
+  there. `conclave_approve_task` applies to whatever is waiting.
 - `conclave_cancel_task(task_id)`: stop a task (its worktree is cleaned up). What it runs stops at
   once, a dispatch or a setup, baseline or gate command (its process group is killed), and the
   task ends `cancelled`; a baseline stopped this way is not cached. `cancelled: false` means
-  nothing was stopped, for example a task a worker claimed at that moment: call it again.
+  nothing was stopped, for example a task a worker claimed at that moment: call it again. With a
+  `state` too, the task moved on before the cancel: an approval reached a task waiting for
+  approval first (`state: approved`), and it was left as it is (REST answers `409` naming it).
 - `conclave_approve_task` / `conclave_cascade_approve_task` for tasks created without
   `auto_approve` (e.g. a planning session's task tree).
 
@@ -570,7 +580,10 @@ raise the threshold so that only longer requests are planned. Prefer several sma
   `source` (`evolver`, `operator`, `template`, `revert`, `proposal`), `reason`, `created_at`,
   `graph_after` and `graph_before` (`null` = the pipeline derived from the agents policy). The
   graph, node and edge tools, templates, Store installs, config patches that change `workflow`
-  and the evolver all record one; pass `reason` to say why.
+  and the evolver all record one; pass `reason` to say why. Writes of a workflow graph run one
+  at a time (these, REST's whole-graph `PUT /api/projects/{id}/workflow` and global settings
+  writes), so none undoes another it did not see; the evolver compares and applies under the
+  same lock, so an apply that lost the race is refused as stale.
 - `conclave_revert_workflow(project_id, version_id, reason?)` restores that version's
   `graph_after` as a new `revert` version (history is never deleted); a version holding `null`
   restores the derived pipeline. It returns `changed`, `reverted_to`, `version` and `is_custom`

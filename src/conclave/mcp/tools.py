@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import math
 import re
-import weakref
 from datetime import date
 from importlib import resources
 from pathlib import Path
@@ -25,6 +23,7 @@ from ..config import (
     config_schema,
     create_project_with_config,
     deep_merge,
+    graph_edit_lock,
     load_global_overrides,
     load_project_config,
     normalize_config_keys,
@@ -37,7 +36,6 @@ from ..config import (
 )
 from ..db import (
     CheckpointStatus,
-    Database,
     Project,
     ProjectMode,
     StoreItem,
@@ -649,7 +647,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     _tool(
         "conclave_complete_node",
         "Approve/complete a workflow node or HITL connector paused at waiting_for_approval, "
-        "or manually override a node's status/verdict/output.",
+        "or manually override a node's status/verdict/output. It applies to the node's pass in "
+        "its latest checkpoint attempt only: for a node that is not paused, a later attempt's "
+        "pass drops it (a log event with stage operator_resolution_dropped says so).",
         {
             "task_id": _prop("string", "Task ID."),
             "node_id": _prop(
@@ -691,7 +691,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "conclave_cancel_task",
-        "Cancel an inbox, approved, waiting_for_approval, or currently running (in_progress) task.",
+        "Cancel an inbox, approved, waiting_for_approval, or currently running (in_progress) task. "
+        "cancelled: false means nothing was cancelled; with state, the task moved on first (e.g. "
+        "an approval reached it).",
         {"task_id": _prop("string", "Task ID.")},
         required=["task_id"],
     ),
@@ -1473,9 +1475,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
 
 
 # The graph edit tools read a project's workflow, change it and save the whole graph, so they
-# run one at a time per Database (each re-reads the project under the lock), or a concurrent
-# edit would be lost. Taken before the config resolver's write lock, never inside it. One lock
-# per Database, held weakly (an asyncio.Lock belongs to one event loop).
+# run under the graph edit lock every writer of a workflow graph takes (``graph_edit_lock``,
+# each re-reading the project under it), or a concurrent write would be lost.
 _GRAPH_EDIT_TOOLS = frozenset(
     {
         "conclave_workflow_upsert_node",
@@ -1488,16 +1489,6 @@ _GRAPH_EDIT_TOOLS = frozenset(
         "conclave_remove_workflow_edge",
     }
 )
-_GRAPH_EDIT_LOCKS: weakref.WeakKeyDictionary[Database, asyncio.Lock] = (
-    weakref.WeakKeyDictionary()
-)
-
-
-def _graph_edit_lock(db: Database) -> asyncio.Lock:
-    lock = _GRAPH_EDIT_LOCKS.get(db)
-    if lock is None:
-        lock = _GRAPH_EDIT_LOCKS[db] = asyncio.Lock()
-    return lock
 
 
 async def _require_project(daemon: Daemon, project_id: str) -> Project:
@@ -1529,13 +1520,15 @@ async def _resolve_active_workflow(daemon: Daemon, project: Project) -> Workflow
 async def _save_workflow(
     daemon: Daemon, project: Project, graph: WorkflowGraph, reason: str
 ) -> dict[str, Any]:
-    """Store an operator's edit of the whole graph (recorded as a workflow version)."""
+    """Store an operator's edit of the whole graph (recorded as a workflow version). The
+    caller holds :func:`graph_edit_lock`."""
     resolved, _ = await save_project_workflow(
         daemon.db,
         project,
         graph.model_dump(mode="json"),
         source=WorkflowVersionSource.operator,
         reason=reason,
+        graph_locked=True,
     )
     active = resolved.workflow or graph
     wf_payload: dict[str, Any] = {
@@ -2350,6 +2343,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             verdict=verdict,
             output=output,
             edge_id=edge_id,
+            attempt=attempt,
         )
         if not signaled and task.state == TaskState.waiting_for_approval:
             await repo.approve_task(daemon.db, task.id)
@@ -2429,7 +2423,14 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         if task.state in (TaskState.in_progress, TaskState.waiting_for_approval):
             cancelled = await daemon.request_cancel(task.id)
             if not cancelled and task.state == TaskState.waiting_for_approval:
-                await repo.set_task_state(daemon.db, task.id, TaskState.cancelled)
+                if not await repo.cancel_task_if_waiting(daemon.db, task.id):
+                    # An approval (or another cancel) landed after the read: say what it is.
+                    task = await _require_task(daemon, task.id)
+                    return {
+                        "cancelled": task.state == TaskState.cancelled,
+                        "task_id": task.id,
+                        "state": task.state.value,
+                    }
                 await daemon.bus.emit(
                     type=EventType.task_cancelled,
                     project_id=task.project_id,
@@ -2596,12 +2597,13 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
         if not isinstance(wf_raw, dict):
             raise McpToolError("workflow must be a JSON object")
         graph = WorkflowGraph.model_validate(wf_raw)
-        return await _save_workflow(
-            daemon, project, graph, _opt_reason(args) or "workflow replaced"
-        )
+        async with graph_edit_lock(daemon.db):
+            return await _save_workflow(
+                daemon, project, graph, _opt_reason(args) or "workflow replaced"
+            )
 
     if name in _GRAPH_EDIT_TOOLS:
-        async with _graph_edit_lock(daemon.db):
+        async with graph_edit_lock(daemon.db):
             return await _edit_workflow_graph(daemon, name, args)
 
     # --- Agent Personas ---

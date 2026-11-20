@@ -29,6 +29,16 @@ import type {
   WorkflowVersion,
 } from "./types";
 
+/** A non-2xx answer: the server's `detail` as the message (shown as before), and the status. */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function req<T>(
   method: string,
   url: string,
@@ -54,7 +64,10 @@ async function req<T>(
     } catch {
       /* ignore */
     }
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    throw new ApiError(
+      typeof detail === "string" ? detail : JSON.stringify(detail),
+      res.status,
+    );
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;

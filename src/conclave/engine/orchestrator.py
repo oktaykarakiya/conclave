@@ -483,14 +483,20 @@ class Orchestrator:
         verdict: str | None = None,
         output: str | None = None,
         edge_id: str | None = None,
+        attempt: int | None = None,
     ) -> bool:
-        """Approve/complete or override a node or HITL connector on *task_id*."""
+        """Approve/complete or override a node or HITL connector on *task_id*.
+
+        A resolution for *attempt* applies only to the node's pass in that attempt (see
+        :meth:`_take_resolution`); ``None`` (an approve) applies to whatever pass takes it.
+        """
         res: dict[str, Any] = {
             "status": status,
             "message": message,
             "verdict": verdict,
             "output": output,
             "edge_id": edge_id,
+            "attempt": attempt,
         }
         self._approval_resolutions[(task_id, node_id)] = res
         if edge_id:
@@ -546,6 +552,48 @@ class Orchestrator:
                 return True, e.id
         return False, None
 
+    async def _take_resolution(
+        self, task: Task, node_id: str, attempt: int, edge_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Pop the operator resolution stored for *node_id* (else *edge_id*) that applies to the
+        node's pass in *attempt*: one posted for that attempt, or for none (an approve).
+
+        One posted for a later attempt stays stored for it. One posted for an earlier attempt
+        is dropped, with a ``log`` event saying so: the pass it was meant for has ended.
+        """
+        for key in (node_id, edge_id):
+            if not key:
+                continue
+            res = self._approval_resolutions.get((task.id, key))
+            if res is None:
+                continue
+            posted = res.get("attempt")
+            if posted is not None and posted > attempt:
+                continue
+            # resolve_node stores one resolution under its node and its edge: take it once.
+            for twin in [k for k, r in self._approval_resolutions.items() if r is res]:
+                del self._approval_resolutions[twin]
+            if posted is None or posted == attempt:
+                return res
+            status = res.get("status") or "completed"
+            await self._bus.emit(
+                type=EventType.log,
+                project_id=task.project_id,
+                task_id=task.id,
+                payload={
+                    "stage": "operator_resolution_dropped",
+                    "node_id": node_id,
+                    "posted_attempt": posted,
+                    "attempt": attempt,
+                    "status": status,
+                    "message": (
+                        f"the operator's '{status}' for {key} was posted for attempt {posted}; "
+                        f"not applied to attempt {attempt}"
+                    ),
+                },
+            )
+        return None
+
     async def _await_human_approval(
         self,
         task: Task,
@@ -565,7 +613,7 @@ class Orchestrator:
             task.id, node_id, config, target_node_id
         )
         if not should_pause:
-            return self._approval_resolutions.pop((task.id, node_id), None)
+            return await self._take_resolution(task, node_id, attempt)
 
         wait_artifact = dict(artifact or {})
         wait_artifact["waiting_for_approval"] = True
@@ -574,40 +622,9 @@ class Orchestrator:
         if target_node_id:
             wait_artifact["target_node_id"] = target_node_id
 
-        await repo.save_task_checkpoint(
-            self._db,
-            task_id=task.id,
-            node_id=node_id,
-            attempt=attempt,
-            status=CheckpointStatus.waiting_for_approval,
-            git_tree_sha=git_tree_sha,
-            artifact=wait_artifact,
-        )
-        await repo.set_task_state(self._db, task.id, TaskState.waiting_for_approval)
-        await self._bus.emit(
-            type=EventType.node_waiting,
-            project_id=task.project_id,
-            task_id=task.id,
-            payload={
-                "node_id": node_id,
-                "edge_id": edge_id,
-                "target_node_id": target_node_id,
-                "attempt": attempt,
-                "status": "waiting_for_approval",
-            },
-        )
-        await self._bus.emit(
-            type=EventType.hitl_waiting,
-            project_id=task.project_id,
-            task_id=task.id,
-            payload={
-                "node_id": node_id,
-                "edge_id": edge_id,
-                "target_node_id": target_node_id,
-                "attempt": attempt,
-            },
-        )
-
+        # The waiter exists before the state reads waiting_for_approval, so an approve that
+        # lands while the wait is announced signals this run. Without it the approve would store
+        # ``approved``, which a parallel worker tick could claim and run a second time.
         wait_ev = asyncio.Event()
         task_waiters = self._approval_waiters.setdefault(task.id, {})
         task_waiters[node_id] = wait_ev
@@ -615,6 +632,39 @@ class Orchestrator:
             task_waiters[edge_id] = wait_ev
 
         try:
+            await repo.save_task_checkpoint(
+                self._db,
+                task_id=task.id,
+                node_id=node_id,
+                attempt=attempt,
+                status=CheckpointStatus.waiting_for_approval,
+                git_tree_sha=git_tree_sha,
+                artifact=wait_artifact,
+            )
+            await repo.set_task_state(self._db, task.id, TaskState.waiting_for_approval)
+            await self._bus.emit(
+                type=EventType.node_waiting,
+                project_id=task.project_id,
+                task_id=task.id,
+                payload={
+                    "node_id": node_id,
+                    "edge_id": edge_id,
+                    "target_node_id": target_node_id,
+                    "attempt": attempt,
+                    "status": "waiting_for_approval",
+                },
+            )
+            await self._bus.emit(
+                type=EventType.hitl_waiting,
+                project_id=task.project_id,
+                task_id=task.id,
+                payload={
+                    "node_id": node_id,
+                    "edge_id": edge_id,
+                    "target_node_id": target_node_id,
+                    "attempt": attempt,
+                },
+            )
             while not wait_ev.is_set():
                 if cancel_event is not None and cancel_event.is_set():
                     break
@@ -641,11 +691,9 @@ class Orchestrator:
             return {"status": "cancelled"}
 
         await repo.set_task_state(self._db, task.id, TaskState.in_progress)
-        resolution = (
-            self._approval_resolutions.pop((task.id, node_id), None)
-            or (self._approval_resolutions.pop((task.id, edge_id), None) if edge_id else None)
-            or {"status": "completed"}
-        )
+        resolution = await self._take_resolution(task, node_id, attempt, edge_id) or {
+            "status": "completed"
+        }
         raw_status = str(resolution.get("status") or "completed")
         cp_status = (
             CheckpointStatus.failed
@@ -1336,7 +1384,7 @@ class Orchestrator:
                     runner, task, project.id, worktree, full_diff, attempts, config, knowledge,
                     rules, started, budget, cancel_event=cancel_event, diff_cmd=diff_cmd,
                     diff_cache=diff_cache, integrity_section=integrity_prompt_section(integrity),
-                    outcome=review,
+                    outcome=review, baseline=baseline,
                 )
                 # Cooperative cancellation — a review cut short by a cancel is not a failed attempt.
                 if cancel_event is not None and cancel_event.is_set():
@@ -2529,12 +2577,15 @@ class Orchestrator:
         diff_cache: dict[BulkLimit, str] | None = None,
         integrity_section: str = "",
         outcome: _ReviewOutcome | None = None,
+        baseline: _Baseline | None = None,
     ) -> tuple[bool, str, bool]:
         """Review the current diff through the derived agent pipeline.
 
         Each reviewer's prompt carries ``current_diff`` fitted to that reviewer's bulk limit;
         *diff_cmd* is the command that reproduces the full diff in the worktree, and readers
-        sharing *diff_cache* share each cut. *integrity_section* (the attempt's TEST INTEGRITY
+        sharing *diff_cache* share each cut. The request is followed by *baseline*'s
+        pre-existing failures, if any, fitted for that reviewer as for the developer, so no
+        reviewer blames them on this diff. *integrity_section* (the attempt's TEST INTEGRITY
         findings, if any) follows the diff in every reviewer prompt, whole.
 
         Returns ``(failed, feedback, timed_out)``. ``timed_out`` is ``True`` when the
@@ -2573,11 +2624,17 @@ class Orchestrator:
             return (n.agent or n.id) in config.agents.mandatory
 
         async def _with_diff(n: WorkflowNode) -> str:
-            """*base_prompt* plus the diff fitted for reviewer *n* (nothing to show if blank),
-            then the whole *integrity_section* and the shared-worktree rule."""
+            """*base_prompt* and the baseline preamble, plus the diff fitted for reviewer *n*
+            (nothing to show if blank), then the whole *integrity_section* and the
+            shared-worktree rule."""
+            head = base_prompt
+            if baseline is not None:
+                head += await self._baseline_preamble(
+                    task, config, baseline, agent=n.agent or n.id, node=n
+                )
             rule = f"\n\n{_SHARED_WORKTREE_RULE}"
             if not current_diff.strip():
-                return base_prompt + integrity_section + rule
+                return head + integrity_section + rule
             diff = await self._fit_bulk(
                 task, config, current_diff,
                 block="diff",
@@ -2586,7 +2643,7 @@ class Orchestrator:
                 node=n,
                 cache=diff_cache,
             )
-            return f"{base_prompt}\n\nDIFF:\n```diff\n{diff}\n```{integrity_section}{rule}"
+            return f"{head}\n\nDIFF:\n```diff\n{diff}\n```{integrity_section}{rule}"
 
         if is_parallel_review(config) and len(review_nodes) > 1:
             if cancel_event is not None and cancel_event.is_set():

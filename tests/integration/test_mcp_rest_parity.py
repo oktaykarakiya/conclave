@@ -357,6 +357,69 @@ async def test_bad_ids_and_arguments_are_tool_errors_and_rest_4xx(
         assert resp.status_code == 422, bad
 
 
+_UNKNOWN_ID_CASES: list[tuple[str, str, str, dict[str, Any]]] = [
+    ("GET", "/api/projects/nope/tasks", "conclave_list_tasks", {"project_id": "nope"}),
+    ("GET", "/api/projects/nope/quarantine", "conclave_list_quarantine", {"project_id": "nope"}),
+    ("GET", "/api/tasks/nope/events", "conclave_get_task_events", {"task_id": "nope"}),
+    ("GET", "/api/tasks/nope/verdicts", "conclave_get_task_verdicts", {"task_id": "nope"}),
+    ("DELETE", "/api/projects/nope", "conclave_detach_project", {"project_id": "nope"}),
+    ("POST", "/api/projects/nope/pause", "conclave_pause_project", {"project_id": "nope"}),
+    ("POST", "/api/projects/nope/resume", "conclave_resume_project", {"project_id": "nope"}),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "tool", "args"),
+    _UNKNOWN_ID_CASES,
+    ids=[f"{method} {path}" for method, path, _, _ in _UNKNOWN_ID_CASES],
+)
+async def test_unknown_ids_are_rest_404_and_change_nothing(
+    daemon: Daemon,
+    client: httpx.AsyncClient,
+    db: Database,
+    method: str,
+    path: str,
+    tool: str,
+    args: dict[str, Any],
+) -> None:
+    """A project or task that does not exist is a 404, as the matching tool's isError: never an
+    empty list, a detach (and project.deleted) or a pause state for an id nobody attached."""
+    resp = await client.request(method, path)
+
+    assert resp.status_code == 404, resp.text
+    kind = "project" if "project_id" in args else "task"
+    assert resp.json() == {"detail": f"{kind} not found"}
+    assert await repo.list_events(db, limit=10_000) == []
+    assert daemon.is_paused("nope") is False
+    text = await _tool_error(client, tool, args)
+    assert f"{kind} not found: nope" in text, text
+
+
+async def test_known_ids_answer_these_routes_as_before(
+    daemon: Daemon, client: httpx.AsyncClient, db: Database, tmp_path: Path
+) -> None:
+    project = await repo.create_project(db, name="p", path=str(tmp_path), default_branch="main")
+    task = await repo.create_task(db, project_id=project.id, request="r")
+    pid, tid = project.id, task.id
+    await daemon.bus.emit(type="log", project_id=pid, task_id=tid, payload={"message": "hi"})
+
+    tasks = await _rest(client, f"/api/projects/{pid}/tasks")
+    assert [t["id"] for t in tasks] == [tid]
+    assert await _rest(client, f"/api/projects/{pid}/quarantine") == []
+    events = await _rest(client, f"/api/tasks/{tid}/events")
+    assert [(e["type"], e["payload"]) for e in events] == [("log", {"message": "hi"})]
+    assert await _rest(client, f"/api/tasks/{tid}/verdicts") == []
+    paused = await client.post(f"/api/projects/{pid}/pause")
+    assert paused.status_code == 200 and paused.json() == {"paused": False}  # no worker runs
+    resumed = await client.post(f"/api/projects/{pid}/resume")
+    assert resumed.status_code == 200 and resumed.json() == {"running": False}
+    detached = await client.delete(f"/api/projects/{pid}")
+    assert detached.status_code == 200 and detached.json() == {"detached": pid}
+    deleted = [e for e in await repo.list_events(db, limit=10_000) if e.type == "project.deleted"]
+    assert [e.payload for e in deleted] == [{"project_id": pid}]
+    assert await repo.get_project(db, pid) is None
+
+
 # --- tools/list -----------------------------------------------------------------
 
 
@@ -773,6 +836,44 @@ async def test_cancel_tool_never_overwrites_a_task_claimed_after_the_read(
     assert answer == {"cancelled": False, "task_id": task.id}
     after = await repo.get_task(db, task.id)
     assert after is not None and after.state == TaskState.in_progress
+
+
+async def test_cancel_tool_never_overwrites_a_paused_task_approved_after_the_read(
+    daemon: Daemon,
+    client: httpx.AsyncClient,
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Like REST: an approval that lands while the tool looks for a run of a task waiting for
+    approval keeps the task approved, and the tool says so instead of reporting it cancelled."""
+    project = await repo.create_project(db, name="p", path=str(tmp_path), default_branch="main")
+    raced = await repo.create_task(
+        db, project_id=project.id, request="r", state=TaskState.waiting_for_approval
+    )
+    calm = await repo.create_task(
+        db, project_id=project.id, request="r2", state=TaskState.waiting_for_approval
+    )
+
+    async def approve_then_find_no_run(task_id: str) -> bool:
+        if task_id == raced.id:  # the operator approves while the tool looks for a run
+            assert await repo.approve_task(db, task_id)
+        return False  # no run of either task is waiting in this daemon
+
+    monkeypatch.setattr(daemon, "request_cancel", approve_then_find_no_run)
+    answer = await _tool(client, "conclave_cancel_task", {"task_id": raced.id})
+
+    assert answer == {"cancelled": False, "task_id": raced.id, "state": "approved"}
+    after = await repo.get_task(db, raced.id)
+    assert after is not None and after.state == TaskState.approved
+
+    # Without the race, a waiting task with no run to signal is still cancelled.
+    answer = await _tool(client, "conclave_cancel_task", {"task_id": calm.id})
+    assert answer == {"cancelled": True, "task_id": calm.id}
+    after = await repo.get_task(db, calm.id)
+    assert after is not None and after.state == TaskState.cancelled
+    events = await repo.list_events(db, limit=10_000)
+    assert [e.task_id for e in events if e.type == "task.cancelled"] == [calm.id]
 
 
 async def test_create_task_with_an_unknown_parent_is_a_tool_error(

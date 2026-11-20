@@ -792,9 +792,10 @@ async def test_detach_project_stops_worker_and_cleans_orphans(
 
 
 async def test_detach_project_idempotent(
-    client_with_workers: httpx.AsyncClient, tmp_path: Path
+    client_with_workers: httpx.AsyncClient, db: Database, tmp_path: Path
 ) -> None:
-    """Detaching the same project twice must not 500."""
+    """Detaching the same project twice must not 500. The second detach answers 404, as MCP's
+    conclave_detach_project does: the project is gone, so nothing is detached or announced."""
     repo_path = tmp_path / "repo_detach_idem"
     await _init_repo(repo_path)
 
@@ -808,11 +809,15 @@ async def test_detach_project_idempotent(
     # First detach.
     r1 = await client_with_workers.delete(f"/api/projects/{project_id}")
     assert r1.status_code == 200, r1.text
+    assert r1.json() == {"detached": project_id}
 
     # Second detach — must not 500 (project already gone).
     r2 = await client_with_workers.delete(f"/api/projects/{project_id}")
-    assert r2.status_code == 200, f"second detach returned {r2.status_code}: {r2.text}"
-    assert r2.json() == {"detached": project_id}
+    assert r2.status_code == 404, f"second detach returned {r2.status_code}: {r2.text}"
+    assert r2.json() == {"detail": "project not found"}
+    events = await repo.list_events(db, limit=10_000)
+    deleted = [e.payload for e in events if e.type == "project.deleted"]
+    assert deleted == [{"project_id": project_id}]
 
 
 # --- create_project tests ----------------------------------------------------
@@ -1122,3 +1127,41 @@ async def test_cancel_never_overwrites_a_task_claimed_after_the_read(
     assert resp.status_code == 409, resp.text
     after = await repo.get_task(db, task.id)
     assert after is not None and after.state == TaskState.in_progress
+
+
+async def test_cancel_never_overwrites_a_paused_task_approved_after_the_read(
+    client: httpx.AsyncClient, db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task waiting for approval with no run to signal is cancelled by a conditional write:
+    an approval that lands after the cancel read the task keeps it approved, and the cancel
+    answers 409 naming that state instead of writing cancelled over it and answering success."""
+    project = await repo.create_project(
+        db, name="p", path=str(tmp_path / "p"), default_branch="main"
+    )
+    raced = await repo.create_task(
+        db, project_id=project.id, request="r", state=TaskState.waiting_for_approval
+    )
+    calm = await repo.create_task(
+        db, project_id=project.id, request="r2", state=TaskState.waiting_for_approval
+    )
+
+    async def approve_then_find_no_run(self: Daemon, task_id: str) -> bool:
+        if task_id == raced.id:  # the operator approves while the cancel looks for a run
+            assert await repo.approve_task(db, task_id)
+        return False  # no run of either task is waiting in this daemon
+
+    monkeypatch.setattr(Daemon, "request_cancel", approve_then_find_no_run)
+    resp = await client.post(f"/api/tasks/{raced.id}/cancel")
+
+    assert resp.status_code == 409, resp.text
+    assert "approved" in resp.json()["detail"]
+    after = await repo.get_task(db, raced.id)
+    assert after is not None and after.state == TaskState.approved
+
+    # Without the race, a waiting task with no run to signal is still cancelled.
+    resp = await client.post(f"/api/tasks/{calm.id}/cancel")
+    assert resp.status_code == 200 and resp.json() == {"cancelled": True}
+    after = await repo.get_task(db, calm.id)
+    assert after is not None and after.state == TaskState.cancelled
+    events = await repo.list_events(db, limit=10_000)
+    assert [e.task_id for e in events if e.type == "task.cancelled"] == [calm.id]

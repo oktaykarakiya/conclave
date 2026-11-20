@@ -23,6 +23,7 @@ from ..config import (
     WorkflowGraph,
     WorkflowNode,
     build_default_workflow,
+    graph_edit_lock,
     resolve_project_config,
     save_project_workflow,
 )
@@ -659,26 +660,32 @@ async def _compare_and_apply(
     decision_reason: str | None = None,
 ) -> tuple[WorkflowVersion | None, ConclaveConfig]:
     """Apply *graph* only while the live workflow still equals *base*, the graph the change
-    was computed from; otherwise raise :class:`WorkflowConflictError` and change nothing."""
-    project = await repo.get_project(db, project_id)
-    if project is None:
-        raise ValueError(f"project not found: {project_id}")
-    live = _active_graph(await resolve_project_config(db, project)).model_dump(mode="json")
-    if live != base:
-        raise WorkflowConflictError(
-            "the project's workflow changed since this change was computed; run workflow "
-            "evolution again (conclave_evolve_workflow or POST "
-            f"/api/projects/{project_id}/workflow/evolve) for an up-to-date proposal"
+    was computed from; otherwise raise :class:`WorkflowConflictError` and change nothing.
+
+    The comparison and the write run under the graph edit lock, so no other workflow write
+    lands between them (and none undoes this one from a read taken before it).
+    """
+    async with graph_edit_lock(db):
+        project = await repo.get_project(db, project_id)
+        if project is None:
+            raise ValueError(f"project not found: {project_id}")
+        live = _active_graph(await resolve_project_config(db, project)).model_dump(mode="json")
+        if live != base:
+            raise WorkflowConflictError(
+                "the project's workflow changed since this change was computed; run workflow "
+                "evolution again (conclave_evolve_workflow or POST "
+                f"/api/projects/{project_id}/workflow/evolve) for an up-to-date proposal"
+            )
+        resolved, version = await save_project_workflow(
+            db,
+            project,
+            graph,
+            source=source,
+            reason=reason,
+            approves_proposal=approves_proposal,
+            decision_reason=decision_reason,
+            graph_locked=True,
         )
-    resolved, version = await save_project_workflow(
-        db,
-        project,
-        graph,
-        source=source,
-        reason=reason,
-        approves_proposal=approves_proposal,
-        decision_reason=decision_reason,
-    )
     return version, resolved
 
 
