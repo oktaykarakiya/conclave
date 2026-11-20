@@ -6,7 +6,6 @@ import { diffConfig } from "../configDiff";
 import type {
   AgentPersona,
   EdgeCondition,
-  EventRow,
   NodeKind,
   OutputContract,
   StoreItem,
@@ -19,6 +18,8 @@ import type {
   WorkflowVersionSource,
 } from "../types";
 import { Badge, Button, NODE_KIND_COLORS, Spinner, fmtRelative, input } from "../ui";
+import type { StreamSubscribe } from "../useStream";
+import { useCoalesced, useStreamListener } from "../useStream";
 
 const BUILTIN_TEMPLATES: { id: string; label: string; hint: string }[] = [
   { id: "standard", label: "Standard", hint: "Plan → Develop → Review → Gate → Merge" },
@@ -138,10 +139,10 @@ function inferKindAndContract(role: string): {
 
 export function AgentStudioView({
   projectId,
-  lastEvent = null,
+  subscribe,
 }: {
   projectId?: string | null;
-  lastEvent?: EventRow | null;
+  subscribe?: StreamSubscribe;
 }) {
   const [graph, setGraph] = useState<WorkflowGraph | null>(null);
   const [isCustom, setIsCustom] = useState<boolean>(false);
@@ -288,11 +289,15 @@ export function AgentStudioView({
     void loadHistory();
   }, [loadHistory]);
 
-  useEffect(() => {
-    if (!projectId || !lastEvent || !HISTORY_EVENTS.has(lastEvent.type)) return;
-    if (lastEvent.project_id && lastEvent.project_id !== projectId) return;
-    void loadHistory();
-  }, [lastEvent, projectId, loadHistory]);
+  const refreshHistory = useCoalesced(loadHistory);
+  useStreamListener(subscribe, {
+    onEvent: (event) => {
+      if (!projectId || !HISTORY_EVENTS.has(event.type)) return;
+      if (event.project_id && event.project_id !== projectId) return;
+      refreshHistory();
+    },
+    onResync: refreshHistory,
+  });
 
   const selectedNode = useMemo<WorkflowNode | null>(() => {
     if (!graph || !selectedNodeId) return null;

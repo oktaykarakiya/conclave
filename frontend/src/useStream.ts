@@ -1,25 +1,37 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
+import type { StreamListener } from "./eventStream";
+import { StreamCursor, coalesce } from "./eventStream";
 import type { EventRow } from "./types";
 
 export type StreamStatus = "connecting" | "live" | "reconnecting";
 
+/** Register a listener; returns its unsubscribe. */
+export type StreamSubscribe = (listener: StreamListener) => () => void;
+
 export interface StreamState {
   events: EventRow[];
-  lastEvent: EventRow | null;
   status: StreamStatus;
+  /** Stable for the hook's lifetime: pass it to components that react to events. */
+  subscribe: StreamSubscribe;
 }
 
 /**
  * Subscribe to the live event stream for a project (or the global stream when
  * `projectId` is null), keeping the last `max` events. Reconnects automatically
- * with exponential backoff + jitter (capped at ~10s, reset on a successful open)
- * and guards against setState-after-unmount.
+ * with exponential backoff + jitter (capped at ~10s, reset on a successful open),
+ * resuming after the last event received, and guards against setState-after-unmount.
  */
 export function useStream(projectId: string | null, max = 400): StreamState {
   const [events, setEvents] = useState<EventRow[]>([]);
-  const [lastEvent, setLastEvent] = useState<EventRow | null>(null);
   const [status, setStatus] = useState<StreamStatus>("connecting");
+  const listeners = useRef(new Set<StreamListener>());
+  const subscribe = useCallback<StreamSubscribe>((listener) => {
+    listeners.current.add(listener);
+    return () => {
+      listeners.current.delete(listener);
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -27,28 +39,25 @@ export function useStream(projectId: string | null, max = 400): StreamState {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let delay = 500; // backoff start
     const MAX_DELAY = 10_000;
+    const cursor = new StreamCursor();
 
     const connect = () => {
       if (!alive) return;
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
-      ws = new WebSocket(`${proto}://${location.host}/ws/stream${query}`);
+      ws = new WebSocket(cursor.nextUrl(location, projectId));
 
       ws.onopen = () => {
         if (!alive) return;
         delay = 500; // reset backoff on a successful connection
         setStatus("live");
+        cursor.open(listeners.current);
       };
 
+      // Listeners are called here, once per event: an effect over React state would see
+      // only the last of the events that arrived before a render.
       ws.onmessage = (msg) => {
         if (!alive) return;
-        try {
-          const event = JSON.parse(msg.data) as EventRow;
-          setLastEvent(event);
-          setEvents((prev) => [...prev.slice(-(max - 1)), event]);
-        } catch {
-          /* ignore malformed frame */
-        }
+        const event = cursor.receive(msg.data, listeners.current);
+        if (event) setEvents((prev) => [...prev.slice(-(max - 1)), event]);
       };
 
       const scheduleReconnect = () => {
@@ -80,5 +89,34 @@ export function useStream(projectId: string | null, max = 400): StreamState {
     };
   }, [projectId, max]);
 
-  return { events, lastEvent, status };
+  return { events, status, subscribe };
+}
+
+/** Run `listener` (as of the latest render) for the stream that `subscribe` belongs to. */
+export function useStreamListener(
+  subscribe: StreamSubscribe | undefined,
+  listener: StreamListener,
+): void {
+  const latest = useRef(listener);
+  useLayoutEffect(() => {
+    latest.current = listener;
+  });
+  useEffect(() => {
+    if (!subscribe) return;
+    return subscribe({
+      onEvent: (event) => latest.current.onEvent?.(event),
+      onResync: () => latest.current.onResync?.(),
+    });
+  }, [subscribe]);
+}
+
+/** A stable trigger for `run` (as of the latest render) that coalesces bursts: see
+ * `coalesce` in `eventStream.ts`. */
+export function useCoalesced(run: () => Promise<unknown>): () => void {
+  const latest = useRef(run);
+  useLayoutEffect(() => {
+    latest.current = run;
+  });
+  const [trigger] = useState(() => coalesce(() => latest.current()));
+  return trigger;
 }

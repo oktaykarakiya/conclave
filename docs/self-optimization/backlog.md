@@ -72,10 +72,25 @@ the old code):
   resolution stored for them, and write nothing between waits; each releases the waits it
   released before. A task whose run is gone (a daemon restart) is still set `approved`.
 
+Resolved after that (the former open item 3, shown first by tests that fail on the old code, and
+two SPA defects found while checking it, covered by vitest unit tests of the SPA's new pure
+stream module):
+- The live stream loses no event unannounced. `/ws/stream` and `/api/events/stream` take
+  `after_id` (SSE also `Last-Event-ID`, preferred, and each SSE event carries an `id:` line) and
+  first replay the persisted events after it that match the stream's project and task filters,
+  in id order, then go live, with none lost or sent twice at the boundary. Where events were
+  lost, a gap frame `{"type": "stream.gap", "reason": ...}` (no `id`): `replay_truncated`
+  (more than 1,000 missed; the newest 1,000 follow it) or `overflow` (the subscriber's queue
+  dropped events). A bad `after_id` is a 422 (SSE) or a 1008 close (WebSocket).
+- The SPA reacted to the last event of a burst only (an effect over `lastEvent`, which React
+  batches), so a `project.*`, `workflow.evolved`, `system.reloaded` or `node.*` event earlier in
+  the burst was never handled. Listeners now get each event once, in arrival order.
+- The SPA reconnected without saying what it had seen and refetched nothing. It reconnects with
+  `after_id`, and on a gap frame or a reconnect it cannot resume, each view refetches what it
+  derives from events.
+
 Open:
 
 1. [engine] Persona-first prompt order: only helps engines with prefix caching; Claude Code sends
    the prompt as one block. Needs an A/B on a funded DeepSeek account.
 2. [engine] Staggered parallel reviewers (to spread a usage window): needs a measurement first.
-3. [web] The WebSocket stream has no `after_id` backfill and ignores the subscriber's gap flag; no
-   contract promises replay (A3).

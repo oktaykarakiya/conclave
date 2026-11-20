@@ -8,13 +8,14 @@ no engine-profile, secret, or repo-knowledge endpoints here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -75,6 +76,7 @@ from ..engine.workflow_evolver import (
     revert_workflow,
 )
 from ..events import EventType
+from ..events.stream import StreamGap, stream_frames
 from ..observability.parquet_sync import export_interaction_logs_to_parquet
 from ..runtime import (
     Daemon,
@@ -240,12 +242,38 @@ async def get_models_catalog(
     return await models_catalog(daemon, project)
 
 
+def _sse_message(frame: EventRow | StreamGap) -> str:
+    """One server-sent event: an event with its id (``EventSource`` sends the last one back as
+    ``Last-Event-ID`` when it reconnects), a gap frame without one."""
+    if isinstance(frame, StreamGap):
+        return f"data: {json.dumps(frame.frame())}\n\n"
+    return f"id: {frame.id}\ndata: {json.dumps(frame.model_dump(mode='json'))}\n\n"
+
+
 @router.get("/events/stream")
 async def stream_events_sse(
     project_id: str | None = None,
     task_id: str | None = None,
+    after_id: int | None = Query(
+        None,
+        ge=0,
+        le=SQLITE_INT_MAX,
+        description="Replay the events after this id (the last one received) first.",
+    ),
+    last_event_id: int | None = Header(
+        None,
+        ge=0,
+        le=SQLITE_INT_MAX,
+        description="As after_id, and preferred to it: an EventSource reconnects with its "
+        "first URL and the id of the last event it received in this header.",
+    ),
     daemon: Daemon = Depends(get_daemon),
 ) -> StreamingResponse:
+    """Live events as server-sent events, optionally of one project or task. With an
+    ``after_id`` or ``Last-Event-ID``, the events missed since then come first. Each event
+    carries an ``id:`` line. A gap frame (``{"type": "stream.gap", "reason": ...}``, without an
+    id) marks where events were lost (:mod:`conclave.events.stream`)."""
+    resume_after = last_event_id if last_event_id is not None else after_id
     norm_pid = project_id.strip() if project_id and project_id.strip() else None
     norm_tid = task_id.strip() if task_id and task_id.strip() else None
     try:
@@ -254,11 +282,14 @@ async def stream_events_sse(
         raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     async def _event_generator() -> AsyncIterator[str]:
+        frames = stream_frames(
+            daemon.db, subscriber, project_id=norm_pid, task_id=norm_tid, after_id=resume_after
+        )
         try:
             with subscriber:
-                async for event in subscriber:
-                    data = json.dumps(event.model_dump(mode="json"))
-                    yield f"data: {data}\n\n"
+                async with contextlib.aclosing(frames):
+                    async for frame in frames:
+                        yield _sse_message(frame)
         except asyncio.CancelledError:
             return
 

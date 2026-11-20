@@ -14,8 +14,9 @@ Conclave — a portable, web-driven autonomous AI coding team that drives the `o
 ## Quality gate (always run before declaring done)
 
 ```bash
-ruff check src tests && mypy && pytest -q         # Python: 1488 tests (deterministic, zero LLM cost)
+ruff check src tests && mypy && pytest -q         # Python: 1520 tests (deterministic, zero LLM cost)
 cd frontend && npx tsc --noEmit && npm run build  # TypeScript strict + rebuild SPA
+cd frontend && npx vitest run                     # SPA unit tests (pure modules, no DOM)
 ```
 
 - Tests use `tests/integration/fake_provider.py` — a deterministic provider test-double that inspects prompts to impersonate the correct agent role (planner, reviewer, developer, post-mortem, repo-analyst; `FakeProvider.role_of`). No real LLM calls.
@@ -37,6 +38,7 @@ pytest -k "test_planning" -q                      # filter by name
 
 cd frontend && npm run dev         # Vite dev server with HMR (connects to a running backend)
 cd frontend && npm run typecheck   # TS type-check only
+cd frontend && npx vitest run      # SPA unit tests
 cd frontend && npm run build       # build SPA into src/conclave/web/static/
 ```
 
@@ -66,6 +68,7 @@ cd frontend && npm run build       # build SPA into src/conclave/web/static/
 - **Usage limits never fail work**: a provider reports an engine's usage-limit or balance refusal as `AgentResult.quota`, and `dispatch_with_quota` (`providers/quota.py`) waits on the daemon-wide `QuotaGate` (`Daemon.quota_gate`) until the reset, then resumes the session. `AgentRunner.run` and the planning session's turn are the only callers of `provider.run_agent` outside `providers/`: a new dispatch path goes through one of them (or `dispatch_with_quota`) with the daemon's gate.
 - **Env vars**: `CONCLAVE_HOST` (default `0.0.0.0`), `CONCLAVE_PORT` (default `8700`), `CONCLAVE_HOME` (default `~/.local/share/conclave`), `CONCLAVE_ENGINE` (default `opencode`; `claude` for Claude Code), `CONCLAVE_OPENCODE_BIN` / `CONCLAVE_CLAUDE_BIN` (binary overrides; the launcher autodiscovers), `PYTHON` (override interpreter for venv bootstrap).
 - **Branch `conclave-selftest`** exists unmerged — contains BMad scale-adaptive planning. Do not accidentally work on it unless that feature is explicitly requested.
+- **The live event stream** (`/ws/stream`, SSE `/api/events/stream`; `events/stream.py`) replays the persisted events after the client's `after_id` before the live ones and sends a gap frame, `{"type": "stream.gap", "reason": ...}` without an `id`, where events were lost. In the SPA, react to events with `useStreamListener` (`useStream.ts`): it calls `onEvent` once per event in arrival order, and `onResync` on a gap frame or a reconnect that cannot resume, where the component refetches what it derives from events (coalesce refetches with `useCoalesced`). Never react through an effect over React state holding the latest event: events that arrive before a render are skipped.
 - **Keep the MCP pilot docs current**: when MCP tools or pilot-relevant behaviour/defaults change, update `src/conclave/mcp/pilot_guide.md` (and `pilot_brief.md`) in the same change; the drift tests enforce tool coverage.
 
 ## Testing
@@ -75,3 +78,4 @@ cd frontend && npm run build       # build SPA into src/conclave/web/static/
 - A test project without a test command fails its tasks with `no_test_command` before any dispatch: give it one (e.g. `execution.baseline_test_command: "echo ok"`), or `execution.allow_no_test_command: true` when the test is about something else.
 - `pytest-asyncio` mode is `auto`; `PYTHONPATH=src` (set in pyproject.toml).
 - Filterwarnings: errors on all warnings except `PytestUnraisableExceptionWarning` (benign asyncio subprocess GC race in per-test event loops).
+- SPA logic that runs without React or the DOM lives in pure modules with a `*.test.ts` beside them (e.g. `frontend/src/eventStream.ts`), run by `npx vitest run` in the node environment (no DOM).

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "../api";
 import type {
-  EventRow,
   InteractionLog,
   InteractionMessage,
   ObservabilityStats,
@@ -10,6 +9,8 @@ import type {
   SqlQueryResult,
 } from "../types";
 import { Badge, Button, Card, Spinner, input } from "../ui";
+import type { StreamSubscribe } from "../useStream";
+import { useCoalesced, useStreamListener } from "../useStream";
 
 /** What an export reports: the file written, its row count, format and size. */
 type ExportResult = Awaited<ReturnType<typeof api.exportParquet>>;
@@ -283,10 +284,10 @@ function TranscriptMessageCard({
 
 export function HistoryView({
   project,
-  lastEvent,
+  subscribe,
 }: {
   project: Project | null;
-  lastEvent?: EventRow | null;
+  subscribe?: StreamSubscribe;
 }) {
   // Scope: All Workspace History (false) vs Current Repo Only (true)
   const [scopeProject, setScopeProject] = useState<boolean>(false);
@@ -359,28 +360,37 @@ export function HistoryView({
   }, [loadData]);
 
   // Real-time auto-sync when interaction.logged, mcp.tool_called, or task.done arrives
-  useEffect(() => {
-    if (!lastEvent) return;
-    if (
-      lastEvent.type === "interaction.logged" ||
-      lastEvent.type === "mcp.tool_called" ||
-      lastEvent.type === "task.done"
-    ) {
-      void loadData(true);
-      const eventSessionId =
-        typeof lastEvent.payload?.session_id === "string"
-          ? lastEvent.payload.session_id
-          : null;
-      if (selectedSessionId && eventSessionId === selectedSessionId) {
-        api
-          .observabilitySession(selectedSessionId)
-          .then((full) => setSelectedSession(full))
-          .catch(() => {
-            /* preserve drawer state on transient error */
-          });
-      }
+  // (a burst of them, or a replay after a reconnect, refetches once or twice).
+  const refreshHistory = useCoalesced(() => loadData(true));
+  const refreshSelectedSession = useCoalesced(async () => {
+    if (!selectedSessionId) return;
+    try {
+      setSelectedSession(await api.observabilitySession(selectedSessionId));
+    } catch {
+      /* preserve drawer state on transient error */
     }
-  }, [lastEvent, loadData, selectedSessionId]);
+  });
+  useStreamListener(subscribe, {
+    onEvent: (event) => {
+      if (
+        event.type !== "interaction.logged" &&
+        event.type !== "mcp.tool_called" &&
+        event.type !== "task.done"
+      ) {
+        return;
+      }
+      refreshHistory();
+      const eventSessionId =
+        typeof event.payload?.session_id === "string" ? event.payload.session_id : null;
+      if (selectedSessionId && eventSessionId === selectedSessionId) {
+        refreshSelectedSession();
+      }
+    },
+    onResync: () => {
+      refreshHistory();
+      refreshSelectedSession();
+    },
+  });
 
   const filteredSessions = useMemo(() => {
     if (filterSource === "all") return sessions;

@@ -33,7 +33,7 @@ import {
   input,
 } from "../ui";
 import type { StreamStatus } from "../useStream";
-import { useStream } from "../useStream";
+import { useCoalesced, useStream, useStreamListener } from "../useStream";
 
 // ============================================================================
 // Constants & Types
@@ -151,7 +151,6 @@ const TASK_LIFECYCLE_EVENTS = new Set([
 
 export interface Props {
   project: Project;
-  lastEvent?: EventRow | null;
   liveNodeStatuses?: Record<string, TaskCheckpoint["status"]>;
 }
 
@@ -161,7 +160,6 @@ export interface Props {
 
 export function WorkspaceView({
   project,
-  lastEvent = null,
   liveNodeStatuses,
 }: Props) {
   const projectId = project.id;
@@ -235,8 +233,8 @@ export function WorkspaceView({
   // --- Real-time WebSocket stream ---
   const {
     events: streamEvents,
-    lastEvent: streamLastEvent,
     status: streamStatus,
+    subscribe,
   } = useStream(projectId);
 
   // Load the model catalog the project's settings offer (and its configured default)
@@ -396,91 +394,84 @@ export function WorkspaceView({
     return () => clearInterval(id);
   }, [selectedPlanId, loadSelectedPlanDetails]);
 
-  // --- Surgical In-Place Live Event Patching (watching lastEvent) ---
-  const effectiveLastEvent = lastEvent ?? streamLastEvent;
-  useEffect(() => {
-    if (!effectiveLastEvent) return;
-    const evType = effectiveLastEvent.type ?? "";
+  // --- Surgical In-Place Live Event Patching (each event once, in arrival order) ---
+  // The refetches are coalesced: a burst of events, or the replay after a reconnect, runs
+  // each at most twice.
+  const refreshTasks = useCoalesced(async () => {
+    setTasks(await api.listTasks(project.id));
+  });
+  const refreshSelectedTask = useCoalesced(async () => {
+    if (selectedTask) await loadSelectedTaskDetails(selectedTask.id);
+  });
+  const refreshPlans = useCoalesced(async () => {
+    setPlans(await api.listPlanningSessions(project.id));
+  });
+  const refreshActivePlan = useCoalesced(async () => {
+    if (activePlanningId) await loadSelectedPlanDetails(activePlanningId);
+  });
+  const refreshWorkflowGraph = useCoalesced(async () => {
+    setWorkflowGraph((await api.getWorkflow(project.id)).workflow);
+  });
+  useStreamListener(subscribe, {
+    onEvent: (event) => {
+      const evType = event.type ?? "";
+      const forSelectedTask = selectedTask !== null && selectedTask.id === event.task_id;
 
-    // 1. Task lifecycle events -> refresh tasks smoothly in place & selectedTask details
-    if (TASK_LIFECYCLE_EVENTS.has(evType)) {
-      void api
-        .listTasks(project.id)
-        .then((taskList) => {
-          setTasks(taskList);
-        })
-        .catch(() => {});
-      if (selectedTask && selectedTask.id === effectiveLastEvent.task_id) {
-        void loadSelectedTaskDetails(selectedTask.id);
+      // 1. Task lifecycle events -> refresh tasks smoothly in place & selectedTask details
+      if (TASK_LIFECYCLE_EVENTS.has(evType)) {
+        refreshTasks();
+        if (forSelectedTask) refreshSelectedTask();
       }
-    }
 
-    // 2. Node execution & HITL events -> refresh selectedTask checkpoints and HITL state in real time
-    if (
-      evType === "node.started" ||
-      evType === "node.completed" ||
-      evType === "node.waiting_for_approval" ||
-      evType === "hitl.waiting" ||
-      evType === "hitl.resolved"
-    ) {
-      if (selectedTask?.id === effectiveLastEvent.task_id) {
-        void loadSelectedTaskDetails(selectedTask.id);
+      // 2. Node execution & HITL events -> refresh selectedTask checkpoints and HITL state in real time
+      if (
+        evType === "node.started" ||
+        evType === "node.completed" ||
+        evType === "node.waiting_for_approval" ||
+        evType === "hitl.waiting" ||
+        evType === "hitl.resolved"
+      ) {
+        if (forSelectedTask) refreshSelectedTask();
+        refreshTasks();
       }
-      void api
-        .listTasks(project.id)
-        .then((taskList) => {
-          setTasks(taskList);
-        })
-        .catch(() => {});
-    }
 
-    // 3. Planning session events -> refresh sessions & active planning messages/nodes in place
-    if (evType.startsWith("planning.")) {
-      void api
-        .listPlanningSessions(project.id)
-        .then((planList) => {
-          setPlans(planList);
-        })
-        .catch(() => {});
-      const evPlanId =
-        effectiveLastEvent.planning_session_id ??
-        (typeof effectiveLastEvent.payload?.planning_session_id === "string"
-          ? effectiveLastEvent.payload.planning_session_id
-          : null);
-      if (activePlanningId && activePlanningId === evPlanId) {
-        void loadSelectedPlanDetails(activePlanningId);
+      // 3. Planning session events -> refresh sessions & active planning messages/nodes in place
+      if (evType.startsWith("planning.")) {
+        refreshPlans();
+        const evPlanId =
+          event.planning_session_id ??
+          (typeof event.payload?.planning_session_id === "string"
+            ? event.payload.planning_session_id
+            : null);
+        if (activePlanningId && activePlanningId === evPlanId) refreshActivePlan();
       }
-    }
 
-    // 4. Verdict / usage / compaction updates on selected task
-    if (
-      selectedTask?.id &&
-      effectiveLastEvent.task_id === selectedTask.id &&
-      (evType === "agent.verdict" ||
-        evType === "usage.recorded" ||
-        evType === "context.compacted")
-    ) {
-      void loadSelectedTaskDetails(selectedTask.id);
-    }
+      // 4. Verdict / usage / compaction updates on selected task
+      if (
+        forSelectedTask &&
+        (evType === "agent.verdict" ||
+          evType === "usage.recorded" ||
+          evType === "context.compacted")
+      ) {
+        refreshSelectedTask();
+      }
 
-    // 5. Workflow updates -> refresh Mini-DAG workflow graph in place
-    if (
-      evType === "workflow.updated" &&
-      (!effectiveLastEvent.project_id || effectiveLastEvent.project_id === project.id)
-    ) {
-      void api
-        .getWorkflow(project.id)
-        .then((env) => setWorkflowGraph(env.workflow))
-        .catch(() => {});
-    }
-  }, [
-    effectiveLastEvent,
-    project.id,
-    selectedTask,
-    activePlanningId,
-    loadSelectedTaskDetails,
-    loadSelectedPlanDetails,
-  ]);
+      // 5. Workflow updates -> refresh Mini-DAG workflow graph in place
+      if (
+        evType === "workflow.updated" &&
+        (!event.project_id || event.project_id === project.id)
+      ) {
+        refreshWorkflowGraph();
+      }
+    },
+    onResync: () => {
+      // Events were missed: refetch everything this view derives from them.
+      void reloadAll();
+      refreshSelectedTask();
+      refreshActivePlan();
+      refreshWorkflowGraph();
+    },
+  });
 
   // --- Composer Actions ---
   const handleModeSwitch = useCallback(

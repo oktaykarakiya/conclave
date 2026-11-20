@@ -873,6 +873,33 @@ async def list_events(
     return [EventRow.from_row(r) for r in rows]
 
 
+async def list_missed_events(
+    db: Database,
+    *,
+    after_id: int,
+    limit: int,
+    project_id: str | None = None,
+    task_id: str | None = None,
+) -> list[EventRow]:
+    """The newest *limit* events after *after_id*, oldest first, that a live subscription
+    filtered by *project_id* and *task_id* delivers (``conclave.events.EventFilter``): a
+    project's stream also carries the events of no project, a task's only that task's."""
+    where = "id > ?"
+    params: list[Any] = [after_id]
+    if project_id is not None:
+        where += " AND (project_id = ? OR project_id IS NULL)"
+        params.append(project_id)
+    if task_id is not None:
+        where += " AND task_id = ?"
+        params.append(task_id)
+    rows = await db.fetchall(
+        f"SELECT * FROM (SELECT * FROM events WHERE {where} ORDER BY id DESC LIMIT ?) "
+        "ORDER BY id",
+        (*params, limit),
+    )
+    return [EventRow.from_row(r) for r in rows]
+
+
 async def gc_events(db: Database, project_id: str, keep: int = 10_000) -> None:
     """Prune ``events`` rows beyond the most-recent *keep* per project.
 

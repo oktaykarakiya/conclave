@@ -19,7 +19,8 @@ import type {
   StoreItem,
   TaskCheckpoint,
 } from "./types";
-import { useStream } from "./useStream";
+import type { StreamSubscribe } from "./useStream";
+import { useStream, useStreamListener } from "./useStream";
 
 export type MainView = "workspace" | "studio" | "history" | "settings";
 
@@ -36,10 +37,42 @@ const QUOTA_POLL_MS = 30_000;
 const AgentStudioView = AgentStudioViewBase as React.ComponentType<{
   projectId?: string | null;
   project?: Project | null;
-  lastEvent?: EventRow | null;
+  subscribe?: StreamSubscribe;
   liveNodeStatuses?: Record<string, TaskCheckpoint["status"]>;
   nodeStatuses?: Record<string, TaskCheckpoint["status"]>;
 }>;
+
+/** The node a node.* or hitl.* event is about, and the status it reports. */
+function liveNodeStatus(
+  event: EventRow,
+): [nodeId: string, status: TaskCheckpoint["status"]] | null {
+  const nodeId =
+    typeof event.payload?.workflow_node_id === "string"
+      ? event.payload.workflow_node_id
+      : typeof event.payload?.node_id === "string"
+        ? event.payload.node_id
+        : null;
+  if (!nodeId) return null;
+  switch (event.type) {
+    case "node.started":
+      return [nodeId, "running"];
+    case "node.waiting_for_approval":
+    case "hitl.waiting":
+      return [nodeId, "waiting_for_approval"];
+    case "node.completed":
+    case "hitl.resolved": {
+      const rs = event.payload?.status;
+      return [
+        nodeId,
+        rs === "failed" || rs === "skipped" || rs === "running" || rs === "waiting_for_approval"
+          ? rs
+          : "completed",
+      ];
+    }
+    default:
+      return null;
+  }
+}
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -75,11 +108,6 @@ export default function App() {
     const timer = setInterval(() => void refreshQuota(), QUOTA_POLL_MS);
     return () => clearInterval(timer);
   }, [refreshQuota]);
-
-  useEffect(() => {
-    const type = stream.lastEvent?.type;
-    if (type === "quota.waiting" || type === "quota.resumed") void refreshQuota();
-  }, [stream.lastEvent, refreshQuota]);
 
   const refreshProjects = useCallback(async () => {
     try {
@@ -119,143 +147,72 @@ export default function App() {
     setLiveNodeStatuses({});
   }, [selectedId]);
 
-  useEffect(() => {
-    const lastEvent = stream.lastEvent;
-    if (!lastEvent) return;
-
-    if (lastEvent.type === "project.created" && lastEvent.payload?.project) {
-      const newProject = lastEvent.payload.project as unknown as Project;
-      if (newProject && typeof newProject.id === "string") {
-        setProjects((prev) => {
-          const exists = prev.some((p) => p.id === newProject.id);
-          return exists
-            ? prev.map((p) => (p.id === newProject.id ? newProject : p))
-            : [...prev, newProject];
-        });
-        setSelectedId((cur) => (cur === null ? newProject.id : cur));
-      }
-    } else if (
-      lastEvent.type === "project.deleted" &&
-      typeof lastEvent.payload?.project_id === "string"
-    ) {
-      const deletedId = lastEvent.payload.project_id;
-      setProjects((prev) => {
-        const next = prev.filter((p) => p.id !== deletedId);
-        setSelectedId((cur) =>
-          cur === deletedId ? (next[0]?.id ?? null) : cur,
-        );
-        return next;
-      });
-    } else if (lastEvent.type === "project.updated" || lastEvent.type === "workflow.evolved") {
-      if (lastEvent.payload?.project) {
-        const updated = lastEvent.payload.project as unknown as Project;
-        if (updated && typeof updated.id === "string") {
-          setProjects((prev) =>
-            prev.map((p) => (p.id === updated.id ? updated : p)),
-          );
+  // Each event once, in arrival order (several can arrive before React renders).
+  useStreamListener(stream.subscribe, {
+    onEvent: (event) => {
+      if (event.type === "quota.waiting" || event.type === "quota.resumed") {
+        void refreshQuota();
+      } else if (event.type === "project.created" && event.payload?.project) {
+        const newProject = event.payload.project as unknown as Project;
+        if (newProject && typeof newProject.id === "string") {
+          setProjects((prev) => {
+            const exists = prev.some((p) => p.id === newProject.id);
+            return exists
+              ? prev.map((p) => (p.id === newProject.id ? newProject : p))
+              : [...prev, newProject];
+          });
+          setSelectedId((cur) => (cur === null ? newProject.id : cur));
         }
-      }
-      void refreshProjects();
-    } else if (lastEvent.type === "system.reloaded") {
-      if (lastEvent.payload?.frontend_rebuilt === true) {
-        window.location.reload();
-        return;
-      }
-      void refreshProjects();
-    } else if (lastEvent.type === "mcp.tool_called") {
-      const toolName =
-        typeof lastEvent.payload?.tool === "string"
-          ? lastEvent.payload.tool
-          : "tool";
-      setLastMcpCall({ tool: toolName, ts: Date.now() });
-    } else if (lastEvent.type === "node.started") {
-      const nodeId =
-        typeof lastEvent.payload?.workflow_node_id === "string"
-          ? lastEvent.payload.workflow_node_id
-          : typeof lastEvent.payload?.node_id === "string"
-            ? lastEvent.payload.node_id
-            : null;
-      if (nodeId) {
-        setLiveNodeStatuses((prev) => ({
-          ...prev,
-          [nodeId]: "running",
-        }));
-      }
-    } else if (
-      lastEvent.type === "node.waiting_for_approval" ||
-      lastEvent.type === "hitl.waiting"
-    ) {
-      const nodeId =
-        typeof lastEvent.payload?.node_id === "string"
-          ? lastEvent.payload.node_id
-          : null;
-      if (nodeId) {
-        setLiveNodeStatuses((prev) => ({
-          ...prev,
-          [nodeId]: "waiting_for_approval",
-        }));
-      }
-    } else if (
-      lastEvent.type === "node.completed" ||
-      lastEvent.type === "hitl.resolved"
-    ) {
-      const nodeId =
-        typeof lastEvent.payload?.workflow_node_id === "string"
-          ? lastEvent.payload.workflow_node_id
-          : typeof lastEvent.payload?.node_id === "string"
-            ? lastEvent.payload.node_id
-            : null;
-      const rawStatus = lastEvent.payload?.status;
-      const status: TaskCheckpoint["status"] =
-        rawStatus === "failed" ||
-        rawStatus === "skipped" ||
-        rawStatus === "running" ||
-        rawStatus === "waiting_for_approval"
-          ? rawStatus
-          : "completed";
-      if (nodeId) {
-        setLiveNodeStatuses((prev) => ({
-          ...prev,
-          [nodeId]: status,
-        }));
-      }
-    }
-    if (Array.isArray(stream.events) && stream.events.length > 0) {
-      setLiveNodeStatuses((prev) => {
-        const next: Record<string, TaskCheckpoint["status"]> = { ...prev };
-        for (const ev of stream.events) {
-          const nid =
-            typeof ev.payload?.workflow_node_id === "string"
-              ? ev.payload.workflow_node_id
-              : typeof ev.payload?.node_id === "string"
-                ? ev.payload.node_id
-                : null;
-          if (!nid) continue;
-          if (ev.type === "node.started") {
-            next[nid] = "running";
-          } else if (
-            ev.type === "node.waiting_for_approval" ||
-            ev.type === "hitl.waiting"
-          ) {
-            next[nid] = "waiting_for_approval";
-          } else if (
-            ev.type === "node.completed" ||
-            ev.type === "hitl.resolved"
-          ) {
-            const rs = ev.payload?.status;
-            next[nid] =
-              rs === "failed" ||
-              rs === "skipped" ||
-              rs === "running" ||
-              rs === "waiting_for_approval"
-                ? rs
-                : "completed";
+      } else if (
+        event.type === "project.deleted" &&
+        typeof event.payload?.project_id === "string"
+      ) {
+        const deletedId = event.payload.project_id;
+        setProjects((prev) => {
+          const next = prev.filter((p) => p.id !== deletedId);
+          setSelectedId((cur) =>
+            cur === deletedId ? (next[0]?.id ?? null) : cur,
+          );
+          return next;
+        });
+      } else if (event.type === "project.updated" || event.type === "workflow.evolved") {
+        if (event.payload?.project) {
+          const updated = event.payload.project as unknown as Project;
+          if (updated && typeof updated.id === "string") {
+            setProjects((prev) =>
+              prev.map((p) => (p.id === updated.id ? updated : p)),
+            );
           }
         }
-        return next;
-      });
-    }
-  }, [stream.lastEvent, stream.events, refreshProjects]);
+        void refreshProjects();
+      } else if (event.type === "system.reloaded") {
+        if (event.payload?.frontend_rebuilt === true) {
+          window.location.reload();
+          return;
+        }
+        void refreshProjects();
+      } else if (event.type === "mcp.tool_called") {
+        const toolName =
+          typeof event.payload?.tool === "string"
+            ? event.payload.tool
+            : "tool";
+        setLastMcpCall({ tool: toolName, ts: Date.now() });
+      } else {
+        const update = liveNodeStatus(event);
+        if (update) {
+          const [nodeId, status] = update;
+          setLiveNodeStatuses((prev) => ({ ...prev, [nodeId]: status }));
+        }
+      }
+    },
+    onResync: () => {
+      // Events were missed: drop the live node statuses (the views fall back to the
+      // checkpoints they refetch) and refetch the projects and usage-limit gates.
+      setLiveNodeStatuses({});
+      void refreshProjects();
+      void refreshQuota();
+    },
+  });
 
   useEffect(() => {
     if (!lastMcpCall) return;
@@ -329,7 +286,6 @@ export default function App() {
         return (
           <WorkspaceView
             project={selectedProject}
-            lastEvent={stream.lastEvent}
             liveNodeStatuses={liveNodeStatuses}
           />
         );
@@ -338,13 +294,13 @@ export default function App() {
           <AgentStudioView
             projectId={selectedProject.id}
             project={selectedProject}
-            lastEvent={stream.lastEvent}
+            subscribe={stream.subscribe}
             liveNodeStatuses={liveNodeStatuses}
             nodeStatuses={liveNodeStatuses}
           />
         );
       case "history":
-        return <HistoryView project={selectedProject} lastEvent={stream.lastEvent} />;
+        return <HistoryView project={selectedProject} subscribe={stream.subscribe} />;
       case "settings":
         return (
           <SettingsView projectId={selectedProject.id} onProjectDeleted={reload} />
@@ -615,7 +571,7 @@ export default function App() {
               <AgentStudioView
                 projectId={null}
                 project={null}
-                lastEvent={stream.lastEvent}
+                subscribe={stream.subscribe}
                 liveNodeStatuses={liveNodeStatuses}
                 nodeStatuses={liveNodeStatuses}
               />
