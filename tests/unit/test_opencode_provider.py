@@ -24,6 +24,7 @@ from conclave.config import ArgMode
 from conclave.providers import AgentResult, opencode_cli
 from conclave.providers.opencode_cli import OpenCodeCliProvider, _parse_events
 from conclave.providers.profiles import ResolvedProfile
+from waits import wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -569,15 +570,6 @@ def _running(pid: int) -> bool:
     return stat.rsplit(")", 1)[-1].split()[0] != "Z"
 
 
-async def _gone_within(pid: int, seconds: float = 5.0) -> bool:
-    deadline = time.monotonic() + seconds
-    while _running(pid):
-        if time.monotonic() > deadline:
-            return False
-        await asyncio.sleep(0.05)
-    return True
-
-
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness")
 async def test_cancelling_the_dispatch_task_kills_the_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -598,16 +590,17 @@ async def test_cancelling_the_dispatch_task_kills_the_cli(
             timeout_seconds=60,
         )
     )
-    deadline = time.monotonic() + 10
-    while not (pid_file.exists() and pid_file.read_text().strip()):
-        assert time.monotonic() < deadline, "the fake opencode never started"
-        await asyncio.sleep(0.05)
-    pid = int(pid_file.read_text())
+    pid = int(
+        await wait_until(
+            lambda: pid_file.exists() and pid_file.read_text().strip(),
+            "the fake opencode never started",
+        )
+    )
     try:
         dispatch.cancel()
         with pytest.raises(asyncio.CancelledError):
             await dispatch
-        assert await _gone_within(pid), f"the CLI ({pid}) still runs after the cancel"
+        await wait_until(lambda: not _running(pid), f"the CLI ({pid}) still runs after the cancel")
     finally:
         if _running(pid):
             with contextlib.suppress(OSError):
@@ -678,6 +671,8 @@ async def test_a_character_split_across_reads_is_decoded_whole(
         "fake_opencode_split.py",
         f"data = open({str(tmp_path / 'payload.bin')!r}, 'rb').read()\n"
         f"sys.stdout.buffer.write(data[:{cut}])\nsys.stdout.buffer.flush()\n"
+        # Lets the provider read the first part on its own. A host too slow for that reads both
+        # at once, which decodes whole too: the test cannot fail on it, only not split the dash.
         "time.sleep(0.3)\n"
         f"sys.stdout.buffer.write(data[{cut}:])\nsys.stdout.buffer.flush()\n",
     )

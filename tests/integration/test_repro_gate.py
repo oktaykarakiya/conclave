@@ -34,6 +34,7 @@ from conclave.engine import repro_gate as repro_gate_mod
 from conclave.engine.gate import GateResult
 from conclave.engine.gitio import run_git
 from conclave.events import EventBus, EventType
+from waits import wait_until, within
 
 _FAILING = "def test_repro_target() -> None:\n    assert 1 == 2\n"
 _PASSING = "def test_repro_target() -> None:\n    assert 1 == 1\n"
@@ -302,14 +303,11 @@ async def test_cancel_stops_the_running_gate_without_a_retry(
             wm=wm, test_command=command, timeout_seconds=600, cancel_event=cancel,
         )
     )
-    for _ in range(200):
-        if runs.exists():
-            break
-        await asyncio.sleep(0.05)
-    assert runs.exists(), "the gate command never started"
+    await wait_until(runs.exists, "the gate command never started")
 
     cancel.set()
-    result = await asyncio.wait_for(gate, timeout=5)
+    # Far below the command's 300 s and the gate's 600 s timeout: it was stopped, not waited for.
+    result = await within(gate, "the cancelled gate never returned")
 
     assert result.outcome is ReproOutcome.infra
     assert result.candidate.status is BugStatus.discovered

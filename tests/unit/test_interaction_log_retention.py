@@ -27,6 +27,7 @@ from conclave.mcp.tools import call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, Provider, ResolvedProfile
 from conclave.runtime import Daemon, prune_interaction_logs
 from conclave.web import create_app
+from waits import wait_until
 
 _DAY_MS = 86_400_000
 
@@ -99,11 +100,12 @@ async def test_every_pass_of_the_retention_loop_deletes_the_expired_logs(
     loop_task = asyncio.create_task(daemon._interaction_log_retention_loop())
     try:
         for expired in ("expired-1", "expired-2"):  # two passes, not just one
+
+            async def deleted(expired: str = expired) -> bool:
+                return expired not in await _session_ids(db)
+
             await _log(db, expired, days_old=91)
-            for _ in range(500):  # bounded wait, about 5 s at most
-                if expired not in await _session_ids(db):
-                    break
-                await asyncio.sleep(0.01)
+            await wait_until(deleted, f"the retention loop never deleted {expired}")
             assert await _session_ids(db) == {"recent"}
     finally:
         loop_task.cancel()

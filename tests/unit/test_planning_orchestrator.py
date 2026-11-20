@@ -18,6 +18,7 @@ from conclave.events import EventBus
 from conclave.planning.session import _SPECIALIST_AGENTS, PlanningOrchestrator
 from conclave.providers import AgentResult
 from conclave.runtime import Daemon
+from waits import wait_until, within
 
 # --- repository layer ---------------------------------------------------------
 
@@ -32,19 +33,16 @@ async def _wait_until_settled(
     ``_run_discussion`` performs awaited database work through aiosqlite's worker
     thread, so a fixed number of event-loop ticks is not a time bound.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + 5.0
-    while True:
+
+    async def settled() -> bool:
         refreshed = await repo.get_planning_session(db, session_id)
         assert refreshed is not None
-        if refreshed.status in (
+        return refreshed.status in (
             PlanningSessionStatus.stable,
             PlanningSessionStatus.completed,
-        ):
-            return
-        if loop.time() >= deadline:
-            raise AssertionError(failure)
-        await asyncio.sleep(0.01)
+        )
+
+    await wait_until(settled, failure)
 
 
 async def test_planning_session_crud(db: Database) -> None:
@@ -300,6 +298,7 @@ class _OneShotThenBlockProvider:
 
     def __init__(self) -> None:
         self._has_initial = False
+        self.blocked = asyncio.Event()  # set once a call blocks: the initial turn is over
 
     async def run_agent(self, *, profile, prompt, timeout_seconds, cwd=None, on_chunk=None):
         if "Planning Facilitator Agent" in prompt and not self._has_initial:
@@ -308,6 +307,7 @@ class _OneShotThenBlockProvider:
                 ok=True, text=self._PLANNER_INITIAL, model_reported="fake", cost_usd=0.0,
             )
         # All subsequent calls block forever, keeping the session active.
+        self.blocked.set()
         await asyncio.Event().wait()
         return AgentResult(ok=True, text="unreachable", model_reported="fake", cost_usd=0.0)
 
@@ -640,16 +640,17 @@ async def test_approve_session_on_active_cancels_loop_before_create(db: Database
     bus = EventBus(db)
     # _OneShotThenBlockProvider: initial planner turn creates 2 task nodes,
     # then blocks forever so the session stays active.
-    orchestrator = PlanningOrchestrator(db, bus, _OneShotThenBlockProvider())
+    provider = _OneShotThenBlockProvider()
+    orchestrator = PlanningOrchestrator(db, bus, provider)
 
     session = await orchestrator.create_and_start(
         project_id=project.id,
         title="Active Approve Test",
         prompt="Test that active approval cancels loop first.",
     )
-    # Let the spawned task enter _run_discussion and complete the initial
-    # planner turn (which creates task nodes), then block.
-    await asyncio.sleep(0.1)
+    # Wait until the spawned task has entered _run_discussion, completed the initial
+    # planner turn (which creates task nodes) and blocked in the next dispatch.
+    await within(provider.blocked.wait(), "the discussion never got past its initial turn")
 
     # Sanity: session is active and has task nodes.
     refreshed = await repo.get_planning_session(db, session.id)

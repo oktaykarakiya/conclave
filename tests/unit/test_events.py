@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
-from conclave.db import Database
+from conclave.db import Database, EventRow
 from conclave.db import repositories as repo
-from conclave.events import EventBus, EventType
+from conclave.events import EventBus, EventType, Subscriber
+from waits import within
+
+
+async def _next(sub: Subscriber) -> EventRow:
+    """The subscriber's next event, which the test emitted before asking for it."""
+    return await within(sub.__anext__(), "the subscriber never got the next event")
 
 
 async def test_emit_persists_and_delivers(db: Database) -> None:
@@ -16,7 +20,7 @@ async def test_emit_persists_and_delivers(db: Database) -> None:
     sub = bus.subscribe()
     event = await bus.emit(type=EventType.task_started, project_id="p", task_id="t")
 
-    delivered = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    delivered = await _next(sub)
     assert delivered.id == event.id
     assert delivered.type == "task.started"
 
@@ -29,7 +33,7 @@ async def test_filter_by_task(db: Database) -> None:
     sub = bus.subscribe(task_id="t1")
     await bus.emit(type="x", task_id="t2")  # filtered out
     await bus.emit(type="y", task_id="t1")
-    delivered = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    delivered = await _next(sub)
     assert delivered.task_id == "t1"
     assert delivered.type == "y"
 
@@ -42,7 +46,7 @@ async def test_overflow_drops_oldest_without_blocking(db: Database) -> None:
     assert sub.queue.qsize() == 10
     assert sub.dropped == 40
     # the queue retains the most recent events
-    latest = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    latest = await _next(sub)
     assert latest.payload["i"] == 40
 
 
@@ -50,7 +54,7 @@ async def test_context_manager_unsubscribes(db: Database) -> None:
     bus = EventBus(db)
     with bus.subscribe() as sub:
         await bus.emit(type="a")
-        assert (await asyncio.wait_for(sub.__anext__(), timeout=1.0)).type == "a"
+        assert (await _next(sub)).type == "a"
         assert bus.subscriber_count() == 1
     assert bus.subscriber_count() == 0
 
@@ -100,11 +104,11 @@ async def test_gap_detected_false_when_no_overflow(db: Database) -> None:
     await bus.emit(type=EventType.log, payload={"i": 2})
 
     assert sub.gap_detected is False
-    evt = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    evt = await _next(sub)
     assert evt.payload["i"] == 1
     assert sub.gap_detected is False
 
-    evt = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    evt = await _next(sub)
     assert evt.payload["i"] == 2
     assert sub.gap_detected is False
 
@@ -119,7 +123,7 @@ async def test_gap_detected_set_when_queue_overflows(db: Database) -> None:
     assert sub.dropped >= 2  # at least 2 events evicted
 
     # The next event delivered must have gap_detected=True.
-    evt = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    evt = await _next(sub)
     assert sub.gap_detected is True
     assert evt.payload is not None
 
@@ -133,11 +137,11 @@ async def test_gap_detected_resets_after_read(db: Database) -> None:
         await bus.emit(type=EventType.log, payload={"i": i})
 
     # First read after overflow — gap_detected must be True.
-    evt1 = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    evt1 = await _next(sub)
     assert sub.gap_detected is True
 
     # Second read — gap_detected must reset to False.
-    evt2 = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    evt2 = await _next(sub)
     assert sub.gap_detected is False
     assert evt2.id != evt1.id
 
@@ -151,6 +155,6 @@ async def test_overflow_preserves_gap_detected_with_existing_test(db: Database) 
     assert sub.queue.qsize() == 10
     assert sub.dropped == 40
     # The first read after overflow must signal a gap.
-    latest = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+    latest = await _next(sub)
     assert latest.payload["i"] == 40
     assert sub.gap_detected is True

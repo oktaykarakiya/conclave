@@ -33,6 +33,7 @@ from conclave.mcp.tools import call_mcp_tool
 from conclave.providers import AgentResult, OnChunk, ResolvedProfile
 from conclave.runtime import Daemon
 from conclave.web import create_app
+from waits import wait_until, within
 
 # Execution settings for tests about stages other than the green gate: their throwaway repos have
 # no test suite, so they run without a test command deliberately (else no_test_command fails them).
@@ -62,6 +63,16 @@ async def _attach_ungated(client: httpx.AsyncClient, repo_path: Path) -> str:
     )
     assert patched.status_code == 200
     return project_id
+
+
+async def _task_state_in(client: httpx.AsyncClient, task_id: str, *states: str) -> str:
+    """Wait until the task's state, as REST reports it, is one of *states*; return it."""
+
+    async def current() -> str | None:
+        state: str = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
+        return state if state in states else None
+
+    return await wait_until(current, f"task {task_id} never reached {' or '.join(states)}")
 
 
 async def _worktree_paths(repo_path: Path) -> set[Path]:
@@ -1207,12 +1218,10 @@ async def test_concurrent_merges_share_lock_then_prune(db: Database, tmp_path: P
     async def _open_gate_once_both_referenced() -> None:
         # Both _merge calls bump the ref count for "main" BEFORE acquiring the lock, so a
         # count of 2 proves the second is queued on the SAME lock the first holds.
-        for _ in range(500):
-            if orchestrator._merge_lock_refs.get("main", 0) >= 2:
-                break
-            await asyncio.sleep(0)
-        else:
-            raise AssertionError("second merge never queued on the shared lock")
+        await wait_until(
+            lambda: orchestrator._merge_lock_refs.get("main", 0) >= 2,
+            "second merge never queued on the shared lock",
+        )
         release_gate.set()
 
     gate_opener = asyncio.create_task(_open_gate_once_both_referenced())
@@ -1588,6 +1597,9 @@ async def test_cancel_event_checked_between_stages(
     # A provider whose developer dispatch blocks until the cancel event is set,
     # while planner and reviewer dispatch pass through instantly.
     class _BlockingDeveloper:
+        def __init__(self) -> None:
+            self.developer_started = asyncio.Event()
+
         async def run_agent(
             self,
             *,
@@ -1607,11 +1619,13 @@ async def test_cancel_event_checked_between_stages(
                     model_reported="fake",
                 )
             # Developer: block until cancel_event is set, then return success.
+            self.developer_started.set()
             if cancel_event is not None:
                 await cancel_event.wait()
             return AgentResult(ok=True, text="done", model_reported="fake")
 
-    orchestrator = Orchestrator(db, EventBus(db), _BlockingDeveloper(), tmp_path / "home")
+    provider = _BlockingDeveloper()
+    orchestrator = Orchestrator(db, EventBus(db), provider, tmp_path / "home")
     cancel_event = asyncio.Event()
 
     # Run process_task in the background so we can signal cancellation mid-flight.
@@ -1620,14 +1634,14 @@ async def test_cancel_event_checked_between_stages(
 
     proc_task = asyncio.create_task(_run())
 
-    # Give the orchestrator time to dispatch the developer and enter the blocking wait.
-    await asyncio.sleep(0.2)
+    # Wait until the orchestrator has dispatched the developer, which now blocks.
+    await within(provider.developer_started.wait(), "the developer was never dispatched")
 
     # Signal cancellation — the blocking developer will return, then the orchestrator
     # checks at the post-developer check point and calls _finish_cancelled.
     cancel_event.set()
 
-    result = await asyncio.wait_for(proc_task, timeout=10.0)
+    result = await within(proc_task, "the cancelled task never ended")
     assert result is False
 
     final = await repo.get_task(db, task.id)
@@ -2281,6 +2295,7 @@ async def test_cancel_via_api_endpoint(
     class _BlockingProvider:
         def __init__(self) -> None:
             self._release = asyncio.Event()
+            self.developer_started = asyncio.Event()
 
         def release(self) -> None:
             self._release.set()
@@ -2303,6 +2318,7 @@ async def test_cancel_via_api_endpoint(
                 return AgentResult(ok=True, text=_AI, model_reported="fake")
             # Developer dispatch — block until released so the cancel request
             # can race against the running task.
+            self.developer_started.set()
             await self._release.wait()
             if cwd is not None:
                 (Path(cwd) / "FEATURE.txt").write_text("done\n", encoding="utf-8")
@@ -2327,17 +2343,14 @@ async def test_cancel_via_api_endpoint(
 
             # Wait for the worker to claim the task (in_progress) and dispatch
             # the developer (which will block on _release).
-            state = ""
-            for _ in range(150):
-                state = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
-                if state == "in_progress":
-                    break
-                await asyncio.sleep(0.1)
+            state = await _task_state_in(client, task_id, "in_progress")
             assert state == "in_progress", f"expected in_progress, got {state!r}"
 
-            # Give the orchestrator a moment to reach the developer dispatch
-            # and enter the blocking wait.
-            await asyncio.sleep(0.2)
+            # Wait until the orchestrator has reached the developer dispatch
+            # and entered the blocking wait.
+            await within(
+                blocking.developer_started.wait(), "the developer dispatch never started"
+            )
 
             # Cancel via the endpoint — this sets the cancel_event on the
             # orchestrator. The developer is still blocked, so the cancel
@@ -2352,11 +2365,7 @@ async def test_cancel_via_api_endpoint(
             blocking.release()
 
             # Wait for the worker to process the cancellation.
-            for _ in range(150):
-                state = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
-                if state in ("cancelled", "done", "failed"):
-                    break
-                await asyncio.sleep(0.1)
+            state = await _task_state_in(client, task_id, "cancelled", "done", "failed")
             assert state == "cancelled", f"expected cancelled, got {state!r}"
 
             # Verify the task_cancelled event was emitted.
@@ -2471,19 +2480,10 @@ async def test_steer_via_api_endpoint_injects_into_in_flight_task(
             task_id = task.json()["id"]
 
             # Wait for the worker to claim the task and reach the blocking developer dispatch.
-            state = ""
-            for _ in range(150):
-                state = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
-                if state == "in_progress":
-                    break
-                await asyncio.sleep(0.1)
+            state = await _task_state_in(client, task_id, "in_progress")
             assert state == "in_progress", f"expected in_progress, got {state!r}"
-            # Give the orchestrator a moment to actually enter the developer dispatch.
-            for _ in range(150):
-                if blocking.dev_prompts:
-                    break
-                await asyncio.sleep(0.1)
-            assert blocking.dev_prompts, "developer dispatch never started"
+            # Wait until the orchestrator has actually entered the developer dispatch.
+            await wait_until(lambda: blocking.dev_prompts, "developer dispatch never started")
 
             # Steer the in-flight task: the endpoint must accept it (200) and the daemon
             # must queue the guidance on the orchestrator, pending the next dispatch. (The
@@ -2498,11 +2498,7 @@ async def test_steer_via_api_endpoint_injects_into_in_flight_task(
 
             # Release the developer so the task completes cleanly.
             blocking.release()
-            for _ in range(150):
-                state = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
-                if state in ("done", "failed", "cancelled"):
-                    break
-                await asyncio.sleep(0.1)
+            state = await _task_state_in(client, task_id, "done", "failed", "cancelled")
             assert state == "done", f"expected done, got {state!r}"
         finally:
             await daemon.shutdown()
@@ -2771,9 +2767,10 @@ async def _cancel_once_started(
     orchestrator._cancel_events[task.id] = cancel_event  # in flight, as the worker registers it
     async with asyncio.timeout(120):
         running = asyncio.create_task(orchestrator.process_task(claimed, cancel_event=cancel_event))
-        while not started.exists():
-            assert not running.done(), "the task ended before its command started"
-            await asyncio.sleep(0.05)
+        await wait_until(
+            lambda: started.exists() or running.done(), "the task's command never started"
+        )
+        assert started.exists(), "the task ended before its command started"
         assert orchestrator.request_cancel(task.id) is True
         cancelled_at = time.monotonic()
         assert await running is False
@@ -2868,9 +2865,10 @@ async def test_concurrent_tasks_of_two_projects_get_their_own_venv_guidance(
 
     async with asyncio.timeout(120):
         running_a = asyncio.create_task(orchestrator.process_task(claimed_a))
-        while not a_waiting.exists():
-            assert not running_a.done()
-            await asyncio.sleep(0.05)
+        await wait_until(
+            lambda: a_waiting.exists() or running_a.done(), "task A's setup never started"
+        )
+        assert a_waiting.exists(), "task A ended before its setup started"
         assert await orchestrator.process_task(claimed_b) is True
         release_a.touch()
         assert await running_a is True
@@ -2941,11 +2939,12 @@ async def test_terminal_tasks_leave_no_running_or_waiting_checkpoint(
         if how == "cancel_in_review":
             await provider.dispatch_blocked.wait()
         elif how == "cancel_in_hitl_pause":
-            for _ in range(1200):
-                paused = await repo.get_task(db, task.id)
-                if paused is not None and paused.state is TaskState.waiting_for_approval:
-                    break
-                await asyncio.sleep(0.05)
+
+            async def paused() -> bool:
+                current = await repo.get_task(db, task.id)
+                return current is not None and current.state is TaskState.waiting_for_approval
+
+            await wait_until(paused, "the task never paused for the developer's approval")
         if how != "developer_raises":
             assert orchestrator.request_cancel(task.id) is True
         assert await running is False

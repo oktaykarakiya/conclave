@@ -17,6 +17,7 @@ from conclave.engine.gitio import run_git
 from conclave.events import EventBus
 from conclave.runtime import Daemon
 from conclave.web import create_app
+from waits import wait_until, within
 
 
 async def _init_repo(path: Path) -> None:
@@ -267,11 +268,11 @@ async def test_pause_after_node_and_source_branch_pr_review(
         # Run process_task in background; it should pause at waiting_for_approval after 'reviewer'
         run_future = asyncio.create_task(daemon.orchestrator.process_task(claimed))
 
-        for _ in range(100):
+        async def paused() -> bool:
             cur = await repo.get_task(db, tid)
-            if cur is not None and cur.state == TaskState.waiting_for_approval:
-                break
-            await asyncio.sleep(0.05)
+            return cur is not None and cur.state == TaskState.waiting_for_approval
+
+        await wait_until(paused, "the task never paused for approval after 'reviewer'")
 
         paused_task = await repo.get_task(db, tid)
         assert paused_task is not None
@@ -292,7 +293,7 @@ async def test_pause_after_node_and_source_branch_pr_review(
         assert comp_res.status_code == 200
         assert comp_res.json()["ok"] is True
 
-        ok = await asyncio.wait_for(run_future, timeout=10.0)
+        ok = await within(run_future, "the task never finished after the approval")
         assert ok is True
 
         final_task = await repo.get_task(db, tid)

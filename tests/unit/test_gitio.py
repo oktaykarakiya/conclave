@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +18,7 @@ from conclave.engine.gitio import (
     _signal_group,
     run_shell,
 )
+from waits import wait_until
 
 # ---------------------------------------------------------------------------
 # run_shell — process-group kill on timeout
@@ -23,7 +26,7 @@ from conclave.engine.gitio import (
 
 
 async def test_run_shell_kills_process_group_on_timeout(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A shell that spawns children must leave no orphans after timeout.
 
@@ -35,6 +38,7 @@ async def test_run_shell_kills_process_group_on_timeout(
     # Write the background child's pid to a file so we can check it after
     # the timeout (stdout is lost when communicate() is interrupted).
     script = f"sleep 300 & echo $! > {pid_file.as_posix()}; wait"
+    _start_the_timeout_once(monkeypatch, lambda: _pid_in(pid_file), "the shell never wrote a pid")
     exit_code, output = await run_shell(tmp_path, script, timeout_seconds=1)
     assert exit_code == 124, f"expected exit 124, got {exit_code}; output={output!r}"
     assert "timed out" in output
@@ -173,23 +177,40 @@ async def test_kill_process_group_sigterm_then_sigkill() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _wait_for_pid(pid_file: Path, deadline_seconds: float = 5.0) -> int:
-    """Poll until *pid_file* holds a pid (the shell wrote it) and return it."""
-    deadline = asyncio.get_event_loop().time() + deadline_seconds
-    while asyncio.get_event_loop().time() < deadline:
-        if pid_file.exists() and pid_file.read_text().strip():
-            return int(pid_file.read_text().strip())
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"{pid_file} never got a pid")
+def _pid_in(pid_file: Path) -> str:
+    """What *pid_file* holds so far ("" until the shell wrote it)."""
+    return pid_file.read_text().strip() if pid_file.exists() else ""
 
 
-async def _wait_for_process_gone(pid: int, deadline_seconds: float = 3.0) -> None:
-    """Poll until *pid* no longer exists or *deadline_seconds* elapses."""
-    deadline = asyncio.get_event_loop().time() + deadline_seconds
-    while asyncio.get_event_loop().time() < deadline:
+def _start_the_timeout_once(
+    monkeypatch: pytest.MonkeyPatch, ready: Callable[[], object], failure: str
+) -> None:
+    """Hand run_shell the shell it starts only once *ready* holds. Its timeout starts when it has
+    the process, so the timeout then covers what the command does next, never how long the host
+    takes to start it."""
+    spawn = asyncio.create_subprocess_shell
+
+    async def spawn_when_ready(cmd: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        proc = await spawn(cmd, **kwargs)
+        await wait_until(ready, failure)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", spawn_when_ready)
+
+
+async def _wait_for_pid(pid_file: Path) -> int:
+    """Wait until *pid_file* holds a pid (the shell wrote it) and return it."""
+    return int(await wait_until(lambda: _pid_in(pid_file), f"{pid_file} never got a pid"))
+
+
+async def _wait_for_process_gone(pid: int) -> None:
+    """Wait until *pid* no longer exists."""
+
+    def gone() -> bool:
         try:
             os.kill(pid, 0)
         except (ProcessLookupError, PermissionError, OSError, SystemError):
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"pid {pid} still alive after {deadline_seconds}s")
+            return True
+        return False
+
+    await wait_until(gone, f"pid {pid} never exited")

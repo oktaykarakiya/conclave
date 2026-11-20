@@ -6,7 +6,9 @@ import asyncio
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -20,6 +22,7 @@ from conclave.engine.gitio import run_git
 from conclave.mcp import mcp_connect_snippets
 from conclave.runtime import Daemon
 from conclave.web import create_app
+from waits import wait_until, within
 
 
 async def _init_repo(path: Path) -> None:
@@ -687,19 +690,47 @@ async def test_operator_sql_cannot_read_raw_database_pages(db: Database) -> None
     assert _SECRET_VALUE not in str(refused.value)
 
 
+class _HeldClock:
+    """The repositories module's ``time``, whose ``monotonic()`` stands still until the test moves
+    it: a query's deadline passes when the test says, however slowly a loaded host runs the
+    test meanwhile. Everything else is the real ``time``."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.reads = 0  # monotonic() calls: the query's deadline, then one per progress check
+
+    def monotonic(self) -> float:
+        self.reads += 1
+        return self.now
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
 async def test_a_runaway_operator_query_stops_at_its_deadline_and_blocks_nothing(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    clock = _HeldClock()
+    monkeypatch.setattr(repo, "time", clock)
     monkeypatch.setattr(repo, "_READONLY_QUERY_TIMEOUT_S", 1.0)
     runaway = asyncio.create_task(repo.query_interaction_logs_readonly(db, _RUNAWAY_SQL))
-    await asyncio.sleep(0.1)  # under way in its worker thread
+    try:
+        # Under way in its worker thread: it read its deadline, and its progress check ran.
+        await wait_until(
+            lambda: clock.reads >= 2 or runaway.done(), "the runaway query never got under way"
+        )
 
-    # Another database call of the daemon completes meanwhile, on the shared connection.
-    assert await asyncio.wait_for(repo.list_projects(db), timeout=0.8) == []
-    assert not runaway.done()
+        # Another database call of the daemon completes meanwhile, on the shared connection.
+        listed = await within(repo.list_projects(db), "list_projects never completed meanwhile")
+        assert listed == []
+        assert not runaway.done()
+    finally:
+        clock.now = 2.0  # past the deadline: the query stops at its next progress check
     with pytest.raises(ValueError, match="took longer than 1 seconds and was stopped"):
         await runaway
 
+    # The real clock again: the REST and MCP answers to a query its deadline stops.
+    monkeypatch.setattr(repo, "time", time)
     monkeypatch.setattr(repo, "_READONLY_QUERY_TIMEOUT_S", 0.2)
     rest, mcp = await _query_rest_and_mcp(db, tmp_path, _RUNAWAY_SQL)
     assert rest.status_code == 400 and "took longer than" in rest.json()["detail"]

@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from conclave.providers import (
     dispatch_with_quota,
 )
 from conclave.providers.claude_cli import _parse_envelope, _scan_stream
+from waits import wait_until, within
 
 # A fake "claude" that echoes the routed model back via the JSON envelope, so we can
 # prove the composed environment actually reaches the child process.
@@ -80,6 +82,25 @@ def _count_spawns(monkeypatch: pytest.MonkeyPatch, script: str) -> list[str]:
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", counting_spawn)
     return spawns
+
+
+def _start_the_timeout_once(
+    monkeypatch: pytest.MonkeyPatch, script: str, ready: Callable[[], object], failure: str
+) -> None:
+    """Hand the provider a process started for *script* only once *ready* holds. The agent timeout
+    starts when the provider has the process, so it then covers what the run does next, never how
+    long the host takes to start the interpreter."""
+    spawn = asyncio.create_subprocess_exec
+
+    async def spawn_when_ready(
+        program: Any, *args: Any, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        proc = await spawn(program, *args, **kwargs)
+        if script in (program, *args):
+            await wait_until(ready, failure)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_when_ready)
 
 
 def _capture_spawns(
@@ -389,7 +410,9 @@ async def test_timeout_kills_and_reports(tmp_path: Path) -> None:
     assert "timed out" in (result.error or "")
 
 
-async def test_timeout_kills_process_group(tmp_path: Path) -> None:
+async def test_timeout_kills_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """On timeout the provider must kill the entire process group, not just the
     direct child — descendant subprocesses must not be orphaned.
 
@@ -411,6 +434,13 @@ time.sleep(300)
     profile = ResolvedProfile(
         name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=(),
     )
+    # The timeout must not fire before the grandchild exists.
+    _start_the_timeout_once(
+        monkeypatch,
+        cli,
+        lambda: pid_file.exists() and pid_file.read_text().strip(),
+        "the fake CLI never wrote its grandchild's pid",
+    )
 
     result = await ClaudeCliProvider().run_agent(
         profile=profile, prompt="hi", timeout_seconds=1,
@@ -421,25 +451,22 @@ time.sleep(300)
     # Read grandchild PID from the file the fake CLI wrote before hanging.
     child_pid = int(pid_file.read_text().strip())
 
-    # Poll until the process is gone (SIGTERM → 0.3s → SIGKILL takes a
-    # moment to fully reap).  os.kill(pid, 0) raises ProcessLookupError
-    # when the process no longer exists.
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
+    def gone() -> bool:
         try:
             os.kill(child_pid, 0)
         except (ProcessLookupError, OSError, SystemError):
-            break  # process is dead — success
+            return True  # process is dead — success
         except PermissionError:
             # Process exists but we cannot signal it — unexpected in a test
             # where the provider runs as the same user.  Treat as alive
             # and keep polling.
             pass
-        await asyncio.sleep(0.1)
-    else:
-        raise AssertionError(
-            f"Grandchild process {child_pid} still alive after timeout kill"
-        )
+        return False
+
+    # Poll until the process is gone (SIGTERM → 0.3s → SIGKILL takes a
+    # moment to fully reap).  os.kill(pid, 0) raises ProcessLookupError
+    # when the process no longer exists.
+    await wait_until(gone, f"Grandchild process {child_pid} still alive after timeout kill")
 
 
 async def test_cancel_kills_the_run_and_flags_the_result(tmp_path: Path) -> None:
@@ -1210,12 +1237,16 @@ def test_a_single_result_is_read_as_it_is() -> None:
 _INIT = {"type": "system", "subtype": "init", "session_id": "ses-1"}
 
 
-def _scripted_cli(tmp_path: Path, *steps: list[dict[str, Any]] | float) -> str:
+def _scripted_cli(
+    tmp_path: Path, *steps: list[dict[str, Any]] | float, started: Path | None = None
+) -> str:
     """A fake "claude" that runs *steps* in order: a list of events is written in one flushed
-    write, a number sleeps that many seconds."""
+    write, a number sleeps that many seconds. Given *started*, it creates that file first, before
+    it reads its prompt."""
+    mark = "" if started is None else f"open({str(started)!r}, 'w').close()\n"
     body = f"""#!/usr/bin/env python3
 import json, sys, time
-sys.stdin.read()
+{mark}sys.stdin.read()
 for step in json.loads({json.dumps(steps)!r}):
     if isinstance(step, list):
         sys.stdout.write("".join(json.dumps(event) + "\\n" for event in step))
@@ -1238,8 +1269,11 @@ for step in json.loads({json.dumps(steps)!r}):
 async def test_a_usage_limit_streamed_before_the_timeout_is_a_quota_not_a_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: dict[str, Any], kind: str
 ) -> None:
-    cli = _scripted_cli(tmp_path, [_INIT, event], 30)
+    started = tmp_path / "started"
+    cli = _scripted_cli(tmp_path, [_INIT, event], 30, started=started)
     spawns = _count_spawns(monkeypatch, cli)
+    # The timeout must not fire before the CLI could stream the limit.
+    _start_the_timeout_once(monkeypatch, cli, started.exists, "the fake CLI never started")
     profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
 
     result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=1)
@@ -1304,7 +1338,7 @@ async def test_the_refusal_watch_reads_each_complete_line_across_chunks() -> Non
         await asyncio.wait_for(watch.outlasts(0.0), 0.1)
 
     watch.feed("\n" + json.dumps(_INIT) + "\n")
-    await asyncio.wait_for(watch.outlasts(0.0), 1)  # armed by the refusing info
+    await within(watch.outlasts(0.0), "the refusing info never armed the watch")
 
     watch.feed(json.dumps(_rate_limit_event("allowed")) + "\n")
     with pytest.raises(TimeoutError):  # disarmed by a newer info that does not refuse
@@ -1406,21 +1440,12 @@ def _running(pid: int) -> bool:
     return stat.rsplit(")", 1)[-1].split()[0] != "Z"
 
 
-async def _gone_within(pid: int, seconds: float = 5.0) -> bool:
-    deadline = time.monotonic() + seconds
-    while _running(pid):
-        if time.monotonic() > deadline:
-            return False
-        await asyncio.sleep(0.05)
-    return True
-
-
-async def _pid_from(path: Path, seconds: float = 10.0) -> int:
-    deadline = time.monotonic() + seconds
-    while not (path.exists() and path.read_text(encoding="utf-8").strip()):
-        assert time.monotonic() < deadline, f"{path} was never written"
-        await asyncio.sleep(0.05)
-    return int(path.read_text(encoding="utf-8"))
+async def _pid_from(path: Path) -> int:
+    text = await wait_until(
+        lambda: path.exists() and path.read_text(encoding="utf-8").strip(),
+        f"{path} was never written",
+    )
+    return int(text)
 
 
 def _kill_leftover(pid: int) -> None:
@@ -1451,7 +1476,7 @@ time.sleep(30)
         dispatch.cancel()
         with pytest.raises(asyncio.CancelledError):
             await dispatch
-        assert await _gone_within(pid), f"the CLI ({pid}) still runs after the cancel"
+        await wait_until(lambda: not _running(pid), f"the CLI ({pid}) still runs after the cancel")
     finally:
         _kill_leftover(pid)
 
@@ -1482,11 +1507,15 @@ async def test_a_cli_that_exits_before_reading_its_prompt_fails_with_its_own_err
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
-async def test_a_timeout_kills_the_group_after_its_leader_exited(tmp_path: Path) -> None:
+async def test_a_timeout_kills_the_group_after_its_leader_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A descendant that outlives the CLI and holds its output pipe is killed on the timeout."""
     pid_file = tmp_path / "child.pid"
+    started = tmp_path / "started"
     body = f"""#!/usr/bin/env python3
 import os, subprocess, sys
+open({str(started)!r}, "w").close()
 sys.stdin.read()
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
 with open({str(pid_file)!r}, "w") as f:
@@ -1494,6 +1523,8 @@ with open({str(pid_file)!r}, "w") as f:
 os._exit(0)
 """
     cli = _make_cli(tmp_path, body, name="leader_exits.py")
+    # The timeout must not fire before the CLI could start its descendant and exit.
+    _start_the_timeout_once(monkeypatch, cli, started.exists, "the fake CLI never started")
     profile = ResolvedProfile(name="sys", arg_mode=ArgMode.inherit, cli=cli, cli_flags=())
 
     result = await ClaudeCliProvider().run_agent(profile=profile, prompt="hi", timeout_seconds=1)
@@ -1501,7 +1532,9 @@ os._exit(0)
     child_pid = await _pid_from(pid_file)
     try:
         assert "timed out" in (result.error or "")
-        assert await _gone_within(child_pid), f"descendant {child_pid} survived the timeout"
+        await wait_until(
+            lambda: not _running(child_pid), f"descendant {child_pid} survived the timeout"
+        )
     finally:
         _kill_leftover(child_pid)
 
@@ -1534,7 +1567,7 @@ sys.stdin.read()
 data = open({str(tmp_path / "payload.bin")!r}, "rb").read()
 sys.stdout.buffer.write(data[:4096])
 sys.stdout.buffer.flush()
-time.sleep(0.2)
+time.sleep(0.2)  # the rest later (the 4096-byte reads split the dash however the writes land)
 sys.stdout.buffer.write(data[4096:])
 sys.stdout.buffer.flush()
 """

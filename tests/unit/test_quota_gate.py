@@ -32,6 +32,7 @@ from conclave.providers import (
     quota_key,
 )
 from conclave.providers.quota import RESUME_MARGIN
+from waits import wait_until, within
 
 T0 = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
 
@@ -83,6 +84,8 @@ class SteppedClock:
 
 
 async def _settle() -> None:
+    """Yield a few times: time for a waiter the gate released by mistake to finish (a check that
+    something does NOT happen)."""
     for _ in range(5):
         await asyncio.sleep(0)
 
@@ -247,15 +250,15 @@ async def test_two_waiters_are_released_together_when_the_key_reopens() -> None:
     gate.close("claude-code", "claude", _limit(), retry_minutes=5)
     first = asyncio.create_task(gate.wait("claude-code"))
     second = asyncio.create_task(gate.wait("claude-code"))
-    await _settle()
-    assert clock.sleepers == 2
+    await wait_until(lambda: clock.sleepers == 2, "the two waiters never both slept")
 
     clock.advance(timedelta(minutes=4))
     await _settle()
     assert not first.done() and not second.done()
 
     clock.advance(timedelta(minutes=1))
-    assert await asyncio.wait_for(asyncio.gather(first, second), 1) == [True, True]
+    released = await within(asyncio.gather(first, second), "the reopened key released nobody")
+    assert released == [True, True]
 
 
 async def test_a_wait_sleeps_in_chunks_of_at_most_a_minute() -> None:
@@ -557,11 +560,10 @@ async def test_a_cancel_during_the_wait_returns_cancelled_without_another_run() 
     provider = ScriptedProvider(clock, [_refused(), AgentResult(ok=True, text="never")])
     cancel = asyncio.Event()
     dispatch = asyncio.create_task(_dispatch(provider, gate, cancel_event=cancel))
-    await _settle()
-    assert clock.sleepers == 1
+    await wait_until(lambda: clock.sleepers == 1, "the dispatch never waited for the reset")
 
     cancel.set()
-    result = await asyncio.wait_for(dispatch, 1)
+    result = await within(dispatch, "the cancelled dispatch never returned")
 
     assert result.cancelled is True and result.ok is False and result.error == "cancelled"
     assert len(provider.calls) == 1

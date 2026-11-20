@@ -41,6 +41,7 @@ from conclave.providers import (
 )
 from conclave.runtime import Daemon, ProjectWorker
 from conclave.web import create_app
+from waits import wait_until, within
 
 T0 = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
 # The key every FakeProvider dispatch draws on: the built-in model is deepseek/deepseek-flash.
@@ -326,11 +327,11 @@ async def test_a_cancel_during_the_wait_cancels_the_task_at_once(
     cancel_event = asyncio.Event()
     orchestrator._cancel_events[task.id] = cancel_event
     running = asyncio.create_task(orchestrator.process_task(claimed, cancel_event=cancel_event))
-    await asyncio.wait_for(clock.sleeping.wait(), 10)
+    await within(clock.sleeping.wait(), "the task never waited for the reset")
     dispatches = len(provider.prompts)
 
     assert orchestrator.request_cancel(task.id) is True
-    assert await asyncio.wait_for(running, 5) is False
+    assert await within(running, "the cancelled task never ended") is False
 
     cancelled = await repo.get_task(db, task.id)
     assert cancelled is not None and cancelled.state is TaskState.cancelled
@@ -348,7 +349,7 @@ async def test_a_restart_during_the_wait_recovers_the_task_and_it_completes(
     claimed = await repo.claim_next_approved(db, project.id)
     assert claimed is not None
     running = asyncio.create_task(first.process_task(claimed))
-    await asyncio.wait_for(clock.sleeping.wait(), 10)
+    await within(clock.sleeping.wait(), "the task never waited for the reset")
 
     running.cancel()  # the daemon stops mid-wait
     with contextlib.suppress(asyncio.CancelledError):
@@ -390,7 +391,7 @@ async def test_a_planning_turn_hitting_the_limit_waits_and_the_session_completes
     provider = FakeProvider(quota_once={"planning:planner"})
     _, session_id, loop = await _planning(db, tmp_path, provider, FakeClock())
 
-    await asyncio.wait_for(loop, 10)
+    await within(loop, "the planning session never finished")
 
     session = await repo.get_planning_session(db, session_id)
     assert session is not None and session.status is PlanningSessionStatus.stable
@@ -415,9 +416,9 @@ async def test_cancelling_a_planning_session_ends_its_wait(
     provider = FakeProvider(quota_once={"planning:planner"})
     clock = BlockingClock()
     orchestrator, session_id, loop = await _planning(db, tmp_path, provider, clock)
-    await asyncio.wait_for(clock.sleeping.wait(), 10)
+    await within(clock.sleeping.wait(), "the planning turn never waited for the reset")
 
-    await asyncio.wait_for(orchestrator.cancel_session(session_id), 5)
+    await within(orchestrator.cancel_session(session_id), "the session's cancel never returned")
 
     assert loop.done()
     session = await repo.get_planning_session(db, session_id)
@@ -506,8 +507,8 @@ async def test_a_wait_sends_one_webhook_notification(
     provider = FakeProvider(quota_once={"developer"})
 
     assert await _process(_orchestrator(db, tmp_path, provider, FakeClock()), project) is True
-    for _ in range(5):  # the delivery runs beside the wait
-        await asyncio.sleep(0)
+    # The delivery runs beside the wait, in a task of its own.
+    await wait_until(lambda: sink.payloads, "the quota.waiting notification was never sent")
 
     (payload,) = sink.payloads  # only quota.waiting: the terminal one has its own sink
     assert payload["event"] == "quota.waiting"

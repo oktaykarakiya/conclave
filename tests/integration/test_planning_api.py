@@ -19,6 +19,7 @@ from conclave.db import Database
 from conclave.engine import run_git
 from conclave.runtime import Daemon
 from conclave.web import create_app
+from waits import wait_until
 
 
 async def _init_repo(path: Path) -> None:
@@ -29,6 +30,19 @@ async def _init_repo(path: Path) -> None:
     (path / "package.json").write_text('{"scripts": {"test": "echo ok"}}\n')
     await run_git(path, "add", "-A")
     await run_git(path, "commit", "-m", "init")
+
+
+async def _settled_status(client: httpx.AsyncClient, session_id: str) -> str:
+    """Wait until the background discussion has settled the session; return its status."""
+
+    async def settled() -> str | None:
+        get_resp = await client.get(f"/api/planning/sessions/{session_id}")
+        if get_resp.status_code != 200:
+            return None
+        status: str = get_resp.json()["status"]
+        return status if status in ("stable", "completed") else None
+
+    return await wait_until(settled, "the session never reached stable or completed")
 
 
 @pytest_asyncio.fixture
@@ -115,13 +129,12 @@ async def test_get_session_and_messages(
     assert get_resp.json()["id"] == session_id
 
     # Messages should appear (initial planner message at minimum)
-    # The background discussion runs asynchronously; poll briefly
-    import asyncio
-    for _ in range(10):
+    # The background discussion runs asynchronously; poll for them
+    async def have_messages() -> bool:
         msgs = await client.get(f"/api/planning/sessions/{session_id}/messages")
-        if msgs.status_code == 200 and len(msgs.json()) > 0:
-            break
-        await asyncio.sleep(0.5)
+        return msgs.status_code == 200 and len(msgs.json()) > 0
+
+    await wait_until(have_messages, "the session never got a message")
 
     messages = await client.get(f"/api/planning/sessions/{session_id}/messages")
     assert messages.status_code == 200
@@ -143,14 +156,7 @@ async def test_human_interjection(
     session_id = create.json()["id"]
 
     # Wait for the session to reach stable first (background discussion finishes)
-    import asyncio
-    for _ in range(15):
-        get_resp = await client.get(f"/api/planning/sessions/{session_id}")
-        if get_resp.status_code == 200:
-            status = get_resp.json()["status"]
-            if status in ("stable", "completed"):
-                break
-        await asyncio.sleep(0.5)
+    await _settled_status(client, session_id)
 
     # Now send a human message (session is stable, no background task racing)
     resp = await client.post(
@@ -176,12 +182,11 @@ async def test_task_nodes_appear(
     session_id = create.json()["id"]
 
     # Task nodes should appear from the planner's initial breakdown
-    import asyncio
-    for _ in range(10):
+    async def have_nodes() -> bool:
         nodes = await client.get(f"/api/planning/sessions/{session_id}/tasks")
-        if nodes.status_code == 200 and len(nodes.json()) > 0:
-            break
-        await asyncio.sleep(0.5)
+        return nodes.status_code == 200 and len(nodes.json()) > 0
+
+    await wait_until(have_nodes, "the planner's breakdown never produced a task node")
 
     nodes = await client.get(f"/api/planning/sessions/{session_id}/tasks")
     assert nodes.status_code == 200
@@ -208,12 +213,11 @@ async def test_nested_task_changes_parsed(
     session_id = create.json()["id"]
 
     # All 3 nested task_changes must be parsed — not truncated at the first nested brace
-    import asyncio
-    for _ in range(10):
+    async def have_three_nodes() -> bool:
         nodes = await client.get(f"/api/planning/sessions/{session_id}/tasks")
-        if nodes.status_code == 200 and len(nodes.json()) == 3:
-            break
-        await asyncio.sleep(0.5)
+        return nodes.status_code == 200 and len(nodes.json()) == 3
+
+    await wait_until(have_three_nodes, "the nested breakdown never produced 3 task nodes")
 
     nodes = await client.get(f"/api/planning/sessions/{session_id}/tasks")
     assert nodes.status_code == 200
@@ -239,15 +243,7 @@ async def test_approve_creates_real_tasks(
     session_id = create.json()["id"]
 
     # Wait for the session to become stable (discussion loop runs in background)
-    import asyncio
-    status = "active"
-    for _ in range(15):
-        get_resp = await client.get(f"/api/planning/sessions/{session_id}")
-        if get_resp.status_code == 200:
-            status = get_resp.json()["status"]
-            if status in ("stable", "completed"):
-                break
-        await asyncio.sleep(0.5)
+    status = await _settled_status(client, session_id)
 
     # It should have reached stable (all fake agents approve + planner ready)
     if status != "stable":

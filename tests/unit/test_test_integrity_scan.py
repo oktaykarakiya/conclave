@@ -8,6 +8,7 @@ marker selects the tests it switches off. Pure, no git and no LLM.
 
 from __future__ import annotations
 
+import gc
 import time
 
 import pytest
@@ -77,18 +78,46 @@ _MARKERS = 20_000
 _MARKER_LINES = ("fit('f{i}',f)", "it.only('o{i}',f)", "fdescribe('d{i}',f)", "x.only()")
 
 
-def test_twenty_thousand_focus_markers_scan_in_linear_time() -> None:
+def _marker_changes(markers: int) -> list[FileChange]:
+    """A test file that gains *markers* focus markers, cycling through :data:`_MARKER_LINES`."""
     before = "it('a', f)\nit('b', f)\nit('c', f)\n"
     after = before + "".join(
-        _MARKER_LINES[i % len(_MARKER_LINES)].format(i=i) + "\n" for i in range(_MARKERS)
+        _MARKER_LINES[i % len(_MARKER_LINES)].format(i=i) + "\n" for i in range(markers)
     )
-    changes = [FileChange("M", "app.test.js", "app.test.js", before, after)]
+    return [FileChange("M", "app.test.js", "app.test.js", before, after)]
 
-    started = time.perf_counter()
-    findings = integrity_findings(changes)
-    elapsed = time.perf_counter() - started
 
-    assert elapsed < 2.0, f"{_MARKERS} markers took {elapsed:.2f}s"
+def _scan(changes: list[FileChange]) -> tuple[float, list[IntegrityFinding]]:
+    """Scan *changes* three times; return the fastest scan's seconds and the findings.
+
+    The seconds are this thread's CPU time, which the host's other work does not inflate, and the
+    fastest of three, since anything else running here only ever adds time. No cyclic garbage
+    collection runs meanwhile: one of the whole test process is no part of the scan.
+    """
+    fastest = float("inf")
+    findings: list[IntegrityFinding] = []
+    for _ in range(3):
+        gc.disable()
+        try:
+            started = time.thread_time()
+            findings = integrity_findings(changes)
+            fastest = min(fastest, time.thread_time() - started)
+        finally:
+            gc.enable()
+    return fastest, findings
+
+
+def test_twenty_thousand_focus_markers_scan_in_linear_time() -> None:
+    # Compared on the same host rather than against a fixed time, which a loaded host exceeds:
+    # four times the markers take about four times as long when the scan is linear, and sixteen
+    # times as long when it is quadratic.
+    quarter, _ = _scan(_marker_changes(_MARKERS // 4))
+    whole, findings = _scan(_marker_changes(_MARKERS))
+
+    assert whole < 8 * quarter, (
+        f"{_MARKERS} markers took {whole:.2f}s, {whole / quarter:.1f} times the "
+        f"{quarter:.2f}s of {_MARKERS // 4}"
+    )
     # One finding per focused test or suite (5,000 of each kind) and one for the bare .only().
     assert len(findings) == 3 * _MARKERS // 4 + 1
     for target in ("f0", "o1", "d2", "", f"d{_MARKERS - 2}"):

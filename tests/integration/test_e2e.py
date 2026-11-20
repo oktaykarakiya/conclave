@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import httpx
@@ -14,6 +13,7 @@ from conclave.db import Database
 from conclave.engine import run_git
 from conclave.runtime import Daemon
 from conclave.web import create_app
+from waits import wait_until
 
 
 async def _init_repo(path: Path) -> None:
@@ -61,12 +61,12 @@ async def test_full_cycle_via_api(db: Database, tmp_path: Path) -> None:
             )
             task_id = task.json()["id"]
 
-            state = ""
-            for _ in range(150):  # up to ~15s
-                state = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
-                if state in ("done", "failed"):
-                    break
-                await asyncio.sleep(0.1)
+            async def ended() -> str | None:
+                state: str = (await client.get(f"/api/tasks/{task_id}")).json()["state"]
+                return state if state in ("done", "failed") else None
+
+            # The whole cycle (worktree, baseline, plan, develop, review, gate, merge).
+            state = await wait_until(ended, "the task never ended", seconds=180)
 
             assert state == "done", f"task ended in state {state!r}"
             code, out = await run_git(repo_path, "show", "main:FEATURE.txt")

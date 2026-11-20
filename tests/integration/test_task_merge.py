@@ -25,6 +25,7 @@ from conclave.engine.worktree import WorktreeManager
 from conclave.events import EventBus
 from conclave.runtime import Daemon
 from conclave.web import create_app
+from waits import wait_until
 
 _MERGE_KEYS = {"task_id", "merged", "target", "branch", "target_sha"}
 
@@ -387,9 +388,10 @@ async def test_merge_reports_its_own_commit_when_a_worker_merge_follows(
             worker.append(
                 asyncio.create_task(orchestrator._merge(repo, "main", "other", "worker-task"))
             )
-            for _ in range(20):
-                await asyncio.sleep(0)
-            assert orchestrator._merge_lock_refs["main"] == 2
+            await wait_until(
+                lambda: orchestrator._merge_lock_refs["main"] == 2,
+                "the worker's merge never queued on the main lock",
+            )
         return result
 
     orchestrator._merge_locked = _merge_locked_then_queue_worker  # type: ignore[method-assign]
@@ -422,7 +424,7 @@ async def test_merge_under_the_held_merge_lock_runs_without_waiting_on_itself(
         assert orchestrator._merge_lock_holders["main"] is asyncio.current_task()
         # Another task's merge into the same target still waits for the lock.
         other = asyncio.create_task(orchestrator._merge(tmp_path, "main", "other", "task-2"))
-        for _ in range(20):
+        for _ in range(20):  # time to finish, were it not waiting for the lock
             await asyncio.sleep(0)
         assert not other.done()
         assert await orchestrator._merge(tmp_path, "main", "feature", "task-1") is (

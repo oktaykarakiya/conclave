@@ -21,6 +21,7 @@ from conclave.db import repositories as repo
 from conclave.events import EventType
 from conclave.runtime import Daemon
 from conclave.web.ws import planning_stream, stream
+from waits import wait_until
 
 
 class _FakeWebSocket:
@@ -78,14 +79,10 @@ async def _wait_for_subscribers(daemon: Daemon, count: int) -> None:
     The planning-stream handler awaits an aiosqlite lookup in a worker thread before
     it subscribes, so a fixed number of event-loop ticks is not a time bound.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + 5.0
-    while daemon.bus.subscriber_count() != count:
-        if loop.time() >= deadline:
-            raise AssertionError(
-                f"expected {count} subscribers, got {daemon.bus.subscriber_count()}"
-            )
-        await asyncio.sleep(0.01)
+    await wait_until(
+        lambda: daemon.bus.subscriber_count() == count,
+        f"the bus never had {count} subscribers",
+    )
 
 
 class _AppShim:
