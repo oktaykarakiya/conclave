@@ -72,6 +72,7 @@ def test_discover_conclave_modules_covers_100_percent_in_topological_order() -> 
     assert idx["conclave.db"] < idx["conclave.verification.quarantine"]
     assert idx["conclave.verification"] < idx["conclave.observability.parquet_sync"]
     assert idx["conclave.observability"] < idx["conclave.providers.base"]
+    assert idx["conclave.providers.sandbox"] < idx["conclave.providers.opencode_cli"]
     assert idx["conclave.providers.opencode_cli"] < idx["conclave.providers.effort"]
     assert idx["conclave.providers.effort"] < idx["conclave.providers.router"]
     assert idx["conclave.providers"] < idx["conclave.bootstrap"]

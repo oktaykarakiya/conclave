@@ -136,12 +136,45 @@ lands. This guide is model-agnostic usage knowledge; read it once per session be
      user's or the repository's (`OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`,
      `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`): only opencode's built-in skill and those in
      opencode's own folders (`~/.config/opencode/skills`, the repository's `.opencode/skills`).
-     The rest of the global and the repository's opencode config (providers, model, agents,
-     commands, plugins, instructions) still applies. When the discovery fails, a warning in the
-     daemon log names why, and that dispatch keeps its MCP servers but still loads none of
-     those skills. To opt out, for a project whose workers need any of that setup (an MCP
-     server such as Playwright for UI tests, a skill), another tool or background tasks, set
-     `execution.worker_isolation: false` (§11).
+     The repository's opencode config still applies; of your global opencode config (providers,
+     model, agents, commands, plugins, instructions) an isolated worker gets all without the
+     worker sandbox and only its provider's block in it (next bullet). When the discovery fails,
+     a warning in the daemon log names why, and that dispatch keeps its MCP servers but still
+     loads none of those skills. To opt out, for a project whose workers need any of that setup
+     (an MCP server such as Playwright for UI tests, a skill), another tool or background tasks,
+     set `execution.worker_isolation: false` (§11).
+   - `execution.worker_sandbox` (`auto` by default, `required` or `off`): an isolated opencode
+     worker runs under bubblewrap (`bwrap --dev-bind / / <mounts> --die-with-parent`) with
+     opencode folders of its own, one set per model provider (the model's part before its first
+     `/`): `$CONCLAVE_HOME/opencode-homes/<provider>/config`, `data` and `state`, mounted over
+     this host's opencode config, data and state folders for the worker and the commands it
+     runs (where those folders are symlinks, as in a dotfiles setup, over the folders they lead
+     to). Its sessions stay there, where a retry or a resume after a usage-limit wait finds them,
+     never in your `opencode.db` or your projects' session lists. Its config folder holds only
+     that provider's block of your opencode config, and its data folder only your credential for
+     that provider (an `api` or `wellknown` entry of your `auth.json`, or of the daemon's
+     `OPENCODE_AUTH_CONTENT` when that is set), both refreshed at each dispatch: no default model,
+     permission rules, MCP servers, agents, commands, plugins, instructions, other providers or
+     other credentials. A key in the environment still reaches it. Your `~/.claude/CLAUDE.md`
+     does not exist in the sandbox (opencode loads it as a global instruction); the repository's
+     own rule files reach the worker as before. The daemon's `OPENCODE_CONFIG`,
+     `OPENCODE_CONFIG_DIR`, `OPENCODE_AUTH_CONTENT` and `OPENCODE_DB` are dropped (an engine
+     profile's `extra_env` may set them again). Every other path stays where it is (the
+     worktree, the repository, `/tmp`, toolchains, caches, your other config and data), and the
+     worker's commands see the same `HOME` and `XDG_*` values as before. A dispatch whose agent
+     names no `provider/model` runs the default `model` of your opencode config (passed as
+     `--model`); without one it fails, asking for a model. Your provider blocks and default model
+     are read once per daemon, with `opencode debug config` in a sandbox of its own (your config
+     folder read-only, its data and state in `opencode-homes/.discovery`), so a change to your
+     opencode config reaches workers after a daemon restart; values that command prints redacted
+     (`***`: keys, tokens, headers, URLs with credentials) are left out of the block. MCP
+     discovery runs inside the worker's sandbox, so exactly the servers it would start (the
+     repository's own and those of the daemon's `OPENCODE_CONFIG_CONTENT`) are disabled. `auto`
+     uses the sandbox when bubblewrap works on this host and otherwise runs the worker as without
+     it, with a warning in the daemon log and a `log` event (`stage: worker_sandbox`) at the
+     start of each task and planning session that names the cause; `required` fails each
+     dispatch before anything starts instead; `off` never sandboxes. Claude Code workers are not
+     sandboxed yet. Pitfalls in §11.
    - `agent_defaults` (applies to every agent) and `agent_overrides.<agent>`:
      `model`, `effort`, `timeout_minutes`, `max_retries`, `compact_before_start`, `skills`
    - `experimental.planner_enabled`, `experimental.auto_planner_char_threshold` (default `0`: the
@@ -694,6 +727,27 @@ add guidance with `conclave_interject_planning_message`, then `conclave_approve_
   tests) or a skill from a `.claude/skills` or `.agents/skills` folder does not get it. Turn
   isolation off for that project the same way (`"worker_isolation": false`), or move such a
   skill to the repository's `.opencode/skills`, which isolated workers still load.
+- The worker sandbox (`execution.worker_sandbox`, §3) needs bubblewrap: `bwrap` on the daemon's
+  `PATH` (or `CONCLAVE_BWRAP_BIN`) and unprivileged user namespaces. Ubuntu 24.04's AppArmor
+  restricts those (`kernel.apparmor_restrict_unprivileged_userns=1`), so the probe
+  `bwrap --dev-bind / / -- true` fails there until bwrap gets an AppArmor profile that allows
+  them or the restriction is lifted. Under `auto` the workers then run without the sandbox (the
+  `worker_sandbox` log event of each task names the cause); under `required` every isolated
+  opencode dispatch fails. Set `worker_sandbox: off` to silence the event where you accept that.
+- A dispatch that fails with "bubblewrap could not set up the worker sandbox" quotes the path
+  bubblewrap refused (a mount point it cannot create, say): fix that path, or set
+  `worker_sandbox: off` for the project.
+- A provider whose opencode credential is an OAuth login (`type: oauth` in `auth.json`, such as
+  a subscription login) cannot be sandboxed: opencode refreshes such a login and writes it back,
+  which could sign you out. Its dispatches fail, naming the provider. Store an API key for it
+  (`opencode auth login`) or set `worker_sandbox: off` for that project.
+- A key written in your opencode config itself (a provider's `options.apiKey`, or a header)
+  does not reach sandboxed workers: `opencode debug config` prints it redacted. Keep provider keys
+  in opencode's credentials (`opencode auth login`) or in the daemon's environment.
+- opencode always reads `~/.opencode/` as a config folder (its installer also keeps the binary
+  there), sandbox or not: keep no config there, or every worker gets it.
+- A change to your opencode config (a provider block, the default model) reaches sandboxed
+  workers after a daemon restart; a changed credential reaches the next dispatch.
 - Frequent `context_truncated` events mean diffs or test output exceed the limit (§3): agents can
   still run the command named in the marker, but for whole-diff review raise
   `context.bulk_max_chars` (or `compaction_max_chars`), or make the task smaller or the test

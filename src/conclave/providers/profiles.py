@@ -23,7 +23,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from ..config import ArgMode
+from ..config import ArgMode, WorkerSandbox
 
 # Always-on CLI args: headless print mode + NDJSON event stream (live output for the UI; the
 # final ``result`` event carries the result/usage/cost fields). stream-json needs --verbose.
@@ -131,6 +131,9 @@ class ResolvedProfile:
     thinking: bool = False
     pure: bool = False
     isolated: bool = True  # worker isolation; secure by default
+    # The worker sandbox of an isolated dispatch (execution.worker_sandbox). Only the opencode
+    # provider applies it so far; Claude Code workers are not sandboxed yet.
+    sandbox: WorkerSandbox = WorkerSandbox.auto
     # Continue this engine session instead of starting a new one (after a usage-limit wait).
     resume_session_id: str | None = None
 

@@ -49,7 +49,7 @@ from .graph_executor import (
 )
 from .memory import AttemptMemory
 from .project_rules import ProjectRules, read_project_rules
-from .runner import AgentRunner
+from .runner import AgentRunner, sandbox_fallback_payload
 from .test_integrity import (
     IntegrityFinding,
     collect_integrity_findings,
@@ -816,6 +816,14 @@ class Orchestrator:
             )
             await self._task_housekeeping(project.id, task.id, config)
             return False
+
+        # Isolated workers that run without the worker sandbox are reported once per task, as
+        # its run starts (a task its config stopped above runs no worker).
+        sandbox_notice = await sandbox_fallback_payload(config)
+        if sandbox_notice is not None:
+            await self._bus.emit(
+                type=EventType.log, project_id=project.id, task_id=task.id, payload=sandbox_notice
+            )
 
         try:
             worktree = await wm.create(task.id, checkout_branch, task_branch)

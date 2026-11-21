@@ -25,7 +25,7 @@ from ..db.planning_models import (
     PlanningTaskNode,
 )
 from ..engine.project_rules import read_project_rules, rules_for_dispatch
-from ..engine.runner import QuotaEvents, effort_clamped_payload
+from ..engine.runner import QuotaEvents, effort_clamped_payload, sandbox_fallback_payload
 from ..engine.verdict import parse_verdict
 from ..events import EventBus, EventType
 from ..observability.parquet_sync import log_agent_interaction
@@ -371,6 +371,19 @@ class PlanningOrchestrator:
                     planning_session_id=session.id,
                     payload={"planning_session_id": session.id},
                 )
+                # Isolated workers that run without the worker sandbox are reported once per
+                # session.
+                project = await repo.get_project(self._db, session.project_id)
+                sandbox_notice = await sandbox_fallback_payload(
+                    await resolve_project_config(self._db, project)
+                )
+                if sandbox_notice is not None:
+                    await self._bus.emit(
+                        type=EventType.log,
+                        project_id=session.project_id,
+                        planning_session_id=session.id,
+                        payload=sandbox_notice,
+                    )
 
                 # Sticky approvals: a reviewer's verdict stays valid until the
                 # planner next changes the tree.  We clear them whenever the
@@ -575,6 +588,7 @@ class PlanningOrchestrator:
                 thinking=settings.thinking,
                 pure=settings.pure,
                 isolated=cfg.execution.worker_isolation,
+                sandbox=cfg.execution.worker_sandbox,
             )
             project_cwd: Path | None = None
             context_parts: list[str] = [system_prompt]

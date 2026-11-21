@@ -38,6 +38,14 @@ def _no_mcp_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(opencode_cli, "_discover_mcp_servers", no_servers)
 
 
+@pytest.fixture(autouse=True)
+def _no_worker_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """These dispatches are isolated (the profile default) under worker_sandbox auto, which
+    would sandbox them against this host's real opencode folders: without bubblewrap they run as
+    without the sandbox. The sandbox is covered in test_opencode_sandbox.py."""
+    monkeypatch.setenv("CONCLAVE_BWRAP_BIN", str(tmp_path / "no-bwrap"))
+
+
 # A representative single-step stream (captured from a real deepseek run).
 _STREAM = "\n".join(
     [

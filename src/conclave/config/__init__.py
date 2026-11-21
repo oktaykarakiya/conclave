@@ -33,6 +33,7 @@ from .models import (
     SystemSettings,
     UiSettings,
     Verdict,
+    WorkerSandbox,
 )
 from .resolver import (
     GLOBAL_DEFAULTS_PRESET,
@@ -88,6 +89,7 @@ __all__ = [
     "SystemSettings",
     "UiSettings",
     "Verdict",
+    "WorkerSandbox",
     "WorkflowEdge",
     "WorkflowGraph",
     "WorkflowNode",

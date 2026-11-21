@@ -480,8 +480,27 @@ export function SettingsView({
               <span className="block text-xs text-zinc-300">Isolate workers</span>
               <span className="block text-[11px] text-zinc-500">
                 On (default): no MCP servers and no .claude or .agents skills; Claude Code workers
-                also skip user plugins, settings, all skills and auto-memory.
+                also skip user plugins, settings, all skills and auto-memory; opencode workers run
+                in the worker sandbox below.
               </span>
+            </span>
+          </label>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-zinc-400">Worker sandbox</span>
+            <select
+              className={input}
+              value={String(execution.worker_sandbox ?? "auto")}
+              onChange={(e) => updateSection("execution", "worker_sandbox", e.target.value)}
+            >
+              <option value="auto">Auto</option>
+              <option value="required">Required</option>
+              <option value="off">Off</option>
+            </select>
+            <span className="block text-[11px] text-zinc-500">
+              Isolated opencode workers run under bubblewrap with their own opencode folders,
+              none of your sessions, config or other credentials; Auto runs without it (warning)
+              where bubblewrap does not work, Required fails instead.
             </span>
           </label>
 

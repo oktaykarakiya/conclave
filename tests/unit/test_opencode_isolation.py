@@ -4,7 +4,8 @@ An isolated dispatch loads no ``.claude`` / ``.agents`` skills and disables ever
 opencode config it resolves (named by ``opencode debug config``) through
 ``OPENCODE_CONFIG_CONTENT``. Every dispatch gets the daemon's environment plus the profile's
 ``extra_env``, applied last. Each test runs a fake ``opencode`` or stubs the discovery: the real
-CLI never starts.
+CLI never starts. These dispatches run without the worker sandbox (``worker_sandbox: off``, which
+is exactly this behaviour); test_opencode_sandbox.py covers the sandbox.
 """
 
 from __future__ import annotations
@@ -15,12 +16,13 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from conclave.config import ArgMode
+from conclave.config import ArgMode, WorkerSandbox
 from conclave.providers import AgentResult, opencode_cli
 from conclave.providers.opencode_cli import (
     OpenCodeCliProvider,
@@ -43,6 +45,9 @@ def _hermetic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
     # A test that installs no fake CLI can never start the real one.
     monkeypatch.setattr(opencode_cli, "_OPENCODE_BIN", str(tmp_path / "no-opencode"))
+    # These tests cover isolation without the worker sandbox (worker_sandbox off, as _dispatch
+    # sets it); none of them may sandbox a dispatch against this host's own opencode folders.
+    monkeypatch.setenv("CONCLAVE_BWRAP_BIN", str(tmp_path / "no-bwrap"))
 
 
 def _fake_cli(
@@ -98,10 +103,13 @@ def _stub_discovery(
     monkeypatch: pytest.MonkeyPatch, found: tuple[str, ...] | Exception
 ) -> list[tuple[Path | None, dict[str, str]]]:
     """Replace ``opencode debug config`` with *found* (names, or an error to raise); return the
-    ``(cwd, env)`` of each discovery."""
+    ``(cwd, env)`` of each discovery, which none of these runs in the sandbox."""
     calls: list[tuple[Path | None, dict[str, str]]] = []
 
-    async def discover(cwd: Path | None, env: dict[str, str]) -> tuple[str, ...]:
+    async def discover(
+        cwd: Path | None, env: dict[str, str], wrap: Sequence[str] = ()
+    ) -> tuple[str, ...]:
+        assert not wrap  # worker_sandbox off: no bubblewrap around the discovery
         calls.append((cwd, dict(env)))
         if isinstance(found, Exception):
             raise found
@@ -125,7 +133,11 @@ async def _dispatch(
     extra_env: dict[str, str] | None = None,
 ) -> AgentResult:
     profile = ResolvedProfile(
-        name="opencode", arg_mode=ArgMode.inherit, isolated=isolated, extra_env=extra_env or {}
+        name="opencode",
+        arg_mode=ArgMode.inherit,
+        isolated=isolated,
+        sandbox=WorkerSandbox.off,
+        extra_env=extra_env or {},
     )
     return await (provider or OpenCodeCliProvider()).run_agent(
         profile=profile, prompt="hi", timeout_seconds=30, cwd=cwd

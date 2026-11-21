@@ -75,6 +75,15 @@ class DeclineConsensus(StrEnum):
     any_two = "any_two"  # at least two agents concur
 
 
+class WorkerSandbox(StrEnum):
+    """Whether an isolated worker runs in the bubblewrap worker sandbox
+    (``execution.worker_sandbox``; opencode workers only for now)."""
+
+    auto = "auto"  # when bubblewrap works on this host, else without it (with a warning)
+    required = "required"  # always: a dispatch fails when bubblewrap does not work
+    off = "off"  # never: worker isolation alone
+
+
 class AgentSettings(BaseModel):
     """Per-agent execution settings (the layer resolved per dispatch)."""
 
@@ -177,7 +186,23 @@ class ExecutionSettings(BaseModel):
             "up to the agent's timeout. The repository's project and local settings still apply. "
             "opencode workers: no MCP servers (every one their resolved config names, the "
             "repository's own included, is disabled) and no skills from .claude or .agents "
-            "folders; the rest of the opencode config, the repository's included, still applies."
+            "folders; the rest of the opencode config, the repository's included, still applies. "
+            "In the worker sandbox (worker_sandbox) an isolated opencode worker also gets its "
+            "own opencode folders: none of the operator's sessions, global config or "
+            "instructions, only its provider's config block and credential."
+        ),
+    )
+    worker_sandbox: WorkerSandbox = Field(
+        default=WorkerSandbox.auto,
+        description=(
+            "Run each isolated opencode worker in a bubblewrap sandbox with its own opencode "
+            "folders per model provider (sessions, config, credentials): only that provider's "
+            "block of the operator's opencode config and its API-key credential, never the "
+            "operator's sessions, other config or global instructions. Every other path, and "
+            "what the worker's commands see, is unchanged. auto: when bubblewrap works on this "
+            "host, else without the sandbox (a warning per task); required: a dispatch fails "
+            "when bubblewrap does not work; off: never. A provider signed in with OAuth cannot "
+            "be sandboxed. Claude Code workers are not sandboxed yet."
         ),
     )
     setup_command: str | None = Field(

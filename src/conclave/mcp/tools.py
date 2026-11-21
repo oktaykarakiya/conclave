@@ -404,6 +404,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "block (default; flag to reviewers, never auto-merge), warn (flag only) or off.",
                 enum=["block", "warn", "off"],
             ),
+            "worker_sandbox": _prop(
+                "string",
+                "Optional worker sandbox of isolated opencode workers (bubblewrap, their own "
+                "opencode folders per model provider): auto (default; without it, with a "
+                "warning, where bubblewrap does not work), required (a dispatch fails there "
+                "instead) or off.",
+                enum=["auto", "required", "off"],
+            ),
             "wall_clock_budget_minutes": _prop(
                 "integer", "Optional task timeout budget in minutes."
             ),
@@ -2022,6 +2030,7 @@ async def call_mcp_tool(daemon: Daemon, name: str, args: dict[str, Any]) -> Any:
             "baseline_test_command",
             "allow_no_test_command",
             "test_integrity",
+            "worker_sandbox",
             "wall_clock_budget_minutes",
             "review_rounds_max",
             "stop_on_failure",

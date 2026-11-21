@@ -16,7 +16,7 @@ import logging
 import time
 from pathlib import Path
 
-from ..config import ArgMode, ConclaveConfig, Effort, resolve_agent
+from ..config import ArgMode, ConclaveConfig, Effort, WorkerSandbox, resolve_agent
 from ..db import Database
 from ..db import repositories as repo
 from ..events import EventBus, EventType, build_notification_sink
@@ -32,6 +32,7 @@ from ..providers import (
     dispatch_with_quota,
     resolve_dispatch_effort,
 )
+from ..providers.sandbox import fallback_message, sandbox_status
 from .project_rules import ProjectRules, rules_for_dispatch
 
 logger = logging.getLogger("conclave.engine.runner")
@@ -63,6 +64,25 @@ def effort_clamped_payload(
             f"{agent}: {model or 'the default model'} does not support effort "
             f"{choice.requested}; using {choice.used or 'no effort flag'}"
         ),
+    }
+
+
+async def sandbox_fallback_payload(config: ConclaveConfig) -> dict[str, object] | None:
+    """Payload of the ``log`` event a task or a planning session records at its start when its
+    isolated workers run without the worker sandbox: ``execution.worker_isolation`` is on,
+    ``execution.worker_sandbox`` is ``auto`` and the sandbox is unavailable on this host. The
+    message names the cause and the fixes. ``None`` otherwise."""
+    execution = config.execution
+    if not execution.worker_isolation or execution.worker_sandbox != WorkerSandbox.auto:
+        return None
+    status = await asyncio.to_thread(sandbox_status)  # its first probe may take a moment
+    if status.available:
+        return None
+    return {
+        "stage": "worker_sandbox",
+        "reason": status.reason,
+        # The Live tab renders log rows as "[stage] message".
+        "message": fallback_message(status),
     }
 
 
@@ -454,7 +474,8 @@ class AgentRunner:
         Conclave no longer looks up a stored Engine Profile. Only the per-agent model and
         effort overrides are carried through (``arg_mode=inherit`` adds no CLI flags; the
         opencode provider ignores a model that is not an opencode-format ``provider/model``),
-        plus the project's ``execution.worker_isolation`` as ``isolated``.
+        plus the project's ``execution.worker_isolation`` as ``isolated`` and
+        ``execution.worker_sandbox`` as ``sandbox``.
         """
         return ResolvedProfile(
             name="opencode",
@@ -465,4 +486,5 @@ class AgentRunner:
             thinking=thinking,
             pure=pure,
             isolated=self._config.execution.worker_isolation,
+            sandbox=self._config.execution.worker_sandbox,
         )
