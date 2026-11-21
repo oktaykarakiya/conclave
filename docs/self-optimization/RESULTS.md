@@ -257,3 +257,60 @@ What changed:
   - The SPA has its first unit tests: vitest in the node environment, on a pure module.
 
 No usage limit was hit in this part. Run 3 in all: 19 tasks, 487.58 reported.
+
+## Run 3, part 4 (2026-11-20/21) — sandboxed opencode workers (W24)
+
+The owner's direction for Conclave: every agent runs in an isolated Claude Code or opencode session
+that gets only what its task needs, and never attaches to the operator's own sessions. Checked on
+2026-11-20, isolated opencode workers fell short of that:
+- they filed their sessions in the operator's own opencode history: 1,507 of its 3,560 sessions were
+  Conclave workers;
+- they loaded the operator's global opencode config (default model, permission rules, every
+  provider) and global instructions;
+- they and the commands they ran could read every credential the operator had stored.
+
+Moving opencode's folders through `XDG_*` or `HOME` would not do: opencode's bash tool runs every
+command with opencode's own environment, so the worker's commands would lose their tools and
+caches. W24 uses bubblewrap instead, which changes only what the sandboxed processes see.
+
+| Task | Attempts | Fixed | Tests after | Reported cost (planner / developer / reviewers) |
+|---|---|---|---|---|
+| W24 sandboxed opencode workers | 2 | 3 | 1584 (+1 skipped), 15 SPA | – / 26.19 / 20.04 |
+
+What changed:
+- `execution.worker_sandbox` (`auto` built-in, `required`, `off`): an isolated opencode worker runs
+  under `bwrap --dev-bind / / <mounts> --die-with-parent`. Its model provider's own folders
+  (`$CONCLAVE_HOME/opencode-homes/<provider>/{config,data,state}`) are mounted over the operator's
+  opencode folders.
+- Those folders hold the worker's sessions, and only its provider's block of the operator's config
+  and its API-key credential. An OAuth login is refused, because opencode would refresh it and could
+  sign the operator out.
+- `~/.claude/CLAUDE.md` does not exist in the sandbox. Every other path, and the `HOME` and `XDG_*`
+  values the worker's commands see, stay as they are.
+- Without bubblewrap, `auto` runs as before. It warns once per daemon and records a `log` event per
+  task and planning session, each naming the cause and the fix. `required` fails the dispatch
+  instead.
+
+The tester rejected the first attempt with a real defect: bubblewrap refuses to mount onto a
+symlink. A dotfiles setup that makes `~/.config/opencode` a symlink would have failed every
+sandboxed dispatch under the default `auto`, with bubblewrap's raw message. The second attempt
+resolves every mount path, and reports any setup failure with its cause and the fix.
+
+The pilot's checks:
+- The hidden tests (`hidden-tests/test_hidden_w24_opencode_home.py`, 14) run a fake opencode that
+  resolves its folders, credentials and instructions as opencode does. On master, 9 failed for
+  the intended reasons. On W24, all passed with real bubblewrap.
+- An end-to-end check (`e2e/w24_opencode_e2e.py`) runs the real opencode CLI (1.19.5) behind
+  Conclave's provider, against a fake OpenAI-compatible model on 127.0.0.1 that asks for one bash
+  command.
+  - On master it showed the operator's global `AGENTS.md` in the system prompt, and the operator's
+    opencode folders written: a session, the log, snapshot repositories, and opencode rewriting
+    the operator's `opencode.json` to add `$schema`. The worker's command could read every
+    credential.
+  - On W24 all 12 checks pass: only the dispatch's key reached the model, no global instructions
+    were sent, the operator's folders stayed byte-identical, the session stayed under
+    `$CONCLAVE_HOME`, and the command saw the operator's `XDG_*` folders and tools unchanged.
+- Live after deploy: the daemon finds bubblewrap, and reads the operator's real opencode config (six
+  providers and the default model) without writing to it.
+
+No usage limit was hit. Run 3 in all: 20 tasks, 533.81 reported.

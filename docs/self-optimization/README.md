@@ -75,6 +75,11 @@ full gate is green.
     (`specs/w22_live_run_never_approved.md`);
   - W23 a complete event stream: replay after a reconnect, gaps announced, the SPA handles every
     event; the SPA's first unit tests (`specs/w23_event_stream_completeness.md`).
+- Run 3, part 4 (2026-11-20/21), the worker sandbox (`RESULTS.md`, run 3 part 4):
+  - W24 isolated opencode workers run under bubblewrap with their own opencode folders per model
+    provider: none of the operator's sessions, global config, instructions or other credentials,
+    while their commands see every path as before (`specs/w24_opencode_home_sandbox.md`,
+    end-to-end check with the real CLI in `e2e/w24_opencode_e2e.py`).
 
 ## Remaining work, in order (one task at a time, pilot review before each merge)
 
@@ -110,6 +115,7 @@ then merges; deploy between waves when the daemon's other project is idle):
 | E | W21 deterministic waits (`specs/w21_deterministic_waits.md`) | found live: with another project compiling on the host, a planning test failed on every run, on master too (a fixed 0.1 s sleep before asserting background work) |
 | E | W22 live runs never approved (`specs/w22_live_run_never_approved.md`) | found by W20: completing another node, or an approval between two waits, wrote `approved` for a live run |
 | E | W23 event stream completeness (`specs/w23_event_stream_completeness.md`) | backlog's WebSocket item, checked: the SPA handled only the last event of a burst, a reconnect lost what was emitted meanwhile, an overflow went unannounced |
+| F | W24 sandboxed opencode workers (`specs/w24_opencode_home_sandbox.md`) | found while checking the owner's isolation requirement: opencode workers filed their sessions in the operator's own opencode history (1,507 of 3,560 sessions), loaded the operator's global config and instructions, and could read every stored credential |
 
 Deferred with reasons: persona-first prompt order (it only helps prefix-cached engines; Claude Code
 sends the prompt as one block, so there is nothing to gain there, and a DeepSeek A/B needs a funded
